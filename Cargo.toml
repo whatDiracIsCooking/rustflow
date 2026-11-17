@@ -1,0 +1,24 @@
+[package]
+name = "rustflow"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+description = "A Rust port of Taskflow, the C++ task-parallel programming system"
+repository = "https://github.com/whatDiracIsCooking/rustflow"
+readme = "README.md"
+keywords = ["taskflow", "task-parallel", "dataflow", "concurrency", "dag"]
+categories = ["concurrency"]
+
+[dependencies]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+# A work-stealing scheduler is exactly the kind of code where an `as` cast or a
+# silent wrap is a real bug, so these are loud from the start rather than
+# retrofitted over a thousand call sites later.
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+undocumented_unsafe_blocks = "warn"

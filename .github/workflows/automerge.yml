@@ -1,0 +1,67 @@
+# Opt-in server-side merge. Adding the `automerge` label to a PR means "land
+# this the moment `ci` goes green, without me watching" -- the contract the
+# `pr` skill documents in its steps 4 and 5.
+#
+# Three things this depends on, none of which lives in this file. As of the
+# last check, the first two are satisfied on this repo:
+#   * the `automerge` label exists                             [verified]
+#   * "Allow squash merging" is enabled                        [verified]
+#   * Settings > Actions > General > Workflow permissions must be
+#     "Read and write permissions"                             [UNVERIFIED]
+#
+# That last one is the likely first failure. GitHub defaults GITHUB_TOKEN to
+# read-only for repositories created since Feb 2023, and the `permissions:`
+# block below can only narrow that ceiling, never raise it -- so on a
+# read-only default the merge step fails with a 403 and the PR just sits there.
+#
+# And one GitHub rule worth knowing: `workflow_run` only fires for the copy of
+# this file on the DEFAULT branch. Editing it on a feature branch changes
+# nothing until it lands on main.
+name: automerge
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+
+permissions:
+  contents: write        # squash-merge the PR, delete the branch
+  pull-requests: write
+
+jobs:
+  automerge:
+    # Only a green `ci` on a pull_request. A green run on a push to main has no
+    # PR to merge, and a red one must never land.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge the PR if it opted in
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          # workflow_run's own `pull_requests` array is empty for fork PRs, so
+          # resolve the PR from the head SHA instead -- it works for both.
+          pr=$(gh api "repos/$REPO/commits/$SHA/pulls" \
+                 --jq '[.[] | select(.state == "open")][0].number // empty')
+          if [ -z "$pr" ]; then
+            echo "No open PR for $SHA -- nothing to merge."
+            exit 0
+          fi
+
+          if ! gh pr view "$pr" --repo "$REPO" --json labels \
+               --jq '.labels[].name' | grep -qx automerge; then
+            echo "PR #$pr has no automerge label -- leaving it for a human."
+            exit 0
+          fi
+
+          echo "Squash-merging PR #$pr."
+          # --delete-branch is safe here and ONLY here: this runs server-side
+          # with no local checkout, so it cannot trip over a worktree holding
+          # main (the trap the `pr` skill warns about for local merges).
+          gh pr merge "$pr" --repo "$REPO" --squash --delete-branch

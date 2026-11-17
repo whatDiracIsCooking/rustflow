@@ -1,0 +1,60 @@
+# The gate, named `ci` because the `pr` skill and automerge.yml both key off
+# that exact name. It runs the same three commands as
+# `devtools/devcontainer.sh check` and the `check` service in
+# docker/compose.yaml, in the same container image -- so a green run here and a
+# green run on your machine mean the same thing.
+#
+# The toolchain pin lives in ONE place: `ARG RUST_VERSION` in the root
+# Dockerfile. The image below must be kept equal to it by hand; there is no
+# mechanism enforcing that, so when you bump one, bump the other.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to a PR branch makes the first run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.100-slim-bookworm
+    steps:
+      # Before checkout, deliberately: the slim image has no git, and
+      # actions/checkout silently falls back to a REST tarball without it,
+      # leaving no .git directory. Same package list as the Dockerfile.
+      - name: Install container prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates pkg-config libssl-dev
+          rm -rf /var/lib/apt/lists/*
+
+      - uses: actions/checkout@v4
+
+      # The official rust images install with --profile minimal, so neither
+      # clippy nor rustfmt is present until asked for.
+      - name: Add clippy and rustfmt
+        run: rustup component add clippy rustfmt
+
+      - name: Toolchain versions
+        run: rustc --version && cargo --version && cargo clippy --version
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features
+
+      # No dependency caching yet, on purpose: this crate has zero
+      # dependencies, so a cache round-trip would cost more than the build it
+      # saves. Add actions/cache on ~/.cargo/registry and ./target once there
+      # is a dependency tree worth restoring.

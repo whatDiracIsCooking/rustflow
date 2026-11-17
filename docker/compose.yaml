@@ -1,0 +1,84 @@
+# The BATCH path: one-shot runs that bring their own container and exit. The
+# other path is the devcontainer (.devcontainer/ + devtools/devcontainer.sh),
+# which is the interactive and agent-facing one. Both build the SAME image --
+# the repo's one ../Dockerfile -- so a result here and a result in there mean
+# the same thing.
+#
+#   export HOST_UID=$(id -u) HOST_GID=$(id -g)
+#   docker compose -f docker/compose.yaml run --rm check
+#
+# Note `context: ..`: the image builds from the REPO ROOT, never from this
+# directory, because the Dockerfile is at the root (shared with
+# .devcontainer/).
+#
+# HOST_UID/HOST_GID are required (`:?` below) rather than defaulted: a default
+# of 1000 on a host where you are not uid 1000 writes root-owned files into the
+# bind mount, and that failure surfaces much later as a confusing permission
+# error. See env.example and README.md in this directory.
+# Pinned, NOT derived. Compose defaults the project name to the directory
+# holding this file -- "docker" -- which would create volumes called
+# docker_cargo-registry and docker_target and a docker_default network. Those
+# names are not specific to anything, so a second repo of yours laid out the
+# same way (docker/compose.yaml) would silently share this project's build
+# cache and network. Pinning it also keeps the volume names below equal to the
+# ones .devcontainer/devcontainer.json mounts, so both front ends warm ONE
+# cargo registry and ONE /target instead of a cold cache each.
+name: rustflow
+
+x-rust: &rust
+  image: ${RUSTFLOW_IMAGE:-rustflow:latest}
+  build:
+    context: ..
+    dockerfile: Dockerfile
+    args:
+      HOST_UID: ${HOST_UID:?Set HOST_UID via id -u}
+      HOST_GID: ${HOST_GID:?Set HOST_GID via id -g}
+  volumes:
+    - ..:/workspace
+    # Named volumes, not binds: the registry download and the build artifacts
+    # are container-side state. /target in particular must NOT land in the
+    # bind mount, or a container build and a host build overwrite each other's
+    # artifacts in ./target.
+    - cargo-registry:/usr/local/cargo/registry
+    - target:/target
+  working_dir: /workspace
+  user: "${HOST_UID:?Set HOST_UID via id -u}:${HOST_GID:?Set HOST_GID via id -g}"
+
+services:
+  # The gate: what CI runs and what prepush should run. `bash -c`, never
+  # `bash -lc` -- a login shell sources /etc/profile, which resets PATH and
+  # loses the image's /usr/local/cargo/bin.
+  check:
+    <<: *rust
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        cargo fmt --all --check
+        cargo clippy --all-targets --all-features -- -D warnings
+        cargo test --all-features ${CARGO_TEST_ARGS:-}
+
+  # The long-lived interactive container devtools/devcontainer.sh execs into.
+  # It holds no state of its own -- the volumes do -- so `down` is cheap.
+  dev:
+    <<: *rust
+    command: ["sleep", "infinity"]
+    init: true
+
+  build:
+    <<: *rust
+    command: ["bash", "-c", "cargo build ${CARGO_BUILD_ARGS:-}"]
+
+  test:
+    <<: *rust
+    command: ["bash", "-c", "cargo test --all-features ${CARGO_TEST_ARGS:-}"]
+
+volumes:
+  # Explicit `name:` so these are NOT prefixed with the project name --
+  # devcontainer.json mounts them by these exact names, and a `rustflow_`
+  # prefix here would make it mount two different, empty volumes instead.
+  cargo-registry:
+    name: rustflow-cargo-registry
+  target:
+    name: rustflow-target

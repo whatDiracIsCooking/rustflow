@@ -1,0 +1,20 @@
+# Cargo build output. Container builds go to /target inside the image instead
+# (CARGO_TARGET_DIR in the Dockerfile), so this only catches host builds.
+/target/
+
+# Committed on purpose, for both binaries and libraries: it is what makes a CI
+# run reproducible. Not ignored -- listed here so nobody "fixes" it later.
+#Cargo.lock
+
+# Local compose overrides; docker/env.example is the committed template.
+docker/.env
+
+# Lightweight throwaway checkouts (see .claude/skills/worktree).
+.claude/worktrees/
+
+# Agent-local state and personal settings overrides.
+.claude/settings.local.json
+.claude/*.lock
+
+*.swp
+.DS_Store

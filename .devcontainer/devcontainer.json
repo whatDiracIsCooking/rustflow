@@ -1,0 +1,28 @@
+{
+  "//": "The interactive half. Builds the repo's one ../Dockerfile, same as docker/compose.yaml, so the two front ends cannot drift into different toolchains. HOST_UID/HOST_GID default to 1000 here because devcontainer.json cannot run `id -u`; on a host where you are not uid 1000, either edit these two values or use devtools/devcontainer.sh, which passes the real ones.",
+  "name": "rustflow",
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "context": "..",
+    "args": {
+      "HOST_UID": "1000",
+      "HOST_GID": "1000"
+    }
+  },
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+  "mounts": [
+    "source=rustflow-cargo-registry,target=/usr/local/cargo/registry,type=volume",
+    "source=rustflow-target,target=/target,type=volume"
+  ],
+  "remoteUser": "dev",
+  "customizations": {
+    "vscode": {
+      "extensions": ["rust-lang.rust-analyzer", "tamasfe.even-better-toml"],
+      "settings": {
+        "rust-analyzer.check.command": "clippy",
+        "editor.formatOnSave": true
+      }
+    }
+  }
+}
