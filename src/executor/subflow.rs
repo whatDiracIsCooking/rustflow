@@ -526,7 +526,6 @@ mod tests {
     use crate::Executor;
     use crate::graph::Task;
     use crate::prelude::*;
-    use crate::task::TaskMut;
 
     /// The subgraph a subflow node kept, as a dump sees it.
     fn subgraph_len(taskflow: &Taskflow, task: Task) -> usize {
@@ -657,8 +656,8 @@ mod tests {
                 let spawner = taskflow.emplace_subflow(move |subflow: &mut Subflow<'_>| {
                     if sourceless {
                         let (a, b) = subflow.emplace_n((|| {}, || {}));
-                        TaskMut::new(subflow.graph_mut(), a).precede([b]);
-                        TaskMut::new(subflow.graph_mut(), b).precede([a]);
+                        subflow.task(a).precede([b]);
+                        subflow.task(b).precede([a]);
                     }
                 });
                 let after = {

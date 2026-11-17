@@ -382,9 +382,15 @@ impl<'a> Subflow<'a> {
 }
 
 impl FlowBuilder for Subflow<'_> {
-    /// The subgraph, through the guard this handle holds. This one method is
-    /// the whole of what upstream gets by deriving `Subflow` from
-    /// `FlowBuilder`.
+    /// The subgraph, read-only: the inherent [`Subflow::graph`], which is the
+    /// same borrow the trait asks for.
+    fn graph(&self) -> &Graph {
+        Subflow::graph(self)
+    }
+
+    /// The subgraph, through the guard this handle holds. This method and the
+    /// one above are the whole of what upstream gets by deriving `Subflow`
+    /// from `FlowBuilder`.
     ///
     /// # Panics
     ///
@@ -439,7 +445,6 @@ mod tests {
     use crate::executor::topology::{GraphOwner, Parent, Topology};
     use crate::graph::{Handle, Task};
     use crate::prelude::*;
-    use crate::task::TaskMut;
     use crate::taskflow::Flow;
 
     /// A one-node taskflow whose node is a subflow task running `body`.
@@ -579,8 +584,8 @@ mod tests {
 
             // `precede` is on the task handle, as upstream's `B1.precede(B3)`
             // is; the builder's own chaining method is `linearize`.
-            TaskMut::new(subflow.graph_mut(), b1).precede([b3]);
-            TaskMut::new(subflow.graph_mut(), b2).precede([b3]);
+            subflow.task(b1).precede([b3]);
+            subflow.task(b2).precede([b3]);
             subflow.linearize([b3, b4]);
 
             assert_eq!(subflow.graph().len(), 4);
@@ -590,6 +595,14 @@ mod tests {
             // is the upstream edge-list trick `graph.rs` documents.
             assert_eq!(subflow.graph().predecessors(b3), [b2, b1].as_slice());
             assert_eq!(subflow.graph().successors(b3), [b4].as_slice());
+
+            // Both halves of the task handle come off the builder, which is
+            // what makes a subflow body read like upstream's: naming `B3` and
+            // asking after it is the same call here as on a taskflow (#120).
+            subflow.task(b3).name("B3");
+            assert_eq!(subflow.task_ref(b3).name(), "B3");
+            assert_eq!(subflow.task_ref(b3).num_predecessors(), 2);
+
             assert!(format!("{subflow:?}").contains("tasks: 4"));
             assert_eq!(subflow.num_workers(), 1);
             assert_eq!(subflow.worker().id(), 0);

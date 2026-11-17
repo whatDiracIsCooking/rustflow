@@ -52,7 +52,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 
 use rustflow::prelude::*;
-use rustflow::{Executor, RunError, TaskMut, Xorshift32};
+use rustflow::{Executor, RunError, Xorshift32};
 
 /// How many times a task body has run, shared with that body.
 type Counter = Arc<AtomicUsize>;
@@ -602,8 +602,8 @@ fn conditional_spawn(counter: &Counter, max_depth: i32, depth: i32, subflow: &mu
         // odd levels go right, even levels left, so the tree is a path per
         // branch rather than a doubling fan-out.
         let cond = subflow.emplace_condition(move || i32::from(depth % 2 != 0));
-        TaskMut::new(subflow.graph_mut(), cond).precede([b, c]);
-        TaskMut::new(subflow.graph_mut(), a).precede([cond]);
+        subflow.task(cond).precede([b, c]);
+        subflow.task(a).precede([cond]);
     }
 }
 
@@ -743,7 +743,7 @@ fn nested_cond(workers: usize) {
             //   S1 -> A1 -> B1 -> cond
             let s1 = subflow.emplace(|| {});
             let a1 = subflow.emplace(|| {});
-            TaskMut::new(subflow.graph_mut(), a1).succeed([s1]);
+            subflow.task(a1).succeed([s1]);
 
             let b1 = {
                 let counter = Arc::clone(&counter);
@@ -756,7 +756,7 @@ fn nested_cond(workers: usize) {
                     //          -----> C, D, E
                     let s2 = subflow.emplace(|| {});
                     let a2 = subflow.emplace(|| {});
-                    TaskMut::new(subflow.graph_mut(), a2).succeed([s2]);
+                    subflow.task(a2).succeed([s2]);
 
                     let b2 = {
                         let counter = Arc::clone(&counter);
@@ -764,13 +764,10 @@ fn nested_cond(workers: usize) {
                             counter.fetch_add(1, Ordering::Relaxed);
                         })
                     };
-                    TaskMut::new(subflow.graph_mut(), b2).succeed([a2]);
+                    subflow.task(b2).succeed([a2]);
 
                     let inner = subflow.emplace_condition(loop_back(INNER_LOOP));
-                    TaskMut::new(subflow.graph_mut(), inner)
-                        .name("cond")
-                        .succeed([b2])
-                        .precede([a2]);
+                    subflow.task(inner).name("cond").succeed([b2]).precede([a2]);
 
                     // Upstream's three redundant tasks: leaves of the
                     // subgraph that nothing depends on, released afresh every
@@ -780,19 +777,14 @@ fn nested_cond(workers: usize) {
                     // counted again each time round.
                     for name in ["C", "D", "E"] {
                         let redundant = subflow.emplace(|| {});
-                        TaskMut::new(subflow.graph_mut(), redundant)
-                            .name(name)
-                            .succeed([a2]);
+                        subflow.task(redundant).name(name).succeed([a2]);
                     }
                 })
             };
-            TaskMut::new(subflow.graph_mut(), b1).succeed([a1]);
+            subflow.task(b1).succeed([a1]);
 
             let mid = subflow.emplace_condition(loop_back(MID_LOOP));
-            TaskMut::new(subflow.graph_mut(), mid)
-                .name("cond")
-                .succeed([b1])
-                .precede([a1]);
+            subflow.task(mid).name("cond").succeed([b1]).precede([a1]);
         })
     };
     flow.task(a).succeed([s]);
@@ -1153,15 +1145,11 @@ fn hierarchical_condition(workers: usize) {
         let tf1 = Arc::clone(&tf1);
         move |subflow: &mut Subflow<'_>| {
             let sbf1_1 = subflow.emplace(|| {});
-            TaskMut::new(subflow.graph_mut(), sbf1_1).name("sbf1_1");
+            subflow.task(sbf1_1).name("sbf1_1");
             let module1 = subflow.composed_of(Arc::clone(&tf1));
-            TaskMut::new(subflow.graph_mut(), module1)
-                .name("module1")
-                .succeed([sbf1_1]);
+            subflow.task(module1).name("module1").succeed([sbf1_1]);
             let sbf1_2 = subflow.emplace(|| {});
-            TaskMut::new(subflow.graph_mut(), sbf1_2)
-                .name("sbf1_2")
-                .succeed([module1]);
+            subflow.task(sbf1_2).name("sbf1_2").succeed([module1]);
             subflow.join().expect("a fresh subflow is joinable");
         }
     });
@@ -1283,7 +1271,7 @@ fn condition_subflow(workers: usize) {
                 assert!(index < I, "the conditioner stops at I");
                 data[index].store(triangular(index), Ordering::Relaxed);
             });
-            TaskMut::new(subflow.graph_mut(), child).name(index.to_string());
+            subflow.task(child).name(index.to_string());
         })
     };
     taskflow.task(subflow).name("subflow");

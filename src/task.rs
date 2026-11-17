@@ -3,14 +3,20 @@
 //! Upstream's `tf::Task` is a copyable wrapper around a `Node*` that keeps
 //! aliasing a graph the caller goes on mutating, which is exactly the shape
 //! Rust's borrow rules exist to forbid. The handle is therefore split in two
-//! short-lived borrows of the owning [`Taskflow`]:
+//! short-lived borrows of the builder that owns the graph:
 //!
-//! - [`TaskMut`], from [`Taskflow::task`], is the editing half -- every method
-//!   returns `&mut Self` so that `tf.task(a).name("a").precede([b, c])` reads
-//!   the way upstream's chain does.
-//! - [`TaskRef`], from [`Taskflow::task_ref`], is the query half. It doubles
-//!   as the port of upstream's `tf::TaskView`, which differs from `tf::Task`
-//!   only in leaving the editing methods out.
+//! - [`TaskMut`], from [`FlowBuilder::task`](crate::FlowBuilder::task), is the
+//!   editing half -- every method returns `&mut Self` so that
+//!   `tf.task(a).name("a").precede([b, c])` reads the way upstream's chain
+//!   does.
+//! - [`TaskRef`], from
+//!   [`FlowBuilder::task_ref`](crate::FlowBuilder::task_ref), is the query
+//!   half. It doubles as the port of upstream's `tf::TaskView`, which differs
+//!   from `tf::Task` only in leaving the editing methods out.
+//!
+//! Both accessors are on the builder trait rather than on
+//! [`Taskflow`](crate::Taskflow), so a subflow body reaches a handle the same
+//! way its enclosing taskflow does (issue #120).
 //!
 //! The lasting handle is the [`Task`] index from [`crate::graph`]; these two
 //! borrow types are the fluent sugar over it and are not meant to be stored.
@@ -66,7 +72,6 @@ use crate::graph::{Graph, Handle, RuntimeWork, SubflowWork, Task, Work};
 use crate::runtime::Runtime;
 use crate::semaphore::Semaphore;
 use crate::subflow::Subflow;
-use crate::taskflow::Taskflow;
 
 /// What a task does when the executor reaches it, as a flat enumeration.
 ///
@@ -152,15 +157,16 @@ fn task_type_of(handle: &Handle) -> TaskType {
     }
 }
 
-/// A read-only handle to one task of a [`Taskflow`].
+/// A read-only handle to one task of a graph being built.
 ///
-/// Handed out by [`Taskflow::task_ref`]. This is a borrow, not the task's
-/// identity: the identity is the [`Task`] index it carries, which outlives it.
+/// Handed out by [`FlowBuilder::task_ref`](crate::FlowBuilder::task_ref). This
+/// is a borrow, not the task's identity: the identity is the [`Task`] index it
+/// carries, which outlives it.
 ///
 /// # Examples
 ///
 /// ```
-/// use rustflow::{Handle, Taskflow};
+/// use rustflow::prelude::*;
 ///
 /// let mut taskflow = Taskflow::new();
 /// let a = taskflow.graph_mut().add_named_node("a", Handle::Placeholder);
@@ -334,17 +340,18 @@ impl<'a> TaskRef<'a> {
     }
 }
 
-/// An editing handle to one task of a [`Taskflow`].
+/// An editing handle to one task of a graph being built.
 ///
-/// Handed out by [`Taskflow::task`]. Every method returns `&mut Self`, which is
-/// what keeps upstream's fluent chain readable; the queries live on
-/// [`TaskRef`], reachable with [`TaskMut::to_ref`], because one Rust type
-/// cannot carry upstream's getter/setter `name()` pair at once.
+/// Handed out by [`FlowBuilder::task`](crate::FlowBuilder::task). Every method
+/// returns `&mut Self`, which is what keeps upstream's fluent chain readable;
+/// the queries live on [`TaskRef`], reachable with [`TaskMut::to_ref`],
+/// because one Rust type cannot carry upstream's getter/setter `name()` pair
+/// at once.
 ///
 /// # Examples
 ///
 /// ```
-/// use rustflow::{Handle, Taskflow};
+/// use rustflow::prelude::*;
 ///
 /// let mut taskflow = Taskflow::new();
 /// let a = taskflow.graph_mut().add_node(Handle::Placeholder);
@@ -556,10 +563,10 @@ impl<'a> TaskMut<'a> {
 
     /// Returns this task to its just-created state: no work, no edges.
     ///
-    /// The name is kept, as [`Taskflow::clear`] keeps the taskflow's. See the
-    /// module docs for why this is not upstream's `_node = nullptr`, and why
-    /// the edges go through [`Graph::remove_edge`] rather than upstream's
-    /// one-sided `_edges.clear()`.
+    /// The name is kept, as [`Taskflow::clear`](crate::Taskflow::clear) keeps
+    /// the taskflow's. See the module docs for why this is not upstream's
+    /// `_node = nullptr`, and why the edges go through [`Graph::remove_edge`]
+    /// rather than upstream's one-sided `_edges.clear()`.
     pub fn reset(&mut self) -> &mut Self {
         // The neighbour lists have to be cloned out first: removing an edge
         // needs the graph mutably, and the slices borrow it.
@@ -667,38 +674,12 @@ impl<'a> TaskMut<'a> {
     }
 }
 
-/// The two accessors that hand out the handles above.
-///
-/// Issue #9 puts these in `src/taskflow.rs`; they are here instead so that
-/// this change touches no file a sibling change is editing. Rust allows an
-/// inherent `impl` anywhere in the defining crate, and both bodies go through
-/// the public [`Taskflow::graph`]/[`Taskflow::graph_mut`], so nothing about
-/// the split is load-bearing.
-impl Taskflow {
-    /// Returns an editing handle to `task`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `task` does not address a task of this taskflow.
-    pub fn task(&mut self, task: Task) -> TaskMut<'_> {
-        TaskMut::new(self.graph_mut(), task)
-    }
-
-    /// Returns a read-only handle to `task`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `task` does not address a task of this taskflow.
-    #[must_use]
-    pub fn task_ref(&self, task: Task) -> TaskRef<'_> {
-        TaskRef::new(self.graph(), task)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flow_builder::FlowBuilder;
     use crate::graph::AsyncWork;
+    use crate::taskflow::Taskflow;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
