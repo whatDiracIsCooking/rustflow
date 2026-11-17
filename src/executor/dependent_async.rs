@@ -337,7 +337,8 @@ impl Executor {
     /// dependencies named against it, and queues it if there are none left to
     /// wait for: upstream's `_schedule_dependent_async_task` plus the
     /// `_process_dependent_async` it calls per dependency and the
-    /// `_increment_topology` its public callers make first.
+    /// `_increment_topology` its public callers make first, which as there is
+    /// taken only for a parentless submission.
     ///
     /// `parent` and `estate` are upstream's own two arguments and mean what
     /// they mean in `Executor::schedule_async_task`: [`Parent::Run`] is its
@@ -361,7 +362,15 @@ impl Executor {
         estate: u32,
         dependencies: impl IntoIterator<Item = &'a AsyncTask>,
     ) -> AsyncTask {
-        self.shared.increment_async();
+        // Parentless only, which is the condition the tear-down below
+        // decrements under and upstream's split between its public
+        // `dependent_async` and the `_dependent_async(..., tpg, parent)` its
+        // runtime and task-group forms call: `Executor::schedule_async_task`
+        // has the whole of the argument, and #115 is what the two conditions
+        // disagreeing cost.
+        if matches!(parent, Parent::Run) {
+            self.shared.increment_async();
+        }
 
         let node = AsyncNode::new("", Handle::DependentAsync(work));
         node.node()
@@ -525,7 +534,8 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &AsyncWork) -> 
     // Upstream's parentless branch of `_tear_down_dependent_async`:
     // `if(node->_parent == nullptr) _decrement_topology()`, where this port's
     // null parent is `Parent::Run` on a free node. A parented one is not
-    // counted here because it was not counted on submission either. The
+    // counted here because the submission does not count it either, and what
+    // accounts for it instead is its parent's join counter (#115). The
     // counters go *after* the release above, as upstream orders them: a
     // successor is already counted in them on its own behalf, so the order
     // cannot let `wait_for_all` return early either way, and keeping
@@ -604,6 +614,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::executor::queue::WorkerQueue;
+    use crate::executor::topology::Nested;
     use crate::prelude::*;
 
     /// How long a handshake waits for the other side before it gives up.
@@ -630,6 +642,45 @@ mod tests {
     fn flag() -> (Arc<AtomicBool>, Arc<AtomicBool>) {
         let flag = Arc::new(AtomicBool::new(false));
         (Arc::clone(&flag), flag)
+    }
+
+    /// The two counters a free async task's submission and tear-down have to
+    /// balance: `(num_asyncs, num_topologies)`.
+    ///
+    /// This helper and the two below are `executor::async`'s, kept here as
+    /// `spin_until` above is: the imbalance they read was one line in each
+    /// module, so each module asserts its own.
+    fn counters(executor: &Executor) -> (usize, usize) {
+        (
+            executor.shared.num_asyncs.load(Ordering::Acquire),
+            executor.num_topologies(),
+        )
+    }
+
+    /// Spends whatever the counters are still carrying, so that a case which
+    /// found them unbalanced fails instead of hanging in [`Executor`]'s own
+    /// `Drop`, which waits for `num_asyncs` to reach zero.
+    fn drain_counters(executor: &Executor) {
+        for _ in 0..executor.shared.num_asyncs.load(Ordering::Acquire) {
+            executor.shared.finish_async();
+        }
+    }
+
+    /// Takes the one job a submission pushed back out of the shared buffers,
+    /// for a case that runs it by hand because the pool cannot: a worker
+    /// skips the steal loop while `num_topologies` is zero, which is what a
+    /// parented submission correctly leaves it at.
+    fn take_submitted_job(executor: &Executor) -> Job {
+        let buffer = executor
+            .shared
+            .buffers
+            .first_nonempty()
+            .expect("the submission pushed a job");
+        executor
+            .shared
+            .buffers
+            .steal_from(buffer)
+            .expect("the job the submission pushed")
     }
 
     /// A dependency that had already finished when the dependent was created
@@ -867,6 +918,63 @@ mod tests {
             "a task panicked: a dependent-async node cannot be run as part of a taskflow: \
              a dependent-async task is submitted to the executor, and its dependencies are \
              other async tasks rather than edges of a graph"
+        );
+    }
+
+    /// The same balance `executor::async` asserts for a plain async task, for
+    /// a dependent-async one: a submission under a parent counts nothing in
+    /// the executor's own counters and its tear-down spends nothing, so the
+    /// parent's join counter is the whole of the accounting.
+    ///
+    /// Issue #115's first half in this module, where #92's two runtime-shaped
+    /// forms and #93's four spawning forms all arrive. The imbalance was the
+    /// same line in both places.
+    ///
+    /// **How a regression surfaces.** As a failed assertion rather than a
+    /// hang -- `executor::async`'s case says why the counters are read and
+    /// spent rather than waited on, and why the job is driven by hand.
+    #[test]
+    fn a_parented_dependent_async_task_is_counted_by_its_parent_only() {
+        let executor = Executor::new(1);
+        let mut worker = WorkerThread::new(Arc::clone(&executor.shared), 0, WorkerQueue::new());
+
+        let parent = Nested::new(None);
+        let (ran, set_ran) = flag();
+
+        let task = executor.schedule_dependent_async_task(
+            AsyncWork::plain(move || set_ran.store(true, Ordering::Release)),
+            &parent.as_parent(),
+            ESTATE_NONE,
+            // No dependencies, so the submission queues the job itself: a
+            // dependency would park it on a node this case would then have to
+            // run as well, and the counters are the subject here.
+            [],
+        );
+        let submitted = counters(&executor);
+        assert_eq!(
+            parent.outstanding(),
+            1,
+            "the child is outstanding against its parent"
+        );
+
+        worker.invoke(take_submitted_job(&executor));
+        let torn_down = counters(&executor);
+
+        drain_counters(&executor);
+
+        assert_eq!(
+            submitted,
+            (0, 0),
+            "a parented submission counts nothing in the executor's own counters"
+        );
+        assert_eq!(torn_down, (0, 0), "and its tear-down spends nothing");
+        assert!(ran.load(Ordering::Acquire), "the body ran");
+        assert!(task.is_done(), "and the task is finished");
+        assert_eq!(
+            parent.outstanding(),
+            0,
+            "the parent's counter is where the child was counted, and the \
+             tear-down is what spent it"
         );
     }
 }
