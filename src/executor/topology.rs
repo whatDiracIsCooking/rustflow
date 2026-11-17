@@ -139,13 +139,17 @@
 //!
 //! - `RunHandle::wait`, its `Future` and its `Drop` sleep in the run's
 //!   completion slot, and are woken by [`Drop for Storage`](Storage).
-//! - `Executor::wait_for_all` and `Executor::drop` sleep on the executor's
-//!   run count, and the decrement that wakes them is the same `Drop`'s. It
+//! - `Executor::wait_for_all` sleeps on the executor's run count, and the
+//!   decrement that wakes it is the same `Drop`'s. It
 //!   used to be the tear-down's, one line before it dropped its own share,
 //!   so a `wait_for_all` could wake to a storage still held -- #109's window
 //!   at #109's own other waiter, reachable in safe code only through a
 //!   leaked `RunHandle`, which is why it was the fourth to be found and not
 //!   the first.
+//! - `Executor::drop` sleeps on the *second* count, the one that holds free
+//!   async tasks only (#88), and the tear-down of the last of those is what
+//!   wakes it. No run is behind that wake and no storage either, which is
+//!   half of why the counts are two: `executor::async` has the other half.
 //! - A `corun` frame sleeps nowhere: it owns the hold and polls it for
 //!   uniqueness, which is the rule asked as a question (#112).
 //! - A `Subflow::join` waits on an anchor and takes its lease back through

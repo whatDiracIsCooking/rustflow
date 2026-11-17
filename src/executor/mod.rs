@@ -22,11 +22,21 @@
 //! - `async_node` the free-standing node an async task is -- a one-node
 //!   graph of its own, which is what lets a node that belongs to no taskflow
 //!   and no run be dispatched by the same code as every other node -- and
-//!   `async` and `dependent_async` the two node kinds that run on one;
+//!   `async` and `dependent_async` the two node kinds that run on one: the
+//!   submitting calls, the two counters that make a free one something
+//!   [`Executor::wait_for_all`] and [`Drop`] can wait for, and the protocol
+//!   that builds a graph of them one task at a time while the tasks already
+//!   submitted run;
+//! - `runtime_async` the same submissions from a [`Runtime`](crate::Runtime)
+//!   body, which is where a free node acquires a *parent* -- so its children
+//!   are counted against the node that spawned them rather than against the
+//!   executor, and go onto the queue of the worker running the body;
 //! - `module`, `subflow` and `runtime` one dynamic-tasking node kind each,
 //!   reached by one line from the worker's handle match. `module` runs a
 //!   composed taskflow as of #49 and an adopted graph as of #74, `runtime` a
-//!   runtime task as of #51 and `subflow` a subflow task as of #50. They are
+//!   runtime task as of #51 -- and, as of #90, the free node whose body is
+//!   handed a `Runtime` too, since everything that hands a body one belongs
+//!   together -- and `subflow` a subflow task as of #50. They are
 //!   separate files so that the three could land without meeting in the
 //!   worker, which is what they did;
 //! - [`run_handle`] the `run` family itself -- `run`, `run_n`, `run_until` and
@@ -113,17 +123,26 @@
 //!
 //! 1. an **explicit** anchor -- upstream's `ESTATE::EXPLICITLY_ANCHORED` --
 //!    is a frame that is blocked on this graph right now: an
-//!    [`Executor::corun`], a subflow's `join` (#50) or a runtime task's own
-//!    `corun` (#51). It is a bit held by a guard for
+//!    [`Executor::corun`], a subflow's `join` (#50), a runtime task's own
+//!    `corun` (#51) or a [`TaskGroup::corun`](crate::TaskGroup) (#93). It is
+//!    a bit held by a guard for
 //!    exactly as long as that frame waits, so a walk that reaches it hands
 //!    the payload to a thread that is about to look. Whoever takes it decides
 //!    what to do: `corun` re-raises it on its own worker,
-//!    [`Executor::try_corun`] returns it;
+//!    [`Executor::try_corun`] returns it. One kind of node carries the bit
+//!    without a frame behind it: a free node whose runtime-shaped body hands
+//!    back an [`AsyncHandle`](crate::AsyncHandle) is anchored for its whole
+//!    life (#90, #92), because the waiter is whoever holds that handle and
+//!    the node is what answers to it;
 //! 2. an **implicit** anchor -- upstream's `NSTATE::IMPLICITLY_ANCHORED` --
 //!    is a node that preempted itself and means to look at its payload slot
 //!    when it is resumed. The *innermost* one the walk saw gets the payload,
-//!    because that is the one closest to the failure. #51's runtime tasks are
-//!    the one node kind that sets the bit; a preempted subflow node does not,
+//!    because that is the one closest to the failure. #51's runtime tasks set
+//!    the bit, as does #90's free node with a runtime-shaped body -- they
+//!    share the entry that sets it -- and a
+//!    [`TaskGroup`](crate::TaskGroup)'s anchor carries it from the moment the
+//!    group is opened (#93), which is what keeps a silent child's failure for
+//!    the next `corun` to report. A preempted subflow node does not set it,
 //!    which is upstream's arrangement too;
 //! 3. the **run**, which is every chain's root and is anchored by definition
 //!    -- upstream constructs its topology `EXPLICITLY_ANCHORED` to say so.
@@ -161,7 +180,11 @@
 //!   [`corun`](Executor::corun) schedules a whole taskflow under. Its counter
 //!   reaching zero means that *nested* graph is over, which ends nothing: it
 //!   either resumes the node that was waiting for it or releases the frame
-//!   that is watching the counter.
+//!   that is watching the counter. A node whose own children are *async
+//!   tasks* rather than a graph is the same thing counted the same way (#92),
+//!   and a [`TaskGroup`](crate::TaskGroup)'s anchor (#93) is a parent of this
+//!   kind with no run around it at all -- a shared `NodeBase` the group's
+//!   children count down and a `corun` reads.
 //!
 //! The parent is carried by the job rather than stored on the node, which is
 //! what this port has instead of upstream's `node->_parent`, and
@@ -206,7 +229,11 @@
 //!
 //! All three arms that can preempt a node now do: a module task (#49, #74),
 //! a runtime task that spawned work (#51) and a subflow left to its implicit
-//! join (#50).
+//! join (#50). A fourth node *kind* joined them with the async family: a free
+//! node whose body is handed a `Runtime` (#90) runs the same protocol through
+//! `executor::runtime`'s own entry, which is what makes an
+//! [`AsyncHandle`](crate::AsyncHandle) on one an answer about the children it
+//! spawned (#92) rather than only about the body.
 //!
 //! # Semaphores: what a node does before and after the dispatch
 //!
@@ -370,7 +397,9 @@ pub(crate) struct Shared {
     pub(crate) buffers: Buffers<Job>,
     /// Where a worker with nothing to steal goes to sleep.
     pub(crate) notifier: CachePadded<DefaultNotifier>,
-    /// How many topologies are running, i.e. upstream's `_num_topologies`.
+    /// How many topologies are running, i.e. upstream's `_num_topologies`:
+    /// runs, plus the free async tasks `executor::async` counts in here as
+    /// upstream's own `async` and `silent_async` do.
     ///
     /// Read on the hot path: a worker with nothing to steal checks it before
     /// it sweeps the queues, because zero means every queue is empty by the
@@ -443,13 +472,15 @@ impl Shared {
         self.num_topologies.load(Ordering::Relaxed)
     }
 
-    /// Counts one more run as in flight. Upstream's `_increment_topology`.
+    /// Counts one more run -- or one more free async task -- as in flight.
+    /// Upstream's `_increment_topology`.
     pub(crate) fn increment_topology(&self) {
         self.num_topologies.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Counts one run as finished, waking [`Executor::wait_for_all`] if that
-    /// was the last. Upstream's `_decrement_topology`.
+    /// Counts one run -- or one free async task -- as finished, waking
+    /// [`Executor::wait_for_all`] if that was the last. Upstream's
+    /// `_decrement_topology`.
     pub(crate) fn decrement_topology(&self) {
         if self.num_topologies.fetch_sub(1, Ordering::AcqRel) == 1 {
             // Under the lock: a waiter that has read a non-zero count but not
@@ -601,7 +632,13 @@ impl Executor {
     /// How many topologies are running. Upstream's `num_topologies`.
     ///
     /// One per [`RunHandle`](crate::RunHandle) whose run has not finished,
-    /// and the count [`Executor::wait_for_all`] blocks on reaching zero.
+    /// plus one per *free* async task queued or running -- upstream counts
+    /// those here too, and `executor::async` has why (#86, #88). A child of a
+    /// [`Runtime`](crate::Runtime) body or of a
+    /// [`TaskGroup`](crate::TaskGroup) is in neither count, because the
+    /// parent waiting for it is what accounts for it (#115).
+    ///
+    /// This is the count [`Executor::wait_for_all`] blocks on reaching zero.
     #[must_use]
     pub fn num_topologies(&self) -> usize {
         self.shared.num_topologies()

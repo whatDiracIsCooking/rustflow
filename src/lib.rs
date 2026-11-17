@@ -39,8 +39,8 @@
 //! [`Executor::corun`] and [`Executor::corun_until`] let a worker wait on a
 //! nested run by working on it rather than parking -- which is what keeps
 //! nesting from starving the pool of the very threads the inner run needs --
-//! and [`Executor::wait_for_all`] blocks until the executor is carrying no
-//! run at all.
+//! and [`Executor::wait_for_all`] blocks until the executor is carrying
+//! neither a run nor one of the free async tasks described below.
 //!
 //! Interfering with a run already under way happens two ways, and both go
 //! through one word of state. Cancelling one works: [`RunHandle::cancel`], or
@@ -57,19 +57,38 @@
 //! first panicking task of a run is reported, and a later run of the same
 //! taskflow starts clean.
 //!
-//! Work needs no graph at all to be run: [`Executor::spawn`] hands a closure
+//! Work needs no graph at all to be run. [`Executor::spawn`] hands a closure
 //! straight to the pool and gives back an [`AsyncHandle`] on its result --
 //! wait on it, poll it as a [`Future`], or drop it, which detaches -- and
 //! [`Executor::silent_async`] does the same for a body nobody is waiting on.
-//! Either may be submitted from any thread, a task body already running on one
-//! of the executor's own workers included, which is how async tasks nest. They
-//! are counted in [`Executor::num_topologies`] like a run, so
-//! [`Executor::wait_for_all`] covers them; a panic out of a `spawn` body is
-//! reported from its handle as [`RunError::Panicked`] and cancels nothing,
-//! since an async task is part of nothing to cancel. Dropping the executor now
-//! waits for this kind of work, because nothing else can -- a detached handle
-//! borrows nothing -- while a leaked [`RunHandle`] still takes the pool down
-//! with it.
+//! [`Executor::spawn_runtime`] and [`Executor::silent_async_runtime`] are
+//! those two over a body that is handed a [`Runtime`] rather than nothing, so
+//! that it can spawn work of its own; such a task is not done until that work
+//! is. [`Executor::dependent_async`] and
+//! [`Executor::silent_dependent_async`] put edges between async tasks: each
+//! hands back an [`AsyncTask`], a shared handle on the one node the task is,
+//! and naming such a handle as a dependency of a later submission is how that
+//! graph is built -- one task at a time, while the tasks already submitted
+//! run, which no [`Taskflow`] can do. An `AsyncTask` answers only what is
+//! about identity and state, upstream's own limit:
+//! [`is_done`](AsyncTask::is_done),
+//! [`use_count`](AsyncTask::use_count) -- which counts the executor's shares
+//! as well as the caller's handles, since a queued job is a share -- and
+//! [`take_panic`](AsyncTask::take_panic). Both of the dependent forms have a
+//! `_runtime`-bodied twin as well.
+//!
+//! Any thread may submit any of them, a task body already running on one of
+//! the executor's own workers included, which is how async tasks nest. A
+//! *free* async task -- one submitted to the executor rather than under
+//! something -- is counted in [`Executor::num_topologies`] like a run, so
+//! [`Executor::wait_for_all`] covers it, and in a second count of its own
+//! that dropping the executor waits for, because nothing else can: a detached
+//! handle borrows nothing, where a leaked [`RunHandle`] still takes the pool
+//! down with it. A panic out of a `spawn` body is reported from its handle as
+//! [`RunError::Panicked`] and cancels nothing, since an async task is part of
+//! nothing to cancel; a `silent_dependent_async`'s stays on the node, where
+//! `take_panic` reads it back, and a `silent_async`'s, which no handle names,
+//! is dropped with the node.
 //!
 //! A task can also be the thing that builds the graph.
 //! [`FlowBuilder::emplace_subflow`] hands its body a [`Subflow`], itself a
@@ -79,22 +98,49 @@
 //! [`Runtime`] instead, whose [`schedule`](Runtime::schedule) puts a task of
 //! its own graph straight onto the worker's queue past that task's
 //! dependencies, and whose [`corun`](Runtime::corun) waits for whatever the
-//! body left outstanding under the node -- which is nothing until the async
-//! family of the README's step 5 gives a body a way to leave anything there.
-//! And [`FlowBuilder::composed_of`] runs another taskflow's graph in place of
-//! a task, as many times and in as many taskflows as the caller likes, since
-//! the module task owns a share of its target; [`FlowBuilder::adopt`] is the
-//! same thing for a graph that has no other owner.
+//! body left outstanding under the node -- which is the async tasks it
+//! spawned, through the same eight forms the executor has, counted against
+//! the node rather than against the run and queued on the very worker the
+//! body is running on. A body that spawns and never coruns is joined all the
+//! same, once it has returned. And [`FlowBuilder::composed_of`] runs another
+//! taskflow's graph in place of a task, as many times and in as many
+//! taskflows as the caller likes, since the module task owns a share of its
+//! target; [`FlowBuilder::adopt`] is the same thing for a graph that has no
+//! other owner.
 //!
-//! One mechanism carries all three, and it is upstream's: a node with work
+//! One mechanism carries all of those, and it is upstream's: a node with work
 //! of its own still outstanding -- a subgraph, a composed graph, or whatever
 //! a runtime body spawned -- does not finish when its body returns but is
 //! entered a second time, by the last job of that work to count it down, and
-//! only then releases its successors. So a failure inside a nested graph is
-//! not automatically the run's. It goes to whoever is *waiting* for that graph
-//! -- a [`Subflow::join`], a [`Runtime::corun`], an [`Executor::corun`] --
-//! and reaches `wait` only when nobody is, which is what lets the task that
-//! asked for the nested work be the task that answers for it.
+//! only then releases its successors. A runtime-bodied *async* task is
+//! entered twice for the same reason, which is what makes its handle's `wait`
+//! an answer about the children as well as the body. So a failure inside a
+//! nested graph is not automatically the run's. It goes to whoever is
+//! *waiting* for that graph -- a [`Subflow::join`], a [`Runtime::corun`], a
+//! [`TaskGroup::corun`], an [`Executor::corun`] -- and reaches `wait` only
+//! when nobody is, which is what lets the task that asked for the nested work
+//! be the task that answers for it.
+//!
+//! A worker can open a scope to spawn into and wait for with no graph and no
+//! node of its own: [`Executor::task_group`] hands back a [`TaskGroup`] with
+//! the same eight submitting forms, and [`TaskGroup::corun`] waits for its
+//! children by staying in the work-stealing loop, which is why only a worker
+//! may open one. Dropping a group with children still outstanding is *not* a
+//! join -- upstream has no destructor on it either -- and the children of a
+//! group are counted by the group rather than by the executor, so
+//! `wait_for_all` does not cover them. Recursive parallelism is what it is
+//! for: a plain recursive function rather than a graph somebody has to build.
+//!
+//! [`Semaphore`] is the one constraint that spans tasks instead of following
+//! the edges. [`TaskMut::acquire`] and [`TaskMut::release`] name the
+//! semaphores a task takes before its body runs and gives back after it, and
+//! a task that cannot have every count it asked for is parked in the
+//! semaphore rather than run, to be rescheduled by whoever releases -- so a
+//! semaphore of one serialises a set of tasks that have no dependency on each
+//! other at all. Releasing past the maximum is the releasing task's own
+//! failure, delivered where a panic in its body would go, and a task parked
+//! when its run is cancelled *stays* parked, which is upstream's behaviour
+//! and the one way a cancelled run does not finish promptly.
 //!
 //! None of that is paid for with `unsafe`: the executor has none at all, and
 //! the crate's only `unsafe` blocks are in [`notifier`](executor::notifier),
@@ -104,9 +150,12 @@
 //! one does without because a queued job *owns* everything it names rather
 //! than pointing at it.
 //!
-//! The README's "Order of work" section is the sequence the whole port
-//! follows, and reading what is next there beats a list here that would go
-//! stale the week after it was written.
+//! What is still out is the two steps that follow: observers and the
+//! algorithms -- partitioners, `for_each`, `reduce`, `sort` -- and then
+//! pipelines, the one family with no Rust equivalent. The README's "Order of
+//! work" section is the sequence the whole port follows, and reading what is
+//! next there beats a list here that would go stale the week after it was
+//! written.
 //!
 //! The port follows **Taskflow v4.1.0** (commit `45366fe5`, 2026-06-19). See
 //! the README's "Upstream pin" section before translating anything.
