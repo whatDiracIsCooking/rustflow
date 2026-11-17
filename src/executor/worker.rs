@@ -751,10 +751,38 @@ impl WorkerThread {
         match release.selected() {
             // Upstream's `default` arm: every successor, each the moment its
             // last strong dependency is spent.
+            //
+            // The decrement stops at zero, which is this port's one departure
+            // here and is issue #98: a successor's counter can *already* be
+            // zero when this runs, because something bypassed its
+            // dependencies -- `Runtime::schedule` stores a zero, as does the
+            // conditional arm below -- and upstream's bare `fetch_sub` on a
+            // `size_t` then wraps it to `SIZE_MAX`. The wrap is silent and
+            // not benign: a wrapped counter never equals the one
+            // `Runtime::corun` waits for nor the zero `Parent::outstanding`
+            // waits for, so a bypassed node that later coruns or preempts
+            // hangs. Flooring it keeps the counter's meaning -- how many
+            // dependencies are outstanding, never fewer than none -- and
+            // loses no release upstream delivers: a `fetch_sub` that
+            // returned 0 queued nothing either.
             None => {
                 for &successor in node.successors() {
                     let next = graph.node(successor);
-                    if next.join_counter().fetch_sub(1, Ordering::AcqRel) == 1 {
+                    // `update` is a compare-exchange loop where upstream has
+                    // one `fetch_sub`, and that cost is deliberate: the
+                    // cheaper shape -- subtract, then add the one back when
+                    // the old value turned out to be zero -- is not sound,
+                    // because two predecessors of the same bypassed node can
+                    // be inside that window at once and the second reads the
+                    // first's `SIZE_MAX` as an ordinary count, leaving the
+                    // counter there. It returns the value the counter held,
+                    // as `fetch_sub` does.
+                    let outstanding = next.join_counter().update(
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                        |outstanding| outstanding.saturating_sub(1),
+                    );
+                    if outstanding == 1 {
                         job.parent().count_queued(topology, 1);
                         self.update_cache(&mut cache, job.successor(successor));
                     }
