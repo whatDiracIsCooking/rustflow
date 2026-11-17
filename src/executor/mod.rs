@@ -21,10 +21,10 @@
 //!   from being a queue of raw pointers;
 //! - `module`, `subflow` and `runtime` one dynamic-tasking node kind each,
 //!   reached by one line from the worker's handle match. `module` runs a
-//!   composed taskflow as of #49 and an adopted graph as of #74;
-//!   `subflow` and `runtime` refuse the run and say which issue lands them
-//!   (#50, #51). They are separate files so that the three can land without
-//!   meeting in the worker;
+//!   composed taskflow as of #49 and an adopted graph as of #74, `runtime` a
+//!   runtime task as of #51 and `subflow` a subflow task as of #50. They are
+//!   separate files so that the three could land without meeting in the
+//!   worker, which is what they did;
 //! - [`run_handle`] the `run` family itself -- `run`, `run_n`, `run_until` and
 //!   the owning half of each -- the tear-down that decides whether a finished
 //!   run goes round again, the handle whose borrow is this port's answer to
@@ -91,8 +91,8 @@
 //!
 //! 1. an **explicit** anchor -- upstream's `ESTATE::EXPLICITLY_ANCHORED` --
 //!    is a frame that is blocked on this graph right now: an
-//!    [`Executor::corun`] today, and a subflow's `join` or a runtime task's
-//!    own `corun` when #50 and #51 land. It is a bit held by a guard for
+//!    [`Executor::corun`], a subflow's `join` (#50) or a runtime task's own
+//!    `corun` (#51). It is a bit held by a guard for
 //!    exactly as long as that frame waits, so a walk that reaches it hands
 //!    the payload to a thread that is about to look. Whoever takes it decides
 //!    what to do: `corun` re-raises it on its own worker,
@@ -100,8 +100,9 @@
 //! 2. an **implicit** anchor -- upstream's `NSTATE::IMPLICITLY_ANCHORED` --
 //!    is a node that preempted itself and means to look at its payload slot
 //!    when it is resumed. The *innermost* one the walk saw gets the payload,
-//!    because that is the one closest to the failure. No node kind this port
-//!    runs sets the bit yet; #51's runtime tasks are the first;
+//!    because that is the one closest to the failure. #51's runtime tasks are
+//!    the one node kind that sets the bit; a preempted subflow node does not,
+//!    which is upstream's arrangement too;
 //! 3. the **run**, which is every chain's root and is anchored by definition
 //!    -- upstream constructs its topology `EXPLICITLY_ANCHORED` to say so.
 //!    Its payload slot is the completion slot, so this is the case where a
@@ -109,9 +110,9 @@
 //!
 //! A node whose nested graph merely *preempted* it is no anchor at all, which
 //! is upstream's arrangement rather than something left out: the children of
-//! a module task -- #49's, and of a subflow once #50 lands -- report straight
-//! past it to the run, so a failure in one of those surfaces from `wait` like
-//! any other failure of that run. What the walk does for
+//! a module task (#49) and of a subflow left to its implicit join (#50)
+//! report straight past it to the run, so a failure in one of those surfaces
+//! from `wait` like any other failure of that run. What the walk does for
 //! such a node is mark it, so the siblings of the failing job are skipped.
 //!
 //! Whichever anchor is found, one `fetch_or` of `EXCEPTION | CAUGHT` on it
@@ -181,9 +182,9 @@
 //! `_update_cache` is not ported, resumes the parent on the worker that
 //! finished the last child.
 //!
-//! None of the three arms that could preempt a node does so yet -- they
-//! refuse the run instead, each naming its issue -- so what is here is the
-//! protocol without a caller. #50's subflows are the first to use it.
+//! All three arms that can preempt a node now do: a module task (#49, #74),
+//! a runtime task that spawned work (#51) and a subflow left to its implicit
+//! join (#50).
 //!
 //! # Why cancellation reads the whole chain
 //!

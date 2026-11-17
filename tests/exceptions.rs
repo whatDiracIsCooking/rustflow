@@ -9,12 +9,17 @@
 //!
 //! The rest of that file is deferred rather than half-ported, because every
 //! one of its remaining cases needs a node kind this port does not run yet:
-//! the subflow family (`SubflowTask`, `JoinedSubflow1..3`, `NestedSubflow`,
-//! `NestedSubflow2`), the `Runtime` and `RuntimeCorun1..2`
-//! cases, the async family (`Async`, `DependentAsync`, `RuntimeAsync`),
-//! `Semaphore`, `TaskGroup`, the `Probe1..4` cases and the algorithm ones
-//! (`Algorithm`, `NestedAlgorithm`). They arrive with M4 and later, together
-//! with the subflow and runtime anchors those cases wait on.
+//! the `Runtime` and `RuntimeCorun1..2` cases, the async family (`Async`,
+//! `DependentAsync`, `RuntimeAsync`), `Semaphore`, `TaskGroup`, the
+//! `Probe1..4` cases and the algorithm ones (`Algorithm`,
+//! `NestedAlgorithm`). They arrive with M4 and later, together with the
+//! runtime anchors those cases wait on.
+//!
+//! Two of the subflow family are here as of subflow tasking (#50), at the end
+//! of the file: `Exception.SubflowTask` and `Exception.JoinedSubflow1`, which
+//! are the cases about where a failure *inside* a subgraph is delivered.
+//! `JoinedSubflow2` and `3`, `NestedSubflow` and `NestedSubflow2` are #55's,
+//! with the rest of that issue's exception work.
 //!
 //! Two more are here as of the anchor walk (#48): `Exception.ExecutorCorun1`
 //! -- its static half, the subflow half being #55's -- and
@@ -131,13 +136,20 @@ fn corun_failure(error: &CorunError) -> &RunError {
 
 /// Asserts that `error` is the panic the failing body raised.
 fn assert_failed_with_x(error: &RunError, context: &str) {
+    assert_failed_with(error, "x", context);
+}
+
+/// The same check over whichever payload the case expects, which the subflow
+/// cases need: upstream's `subflow_task` panics with `"x"` from one body and
+/// `"y"` from another, and which of the two comes back is the whole claim.
+fn assert_failed_with(error: &RunError, expected: &str, context: &str) {
     let RunError::Panicked(payload) = error else {
         panic!("{context}: unexpected error: {error:?}");
     };
     assert_eq!(
         payload.downcast_ref::<&str>(),
-        Some(&"x"),
-        "{context}: the payload is not the one `C` panicked with"
+        Some(&expected),
+        "{context}: the payload is not the one the failing task panicked with"
     );
 }
 
@@ -476,5 +488,109 @@ fn a_panic_inside_a_module_fails_the_composing_run() {
             .wait()
             .expect_err("the task of the composed taskflow panicked");
         assert_failed_with_x(&error, &format!("{workers} worker(s)"));
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Exception.SubflowTask
+// ----------------------------------------------------------------------------
+
+/// Upstream's `subflow_task(W)`, both halves: a hundred subflow tasks whose
+/// *body* panics with `"x"` after emplacing a child that would panic with
+/// `"z"`, and then a hundred whose body returns and whose child panics with
+/// `"y"`.
+///
+/// What each half pins is which payload survives, and they are different
+/// claims:
+///
+/// - the body's `"x"` is reported, and the `"z"` of the child it had already
+///   emplaced is never raised at all. A body that panicked is still followed
+///   by the implicit join -- upstream's exception handler is the body of its
+///   first switch and does not return -- so those children *are* scheduled;
+///   what stops them is that the walk which recorded `"x"` marked their
+///   parent, so each is skipped as the child of a failed node;
+/// - with no failure in the body, the child's `"y"` is what the walk carries
+///   up. A subflow node left to the implicit join is no anchor -- it
+///   preempted itself and undertook to look at nothing -- so the payload goes
+///   past it to the run.
+#[test]
+fn a_panic_in_a_subflow_body_beats_the_child_it_emplaced() {
+    for workers in 1..=4 {
+        let context = format!("{workers} worker(s)");
+        let executor = Executor::new(workers);
+
+        let mut taskflow = Taskflow::new();
+        for _ in 0..100 {
+            taskflow.emplace_subflow(|subflow: &mut Subflow<'_>| {
+                subflow.emplace(|| {});
+                subflow.emplace(|| panic!("z"));
+                panic!("x");
+            });
+        }
+
+        let error = executor
+            .run(&taskflow)
+            .wait()
+            .expect_err("every subflow body panicked");
+        assert_failed_with(&error, "x", &context);
+
+        let mut taskflow = Taskflow::new();
+        for _ in 0..100 {
+            taskflow.emplace_subflow(|subflow: &mut Subflow<'_>| {
+                subflow.emplace(|| {});
+                subflow.emplace(|| panic!("y"));
+            });
+        }
+
+        let error = executor
+            .run(&taskflow)
+            .wait()
+            .expect_err("a child of every subflow panicked");
+        assert_failed_with(&error, "y", &context);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Exception.JoinedSubflow1
+// ----------------------------------------------------------------------------
+
+/// Upstream's `joined_subflow_1(W)`: one subflow task spawning a hundred
+/// subflow tasks, each of which emplaces two panicking children and joins
+/// them explicitly.
+///
+/// This is the anchor priority of #48 under three levels of nesting. Each
+/// `join` anchors its own node for the length of its corun, so a child's
+/// `"x"` is delivered *there* rather than to the run -- and `join` re-raises
+/// it, which makes it the failure of the body that joined, which the executor
+/// records against the next thing waiting, which is eventually the run. So the
+/// payload travels up one level at a time and `wait` reports the same `"x"`
+/// upstream's `get()` throws.
+#[test]
+fn a_panic_under_a_hundred_joined_subflows_reaches_the_run() {
+    for workers in 1..=4 {
+        let context = format!("{workers} worker(s)");
+
+        let mut taskflow = Taskflow::new();
+        taskflow.emplace_subflow(|subflow: &mut Subflow<'_>| {
+            for _ in 0..100 {
+                subflow.emplace_subflow(|subflow: &mut Subflow<'_>| {
+                    for _ in 0..2 {
+                        subflow.emplace(|| panic!("x"));
+                    }
+                    // Upstream's note: nothing after this line is guaranteed
+                    // to be reached, because the failure cancels the rest of
+                    // the subgraph and the join may therefore succeed with
+                    // both children skipped. Letting the panic through is the
+                    // one behaviour that does not depend on which happened.
+                    subflow.join().expect("a fresh subflow is joinable");
+                });
+            }
+        });
+
+        let error = Executor::new(workers)
+            .run(&taskflow)
+            .wait()
+            .expect_err("the children of every joined subflow panicked");
+        assert_failed_with(&error, "x", &context);
     }
 }

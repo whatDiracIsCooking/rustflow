@@ -138,8 +138,9 @@ pub trait FlowBuilder {
     /// and a fresh entry to the same node starts from an empty one, which is
     /// what makes a subflow inside a loop behave.
     ///
-    /// Running one is issue #50: today this builds a graph citizen that reports
-    /// [`crate::TaskType::Subflow`], and a run that reaches it is refused.
+    /// The body may also run its subgraph itself, with
+    /// [`Subflow::join`](crate::Subflow::join), and read what the children
+    /// left behind before it returns.
     ///
     /// ```
     /// use rustflow::prelude::*;

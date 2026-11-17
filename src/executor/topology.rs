@@ -133,10 +133,27 @@
 //! it already shows for a subgraph whose lock is held, so the lease adds no
 //! observable of its own.
 //!
-//! Putting the graph back where it came from is #50's, along with the
+//! Putting the graph back where it came from is #50's, and the answer is
+//! `Drop for Inside`: **the last share of a lease is what sends the graph
+//! home**, through `subflow::return_subgraph`, which also applies the
 //! clear-unless-`RETAIN_SUBFLOW` rule that decides whether it goes back at
-//! all; what this module owes it is the shape, and [`Inside`] is also the
-//! path a restore would resolve the destination lock through.
+//! all. [`Inside`] is the path that restore resolves the destination lock
+//! through, which is the other half of why the type is here.
+//!
+//! The frame that is *waiting* for a nested run would be the obvious
+//! restorer, and it cannot be, which is worth stating in this module because
+//! the reason is this module's ownership shape rather than anything about
+//! subflows. A job of a graph nested inside a leased subgraph decrements the
+//! join counter of its parent node -- a node **of the leased graph**, so the
+//! counter is inside the lease and the job must hold the lease to reach it --
+//! and [`finish_job`](crate::executor::Shared::finish_job) releases that hold
+//! *after* the decrement, which is the decrement that can end the leased
+//! graph's own run. So a straggling share can outlive the run it belongs to by
+//! a few instructions, no holder can prove it is the last, and a waiting
+//! frame's `Arc::into_inner` would fail at random.
+//! [`GraphOwner::take_lease`] is that attempt all the same, for the one
+//! caller that benefits from the common case; `executor::subflow` has what
+//! losing the race costs.
 //!
 //! # Why a parent travels with the job
 //!
@@ -188,6 +205,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Poll, Waker};
 
+use crate::executor::subflow;
 use crate::graph::{Graph, Handle, Node, NodeBase, Task};
 use crate::task::TaskRef;
 use crate::taskflow::Flow;
@@ -492,6 +510,33 @@ impl GraphOwner {
             .any(|(_, node)| node.num_predecessors() == 0)
     }
 
+    /// Takes the leased graph back out of this owner, if this is the last
+    /// share of it.
+    ///
+    /// `Subflow::join`'s way home: the joining frame wants the graph back in
+    /// the node before it returns, so that the body can read what it built,
+    /// and it is the one caller that *can* ask -- it owns a share and is not
+    /// itself a job. `None` means some straggling job of a graph nested inside
+    /// this one still holds a share, in which case the policy is applied by
+    /// that share's own `Drop`; `executor::subflow` says why that case cannot
+    /// be ruled out and what it costs.
+    ///
+    /// Also `None` for an owner that is not a lease at all, which no caller
+    /// has reason to ask about: a taskflow's storage and an adopted module's
+    /// graph are read where they lie.
+    pub(crate) fn take_lease(self) -> Option<Graph> {
+        match self {
+            Self::Flow(_) => None,
+            // Taking the field rather than moving it out, because `Inside`
+            // implements `Drop` -- and leaving `None` behind is exactly what
+            // keeps that `Drop` from returning the graph a second time.
+            Self::Inside(inside) => {
+                let mut inside = Arc::into_inner(inside)?;
+                inside.leased.take()
+            }
+        }
+    }
+
     /// The address that identifies the graph this owner names, for the hash
     /// and the `Debug` a job needs.
     ///
@@ -534,6 +579,40 @@ impl Inside {
             // A subflow's handle does not reach here either -- its graph is
             // the lease above.
             handle => unreachable!("a nested graph hangs off {handle:?}, which owns none"),
+        }
+    }
+}
+
+impl Drop for Inside {
+    /// Sends a leased subgraph home, which is issue #50's half of the lease
+    /// and the only reason this type has a destructor.
+    ///
+    /// The last share of a lease is the one that runs this, and the module
+    /// docs' lease section plus `executor::subflow` are the argument for why
+    /// it has to be a `Drop` at all: a job of a graph nested inside the
+    /// leased one holds the lease *across* the decrement that can end the
+    /// leased graph's own run -- the counter it decrements is in a node of
+    /// that graph -- so no holder can prove it is the last, and a waiting
+    /// frame's `Arc::into_inner` would fail at random.
+    /// [`GraphOwner::take_lease`] is that attempt, for the one caller that has
+    /// a use for it.
+    ///
+    /// What "home" means -- back into the node's `Mutex`, or dropped, which
+    /// is upstream's `g.clear()` -- is the subflow's policy rather than this
+    /// module's, so it lives with the rest of it in
+    /// [`subflow::return_subgraph`](crate::executor::subflow::return_subgraph).
+    /// Nothing happens for the lease-free owners: an adopted module's graph is
+    /// read where it lies, and so is a taskflow's.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the owning node is not a live subflow node of its graph,
+    /// which cannot happen for a lease the scheduler built: the chain of
+    /// owners above it is owning, so the graph the node lives in is alive
+    /// until after this runs.
+    fn drop(&mut self) {
+        if let Some(graph) = self.leased.take() {
+            subflow::return_subgraph(self.owner.graph().node(self.node), graph);
         }
     }
 }
