@@ -1,0 +1,266 @@
+//! Translated from `benchmarks/fibonacci/` (Taskflow v4.1.0).
+//!
+//! The naive recursion, parallelised the way a work-stealing scheduler is
+//! supposed to make easy: one branch spawned, the other computed on the
+//! calling worker, and a wait that keeps that worker in the pool instead of
+//! parking it. Upstream's `fibonacci_taskflow` wraps the whole recursion in
+//! one `executor.async(...)` and reads the handle, because the recursion has
+//! to start on a worker; so does each `rustflow` id here.
+//!
+//! Three variants, two of which are ours to choose between:
+//!
+//! - **`rustflow-group`** is upstream's `fibonacci/taskflow.cpp` line for
+//!   line: a [`TaskGroup`](rustflow::TaskGroup) per level, one
+//!   `silent_async` into it, the `n - 2` branch inline -- upstream's "tail
+//!   optimization" -- and `corun` to join.
+//! - **`rustflow-runtime`** is the same recursion through a runtime task,
+//!   which is upstream's `unittests/test_runtimes.cpp` `Runtime.Fibonacci`
+//!   rather than its benchmark: `rt.silent_async` with a runtime-shaped body,
+//!   which this port spells
+//!   [`silent_async_runtime`](rustflow::Runtime::silent_async_runtime), and
+//!   `rt.corun`. It needs no executor handle and no group, since the node the
+//!   children hang off is the runtime task's own.
+//! - **`rayon`** is `rayon::join`, which is the shape rayon has for exactly
+//!   this and is what anyone would write: a fork of two closures, the second
+//!   of which usually runs on the forking thread.
+//!
+//! Unlike every other shape in this suite there is **no graph to build**, so
+//! the asymmetry `binary_tree.rs` and `embarrassing_parallelism.rs` have to
+//! warn about is absent here: all three ids measure "run the recursion" and
+//! nothing else. What they do not share is how much of the recursion is
+//! scheduled at all -- `rayon::join` runs the second closure inline when
+//! nobody steals the first, so a `join` that nobody steals from is direct
+//! recursion with one atomic, while a group or a runtime task submits a job
+//! per level whatever the pool is doing.
+//!
+//! # `N` is smaller than upstream's, and issue #119 is why
+//!
+//! Upstream sweeps `f = 1..=40` and its own unit test asserts `fib(25)`. The
+//! sizes below are smaller, and the limit is not the time a round takes but a
+//! **stack overflow**: a corun keeps its worker in the work-stealing loop, so
+//! every job that worker picks up while waiting nests one frame deeper, and
+//! this port's children go into the shared FIFO buffers rather than onto the
+//! submitting worker's LIFO queue -- the `if(auto w = this_worker(); w)`
+//! branch of upstream's `_schedule_async_task`. A corun therefore gets the
+//! oldest outstanding job in the pool, which is somebody else's unfinished
+//! subtree, and the nesting grows one frame per outstanding *child* rather
+//! than one per level of recursion. `tests/runtimes.rs` and
+//! `tests/task_group.rs` carry the same reduction with the same citation.
+//!
+//! The figure in those files is a debug one -- `fib(14)` passes and `fib(15)`
+//! aborts -- and a release build is not it, so the cliff was measured again
+//! for this profile rather than assumed. It sits in a different place and,
+//! more usefully, it sits in a *different place per worker count*: at 24
+//! workers `fib(23)` passes and `fib(24)` aborts, while at **one** worker
+//! `fib(17)` passes and `fib(18)` aborts every time. One worker is the
+//! binding end for the reason the paragraph above gives -- the one worker
+//! that coruns is the only worker there is to pick the outstanding children
+//! up, so it nests a frame for every one of them -- and since both worker
+//! counts measure the same `n`, that end is what sets it.
+//! `BENCHMARKS.md`'s `fibonacci` section has the measurement. **Neither size
+//! is chosen for speed**, and if the cliff moves, these move with it.
+
+use std::hint::black_box;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::available_parallelism;
+use std::time::Duration;
+
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use rustflow::{Executor, Runtime};
+
+/// The two `n` this shape is measured at, both inside the stack-depth cliff
+/// the module header describes -- which at **one** worker, the binding end,
+/// sits between `fib(17)` and `fib(18)`. Upstream's sweep is `1..=40` and its
+/// own unit test asserts `fib(25)`.
+const SIZES: [u64; 2] = [12, 15];
+
+/// Samples per measurement, and the time criterion may spend reaching them.
+/// Below criterion's defaults for the reason `linear_chain.rs` gives.
+const SAMPLES: usize = 20;
+/// Warm-up time per measurement. See [`SAMPLES`].
+const WARM_UP: Duration = Duration::from_secs(1);
+/// Measurement time per measurement. See [`SAMPLES`].
+const MEASUREMENT: Duration = Duration::from_secs(3);
+
+/// The worker counts every shape is measured at: one, and the machine's own.
+fn worker_counts() -> Vec<usize> {
+    let parallel = available_parallelism().map_or(1, NonZeroUsize::get);
+    if parallel > 1 {
+        vec![1, parallel]
+    } else {
+        vec![1]
+    }
+}
+
+/// The answer, iteratively, so that every variant's result can be checked.
+///
+/// Upstream carries the sequence as a table in `fibonacci.hpp` and its
+/// benchmark checks nothing against it; this is the same guard the other
+/// shapes' counters are -- the one thing standing between the benchmark and
+/// timing a recursion that returned early.
+fn fibonacci_reference(n: u64) -> u64 {
+    let mut pair = (0u64, 1u64);
+    for _ in 0..n {
+        pair = (pair.1, pair.0 + pair.1);
+    }
+    pair.0
+}
+
+/// Upstream's `fibonacci(size_t n, tf::Executor& executor)`: the `n - 1`
+/// branch into a group of this level's own, the `n - 2` branch on this very
+/// worker, and a `corun` to join them.
+///
+/// Two adaptations, both the port's shapes rather than the algorithm's.
+/// Upstream's child writes `res1`, a local of the frame that spawned it; a
+/// body here is `'static` and cannot borrow a frame, so the slot is an
+/// `Arc<AtomicU64>`. And the executor arrives as an `Arc` because the child
+/// opens a group of its own and a group needs the executor to open it --
+/// which is what `tests/task_group.rs`'s port of the same recursion does.
+/// `Relaxed` on both ends of the slot is sound for the reason it is there:
+/// what orders the child's store against this frame's load is the `corun`.
+fn fibonacci_group(n: u64, executor: &Arc<Executor>) -> u64 {
+    if n < 2 {
+        return n;
+    }
+
+    let group = executor
+        .task_group()
+        .expect("the recursion runs on a worker, which may open a group");
+    let first = Arc::new(AtomicU64::new(0));
+
+    group.silent_async({
+        let executor = Arc::clone(executor);
+        let first = Arc::clone(&first);
+        move || first.store(fibonacci_group(n - 1, &executor), Ordering::Relaxed)
+    });
+
+    let second = fibonacci_group(n - 2, executor);
+
+    group.corun();
+
+    first.load(Ordering::Relaxed) + second
+}
+
+/// The same recursion under a runtime task, which is upstream's
+/// `Runtime.Fibonacci`: `rt.silent_async` with a runtime-shaped body, so that
+/// the child can spawn children of its own, and `rt.corun` to wait for
+/// everything left outstanding under this node.
+///
+/// Note what the tail optimisation means here: the `n - 2` branch spawns its
+/// children under *this* node too, so the corun waits for those as well.
+fn fibonacci_runtime(n: u64, runtime: &mut Runtime<'_>) -> u64 {
+    if n < 2 {
+        return n;
+    }
+
+    let first = Arc::new(AtomicU64::new(0));
+    runtime.silent_async_runtime({
+        let first = Arc::clone(&first);
+        move |child: &mut Runtime<'_>| {
+            first.store(fibonacci_runtime(n - 1, child), Ordering::Relaxed);
+        }
+    });
+
+    let second = fibonacci_runtime(n - 2, runtime);
+
+    runtime.corun();
+
+    first.load(Ordering::Relaxed) + second
+}
+
+/// The same recursion as `rayon::join`, in the role TBB's task group plays
+/// upstream.
+fn fibonacci_rayon(n: u64) -> u64 {
+    if n < 2 {
+        return n;
+    }
+
+    let (first, second) = rayon::join(|| fibonacci_rayon(n - 1), || fibonacci_rayon(n - 2));
+
+    first + second
+}
+
+/// Upstream's `fibonacci_taskflow` around [`fibonacci_group`]: the recursion
+/// has to start on a worker, so the whole of it runs inside one `spawn`.
+fn group_on(n: u64, executor: &Arc<Executor>) {
+    let result = executor
+        .spawn({
+            let executor = Arc::clone(executor);
+            move || fibonacci_group(n, &executor)
+        })
+        .wait()
+        .expect("nothing under the recursion panicked");
+
+    assert_eq!(result, fibonacci_reference(n), "fib({n})");
+}
+
+/// The same wrapper for [`fibonacci_runtime`], which needs a runtime-shaped
+/// body rather than a plain one: upstream's
+/// `executor.async([&](tf::Runtime& rt){...})`.
+fn runtime_on(n: u64, executor: &Executor) {
+    let result = Arc::new(AtomicU64::new(0));
+
+    let task = executor.spawn_runtime({
+        let result = Arc::clone(&result);
+        move |runtime: &mut Runtime<'_>| {
+            result.store(fibonacci_runtime(n, runtime), Ordering::Relaxed);
+        }
+    });
+    task.wait().expect("nothing under the recursion panicked");
+
+    assert_eq!(
+        result.load(Ordering::Relaxed),
+        fibonacci_reference(n),
+        "fib({n})"
+    );
+}
+
+/// The rayon wrapper. `install` is what holds the recursion to the worker
+/// count this row is measuring, as in every other shape here.
+fn rayon_on(n: u64, pool: &rayon::ThreadPool) {
+    let result = pool.install(|| fibonacci_rayon(n));
+
+    assert_eq!(result, fibonacci_reference(n), "fib({n})");
+}
+
+/// Registers all three variants at every size and worker count.
+fn bench_fibonacci(c: &mut Criterion) {
+    let mut group = c.benchmark_group("fibonacci");
+    group
+        .sample_size(SAMPLES)
+        .warm_up_time(WARM_UP)
+        .measurement_time(MEASUREMENT);
+
+    for workers in worker_counts() {
+        // An `Arc` because the group recursion reaches the executor from a
+        // `'static` closure; the runtime id borrows it through the same
+        // handle, so both measure one pool.
+        let executor = Arc::new(Executor::new(workers));
+        // rayon's answer to TBB's `global_control(max_allowed_parallelism)`.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .expect("a rayon pool of the requested size");
+
+        for n in SIZES {
+            group.bench_function(
+                BenchmarkId::new(format!("rustflow-group/{workers}w"), n),
+                |b| b.iter(|| group_on(black_box(n), &executor)),
+            );
+            group.bench_function(
+                BenchmarkId::new(format!("rustflow-runtime/{workers}w"), n),
+                |b| b.iter(|| runtime_on(black_box(n), &executor)),
+            );
+            group.bench_function(BenchmarkId::new(format!("rayon/{workers}w"), n), |b| {
+                b.iter(|| rayon_on(black_box(n), &pool));
+            });
+        }
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_fibonacci);
+criterion_main!(benches);
