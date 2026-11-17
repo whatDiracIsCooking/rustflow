@@ -37,7 +37,14 @@
 //!   [`TaskRef::is_empty`] asks whether the node is indistinguishable from a
 //!   freshly created placeholder -- no work, no edges -- which keeps upstream's
 //!   documented pair `task.reset(); assert(task.empty())` true.
-//! - Semaphores, `exception_ptr()`, `dump()` and `for_each_subflow_task()`
+//! - [`TaskMut::acquire`] and [`TaskMut::release`] take an
+//!   `&Arc<Semaphore>` where upstream takes a `Semaphore&` and stores the
+//!   address of it: a task keeps a *share* of the semaphore it is constrained
+//!   by, since the graph cannot be asked to promise that an object it only
+//!   points at outlives it. Upstream's `(first, last)` overloads become
+//!   [`TaskMut::acquire_each`] and [`TaskMut::release_each`], there being no
+//!   overloading to hang them on.
+//! - `exception_ptr()`, `dump()` and `for_each_subflow_task()`
 //!   wait for the milestones that give them meaning, and so does the
 //!   `composed_of()`/`adopt()` pair that upstream has on `tf::Task` as well as
 //!   on its builder: the builder forms are
@@ -53,10 +60,11 @@ use core::fmt;
 use core::hash::{Hash, Hasher};
 use std::hash::DefaultHasher;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::graph::{Graph, Handle, RuntimeWork, SubflowWork, Task, Work};
 use crate::runtime::Runtime;
+use crate::semaphore::Semaphore;
 use crate::subflow::Subflow;
 use crate::taskflow::Taskflow;
 
@@ -290,6 +298,30 @@ impl<'a> TaskRef<'a> {
         for predecessor in self.graph.predecessors(self.task) {
             visitor(*predecessor);
         }
+    }
+
+    /// How many semaphores this task acquires before its work runs.
+    ///
+    /// Upstream has no query for this at all -- its `Node::Semaphores` is
+    /// private to the node and only the executor reads it. The count is what
+    /// makes [`TaskMut::acquire`] observable without handing out the shares
+    /// themselves, which would be a second way to reach a semaphore the graph
+    /// holds.
+    #[must_use]
+    pub fn num_semaphores_to_acquire(self) -> usize {
+        self.graph
+            .node(self.task)
+            .semaphores()
+            .map_or(0, |semaphores| semaphores.to_acquire.len())
+    }
+
+    /// How many semaphores this task releases after its work has run.
+    #[must_use]
+    pub fn num_semaphores_to_release(self) -> usize {
+        self.graph
+            .node(self.task)
+            .semaphores()
+            .map_or(0, |semaphores| semaphores.to_release.len())
     }
 }
 
@@ -531,6 +563,90 @@ impl<'a> TaskMut<'a> {
             self.graph.remove_edge(predecessor, self.task);
         }
         self.reset_work()
+    }
+
+    /// Makes this task acquire `semaphore` before its work runs: upstream's
+    /// `acquire(Semaphore&)`.
+    ///
+    /// The task takes a *share* of the semaphore, where upstream stores a
+    /// pointer and leaves the caller to keep the object alive. That is the
+    /// whole of the departure: the semaphore that constrains a set of tasks is
+    /// one object, so the tasks of that set are given clones of one `Arc` and
+    /// the set is however many of them share it.
+    ///
+    /// Acquiring the same semaphore twice records it twice, as upstream's
+    /// `push_back` does, and means a task that takes two of its counts.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use rustflow::prelude::*;
+    /// use rustflow::Semaphore;
+    ///
+    /// let semaphore = Arc::new(Semaphore::new(1));
+    /// let mut taskflow = Taskflow::new();
+    /// let (a, b) = taskflow.emplace_n((|| print!("a"), || print!("b")));
+    ///
+    /// // Two independent tasks that nonetheless run one at a time.
+    /// for task in [a, b] {
+    ///     taskflow.task(task).acquire(&semaphore).release(&semaphore);
+    /// }
+    ///
+    /// assert_eq!(taskflow.task_ref(a).num_semaphores_to_acquire(), 1);
+    /// assert_eq!(taskflow.task_ref(a).num_semaphores_to_release(), 1);
+    /// ```
+    pub fn acquire(&mut self, semaphore: &Arc<Semaphore>) -> &mut Self {
+        self.graph
+            .node_mut(self.task)
+            .semaphores_mut()
+            .to_acquire
+            .push(Arc::clone(semaphore));
+        self
+    }
+
+    /// Makes this task acquire each of `semaphores` before its work runs, in
+    /// the order given: upstream's `acquire(I first, I last)`.
+    ///
+    /// The iterator form is over `&Arc<Semaphore>` so that the usual argument
+    /// -- a slice or a `Vec` of the semaphores a caller is keeping -- can be
+    /// passed by reference and shared rather than given up, which is what
+    /// [`TaskMut::acquire`] does for one.
+    pub fn acquire_each<'s>(
+        &mut self,
+        semaphores: impl IntoIterator<Item = &'s Arc<Semaphore>>,
+    ) -> &mut Self {
+        let to_acquire = &mut self.graph.node_mut(self.task).semaphores_mut().to_acquire;
+        to_acquire.extend(semaphores.into_iter().map(Arc::clone));
+        self
+    }
+
+    /// Makes this task release `semaphore` after its work has run: upstream's
+    /// `release(Semaphore&)`.
+    ///
+    /// A task may release a semaphore it never acquired, which is upstream's
+    /// way of letting one task open a gate another task waits at -- and is
+    /// why releasing past the maximum is a failure the executor has to report
+    /// rather than something the graph can rule out.
+    pub fn release(&mut self, semaphore: &Arc<Semaphore>) -> &mut Self {
+        self.graph
+            .node_mut(self.task)
+            .semaphores_mut()
+            .to_release
+            .push(Arc::clone(semaphore));
+        self
+    }
+
+    /// Makes this task release each of `semaphores` after its work has run, in
+    /// the order given: upstream's `release(I first, I last)`.
+    pub fn release_each<'s>(
+        &mut self,
+        semaphores: impl IntoIterator<Item = &'s Arc<Semaphore>>,
+    ) -> &mut Self {
+        let to_release = &mut self.graph.node_mut(self.task).semaphores_mut().to_release;
+        to_release.extend(semaphores.into_iter().map(Arc::clone));
+        self
     }
 
     /// Drops this task's work, leaving it a placeholder with its edges intact.
@@ -881,5 +997,93 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    /// Upstream's `Task::acquire`/`release`, plus the one departure: what the
+    /// node keeps is a share of the caller's semaphore, so the constraint is
+    /// over the *same* object and not a copy of it.
+    #[test]
+    fn acquire_and_release_record_shares_in_order() {
+        let first = Arc::new(Semaphore::new(1));
+        let second = Arc::new(Semaphore::new(2));
+        let (mut taskflow, t) = taskflow_of(1);
+
+        taskflow
+            .task(t[0])
+            .acquire(&first)
+            .acquire(&second)
+            .release(&second);
+
+        let handle = taskflow.task_ref(t[0]);
+        assert_eq!(handle.num_semaphores_to_acquire(), 2);
+        assert_eq!(handle.num_semaphores_to_release(), 1);
+
+        let semaphores = taskflow
+            .graph()
+            .node(t[0])
+            .semaphores()
+            .expect("the lists were allocated on the first acquire");
+        // In order, and shared rather than cloned: the task is constrained by
+        // the caller's semaphore.
+        assert!(Arc::ptr_eq(&semaphores.to_acquire[0], &first));
+        assert!(Arc::ptr_eq(&semaphores.to_acquire[1], &second));
+        assert!(Arc::ptr_eq(&semaphores.to_release[0], &second));
+        assert_eq!(Arc::strong_count(&first), 2);
+    }
+
+    /// A task with nothing to acquire has no lists at all, which is the
+    /// `None` every node of every other case in this crate is in.
+    #[test]
+    fn a_task_that_asked_for_nothing_has_no_lists() {
+        let (taskflow, t) = taskflow_of(1);
+        assert!(taskflow.graph().node(t[0]).semaphores().is_none());
+        assert_eq!(taskflow.task_ref(t[0]).num_semaphores_to_acquire(), 0);
+        assert_eq!(taskflow.task_ref(t[0]).num_semaphores_to_release(), 0);
+    }
+
+    /// Upstream's `push_back` keeps a duplicate, and so does this: a task that
+    /// acquires one semaphore twice takes two of its counts.
+    #[test]
+    fn acquiring_the_same_semaphore_twice_records_it_twice() {
+        let semaphore = Arc::new(Semaphore::new(2));
+        let (mut taskflow, t) = taskflow_of(1);
+
+        taskflow.task(t[0]).acquire(&semaphore).acquire(&semaphore);
+
+        assert_eq!(taskflow.task_ref(t[0]).num_semaphores_to_acquire(), 2);
+    }
+
+    /// Upstream's `(first, last)` overloads, as iterators over shares.
+    #[test]
+    fn the_each_forms_take_a_whole_range() {
+        let semaphores: Vec<Arc<Semaphore>> = (0..3).map(|_| Arc::new(Semaphore::new(1))).collect();
+        let (mut taskflow, t) = taskflow_of(1);
+
+        taskflow
+            .task(t[0])
+            .acquire_each(&semaphores)
+            .release_each(semaphores.iter().rev());
+
+        let handle = taskflow.task_ref(t[0]);
+        assert_eq!(handle.num_semaphores_to_acquire(), 3);
+        assert_eq!(handle.num_semaphores_to_release(), 3);
+
+        let stored = taskflow
+            .graph()
+            .node(t[0])
+            .semaphores()
+            .expect("three of each");
+        // In the order of the iterator, which the release form here reverses.
+        assert!(Arc::ptr_eq(&stored.to_acquire[0], &semaphores[0]));
+        assert!(Arc::ptr_eq(&stored.to_release[0], &semaphores[2]));
+    }
+
+    /// An empty range allocates the lists and adds nothing, which is
+    /// upstream's behaviour for `first == last`.
+    #[test]
+    fn an_empty_range_adds_nothing() {
+        let (mut taskflow, t) = taskflow_of(1);
+        taskflow.task(t[0]).acquire_each([]);
+        assert_eq!(taskflow.task_ref(t[0]).num_semaphores_to_acquire(), 0);
     }
 }
