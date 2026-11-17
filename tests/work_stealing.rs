@@ -8,29 +8,25 @@
 //! conditioner branch all behave -- so these are assertions about the
 //! executor, not about the graph they are written on.
 //!
-//! Two cases upstream has are not here, because both need something this port
-//! has not got. Neither is weakened into a lookalike: a starvation test that
-//! cannot starve is worse than no test, since it reports green while
-//! exercising nothing. `SubflowStarvation` was a third until #54 -- it is
-//! `Starvation.Loop` built inside a subflow, so it waited on subflows (#50)
-//! and is now below with the rest.
-//!
-//! - **`Oversubscription`** and **`Continuation`** both assert that a chain of
-//!   tasks runs end to end on the *same* worker: `Continuation` compares
-//!   `this_worker_id()` across a thousand chained tasks, and
-//!   `Oversubscription` asserts `set.size() <= W/2` for `W/2` independent
-//!   hundred-task chains, which can only hold if a chain never visits a queue
-//!   at all. That is upstream's `_update_cache`/`TF_INVOKE_CONTINUATION`,
-//!   which `Worker::invoke` says in so many words is deliberately not ported
-//!   yet: its own comment puts the optimisation with the benchmarks (#18)
-//!   rather than with the first correct version, and no issue tracks it on its
-//!   own. Both cases were written against this port and run before being
-//!   taken out, so this is measured rather than assumed: `Continuation` fails
-//!   at two and at eight workers on the identity assertion itself (`task 87
-//!   ran on another worker`, worker 7 against worker 1), and
-//!   `Oversubscription` fails on its very first run at both counts, with
-//!   `set.size()` equal to the whole pool rather than half of it. Both become
-//!   portable, as written, the day that optimisation lands.
+//! No case upstream has is missing from this file, which was not true before
+//! #62. Two of them -- **`Oversubscription`** and **`Continuation`** -- both
+//! assert that a chain of tasks runs end to end on the *same* worker:
+//! `Continuation` compares `this_worker_id()` across a thousand chained
+//! tasks, and `Oversubscription` asserts `set.size() <= W/2` for `W/2`
+//! independent hundred-task chains, which can only hold if a chain never
+//! visits a queue a thief can reach. That is upstream's
+//! `_update_cache`/`TF_INVOKE_CONTINUATION`, which `WorkerThread::invoke`
+//! deliberately did not port until #62, so both cases were written against
+//! this port, run, and then taken out rather than weakened into lookalikes --
+//! a `Continuation` that tolerates a chain hopping workers tests nothing, and
+//! a test that cannot fail reports green while exercising nothing. What they
+//! said then is what they are for: `Continuation` failed at two and at eight
+//! workers on the identity assertion itself (`task 87 ran on another worker`,
+//! worker 7 against worker 1), and `Oversubscription` failed on its very
+//! first run at both counts, with `set.size()` equal to the whole pool rather
+//! than half of it. `SubflowStarvation` has the same history and a shorter
+//! one: it is `Starvation.Loop` built inside a subflow, so it waited on
+//! subflows (#50) and arrived with #54.
 //!
 //! One case is here with its middle third missing, named where it is cut:
 //! `Waiter`'s second phase runs its check inside `executor.async(...)`, and
@@ -1202,6 +1198,109 @@ fn wavefront_starvation_8_workers() {
 }
 
 // ----------------------------------------------------------------------------
+// Testcase: Oversubscription
+// ----------------------------------------------------------------------------
+
+/// Upstream's `oversubscription(W)`.
+///
+/// `W/2` independent hundred-task chains, every task recording the worker it
+/// ran on, a hundred runs of the same graph. The assertion is `set.size() <=
+/// W/2`: half the pool has nothing to do, and half a chain that got stolen
+/// would put a worker in the set that no chain started on. So this is the
+/// continuation optimisation (#62) measured from the outside -- a chain may
+/// only ever be on one worker's hook, however many workers are awake and
+/// looking for work.
+///
+/// Upstream instantiates this from two workers up, and so does this file: at
+/// one worker `W/2` is no chains at all, and a case with nothing in it would
+/// assert nothing while reporting green.
+fn oversubscription(workers: usize) {
+    const L: usize = 100;
+    const RUNS: usize = 100;
+
+    // Upstream's `W/2`.
+    let chains = workers / 2;
+    assert!(chains > 0, "upstream instantiates this from two workers up");
+
+    let executor = Arc::new(Executor::new(workers));
+    let mut taskflow = Taskflow::new();
+    let counter = shared_counter();
+    let involved = Involved::new();
+
+    for _ in 0..chains {
+        let mut prev: Option<Task> = None;
+        for _ in 0..L {
+            let executor = Arc::clone(&executor);
+            let counter = Arc::clone(&counter);
+            let involved = Arc::clone(&involved);
+            let curr = taskflow.emplace(move || {
+                involved.record(&executor);
+                counter.fetch_add(1, Ordering::Relaxed);
+            });
+            if let Some(prev) = prev {
+                taskflow.task(curr).succeed([prev]);
+            }
+            prev = Some(curr);
+        }
+    }
+
+    // Upstream's `for(t=1; t<=100; t++)`, which runs the same graph again
+    // rather than `run_n`: the set is cleared between runs and the counter is
+    // not, so the two assertions are "this run stayed on its own workers" and
+    // "every run ran every task".
+    for t in 1..=RUNS {
+        involved.clear();
+        run(&executor, &taskflow);
+
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            L * chains * t,
+            "{workers} worker(s), run {t}"
+        );
+        assert!(
+            involved.count() <= chains,
+            "{workers} worker(s), run {t}: {chains} chain(s) ran on {} workers",
+            involved.count()
+        );
+    }
+}
+
+#[test]
+fn oversubscription_2_workers() {
+    oversubscription(2);
+}
+
+#[test]
+fn oversubscription_3_workers() {
+    oversubscription(3);
+}
+
+#[test]
+fn oversubscription_4_workers() {
+    oversubscription(4);
+}
+
+#[test]
+fn oversubscription_5_workers() {
+    oversubscription(5);
+}
+
+#[test]
+fn oversubscription_6_workers() {
+    oversubscription(6);
+}
+
+#[test]
+fn oversubscription_7_workers() {
+    oversubscription(7);
+}
+
+#[test]
+fn oversubscription_8_workers() {
+    oversubscription(8);
+}
+
+// ----------------------------------------------------------------------------
 // Testcase: Waiter
 // ----------------------------------------------------------------------------
 
@@ -1293,4 +1392,116 @@ fn waiter_7_workers() {
 #[test]
 fn waiter_8_workers() {
     waiter(8);
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: Continuation
+// ----------------------------------------------------------------------------
+
+/// Upstream's `continuation(W)`.
+///
+/// A thousand-task chain in which every task but the first asserts that it is
+/// running on the worker the first one ran on. Nothing here is statistical:
+/// one task of the thousand landing elsewhere fails the case, which is what
+/// makes it the direct test of upstream's `_update_cache` /
+/// `TF_INVOKE_CONTINUATION` -- a released successor that goes onto a queue is
+/// a successor a thief may take, and at eight workers one of a thousand
+/// handovers is all it takes.
+fn continuation(workers: usize) {
+    const N: usize = 1000;
+
+    /// Upstream's `-1`: the value of `w` before the chain's first task has
+    /// run. `this_worker_id` is an `Option` here, so the sentinel is only
+    /// needed inside the shared cell.
+    const NO_WORKER: usize = usize::MAX;
+
+    let executor = Arc::new(Executor::new(workers));
+
+    // Upstream's `REQUIRE(w == -1)` before the graph is built: the thread
+    // building it is not one of the executor's workers.
+    assert_eq!(
+        executor.this_worker_id(),
+        None,
+        "{workers} worker(s): the thread that builds the graph is not a worker"
+    );
+
+    // Upstream's `int w`, captured by reference: written by the chain's first
+    // task and read by every task after it. One cell is enough because a
+    // chain serialises every access to it, and relaxed is enough for the same
+    // reason -- the scheduler's own join counters are what order a task
+    // against its predecessor.
+    let chain_worker = Arc::new(AtomicUsize::new(NO_WORKER));
+
+    let mut taskflow = Taskflow::new();
+    let mut prev: Option<Task> = None;
+    for i in 0..N {
+        let executor = Arc::clone(&executor);
+        let chain_worker = Arc::clone(&chain_worker);
+        let curr = taskflow.emplace(move || {
+            let id = executor
+                .this_worker_id()
+                .expect("a task body runs on a worker of the executor running it");
+            if i == 0 {
+                chain_worker.store(id, Ordering::Relaxed);
+            } else {
+                assert_eq!(
+                    chain_worker.load(Ordering::Relaxed),
+                    id,
+                    "{workers} worker(s): task {i} ran on another worker"
+                );
+            }
+        });
+        if let Some(prev) = prev {
+            taskflow.task(prev).precede([curr]);
+        }
+        prev = Some(curr);
+    }
+
+    run(&executor, &taskflow);
+
+    assert_ne!(
+        chain_worker.load(Ordering::Relaxed),
+        NO_WORKER,
+        "{workers} worker(s): the chain's first task ran"
+    );
+}
+
+#[test]
+fn continuation_1_worker() {
+    continuation(1);
+}
+
+#[test]
+fn continuation_2_workers() {
+    continuation(2);
+}
+
+#[test]
+fn continuation_3_workers() {
+    continuation(3);
+}
+
+#[test]
+fn continuation_4_workers() {
+    continuation(4);
+}
+
+#[test]
+fn continuation_5_workers() {
+    continuation(5);
+}
+
+#[test]
+fn continuation_6_workers() {
+    continuation(6);
+}
+
+#[test]
+fn continuation_7_workers() {
+    continuation(7);
+}
+
+#[test]
+fn continuation_8_workers() {
+    continuation(8);
 }

@@ -99,7 +99,11 @@ queue it was pushed to.
 **These four rows predate #40**, which made a queued job own a share of its run
 and of the taskflow's storage and cost this shape about 19% at 24 workers --
 see "The #40 decision" below for the measurement. The rows are left as measured
-rather than scaled.
+rather than scaled. They also predate **#62**, which ported upstream's
+continuation optimisation and took 40 to 50% off this shape at 24 workers --
+far more than #40 and #74 together had added -- so the paragraph above about
+23 idle workers costing the busy one 40% is the old scheduler's behaviour.
+"The #62 measurement" below has the figures.
 
 ## binary_tree
 
@@ -238,10 +242,13 @@ scheduler overhead, and ~2% on the shape with work in it. **That is accepted,
 and it is the whole point of the issue**: the alternative is a safe API with a
 reachable use-after-free, which is not a thing to trade nanoseconds against.
 
-Two things would get most of it back, and neither is this PR:
+Two things would get most of it back, and neither is this PR. **The first of
+them has since landed** -- #62 -- and got back rather more than #40 cost; "The
+#62 measurement" below is that measurement, and the prediction it confirms is
+the one in the first bullet:
 
 - **Upstream's `_update_cache`/`TF_INVOKE_CONTINUATION`**, which `worker.rs`
-  already records as unported: it keeps one ready successor out of the queue
+  recorded as unported until #62: it keeps one ready successor out of the queue
   and jumps back to the top of `_invoke` with it. Under the old pointers that
   saved a queue push; under these shares it also saves a clone *and* a drop,
   which is exactly the 4 atomics -- on a chain, all of them. The shape it helps
@@ -317,6 +324,70 @@ and no second load in it. So the extra word is accepted, and what it buys is
 not a nanosecond trade at all: before it, a job of an adopted module's graph
 resolved its indices against the composing taskflow's arena, and the arm that
 ran one refused the run rather than do that silently.
+
+## The #62 measurement: the continuation takes half of a chain away
+
+Issue #62 ported upstream's `_update_cache`/`TF_INVOKE_CONTINUATION`, which
+#40's section above had named as the thing that would get its cost back: a
+worker keeps one ready successor out of its queue and loops back to the top of
+`invoke` with it, so a chain runs end to end on the worker that started it
+instead of being pushed, notified and re-stolen per link. `linear_chain` is
+the shape built to measure exactly that.
+
+Measured the way #40's and #74's were, and for the same reason -- a
+cross-run criterion comparison on this box measures the other agents' builds,
+not the patch. Three interleaved rounds, both variants of each round within a
+minute of each other, `src/executor/worker.rs` swapped and the library rebuilt
+between halves. **The box was carrying three other agents' `cargo` builds and
+test runs throughout**: load average 4.0 to 12.0, read at the start of each
+half and recorded with it. That is not a quiet machine and these are not
+quiet-machine absolutes; what interleaving protects is the comparison, and
+every round agrees on it. Point estimates of the mean, in the order the rounds
+ran:
+
+| id | before (queue per link) | after (continuation) | delta | per task |
+|---|---|---|---|---|
+| `linear_chain/rustflow/1w/1024` | 165.3, 162.2, 160.5 µs | 156.2, 126.6, 137.6 µs | **−13.9%** | −22 ns |
+| `linear_chain/rustflow/1w/16384` | 2.876, 2.232, 2.264 ms | 1.948, 1.951, 1.785 ms | **−22.9%** | −34 ns |
+| `linear_chain/rustflow/24w/1024` | 274.0, 300.1, 309.8 µs | 156.6, 145.2, 188.4 µs | **−44.5%** | −128 ns |
+| `linear_chain/rustflow/24w/16384` | 4.002, 4.309, 4.326 ms | 1.888, 1.661, 2.342 ms | **−53.4%** | −137 ns |
+
+What that says:
+
+- **At 24 workers a chain costs half what it did**, −39% to −62% in each of
+  the three rounds of each id, and the per-task figure of 128 to 137 ns is
+  three times what #40 (35 to 41 ns) and #74 (6 to 11 ns) had added between
+  them. It is also the whole of the "40% more per task at 24 workers than at
+  1" that the `linear_chain` table above records: after this change the two
+  worker counts measure the same thing, because 23 idle workers no longer get
+  a say in where the next link runs. What a hand-off cost was a contended
+  queue slot, a `notify_one`, a thief's successful steal, and a node and a
+  job arriving cold in another core's cache.
+- **At one worker it is still 22 to 34 ns per task**, which is the part that
+  has nothing to do with stealing: a push and a pop of the local deque, and
+  the `notify_one` every push makes. A single worker's queue is LIFO, so it
+  already handed back the same job the continuation keeps -- `update_cache`'s
+  docs make that equivalence -- and this is purely the queueing round trip
+  that is no longer made.
+- **The two single-worker ids are the noisy ones**, as they were in #74's
+  table: round 1's `1w/16384` "before" reported a 95% interval of 2.80 to
+  2.98 ms and the id swings ±14% round to round, so read −22.9% as "a fifth
+  or so" and not as a resolved figure. The 24-worker ids are where the effect
+  is far larger than the noise: the smallest gap any round produced there is
+  39%, against a round-to-round spread of about 12%.
+
+**The optimisation is not only a nanosecond trade**, which is why it is in
+`tests/work_stealing.rs` as well as here: `Continuation` and
+`Oversubscription` are upstream acceptance cases that assert the locality it
+produces, and both failed against this port at every worker count above one
+before this change -- `Continuation` on the identity of the worker running
+task 87, `Oversubscription` with 4 chains spread over all 8 workers.
+
+**What is still not cached** is the other half of upstream's: a preempted
+parent resumed by its last child goes back on a queue rather than being run on
+the spot (`WorkerThread::finish_job`). A chain has no preempted parents, so
+none of the rows above would move; the shapes that would are the nested ones,
+and nothing here measures those yet.
 
 ## The `Work` decision: `Mutex::try_lock` stays
 
