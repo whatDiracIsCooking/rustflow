@@ -57,6 +57,20 @@
 //! first panicking task of a run is reported, and a later run of the same
 //! taskflow starts clean.
 //!
+//! Work needs no graph at all to be run: [`Executor::spawn`] hands a closure
+//! straight to the pool and gives back an [`AsyncHandle`] on its result --
+//! wait on it, poll it as a [`Future`], or drop it, which detaches -- and
+//! [`Executor::silent_async`] does the same for a body nobody is waiting on.
+//! Either may be submitted from any thread, a task body already running on one
+//! of the executor's own workers included, which is how async tasks nest. They
+//! are counted in [`Executor::num_topologies`] like a run, so
+//! [`Executor::wait_for_all`] covers them; a panic out of a `spawn` body is
+//! reported from its handle as [`RunError::Panicked`] and cancels nothing,
+//! since an async task is part of nothing to cancel. Dropping the executor now
+//! waits for this kind of work, because nothing else can -- a detached handle
+//! borrows nothing -- while a leaked [`RunHandle`] still takes the pool down
+//! with it.
+//!
 //! A task can also be the thing that builds the graph.
 //! [`FlowBuilder::emplace_subflow`] hands its body a [`Subflow`], itself a
 //! [`FlowBuilder`] over a subgraph the node owns, and that subgraph runs
@@ -136,6 +150,7 @@ pub mod taskflow;
 
 pub use crate::async_task::AsyncTask;
 pub use crate::executor::Executor;
+pub use crate::executor::r#async::AsyncHandle;
 pub use crate::executor::corun::CorunError;
 pub use crate::executor::queue::{Buffers, Thief, WorkerQueue};
 pub use crate::executor::rng::{Xorshift32, Xorshift64};
