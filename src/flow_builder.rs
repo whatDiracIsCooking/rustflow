@@ -44,9 +44,10 @@ pub trait FlowBuilder {
     /// Creates a static task running `callable`, and returns its handle.
     ///
     /// Upstream overloads `emplace` on the callable's signature to pick a node
-    /// kind (static, condition, subflow, ...). Only [`Handle::Static`] exists
-    /// so far, so there is one `emplace` here; the others arrive with their
-    /// node kinds rather than as overloads, since Rust has none.
+    /// kind (static, condition, subflow, ...). Rust has no overloading, so each
+    /// kind arrives as a named method instead: this one is the static task, and
+    /// [`FlowBuilder::emplace_condition`] and
+    /// [`FlowBuilder::emplace_multi_condition`] are the two conditioners.
     ///
     /// The `Send + 'static` bound is what lets the executor own the closure and
     /// run it on a worker thread. An already-boxed closure satisfies it --
@@ -58,6 +59,65 @@ pub trait FlowBuilder {
     {
         self.graph_mut()
             .add_node(Handle::Static(Work::new(callable)))
+    }
+
+    /// Creates a condition task running `callable`, and returns its handle.
+    ///
+    /// Upstream's `emplace` overload for a `ConditionTaskLike` callable. The
+    /// `i32` it returns indexes this task's own successor list, so `0` runs the
+    /// first successor and nothing else; a negative or out-of-range value
+    /// selects nothing, which is how a branch ends.
+    ///
+    /// Nothing schedules on that yet -- the conditional branch belongs to the
+    /// executor -- so what this builds today is a graph citizen that reports
+    /// [`crate::TaskType::Condition`] and makes a dependency on it weak.
+    ///
+    /// ```
+    /// use rustflow::prelude::*;
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// let (init, yes, no) = taskflow.emplace_n((|| {}, || {}, || {}));
+    /// // Upstream's if-else block: `yes` on 0, `no` on 1.
+    /// let cond = taskflow.emplace_condition(|| 0);
+    /// taskflow.task(cond).succeed([init]).precede([yes, no]);
+    ///
+    /// assert!(taskflow.graph().node(cond).handle().is_conditioner());
+    /// assert_eq!(taskflow.task_ref(yes).num_weak_dependencies(), 1);
+    /// ```
+    fn emplace_condition<C>(&mut self, callable: C) -> Task
+    where
+        C: FnMut() -> i32 + Send + 'static,
+    {
+        self.graph_mut()
+            .add_node(Handle::Condition(Work::new(callable)))
+    }
+
+    /// Creates a multi-condition task running `callable`, and returns its
+    /// handle.
+    ///
+    /// Upstream's `emplace` overload for a `MultiConditionTaskLike` callable.
+    /// Where [`FlowBuilder::emplace_condition`] names one successor, this names
+    /// as many as it likes -- `vec![0, 2]` runs the first and third -- and the
+    /// same out-of-range rule applies to each index independently, so a list
+    /// may select none of them.
+    ///
+    /// ```
+    /// use rustflow::prelude::*;
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// let branches: Vec<Task> = (0..3).map(|_| taskflow.emplace(|| {})).collect();
+    /// let cond = taskflow.emplace_multi_condition(|| vec![0, 2]);
+    /// taskflow.task(cond).precede(branches.iter().copied());
+    ///
+    /// assert!(taskflow.graph().node(cond).handle().is_conditioner());
+    /// assert_eq!(taskflow.graph().node(cond).num_successors(), 3);
+    /// ```
+    fn emplace_multi_condition<C>(&mut self, callable: C) -> Task
+    where
+        C: FnMut() -> Vec<i32> + Send + 'static,
+    {
+        self.graph_mut()
+            .add_node(Handle::MultiCondition(Work::new(callable)))
     }
 
     /// Creates one static task per callable in a tuple, and returns a tuple of
@@ -262,6 +322,49 @@ mod tests {
 
         run_in_order(&taskflow);
         assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn the_two_conditioner_builders_attach_their_own_handles() {
+        let mut taskflow = Taskflow::new();
+        let still = taskflow.emplace(|| {});
+        let one = taskflow.emplace_condition(|| 1);
+        let many = taskflow.emplace_multi_condition(|| vec![0, 2]);
+
+        assert_eq!(taskflow.num_tasks(), 3);
+        assert!(taskflow.graph().node(still).handle().is_static());
+        assert!(taskflow.graph().node(one).handle().is_condition());
+        assert!(taskflow.graph().node(many).handle().is_multi_condition());
+
+        // The builder hands the callable over whole: what comes back out of
+        // the node is what was emplaced, return value and all.
+        let Handle::Condition(work) = taskflow.graph().node(one).handle() else {
+            panic!("emplace_condition left something else behind");
+        };
+        assert_eq!(work.invoke(), 1);
+        let Handle::MultiCondition(work) = taskflow.graph().node(many).handle() else {
+            panic!("emplace_multi_condition left something else behind");
+        };
+        assert_eq!(work.invoke(), vec![0, 2]);
+
+        // The run-in-order stand-in invokes static work only, so a conditioner
+        // is inert until the executor learns to branch on it.
+        run_in_order(&taskflow);
+    }
+
+    /// A boxed callable is upstream's `std::function<int()>` case, and the
+    /// bound has to admit it for the same reason [`FlowBuilder::emplace`]'s
+    /// does: `Box<dyn FnMut() -> i32 + Send>` is itself `FnMut() -> i32`.
+    #[test]
+    fn a_conditioner_builder_takes_an_already_boxed_callable() {
+        let mut taskflow = Taskflow::new();
+        let boxed: Box<dyn FnMut() -> i32 + Send> = Box::new(|| -1);
+        let one = taskflow.emplace_condition(boxed);
+        let boxed: Box<dyn FnMut() -> Vec<i32> + Send> = Box::new(Vec::new);
+        let many = taskflow.emplace_multi_condition(boxed);
+
+        assert!(taskflow.graph().node(one).handle().is_conditioner());
+        assert!(taskflow.graph().node(many).handle().is_conditioner());
     }
 
     #[test]

@@ -38,9 +38,12 @@
 //!   freshly created placeholder -- no work, no edges -- which keeps upstream's
 //!   documented pair `task.reset(); assert(task.empty())` true.
 //! - Semaphores, `exception_ptr()`, `dump()`, `composed_of()`, `adopt()` and
-//!   `for_each_subflow_task()` wait for the milestones that give them meaning;
-//!   so does the `work()` overload set, which upstream dispatches over five
-//!   callable shapes and which here takes the one that exists.
+//!   `for_each_subflow_task()` wait for the milestones that give them meaning.
+//!   So does the rest of the `work()` overload set: upstream dispatches one
+//!   `work()` over five callable shapes, and with no overloading here each
+//!   shape is its own method -- [`TaskMut::work`],
+//!   [`TaskMut::condition_work`] and [`TaskMut::multi_condition_work`] are the
+//!   three whose node kinds exist.
 
 use core::fmt;
 use core::hash::{Hash, Hasher};
@@ -52,10 +55,11 @@ use crate::taskflow::Taskflow;
 /// What a task does when the executor reaches it, as a flat enumeration.
 ///
 /// This is upstream's `tf::TaskType`, kept complete even though only
-/// [`TaskType::Placeholder`] and [`TaskType::Static`] can be built yet: the
-/// variants name the port's own roadmap, and the DOT output and the profiler
-/// want the whole set. Upstream's `UNDEFINED` is kept for the same reason,
-/// though nothing can produce it while [`Handle`] has two variants.
+/// [`TaskType::Placeholder`], [`TaskType::Static`] and [`TaskType::Condition`]
+/// can be built yet: the variants name the port's own roadmap, and the DOT
+/// output and the profiler want the whole set. Upstream's `UNDEFINED` is kept
+/// for the same reason, though nothing can produce it while every [`Handle`]
+/// variant maps to a type of its own.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum TaskType {
     /// A task with no work attached, upstream's `PLACEHOLDER`.
@@ -111,6 +115,10 @@ fn task_type_of(handle: &Handle) -> TaskType {
     match handle {
         Handle::Placeholder => TaskType::Placeholder,
         Handle::Static(_) => TaskType::Static,
+        // Upstream folds both conditioners into one task type, so a
+        // multi-condition task reports `condition` as well. The handle is what
+        // tells the two apart; see [`Handle::is_multi_condition`].
+        Handle::Condition(_) | Handle::MultiCondition(_) => TaskType::Condition,
     }
 }
 
@@ -190,10 +198,10 @@ impl<'a> TaskRef<'a> {
     /// Returns how many predecessors are conditioners, any one of which may
     /// instead branch away from this task.
     ///
-    /// The predicate is trivially false until conditional tasks land, so this
-    /// is zero for now; it is written the upstream way -- a count over the
-    /// predecessors, keyed on the predecessor's own type -- so that milestone
-    /// does not have to come back to this file.
+    /// It is upstream's count exactly: over the predecessors, keyed on each
+    /// predecessor's own type rather than on anything stored here, which is why
+    /// adding the two conditioner handles brought it to life without touching
+    /// a line of it.
     #[must_use]
     pub fn num_weak_dependencies(self) -> usize {
         self.graph
@@ -354,8 +362,8 @@ impl<'a> TaskMut<'a> {
     /// Attaches `callable` as this task's work, replacing whatever was there.
     ///
     /// Upstream's `work()` dispatches over five callable shapes at compile
-    /// time; a static task is the only one this port can build so far, so this
-    /// is that arm.
+    /// time; this is its static-task arm, and the two below are its
+    /// conditioner arms.
     pub fn work<C>(&mut self, callable: C) -> &mut Self
     where
         C: FnMut() + Send + 'static,
@@ -363,6 +371,39 @@ impl<'a> TaskMut<'a> {
         self.graph
             .node_mut(self.task)
             .set_handle(Handle::Static(Work::new(callable)));
+        self
+    }
+
+    /// Makes this task a condition task running `callable`, replacing whatever
+    /// work was there.
+    ///
+    /// Upstream's `work()` arm for a `ConditionTaskLike` callable, which is how
+    /// `test_control_flow.cpp` turns a placeholder into a conditioner after the
+    /// branches it selects have been wired up. The returned `i32` indexes this
+    /// task's successor list; negative or out of range selects nothing.
+    pub fn condition_work<C>(&mut self, callable: C) -> &mut Self
+    where
+        C: FnMut() -> i32 + Send + 'static,
+    {
+        self.graph
+            .node_mut(self.task)
+            .set_handle(Handle::Condition(Work::new(callable)));
+        self
+    }
+
+    /// Makes this task a multi-condition task running `callable`, replacing
+    /// whatever work was there.
+    ///
+    /// Upstream's `work()` arm for a `MultiConditionTaskLike` callable. Each
+    /// index in the returned list names a successor to run, under the same
+    /// out-of-range rule as [`TaskMut::condition_work`].
+    pub fn multi_condition_work<C>(&mut self, callable: C) -> &mut Self
+    where
+        C: FnMut() -> Vec<i32> + Send + 'static,
+    {
+        self.graph
+            .node_mut(self.task)
+            .set_handle(Handle::MultiCondition(Work::new(callable)));
         self
     }
 
@@ -599,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn every_dependency_is_strong_until_conditioners_exist() {
+    fn a_predecessor_that_is_not_a_conditioner_is_a_strong_dependency() {
         let (mut taskflow, t) = taskflow_of(4);
         taskflow.task(t[3]).succeed([t[0], t[1], t[2]]);
 
@@ -612,6 +653,89 @@ mod tests {
         assert_eq!(source.num_successors(), 1);
         assert_eq!(source.num_strong_dependencies(), 0);
         assert_eq!(source.num_weak_dependencies(), 0);
+    }
+
+    /// Both conditioners report one task type, as upstream's `type()` switch
+    /// maps `CONDITION` and `MULTI_CONDITION` to the same `TaskType`.
+    #[test]
+    fn both_conditioners_report_one_task_type() {
+        let (mut taskflow, t) = taskflow_of(2);
+        taskflow.task(t[0]).condition_work(|| 0);
+        taskflow.task(t[1]).multi_condition_work(|| vec![0, 1]);
+
+        for task in &t {
+            let handle = taskflow.task_ref(*task);
+            assert_eq!(handle.task_type(), TaskType::Condition);
+            assert_eq!(handle.task_type().as_str(), "condition");
+            assert!(handle.has_work());
+            assert!(!handle.is_empty());
+        }
+        // The task type cannot tell the two apart; the handle can.
+        assert!(taskflow.graph().node(t[0]).handle().is_condition());
+        assert!(taskflow.graph().node(t[1]).handle().is_multi_condition());
+    }
+
+    /// The setters are upstream's `work()` arms, so they replace whatever was
+    /// there -- in either direction -- and keep the edges and the name.
+    #[test]
+    fn the_conditioner_setters_replace_the_work_in_place() {
+        let (mut taskflow, t) = taskflow_of(3);
+        taskflow.task(t[1]).succeed([t[0]]).precede([t[2]]);
+
+        taskflow.task(t[1]).work(|| {}).condition_work(|| 1);
+        assert_eq!(taskflow.task_ref(t[1]).task_type(), TaskType::Condition);
+        let Handle::Condition(work) = taskflow.graph().node(t[1]).handle() else {
+            panic!("condition_work left something else behind");
+        };
+        assert_eq!(work.invoke(), 1);
+
+        taskflow.task(t[1]).multi_condition_work(|| vec![0]);
+        let Handle::MultiCondition(work) = taskflow.graph().node(t[1]).handle() else {
+            panic!("multi_condition_work left something else behind");
+        };
+        assert_eq!(work.invoke(), vec![0]);
+
+        // Back to a static task, and the graph around it never moved.
+        taskflow.task(t[1]).work(|| {});
+        assert_eq!(taskflow.task_ref(t[1]).task_type(), TaskType::Static);
+        assert_eq!(taskflow.task_ref(t[1]).name(), "b");
+        assert_eq!(taskflow.task_ref(t[1]).num_predecessors(), 1);
+        assert_eq!(taskflow.task_ref(t[1]).num_successors(), 1);
+
+        // And `reset_work` drops a conditioner as readily as it drops static
+        // work, which is what keeps `is_empty` the postcondition of `reset`.
+        taskflow.task(t[1]).condition_work(|| 0).reset();
+        assert!(taskflow.task_ref(t[1]).is_empty());
+    }
+
+    /// A conditioner predecessor is a *weak* dependency and every other one is
+    /// strong, which is the split `num_weak_dependencies` was written for
+    /// before either conditioner handle existed.
+    #[test]
+    fn a_conditioner_predecessor_is_a_weak_dependency() {
+        let (mut taskflow, t) = taskflow_of(4);
+        taskflow.task(t[0]).condition_work(|| 0);
+        taskflow.task(t[1]).multi_condition_work(|| vec![0]);
+        // d succeeds a condition, a multi-condition and a plain placeholder.
+        taskflow.task(t[3]).succeed([t[0], t[1], t[2]]);
+
+        let handle = taskflow.task_ref(t[3]);
+        assert_eq!(handle.num_predecessors(), 3);
+        assert_eq!(handle.num_weak_dependencies(), 2);
+        assert_eq!(handle.num_strong_dependencies(), 1);
+
+        // Duplicates count twice, as they do in the join counter.
+        taskflow.task(t[3]).succeed([t[0], t[2]]);
+        let handle = taskflow.task_ref(t[3]);
+        assert_eq!(handle.num_predecessors(), 5);
+        assert_eq!(handle.num_weak_dependencies(), 3);
+        assert_eq!(handle.num_strong_dependencies(), 2);
+
+        // A conditioner's *successors* say nothing about its own counts.
+        let source = taskflow.task_ref(t[0]);
+        assert_eq!(source.num_successors(), 2);
+        assert_eq!(source.num_weak_dependencies(), 0);
+        assert_eq!(source.num_strong_dependencies(), 0);
     }
 
     #[test]

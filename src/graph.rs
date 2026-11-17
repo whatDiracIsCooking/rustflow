@@ -74,33 +74,40 @@ impl From<Task> for u32 {
     }
 }
 
-/// The callable behind a static task.
+/// The callable behind a task, returning `R`.
 ///
-/// Upstream keeps a `std::function<void()>` in the node and calls it through a
-/// `Node*`. A Rust closure needs `&mut` to be called, so the `Mutex` is what
-/// lets a `&Node` shared across workers invoke the work at all. It is an
-/// assertion rather than a synchronisation primitive: the scheduler promises
-/// one worker per node, so [`Work::invoke`] takes the lock with `try_lock` and
-/// panics instead of blocking if that promise is ever broken. Whether to trade
-/// it for an `UnsafeCell` is for the M2 benchmark to decide.
-pub struct Work(Mutex<Box<dyn FnMut() + Send + 'static>>);
+/// Upstream stores a different `std::function` per node kind and the return
+/// type is the only thing that differs between three of them -- `void()` for a
+/// static task, `int()` for a condition, `SmallVector<int>()` for a
+/// multi-condition -- so one type parameter covers all three. It defaults to
+/// `()`, which keeps `Work` on its own meaning the static case.
+///
+/// Upstream calls the function through a `Node*`. A Rust closure needs `&mut`
+/// to be called, so the `Mutex` is what lets a `&Node` shared across workers
+/// invoke the work at all. It is an assertion rather than a synchronisation
+/// primitive: the scheduler promises one worker per node, so [`Work::invoke`]
+/// takes the lock with `try_lock` and panics instead of blocking if that
+/// promise is ever broken. Whether to trade it for an `UnsafeCell` is for the
+/// M2 benchmark to decide.
+pub struct Work<R = ()>(Mutex<Box<dyn FnMut() -> R + Send + 'static>>);
 
-impl Work {
-    /// Wraps a callable as the work of a static task.
+impl<R> Work<R> {
+    /// Wraps a callable as the work of a task.
     pub fn new<C>(callable: C) -> Self
     where
-        C: FnMut() + Send + 'static,
+        C: FnMut() -> R + Send + 'static,
     {
         Self(Mutex::new(Box::new(callable)))
     }
 
-    /// Runs the callable.
+    /// Runs the callable and hands back what it returned, which for a
+    /// conditioner is the successors it selects.
     ///
     /// # Panics
     ///
     /// Panics if the work is already running on another thread, which means
     /// the scheduler's one-worker-per-node invariant was violated.
-    pub fn invoke(&self) {
+    pub fn invoke(&self) -> R {
         let mut callable = match self.0.try_lock() {
             Ok(callable) => callable,
             // A task that panics poisons its own work. Handing the closure
@@ -112,11 +119,11 @@ impl Work {
                 panic!("work is already running: one worker per node was violated")
             }
         };
-        callable();
+        callable()
     }
 }
 
-impl fmt::Debug for Work {
+impl<R> fmt::Debug for Work<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Work(..)")
     }
@@ -124,9 +131,9 @@ impl fmt::Debug for Work {
 
 /// What a node does when the executor reaches it.
 ///
-/// Upstream is a `std::variant` of eleven alternatives (subflow, condition,
-/// module, async, ...). This port grows one variant per milestone, so the enum
-/// is `#[non_exhaustive]`: adding the rest must not break callers outside the
+/// Upstream is a `std::variant` of eleven alternatives (subflow, module,
+/// async, ...). This port grows one variant per milestone, so the enum is
+/// `#[non_exhaustive]`: adding the rest must not break callers outside the
 /// crate.
 #[derive(Debug, Default)]
 #[non_exhaustive]
@@ -136,6 +143,22 @@ pub enum Handle {
     Placeholder,
     /// A plain callable, upstream's `Node::Static`.
     Static(Work),
+    /// A callable whose return value picks which one of this node's successors
+    /// runs next, upstream's `Node::Condition`.
+    ///
+    /// The index is an `i32` because upstream's is, and that is load-bearing
+    /// rather than incidental: a negative or out-of-range value selects
+    /// nothing, which is how a condition task ends a branch. Narrowing it to a
+    /// successor position is the scheduler's job, through `usize::try_from`
+    /// plus a range check and never an `as` cast.
+    Condition(Work<i32>),
+    /// A callable whose return value picks any number of this node's
+    /// successors to run next, upstream's `Node::MultiCondition`.
+    ///
+    /// `Vec<i32>` stands in for upstream's inline `SmallVector<int>`: the
+    /// allocation per invocation is a known cost, to revisit with a bench
+    /// before hand-rolling a small-vector type for it.
+    MultiCondition(Work<Vec<i32>>),
 }
 
 impl Handle {
@@ -149,6 +172,29 @@ impl Handle {
     #[must_use]
     pub fn is_static(&self) -> bool {
         matches!(self, Self::Static(_))
+    }
+
+    /// Returns `true` for [`Handle::Condition`].
+    #[must_use]
+    pub fn is_condition(&self) -> bool {
+        matches!(self, Self::Condition(_))
+    }
+
+    /// Returns `true` for [`Handle::MultiCondition`].
+    #[must_use]
+    pub fn is_multi_condition(&self) -> bool {
+        matches!(self, Self::MultiCondition(_))
+    }
+
+    /// Returns `true` if this handle picks its own successors at runtime,
+    /// either kind of condition task. Upstream's `Node::_is_conditioner`.
+    ///
+    /// This is the predicate that makes a dependency *weak*: a task preceded
+    /// by a conditioner may never run at all, so it cannot be waited for the
+    /// way a strong dependency is.
+    #[must_use]
+    pub fn is_conditioner(&self) -> bool {
+        self.is_condition() || self.is_multi_condition()
     }
 }
 
@@ -872,6 +918,79 @@ mod tests {
         for (_, node) in graph.iter() {
             assert_eq!(node.join_counter().load(Ordering::Relaxed), 1);
         }
+    }
+
+    /// A conditioner's work is only useful if the value comes back out, so
+    /// this is the bar issue #28 sets for making [`Work`] generic.
+    #[test]
+    fn invoke_returns_what_the_callable_returned() {
+        let mut next = 0;
+        let counting = Work::new(move || {
+            next += 1;
+            next - 1
+        });
+        assert_eq!(counting.invoke(), 0);
+        assert_eq!(counting.invoke(), 1);
+
+        // Upstream's `-10..=110` case is only expressible because the index is
+        // signed and unbounded: out of range is the caller's prerogative, not
+        // an error the handle rejects.
+        let branch_nowhere = Work::new(|| -1);
+        assert_eq!(branch_nowhere.invoke(), -1);
+
+        let selection = Work::new(|| vec![-10, 0, 2, 110]);
+        assert_eq!(selection.invoke(), vec![-10, 0, 2, 110]);
+        // And a second invocation gets its own vector, not a drained one.
+        assert_eq!(selection.invoke(), vec![-10, 0, 2, 110]);
+    }
+
+    #[test]
+    fn the_handle_predicates_split_conditioners_from_the_rest() {
+        let placeholder = Handle::Placeholder;
+        let still = Handle::Static(Work::new(|| {}));
+        let one = Handle::Condition(Work::new(|| 0));
+        let many = Handle::MultiCondition(Work::new(Vec::new));
+
+        assert!(placeholder.is_placeholder());
+        assert!(still.is_static());
+        assert!(one.is_condition());
+        assert!(many.is_multi_condition());
+
+        // `is_conditioner` is either of the two and nothing else, which is the
+        // whole point: it is what the dependency counts key on.
+        assert!(one.is_conditioner());
+        assert!(many.is_conditioner());
+        assert!(!placeholder.is_conditioner());
+        assert!(!still.is_conditioner());
+
+        assert!(!one.is_multi_condition());
+        assert!(!many.is_condition());
+        assert!(!one.is_static());
+        assert!(!one.is_placeholder());
+    }
+
+    #[test]
+    fn a_node_carries_either_conditioner_handle() {
+        let mut graph = Graph::new();
+        let one = graph.add_named_node("one", Handle::Condition(Work::new(|| 7)));
+        let many = graph.add_named_node("many", Handle::MultiCondition(Work::new(|| vec![1, 3])));
+
+        let Handle::Condition(work) = graph.node(one).handle() else {
+            panic!("the condition handle did not survive add_named_node");
+        };
+        assert_eq!(work.invoke(), 7);
+        let Handle::MultiCondition(work) = graph.node(many).handle() else {
+            panic!("the multi-condition handle did not survive add_named_node");
+        };
+        assert_eq!(work.invoke(), vec![1, 3]);
+
+        // And a conditioner replaces a static handle in place, which is what
+        // `TaskMut::condition_work` is built on.
+        graph
+            .node_mut(one)
+            .set_handle(Handle::Static(Work::new(|| {})));
+        assert!(graph.node(one).handle().is_static());
+        assert!(!graph.node(one).handle().is_conditioner());
     }
 
     #[test]
