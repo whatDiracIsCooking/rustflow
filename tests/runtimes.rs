@@ -8,11 +8,14 @@
 //! on the public surface of the handle and on what `schedule` does with a
 //! task that is not the runtime task's to schedule.
 //!
+//! `Runtime.ExternalGraph.Simple` is here as of #55, at the end of the file:
+//! a hundred runtime tasks each corunning a taskflow of its own, a hundred
+//! times over, which is the case that puts `run_n` and
+//! [`Executor::corun`](rustflow::Executor::corun) under one run.
+//!
 //! The rest of upstream's file is named rather than half-ported, each with
 //! what it waits on:
 //!
-//! - `Runtime.ExternalGraph.Simple` needs `run_n` and `Executor::corun`
-//!   together, and is issue #55's;
 //! - `Fibonacci`, `FibonacciSwapped`, `ImplicitJoin`,
 //!   `RecursiveImplicitJoin`, `MergeSort` and `QuickSort` are all built on
 //!   `rt.async` / `rt.silent_async`, which is milestone 5. They are also the
@@ -280,5 +283,81 @@ fn scheduling_a_task_of_another_graph_is_reported_as_the_run_failing() {
             );
         }
         error => panic!("unexpected failure: {error:?}"),
+    }
+}
+
+/// Upstream's `Runtime.ExternalGraph.Simple`: a hundred taskflows of four
+/// chained tasks, one runtime task per taskflow corunning it, and the lot run
+/// a hundred times -- so each of the hundred counters is bumped four times a
+/// round and reads 400 at the end.
+///
+/// `400` is the whole assertion and it needs no handshake of any kind: it is
+/// arithmetic over work the run cannot have finished without doing, since a
+/// corun returns only once the graph it scheduled is done and the run returns
+/// only once every runtime task has.
+///
+/// What it adds to the two cases above is the *shape* rather than one more
+/// method: a hundred external graphs under one run is where a corun stops
+/// being a single nested wait. A worker that enters one corun and then steals
+/// another runtime task coruns again on top of it, so the pool works its way
+/// through frames stacked however deep the stealing happens to go -- which is
+/// exactly the thing the `executor::corun` module docs say a nested `run` plus
+/// `wait` cannot survive, and which at one worker has no second thread to hide
+/// a mistake behind.
+#[test]
+fn a_hundred_runtime_tasks_corun_an_external_graph_each() {
+    /// Upstream's `N`: how many external graphs, and therefore how many
+    /// runtime tasks.
+    const GRAPHS: usize = 100;
+    /// Upstream's `run_n(taskflow, 100)`.
+    const ROUNDS: usize = 100;
+    /// Upstream's four-task chain, one per external graph.
+    const CHAIN: usize = 4;
+
+    for workers in 1..=4 {
+        // Shared with the task bodies, which are `'static` and so cannot
+        // borrow the executor the way upstream's lambdas capture it.
+        let executor = Arc::new(Executor::new(workers));
+
+        let results: Vec<Arc<AtomicI32>> =
+            (0..GRAPHS).map(|_| Arc::new(AtomicI32::new(0))).collect();
+        let graphs: Vec<Arc<Taskflow>> = results
+            .iter()
+            .map(|result| {
+                let mut graph = Taskflow::new();
+                let chain: Vec<Task> = (0..CHAIN).map(|_| graph.emplace(count(result))).collect();
+                graph.linearize(chain);
+                Arc::new(graph)
+            })
+            .collect();
+
+        let mut taskflow = Taskflow::new();
+        for graph in &graphs {
+            let executor = Arc::clone(&executor);
+            let graph = Arc::clone(graph);
+            // Upstream's body takes a `tf::Runtime&` it never uses: what the
+            // case is about is that the *corun* is made from inside a task,
+            // and the handle is there to say which task kind it is made from.
+            taskflow.emplace_runtime(move |_runtime: &mut Runtime<'_>| {
+                executor
+                    .corun(&graph)
+                    .expect("a runtime body runs on a worker of this executor");
+            });
+        }
+
+        executor
+            .run_n(&taskflow, ROUNDS)
+            .wait()
+            .expect("no task panicked");
+
+        let expected =
+            i32::try_from(ROUNDS * CHAIN).expect("four tasks on a hundred rounds fit in an i32");
+        for (which, result) in results.iter().enumerate() {
+            assert_eq!(
+                result.load(Ordering::Relaxed),
+                expected,
+                "{workers} worker(s): graph {which} ran its whole chain on every round"
+            );
+        }
     }
 }
