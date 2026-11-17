@@ -19,6 +19,10 @@
 //!   argument lives: a job owns a share of its run, of the taskflow's
 //!   storage and of its parent chain, which is what keeps a queue of jobs
 //!   from being a queue of raw pointers;
+//! - `async_node` the free-standing node an async task is -- a one-node
+//!   graph of its own, which is what lets a node that belongs to no taskflow
+//!   and no run be dispatched by the same code as every other node -- and
+//!   `async` and `dependent_async` the two node kinds that run on one;
 //! - `module`, `subflow` and `runtime` one dynamic-tasking node kind each,
 //!   reached by one line from the worker's handle match. `module` runs a
 //!   composed taskflow as of #49 and an adopted graph as of #74, `runtime` a
@@ -218,7 +222,10 @@
 //! was in a sibling subtree under the same anchor, and every job under a
 //! failed anchor is one whose result nobody will collect.
 
+pub(crate) mod r#async;
+pub(crate) mod async_node;
 pub mod corun;
+pub(crate) mod dependent_async;
 pub(crate) mod module;
 pub mod notifier;
 pub mod queue;

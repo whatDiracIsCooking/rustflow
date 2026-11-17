@@ -123,6 +123,7 @@
 
 #![doc(html_root_url = "https://docs.rs/rustflow/0.0.0")]
 
+pub mod async_task;
 pub mod dump;
 pub mod executor;
 pub mod flow_builder;
@@ -133,6 +134,7 @@ pub mod subflow;
 pub mod task;
 pub mod taskflow;
 
+pub use crate::async_task::AsyncTask;
 pub use crate::executor::Executor;
 pub use crate::executor::corun::CorunError;
 pub use crate::executor::queue::{Buffers, Thief, WorkerQueue};
@@ -141,7 +143,9 @@ pub use crate::executor::run_handle::{Canceller, RunError, RunHandle};
 pub use crate::executor::subflow::JoinError;
 pub use crate::executor::worker::{Worker, WorkerInterface};
 pub use crate::flow_builder::{Callables, FlowBuilder};
-pub use crate::graph::{Graph, Handle, Node, RuntimeWork, SubflowWork, Task, Work};
+pub use crate::graph::{
+    AsyncWork, Graph, Handle, Node, OnceWork, RuntimeWork, SubflowWork, Task, Work,
+};
 pub use crate::runtime::Runtime;
 pub use crate::semaphore::Semaphore;
 pub use crate::subflow::Subflow;

@@ -110,7 +110,7 @@ use crate::executor::notifier::Notifier;
 use crate::executor::queue::{Thief, WorkerQueue};
 use crate::executor::rng::Xorshift32;
 use crate::executor::topology::Job;
-use crate::executor::{module, runtime, subflow};
+use crate::executor::{r#async, dependent_async, module, runtime, subflow};
 use crate::graph::{Handle, Node};
 
 /// A worker of an [`Executor`](crate::Executor), as every thread but its own
@@ -571,6 +571,17 @@ impl WorkerThread {
             Handle::Runtime(work) => runtime::invoke(self, &job, work),
             Handle::Module(target) => module::invoke(self, &job, target),
             Handle::AdoptedModule(adopted) => module::invoke_adopted(self, &job, adopted),
+            // The two async handles, which are the one pair of arms here that
+            // a graph is not supposed to reach at all: an async task's node
+            // is free-standing and is dispatched through a job of its own
+            // arena, so what gets here is a handle somebody put in a
+            // taskflow. Both refuse, each in its own file for the reason the
+            // four above have theirs -- `r#async` is #88's and
+            // `dependent_async` is #91's -- and those docs say why running a
+            // `FnOnce` body as part of a graph is refused rather than
+            // supported.
+            Handle::Async(work) => r#async::invoke(self, &job, work),
+            Handle::DependentAsync(work) => dependent_async::invoke(self, &job, work),
         };
 
         // Upstream's `return true` out of `_invoke_subflow_task`,

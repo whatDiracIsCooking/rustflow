@@ -242,6 +242,181 @@ impl<R> fmt::Debug for Work<R> {
     }
 }
 
+/// A body that runs **once**, in the slot the one worker that runs it takes
+/// it out of.
+///
+/// The three [`AsyncWork`] shapes are built out of this, and it is what makes
+/// them different in kind from [`Work`] rather than merely different in
+/// signature: upstream's async bodies are a `std::packaged_task` or a
+/// `mutable` lambda that is moved into the node and called once, where a
+/// static task's `std::function` is called afresh on every run of the graph
+/// it belongs to. A `FnOnce` says that, and a `FnOnce` cannot be called
+/// through a shared reference -- so the body has to be *moved out* of the
+/// node to be run, which is what [`OnceWork::take`] is.
+///
+/// The `Mutex` here is a synchronisation primitive and not the assertion
+/// [`Work`]'s is. [`Work::invoke`] panics rather than blocking, because the
+/// scheduler promises one worker per node and a second one is a defect to
+/// report; this lock is what *arbitrates* that promise instead -- two callers
+/// racing to take the body are given an answer rather than a panic, exactly
+/// one of them gets `Some`, and the critical section is an
+/// [`Option::take`] rather than a user's body. A free async node is reachable
+/// through an [`AsyncTask`](crate::AsyncTask) handle a caller holds, so
+/// "exactly one caller arrives" is a weaker thing to rest on there than it is
+/// inside a graph a run owns.
+pub struct OnceWork<F: ?Sized>(Mutex<Option<Box<F>>>);
+
+impl<F: ?Sized> OnceWork<F> {
+    /// Fills the slot with `body`, which is the one call of it there will be.
+    ///
+    /// Takes the box rather than the callable, because `F` is a `dyn FnOnce`
+    /// of one of three shapes and the coercion belongs at the three call
+    /// sites in [`AsyncWork`] rather than in a bound here.
+    #[must_use]
+    pub fn new(body: Box<F>) -> Self {
+        Self(Mutex::new(Some(body)))
+    }
+
+    /// Takes the body out, leaving the slot empty: `Some` for the one caller
+    /// that got there first, `None` for every caller after it.
+    ///
+    /// Upstream has no equivalent because it needs none -- its async node is
+    /// recycled by the worker that ran it, so nothing can reach the body a
+    /// second time. Here the node lives as long as the last handle on it, and
+    /// this is what keeps a body from being run twice.
+    pub fn take(&self) -> Option<Box<F>> {
+        self.lock().take()
+    }
+
+    /// Whether the body has been taken, which is as close to "has run" as the
+    /// slot itself can say -- the taker may still be running it.
+    #[must_use]
+    pub fn is_spent(&self) -> bool {
+        self.lock().is_none()
+    }
+
+    /// The slot. Poisoning is taken rather than propagated, as it is
+    /// everywhere else in the crate: nothing under this lock does more than
+    /// move a box, so a poisoned slot means a panic *elsewhere* -- in the body
+    /// after it was taken -- and refusing to hand the slot back would turn a
+    /// reported failure into one nobody can account for.
+    fn lock(&self) -> MutexGuard<'_, Option<Box<F>>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl<F: ?Sized> fmt::Debug for OnceWork<F> {
+    /// Whether the body is still there is the whole of what is printable about
+    /// it, as it is for a `NodeBase`'s payload slot.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The lock rather than a `try_lock`, where a `NodeBase`'s `Debug`
+        // declines to wait: nothing holds this one across anything but an
+        // `Option::take`, so there is no lock here to be stuck behind and no
+        // reason to print a guess.
+        f.debug_tuple("OnceWork")
+            .field(&if self.is_spent() { "spent" } else { "pending" })
+            .finish()
+    }
+}
+
+/// The body of an async or dependent-async task, in one of upstream's three
+/// shapes.
+///
+/// Upstream's `Node::Async::work` and `Node::DependentAsync::work`, which are
+/// the same `std::variant<std::function<void()>,
+/// std::function<void(tf::Runtime&)>, std::function<void(tf::Runtime&, bool)>>`
+/// twice over -- so this is one type used by both [`Handle::Async`] and
+/// [`Handle::DependentAsync`], as the two upstream structs are one layout
+/// under two names.
+///
+/// Not generic over a return value, where upstream's third `async` form is a
+/// `std::packaged_task<R()>`: what delivers the result of a value-returning
+/// body is a wrapper closure the submitting call builds, which captures the
+/// slot it will put the value in and is itself a `Plain` body. That keeps the
+/// node one type whatever the body returns, which is what lets a queue hold
+/// jobs of async tasks that disagree about `R`.
+#[derive(Debug)]
+pub enum AsyncWork {
+    /// A plain callable, upstream's `std::function<void()>` alternative: the
+    /// body of a `silent_async`, and the wrapper a value-returning `async`
+    /// submits.
+    Plain(OnceWork<PlainAsyncBody>),
+    /// A callable handed the scheduler, upstream's
+    /// `std::function<void(tf::Runtime&)>` alternative: a *silent*
+    /// runtime-shaped body, which nobody is waiting on and which therefore
+    /// needs no second entry.
+    Runtime(OnceWork<AsyncRuntimeBody>),
+    /// A runtime-shaped body somebody *is* waiting on, upstream's
+    /// `std::function<void(tf::Runtime&, bool reentered)>` alternative.
+    ///
+    /// Two closures rather than one closure and a flag, and that is this
+    /// port's one departure from the variant above it. Upstream's lambda is
+    /// called twice: once with `reentered == false`, when it runs the user's
+    /// body, and once with `true`, when its only job is to deliver the node's
+    /// payload slot to whoever holds the handle (`_async` in
+    /// `taskflow/core/async.hpp`, which reads `rt._node->_exception_ptr` on
+    /// that second entry). Each half therefore runs exactly once, and two
+    /// `FnOnce`s say so where one `FnMut` and a `bool` would leave a reader --
+    /// and the type system -- to take it on trust.
+    Reentrant {
+        /// The user's body, run on the first entry.
+        body: OnceWork<AsyncRuntimeBody>,
+        /// What delivers the node's one failure, if there was one, on the
+        /// second entry: upstream's `eptr ? set_exception : set_value`.
+        complete: OnceWork<AsyncCompleteBody>,
+    },
+}
+
+/// The boxed body of a plain async task, named rather than written inline for
+/// [`SubflowBody`]'s reason.
+type PlainAsyncBody = dyn FnOnce() + Send + 'static;
+
+/// The boxed body of a runtime-shaped async task.
+///
+/// Higher-ranked over the runtime's own lifetime, as [`RuntimeBody`] is and
+/// for its reason: the handle borrows the node the body is running on.
+type AsyncRuntimeBody = dyn for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static;
+
+/// The boxed second half of an [`AsyncWork::Reentrant`] body: what hands the
+/// node's payload -- upstream's `_exception_ptr`, `None` for a task that did
+/// not fail -- to whoever is waiting on the task.
+type AsyncCompleteBody = dyn FnOnce(Option<Box<dyn Any + Send>>) + Send + 'static;
+
+impl AsyncWork {
+    /// Wraps a plain callable as the body of an async task: upstream's
+    /// `std::function<void()>` alternative.
+    pub fn plain<C>(body: C) -> Self
+    where
+        C: FnOnce() + Send + 'static,
+    {
+        Self::Plain(OnceWork::new(Box::new(body)))
+    }
+
+    /// Wraps a runtime-shaped callable nobody is waiting on: upstream's
+    /// `std::function<void(tf::Runtime&)>` alternative.
+    pub fn runtime<C>(body: C) -> Self
+    where
+        C: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
+    {
+        Self::Runtime(OnceWork::new(Box::new(body)))
+    }
+
+    /// Wraps a runtime-shaped callable somebody is waiting on, plus what
+    /// delivers the node's payload to them: upstream's
+    /// `std::function<void(tf::Runtime&, bool)>` alternative, as the two
+    /// `FnOnce`s the variant's docs argue for.
+    pub fn reentrant<B, C>(body: B, complete: C) -> Self
+    where
+        B: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
+        C: FnOnce(Option<Box<dyn Any + Send>>) + Send + 'static,
+    {
+        Self::Reentrant {
+            body: OnceWork::new(Box::new(body)),
+            complete: OnceWork::new(Box::new(complete)),
+        }
+    }
+}
+
 /// What a node does when the executor reaches it.
 ///
 /// Upstream is a `std::variant` of eleven alternatives (subflow, module,
@@ -304,6 +479,34 @@ pub enum Handle {
     /// `Node::AdoptedModule` -- the `adopt(Graph&&)` form of the variant
     /// above, which moves the graph in rather than sharing it.
     AdoptedModule(Graph),
+    /// A task submitted outside any graph, upstream's `Node::Async`: the body
+    /// a `silent_async` or `async` call hands the pool, which has no
+    /// dependencies and no successors.
+    ///
+    /// The node such a task is lives in a one-node graph of its own rather
+    /// than in a taskflow's arena -- `executor::async_node` is where that
+    /// node and its ownership are -- so this variant is the *handle* of an
+    /// async task and not a way to build one. Nothing on
+    /// [`FlowBuilder`](crate::FlowBuilder) produces it.
+    ///
+    /// One can nevertheless be put in a taskflow's graph through
+    /// [`Graph::add_node`], because that function takes any handle. Such a
+    /// node dumps as a plain node and the worker that reaches it refuses the
+    /// run -- `executor::async` -- rather than running a body that has no
+    /// business being counted as part of a taskflow.
+    Async(AsyncWork),
+    /// A task submitted outside any graph that other such tasks can depend
+    /// on, upstream's `Node::DependentAsync`.
+    ///
+    /// The same body as [`Handle::Async`] over the same free-standing node;
+    /// what the two differ in is who may wait for it and what the node keeps
+    /// besides its body -- a dependent-async node holds the successors
+    /// upstream keeps in `_edges` under its `ESTATE::LOCKED` spin bit, and
+    /// hands out an [`AsyncTask`](crate::AsyncTask) handle so that a later
+    /// submission can name it as a dependency. Everything the paragraphs
+    /// above say about a node of this kind inside a taskflow holds of this
+    /// one too.
+    DependentAsync(AsyncWork),
 }
 
 impl Handle {
@@ -354,6 +557,27 @@ impl Handle {
     #[must_use]
     pub fn is_module(&self) -> bool {
         matches!(self, Self::Module(_) | Self::AdoptedModule(_))
+    }
+
+    /// Returns `true` for [`Handle::Async`].
+    #[must_use]
+    pub fn is_async(&self) -> bool {
+        matches!(self, Self::Async(_))
+    }
+
+    /// Returns `true` for [`Handle::DependentAsync`].
+    ///
+    /// Separate from [`Handle::is_async`] where [`is_module`](Handle::is_module)
+    /// folds its two variants together, and the difference is upstream's: the
+    /// two module forms differ only in who owns the target graph, which
+    /// nothing outside the dispatch arm asks, whereas an async and a
+    /// dependent-async task differ in whether anything can depend on them --
+    /// a question a caller holding an [`AsyncTask`](crate::AsyncTask) asks all
+    /// the time. The flat [`TaskType`](crate::TaskType) still folds them, as
+    /// upstream's does.
+    #[must_use]
+    pub fn is_dependent_async(&self) -> bool {
+        matches!(self, Self::DependentAsync(_))
     }
 
     /// Returns `true` if this handle picks its own successors at runtime,
@@ -1980,5 +2204,78 @@ mod tests {
             .release_all(&mut Vec::new())
             .expect_err("the semaphore is already at its maximum");
         assert_eq!(error.max_value(), 1);
+    }
+
+    /// The two async handles answer their own predicate and nobody else's.
+    /// They do *not* fold together the way the two module forms do, and
+    /// [`Handle::is_dependent_async`] says why.
+    #[test]
+    fn the_handle_predicates_split_the_two_async_kinds() {
+        let free = Handle::Async(AsyncWork::plain(|| {}));
+        let dependent = Handle::DependentAsync(AsyncWork::plain(|| {}));
+
+        assert!(free.is_async());
+        assert!(dependent.is_dependent_async());
+        assert!(!free.is_dependent_async());
+        assert!(!dependent.is_async());
+
+        for handle in [&free, &dependent] {
+            assert!(!handle.is_placeholder());
+            assert!(!handle.is_static());
+            assert!(!handle.is_module());
+            assert!(!handle.is_subflow());
+            assert!(!handle.is_runtime());
+            // Above all not a conditioner: an async node picks no successors.
+            assert!(!handle.is_conditioner());
+        }
+        assert!(!Handle::Placeholder.is_async());
+        assert!(!Handle::Static(Work::new(|| {})).is_dependent_async());
+    }
+
+    /// An async body runs **once**, which is the whole of what separates
+    /// [`AsyncWork`] from [`Work`]: the one worker that gets there takes the
+    /// body out of the slot, and every caller after it finds nothing.
+    #[test]
+    fn an_async_body_is_taken_out_of_its_slot_once() {
+        let AsyncWork::Plain(slot) = AsyncWork::plain(|| {}) else {
+            panic!("`plain` builds the plain shape");
+        };
+
+        assert!(!slot.is_spent());
+        let body = slot.take().expect("the first taker gets the body");
+        assert!(slot.is_spent(), "and the slot is empty behind it");
+        assert!(slot.take().is_none(), "so a second worker runs nothing");
+
+        // The body is a `FnOnce`, so running it is what consumes it: there is
+        // no second call to be had even for the taker.
+        body();
+    }
+
+    /// The reentrant shape's two halves are taken independently, which is the
+    /// port's one departure from upstream's single `void(Runtime&, bool)`
+    /// lambda: the first entry takes the body and the second, which may be on
+    /// another worker, takes what delivers the node's payload.
+    #[test]
+    fn a_reentrant_body_and_its_completion_are_two_separate_onces() {
+        let delivered = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&delivered);
+        let work =
+            AsyncWork::reentrant(|_| {}, move |payload| *slot.lock().expect("free") = payload);
+
+        let AsyncWork::Reentrant { body, complete } = work else {
+            panic!("`reentrant` builds the reentrant shape");
+        };
+
+        // The first entry spends the body and leaves the completion alone.
+        assert!(body.take().is_some());
+        assert!(body.is_spent());
+        assert!(!complete.is_spent(), "the second entry still has its half");
+
+        // The second entry hands over whatever the node's slot held, which is
+        // upstream's `eptr ? set_exception : set_value`.
+        complete.take().expect("the completion")(Some(Box::new("oops")));
+        assert!(complete.is_spent());
+        let payload = delivered.lock().expect("free").take().expect("delivered");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"oops"));
     }
 }

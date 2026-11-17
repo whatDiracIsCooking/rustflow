@@ -553,13 +553,20 @@ fn dump_node(
             )?;
         }
         // A module task owns no graph either, and does not reach this function
-        // at all: [`dump_graph`] sends it to [`dump_module_node`].
+        // at all: [`dump_graph`] sends it to [`dump_module_node`]. Neither
+        // async handle owns a graph: the one-node graph a free async task is
+        // belongs to the task rather than to the handle, and nothing dumps
+        // one -- a free node is in no taskflow to be dumped. What reaches
+        // here is an async handle somebody put in a graph through
+        // [`Graph::add_node`], and it is a plain node like any other.
         Handle::Placeholder
         | Handle::Static(_)
         | Handle::Condition(_)
         | Handle::MultiCondition(_)
         | Handle::Runtime(_)
-        | Handle::Module(_) => {}
+        | Handle::Module(_)
+        | Handle::Async(_)
+        | Handle::DependentAsync(_) => {}
     }
 
     Ok(())
@@ -656,7 +663,9 @@ fn node_shape(handle: &Handle) -> &'static str {
         | Handle::Subflow { .. }
         | Handle::Runtime(_)
         | Handle::Module(_)
-        | Handle::AdoptedModule(_) => "",
+        | Handle::AdoptedModule(_)
+        | Handle::Async(_)
+        | Handle::DependentAsync(_) => "",
         Handle::Condition(_) | Handle::MultiCondition(_) => {
             "shape=diamond color=black fillcolor=aquamarine style=filled"
         }
@@ -678,7 +687,9 @@ fn edge_attributes(handle: &Handle, position: usize) -> String {
         | Handle::Subflow { .. }
         | Handle::Runtime(_)
         | Handle::Module(_)
-        | Handle::AdoptedModule(_) => String::new(),
+        | Handle::AdoptedModule(_)
+        | Handle::Async(_)
+        | Handle::DependentAsync(_) => String::new(),
         Handle::Condition(_) | Handle::MultiCondition(_) => {
             format!(" [style=dashed label=\"{position}\"]")
         }
@@ -695,7 +706,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::graph::{SubflowWork, Work};
+    use crate::graph::{AsyncWork, SubflowWork, Work};
 
     /// A graph of `children` placeholders named `c0`, `c1`, ..., which is what
     /// a subflow body would have built had the executor run one yet.
@@ -753,6 +764,29 @@ mod tests {
                 "    p1[label=\"p1\" ];\n",
             )
         );
+    }
+
+    /// Both async handles dump like a placeholder too: no shape of their own,
+    /// no edge attributes and no nested cluster, which is upstream's
+    /// `default` again. A free async node is in no taskflow to be dumped at
+    /// all -- what this covers is an async handle somebody put in a graph
+    /// through [`Graph::add_node`].
+    #[test]
+    fn the_async_handles_dump_like_a_placeholder() {
+        let mut placeholder = Taskflow::with_name("t");
+        placeholder
+            .graph_mut()
+            .add_named_node("a", Handle::Placeholder);
+        let expected = placeholder.dump();
+
+        for handle in [
+            Handle::Async(AsyncWork::plain(|| {})),
+            Handle::DependentAsync(AsyncWork::plain(|| {})),
+        ] {
+            let mut taskflow = Taskflow::with_name("t");
+            taskflow.graph_mut().add_named_node("a", handle);
+            assert_eq!(taskflow.dump(), expected);
+        }
     }
 
     /// A static task and a placeholder dump identically: both fall through
