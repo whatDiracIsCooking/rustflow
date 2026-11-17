@@ -37,6 +37,7 @@
 
 #![doc(html_root_url = "https://docs.rs/rustflow/0.0.0")]
 
+pub mod dump;
 pub mod graph;
 pub mod taskflow;
 
