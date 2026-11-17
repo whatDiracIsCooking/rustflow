@@ -22,6 +22,7 @@ either means the same thing:
 devtools/devcontainer.sh up             # start the container
 devtools/devcontainer.sh check          # fmt + clippy -D warnings + test
 devtools/devcontainer.sh shell          # bash inside it
+devtools/devcontainer.sh claude         # Claude Code inside it
 devtools/devcontainer.sh test graph::   # cargo test, filtered
 devtools/devcontainer.sh down           # stop it (volumes survive)
 ```
@@ -29,6 +30,45 @@ devtools/devcontainer.sh down           # stop it (volumes survive)
 `check` is the gate: `cargo fmt --all --check`, then
 `cargo clippy --all-targets --all-features -- -D warnings`, then
 `cargo test --all-features`. Anything that passes locally should pass in CI.
+
+## Working inside the container
+
+The image carries the agent tooling as well as the toolchain, pinned the same
+way `RUST_VERSION` is: `ARG CLAUDE_CODE_VERSION` and `ARG GH_VERSION` in the
+[`Dockerfile`](Dockerfile). Bump the arg and rebuild rather than letting either
+self-update — an image whose contents depend on the day it was built is the
+thing the pins exist to prevent.
+
+```sh
+devtools/devcontainer.sh claude         # Claude Code, TTY attached
+devtools/devcontainer.sh shell -c 'gh pr checks 12'
+```
+
+**The first run needs two one-time answers**, both of which then persist in the
+`rustflow-claude-config` volume (`CLAUDE_CONFIG_DIR=/claude-config`) and
+survive `down` and `rebuild`:
+
+1. `/login`, unless the host exports `ANTHROPIC_API_KEY` or
+   `CLAUDE_CODE_OAUTH_TOKEN` — `docker/compose.yaml` forwards either when set.
+2. the workspace trust prompt. Until it is accepted, Claude Code ignores the
+   `permissions.allow` list in `.claude/settings.json` and says so. It is left
+   as a prompt on purpose: pre-accepting a trust decision in a committed file
+   would answer a safety question on behalf of whoever builds the image next.
+
+`devtools/devcontainer.sh nuke` drops that volume along with the build caches,
+so it is also "log in again".
+
+`gh` authenticates from a forwarded `GH_TOKEN` and nothing else — no keyring,
+no `gh auth login` state in the image. If the host has no `GH_TOKEN` exported,
+in-container `gh` is simply unauthenticated; `gh auth status` is the check.
+
+**Two things the container cannot do.** `docker` is not installed in it, so
+`devtools/devcontainer.sh` and `docker/compose.yaml` are host-only — from
+inside, run the three `cargo` commands of the gate directly. And git does not
+work inside a `.claude/worktrees/` checkout mounted into the container: a
+worktree's `.git` is a *file* holding an absolute host path, which resolves to
+nothing under `/workspace`. The devcontainer is for the main checkout; worktree
+work does its git from the host.
 
 ### Two things that will bite otherwise
 

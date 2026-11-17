@@ -4,14 +4,24 @@ description: >-
   Ship the current work: commit the relevant changes, push the branch, open a
   GitHub PR with gh, and merge it. Use when the user asks to "PR this", "ship
   it", "commit/push/merge", or otherwise wants the working-tree changes landed
-  on main end to end. Requires gh + GH_TOKEN on the HOST; the container image
-  has neither, so run every step of this skill from the host.
+  on main end to end. Needs gh plus a GH_TOKEN: the host has both, and the
+  container image has gh with GH_TOKEN forwarded only when the host exports
+  it -- so from inside, confirm with `gh auth status` first.
 ---
 
 # Commit → push → PR → merge
 
 Drive the current changes all the way to `main` in one pass. Each step has a
 gotcha; follow them in order.
+
+**Where to run it.** From the host, every step works. From inside the
+devcontainer, `gh` is installed and `docker/compose.yaml` forwards GH_TOKEN
+when the host has it exported -- so the whole skill runs in there too, with two
+exceptions: step 3's `devtools/devcontainer.sh check` is host-only (no `docker`
+in the container; run the three `cargo` commands directly instead), and git
+does not work at all in a `.claude/worktrees/` checkout mounted into the
+container, because its `.git` file points at an absolute host path the
+container cannot see. Worktree work therefore commits and pushes from the host.
 
 ## 1. Commit the relevant changes
 

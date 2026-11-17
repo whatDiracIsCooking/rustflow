@@ -9,11 +9,13 @@
 #   devtools/devcontainer.sh up            start the container
 #   devtools/devcontainer.sh shell         interactive bash inside it
 #   devtools/devcontainer.sh shell -c CMD  run one command inside it
+#   devtools/devcontainer.sh claude [ARGS] Claude Code inside it
 #   devtools/devcontainer.sh check         fmt + clippy + test (the CI gate)
 #   devtools/devcontainer.sh test [ARGS]   cargo test
 #   devtools/devcontainer.sh rebuild       rebuild the image after a Dockerfile edit
 #   devtools/devcontainer.sh down          stop it (volumes survive)
-#   devtools/devcontainer.sh nuke          stop it AND drop the cargo/target volumes
+#   devtools/devcontainer.sh nuke          stop it AND drop every volume, the
+#                                          Claude Code login included
 #   devtools/devcontainer.sh status        what is running
 #
 # VS Code / IDE users can instead open .devcontainer/devcontainer.json; it
@@ -53,6 +55,20 @@ case "$cmd" in
         else
             dc exec dev bash
         fi
+        ;;
+    # Not routed through in_dev: that wraps the command in `bash -c`, and
+    # Claude Code is a TUI that needs the terminal handed straight to it.
+    # `exec` (no -T) keeps the TTY attached; a bash -c layer in between breaks
+    # arrow keys and resize.
+    #
+    # Credentials come from the rustflow-claude-config volume, so the first run
+    # in a fresh volume needs an interactive `/login` once -- and only once,
+    # since `down` and `rebuild` both leave the volume standing. Already have
+    # ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN exported on the host?
+    # compose.yaml forwards it and there is nothing to log in to.
+    claude)
+        ensure_up
+        dc exec dev claude "$@"
         ;;
     check)
         in_dev 'set -e
