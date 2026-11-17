@@ -14,14 +14,17 @@
 //! cancelled runs of a four-level composition all finish, where this one
 //! pins which tasks ran.
 //!
-//! Two cases of that file are deliberately not here, each named with the
-//! milestone that brings it:
+//! Four more arrived with #94, and they are the file's async-launch family:
+//! `Module.AsyncLaunch`, `Module.SilentAsyncLaunch` and the two cases
+//! upstream both names `Module.DependentAsyncLaunch`, which launch a
+//! composition from a free-standing task rather than from a run. They are at
+//! the end of the file and the section there has the one adaptation they
+//! need.
 //!
-//! - `Module4` builds its module tasks with `tf::make_module_task` from
-//!   `taskflow/algorithm/module.hpp`, which is the algorithm library and
-//!   milestone 6;
-//! - `Module.ModuleWithAsyncLaunch` and `Module.AsyncLaunchWithModule` launch
-//!   their compositions through `executor.async`, which is milestone 5.
+//! One case of that file is deliberately not here: `Module4` builds its
+//! module tasks with `tf::make_module_task` from
+//! `taskflow/algorithm/module.hpp`, which is the algorithm library a later
+//! milestone brings.
 //!
 //! Nothing here composes an *adopted* graph either, and nothing upstream does
 //! in this file: `adopt` is the owned form of the same node kind, so these
@@ -587,4 +590,232 @@ fn a_composition_is_editable_the_instant_its_run_reports_done() {
             "a run reported done while a share of its taskflow was still held"
         );
     }
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: AsyncLaunch, SilentAsyncLaunch and DependentAsyncLaunch
+// ----------------------------------------------------------------------------
+
+/// Upstream's `f1` for the four async-launch cases: a chain of five tasks of
+/// its own with a module task of a chain of five behind it, so a launch that
+/// ran the whole thing counts ten.
+///
+/// Ten rather than five is what makes it a *composition* launched rather than
+/// a graph launched: the module node is the last task of `f1`, so a launch
+/// that stopped at the node -- or ran it without expanding it -- counts five
+/// and fails.
+fn five_then_a_module_of_five(counter: &Counter) -> Arc<Taskflow> {
+    let f0 = chain(5, counter);
+
+    let mut f1 = Taskflow::new();
+    let own: Vec<Task> = (0..5)
+        .map(|_| {
+            let counter = Arc::clone(counter);
+            f1.emplace(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            })
+        })
+        .collect();
+    let module = f1.composed_of(f0);
+    f1.linearize(own.iter().copied().chain([module]));
+    Arc::new(f1)
+}
+
+/// The body upstream builds with `tf::make_module_task(f1)`: run the whole of
+/// `f1` from inside a free-standing task.
+///
+/// **The one adaptation these four cases need.** Upstream's maker returns a
+/// `void(tf::Runtime&)` body that calls the executor's internal
+/// `_schedule_graph(.., graph, rt._node->_topology, rt._node)` -- it hangs
+/// `f1`'s graph under the async task's own node, so the node preempts itself
+/// and is resumed by the last child of that graph. `make_module_task` is in
+/// `taskflow/algorithm/module.hpp`, the algorithm library a later milestone
+/// brings, and this port has no seam that schedules a graph under a free node
+/// either.
+///
+/// What it has is [`Executor::corun`], which is the same claim made by the
+/// other route: the worker stays in its scheduling loop and runs that graph
+/// to completion before the body returns, rather than returning and being
+/// re-entered. Both make the launching task finish only once the whole
+/// composition has, which is what every one of these cases asserts -- so the
+/// count is upstream's, and what differs is which of the two waits the worker
+/// does. That also makes the body a plain one where upstream's is
+/// runtime-shaped: nothing here needs the scheduler handed to it.
+fn launch(executor: &Arc<Executor>, taskflow: &Arc<Taskflow>) -> impl FnOnce() + Send + 'static {
+    let executor = Arc::clone(executor);
+    let taskflow = Arc::clone(taskflow);
+    move || {
+        executor
+            .corun(&taskflow)
+            .expect("a free-standing task runs on a worker, which may corun");
+    }
+}
+
+/// Upstream's `module_with_async_launch(W)`: the composition launched from an
+/// `async` task, waited for through its handle.
+fn module_with_async_launch(workers: usize) {
+    let context = format!("{workers} worker(s)");
+    let executor = Arc::new(Executor::new(workers));
+    let counter = counter();
+    let f1 = five_then_a_module_of_five(&counter);
+
+    executor
+        .spawn(launch(&executor, &f1))
+        .wait()
+        .expect("no task of the composition panicked");
+
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        10,
+        "{context}: the launching task's handle answered only once the whole \
+         composition had run"
+    );
+}
+
+#[test]
+fn module_with_async_launch_1_worker() {
+    module_with_async_launch(1);
+}
+
+#[test]
+fn module_with_async_launch_2_workers() {
+    module_with_async_launch(2);
+}
+
+#[test]
+fn module_with_async_launch_3_workers() {
+    module_with_async_launch(3);
+}
+
+#[test]
+fn module_with_async_launch_4_workers() {
+    module_with_async_launch(4);
+}
+
+/// Upstream's `module_with_silent_async_launch(W)`: the same launch with no
+/// handle on it, so the executor's own count of free tasks is what waits.
+fn module_with_silent_async_launch(workers: usize) {
+    let context = format!("{workers} worker(s)");
+    let executor = Arc::new(Executor::new(workers));
+    let counter = counter();
+    let f1 = five_then_a_module_of_five(&counter);
+
+    executor.silent_async(launch(&executor, &f1));
+    executor.wait_for_all();
+
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        10,
+        "{context}: `wait_for_all` waited for the launch and for the whole \
+         composition under it"
+    );
+}
+
+#[test]
+fn module_with_silent_async_launch_1_worker() {
+    module_with_silent_async_launch(1);
+}
+
+#[test]
+fn module_with_silent_async_launch_2_workers() {
+    module_with_silent_async_launch(2);
+}
+
+#[test]
+fn module_with_silent_async_launch_3_workers() {
+    module_with_silent_async_launch(3);
+}
+
+#[test]
+fn module_with_silent_async_launch_4_workers() {
+    module_with_silent_async_launch(4);
+}
+
+/// Upstream's `module_with_dependent_async_launch(W)`: the launch as a
+/// dependent-async task with no dependencies, waited for through the handle
+/// of the pair.
+fn module_with_dependent_async_launch(workers: usize) {
+    let context = format!("{workers} worker(s)");
+    let executor = Arc::new(Executor::new(workers));
+    let counter = counter();
+    let f1 = five_then_a_module_of_five(&counter);
+
+    let (_task, done) = executor.dependent_async(launch(&executor, &f1), []);
+    done.wait().expect("no task of the composition panicked");
+
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        10,
+        "{context}: the pair's handle answered only once the whole \
+         composition had run"
+    );
+}
+
+#[test]
+fn module_with_dependent_async_launch_1_worker() {
+    module_with_dependent_async_launch(1);
+}
+
+#[test]
+fn module_with_dependent_async_launch_2_workers() {
+    module_with_dependent_async_launch(2);
+}
+
+#[test]
+fn module_with_dependent_async_launch_3_workers() {
+    module_with_dependent_async_launch(3);
+}
+
+#[test]
+fn module_with_dependent_async_launch_4_workers() {
+    module_with_dependent_async_launch(4);
+}
+
+/// Upstream's `module_with_silent_dependent_async_launch(W)`: the silent
+/// dependent form, where the [`AsyncTask`](rustflow::AsyncTask) is the only
+/// handle there is.
+///
+/// `is_done` is upstream's own assertion and is the one thing this case adds
+/// to the three above: the task that launched a composition counts as done
+/// only once the composition is, which for the silent forms is the only way
+/// to ask.
+fn module_with_silent_dependent_async_launch(workers: usize) {
+    let context = format!("{workers} worker(s)");
+    let executor = Arc::new(Executor::new(workers));
+    let counter = counter();
+    let f1 = five_then_a_module_of_five(&counter);
+
+    let task = executor.silent_dependent_async(launch(&executor, &f1), []);
+    executor.wait_for_all();
+
+    assert!(
+        task.is_done(),
+        "{context}: the launching task is done once `wait_for_all` has returned"
+    );
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        10,
+        "{context}: `wait_for_all` waited for the launch and for the whole \
+         composition under it"
+    );
+}
+
+#[test]
+fn module_with_silent_dependent_async_launch_1_worker() {
+    module_with_silent_dependent_async_launch(1);
+}
+
+#[test]
+fn module_with_silent_dependent_async_launch_2_workers() {
+    module_with_silent_dependent_async_launch(2);
+}
+
+#[test]
+fn module_with_silent_dependent_async_launch_3_workers() {
+    module_with_silent_dependent_async_launch(3);
+}
+
+#[test]
+fn module_with_silent_dependent_async_launch_4_workers() {
+    module_with_silent_dependent_async_launch(4);
 }

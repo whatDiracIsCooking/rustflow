@@ -28,10 +28,9 @@
 //! one: it is `Starvation.Loop` built inside a subflow, so it waited on
 //! subflows (#50) and arrived with #54.
 //!
-//! One case is here with its middle third missing, named where it is cut:
-//! `Waiter`'s second phase runs its check inside `executor.async(...)`, and
-//! async tasks are milestone 5. The first and third phases need nothing that
-//! is missing and are upstream's own.
+//! `Waiter` is here in full as of #94, which brought the `async` form its
+//! middle phase submits its check from; the first and third phases were
+//! always upstream's own.
 //!
 //! One case was here with an adaptation rather than a cut, and it is no
 //! longer: `EmbarrasingStarvation` wraps its 65536-task fan-out in
@@ -1302,22 +1301,23 @@ fn oversubscription_8_workers() {
 // Testcase: Waiter
 // ----------------------------------------------------------------------------
 
-/// Upstream's `waiter(W)`, less its middle phase.
+/// Upstream's `waiter(W)`, all three phases.
 ///
-/// Three phases upstream, of which the second is the one this port cannot
-/// run: it submits a closure with `executor.async(...)` and has it wait, from
-/// inside the pool, until the other `W - 1` workers have gone to sleep. Async
-/// tasks are milestone 5, and there is no other way to put a single closure on
-/// a worker without a graph to hang it on, so that phase is absent rather than
-/// imitated.
+/// What they make `num_waiters` worth is cumulative: an executor with nothing
+/// to do must park every worker, a single async task must be able to watch
+/// the other `W - 1` fall asleep underneath it, a worker running a task must
+/// not be counted as parked, and a task of a graph must be able to watch the
+/// same thing the async task did. The crate's own docs call `num_waiters` a
+/// diagnostic and never a predicate, which is exactly how upstream uses it
+/// here -- every assertion below is about a pool that has already settled,
+/// not about a race.
 ///
-/// The two that are here are upstream's own, and they are what makes
-/// `num_waiters` worth anything: an executor with nothing to do must park
-/// every worker, a worker running a task must not be counted as parked, and a
-/// task must be able to watch the rest of the pool fall asleep underneath it.
-/// The crate's own docs call `num_waiters` a diagnostic and never a predicate,
-/// which is exactly how upstream uses it here -- every assertion below is
-/// about a pool that has already settled, not about a race.
+/// The middle phase is the one that needs nothing but a worker to run on, and
+/// it is the reason upstream writes it as an `async`: there is no graph in
+/// it, so what it measures is one woken worker against a pool that goes back
+/// to sleep. At one worker it is the degenerate case of that -- the body
+/// waits for `W - 1 == 0` workers to park, which is satisfied by the pool it
+/// is itself the whole of.
 fn waiter(workers: usize) {
     let executor = Arc::new(Executor::new(workers));
 
@@ -1326,6 +1326,27 @@ fn waiter(workers: usize) {
         executor.num_waiters(),
         workers,
         "an executor with nothing to do parks every worker"
+    );
+
+    // Upstream's middle phase: one async task, which waits for the rest of
+    // the pool to park and then answers. The `1` it returns is upstream's own
+    // and it is not decoration -- it is what says the body ran to its end
+    // rather than the handle having been satisfied some other way.
+    let watching = executor.spawn({
+        let executor = Arc::clone(&executor);
+        move || {
+            spin_until("the other W-1 workers to park", || {
+                executor.num_waiters() + 1 == workers
+            });
+            1
+        }
+    });
+    assert_eq!(
+        watching
+            .wait()
+            .expect("the watching async task did not panic"),
+        1,
+        "{workers} worker(s): the async task saw the rest of the pool park"
     );
 
     let mut taskflow = Taskflow::new();

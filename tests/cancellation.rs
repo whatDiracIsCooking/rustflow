@@ -9,9 +9,10 @@
 //! `CancelComposition` with #55, once there were subflows and module tasks to
 //! cancel *through*. Those last two are at the end of the file.
 //!
-//! The one case still named rather than half-ported is `CancelFromAsync`,
-//! which needs async tasks (M5). Upstream's commented-out `CancelLinearChain`
-//! is left commented out.
+//! The ninth, `CancelFromAsync`, arrived with #94 and sits beside
+//! `CancelFromAnother`: it is the same cancellation made from a free-standing
+//! async task rather than from a task of a second graph. Upstream's
+//! commented-out `CancelLinearChain` is left commented out.
 //!
 //! Five adaptations, and the first three are the ones that change what is
 //! being asserted:
@@ -384,6 +385,62 @@ fn cancel_from_another() {
         .expect("a task of the second taskflow panicked");
 
     run.wait().expect("a cancelled run completes normally");
+    assert_eq!(executor.num_topologies(), 0);
+}
+
+/// Upstream's `CancelFromAsync`: an async task submits a hundred runs of the
+/// endless graph and cancels them from inside the pool.
+///
+/// The question it adds to `cancel_from_another` is who may hold the handle.
+/// There the cancelling task is part of a *second* run, so the first run's
+/// handle is reachable only through a
+/// [`Canceller`](rustflow::Canceller); here the submitting thread is the
+/// async task itself, so it owns the [`RunHandle`] outright and cancels
+/// through it -- which is upstream's own shape, since its `fu` is a local of
+/// the lambda rather than something captured from outside.
+///
+/// Upstream sleeps 100 ms before cancelling, to give the run time to start.
+/// The poll replaces it for `cancel_from_another`'s reason, which is stronger
+/// than the sleep rather than cheaper: `b` precedes itself, so this run can
+/// never finish by itself and `Pending` is the answer by construction -- the
+/// cancel is therefore observed to be what ends it however the pool is
+/// scheduled.
+///
+/// Waiting on the run from inside the async task blocks that worker, so the
+/// hundred rounds need a worker to wind down on; upstream's four are kept.
+#[test]
+fn cancel_from_async() {
+    let executor = Arc::new(Executor::new(4));
+    let mut taskflow = Taskflow::new();
+
+    // Upstream's single infinite loop, as in `cancel_from_another`.
+    let a = taskflow.emplace(|| {});
+    let b = taskflow.emplace_condition(|| 0);
+    taskflow.task(a).precede([b]);
+    taskflow.task(b).precede([b]);
+    let taskflow = Arc::new(taskflow);
+
+    executor
+        .spawn({
+            let executor = Arc::clone(&executor);
+            let taskflow = Arc::clone(&taskflow);
+            move || {
+                let mut run = executor.run_n(&taskflow, 100);
+                assert!(
+                    poll_once(&mut run).is_pending(),
+                    "an endless run cannot have finished"
+                );
+                assert!(run.cancel(), "the endless run had already finished");
+                run.wait().expect("a cancelled run completes normally");
+            }
+        })
+        .wait()
+        .expect("the cancelling async task panicked");
+
+    // Upstream's `executor.wait_for_all()`, which here is also what makes the
+    // count below meaningful: the async task's own accounting is settled by
+    // it.
+    executor.wait_for_all();
     assert_eq!(executor.num_topologies(), 0);
 }
 
