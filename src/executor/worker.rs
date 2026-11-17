@@ -45,6 +45,56 @@
 //! worker does not. That costs the port upstream's `WorkerInterface` trick of
 //! setting thread affinity from the prologue, which needs the handle; a
 //! `Worker` here cannot hand one out.
+//!
+//! # Conditional scheduling
+//!
+//! A conditioner -- [`Handle::Condition`] or [`Handle::MultiCondition`] -- is
+//! the one node kind that picks its own successors, and that single fact is
+//! what the strong/weak dependency split exists for. Upstream's `_invoke` has
+//! two switches over the handle because of it, and so does
+//! [`WorkerThread::invoke`]: the first runs the work and keeps what a
+//! conditioner returned, the second decides what this node's successors are
+//! owed.
+//!
+//! - An edge out of a *non*-conditioner is a **strong** dependency. It is
+//!   counted into the successor's join counter by
+//!   [`Topology::set_up`](crate::executor::topology::Topology::set_up), and
+//!   finishing the predecessor decrements that counter; the successor becomes
+//!   ready when the count reaches zero, which is when every strong
+//!   predecessor has run.
+//! - An edge out of a conditioner is a **weak** dependency. It is not counted,
+//!   so it gates nothing. The conditioner's return value instead names
+//!   successor *positions* -- one `i32` for a condition task, any number of
+//!   them for a multi-condition one -- and each named successor is scheduled
+//!   outright. An index that is negative or past the last successor names
+//!   nothing, which is how a branch ends, and so does a conditioner whose body
+//!   panics: the panic is recorded on the topology and the selection stays
+//!   empty.
+//!
+//! A selected successor has its join counter *stored to zero* rather than
+//! decremented. That is upstream's "zeroing the join counter for invariant",
+//! and the invariant is that a node's counter reads zero exactly when the node
+//! is ready to run. A node entered through a weak edge cannot get there by
+//! arithmetic: a cycle may re-enter it before its strong predecessors run
+//! again -- in upstream's `loop_cond` shape the conditioner's weak successor is
+//! the conditioner itself, re-armed to its strong count a few lines earlier by
+//! the `fetch_add` that makes cycles work at all -- and nothing else is going
+//! to decrement it. So the counter is told.
+//!
+//! That is also where upstream's one rule for writing a conditional graph comes
+//! from (its `ConditionalTasking` page): **a task reached through a condition
+//! must be reachable only through that condition.** A weak successor that also
+//! has a strong predecessor can be started by the conditioner before that
+//! predecessor has run, since the zeroed counter says "ready" either way; and a
+//! weak successor two conditioners can both select may be started twice at
+//! once, which [`Work::invoke`](crate::Work::invoke) reports as a violated
+//! one-worker-per-node promise. Neither is diagnosed when the graph is built,
+//! and upstream does not diagnose them either.
+//!
+//! None of this state outlives a run. `run_n`/`run_until` re-arm every node
+//! through `Topology::set_up` before queueing the next run's sources, so the
+//! counters a cycle drove to zero start the next run at their strong counts and
+//! two runs of one taskflow cannot see each other's arithmetic.
 
 use std::any::Any;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -403,15 +453,19 @@ impl WorkerThread {
     /// Runs one job: the task's work, then the bookkeeping that decides what
     /// becomes runnable next.
     ///
-    /// Upstream's `_invoke`, restricted to the two node kinds it can run --
-    /// static and placeholder. Upstream's eight other kinds, its semaphores,
-    /// its observers and its cancellation check are each a later milestone,
-    /// and none of them is silently absent: the `match` below is exhaustive
-    /// over [`Handle`], so a new kind arrives as a compile error here rather
-    /// than as a task that mysteriously does nothing. The two conditioner
-    /// handles are what that caught first -- they are graph citizens as of
-    /// #28, with nothing to branch on them until #31 -- and their arm refuses
-    /// the run instead of guessing at the scheduling.
+    /// Upstream's `_invoke`, restricted to the four node kinds it can run --
+    /// static, placeholder and the two conditioners. Upstream's six other
+    /// kinds, its semaphores, its observers and its cancellation check are
+    /// each a later milestone, and none of them is silently absent: the
+    /// `match` below is exhaustive over [`Handle`], so a new kind arrives as a
+    /// compile error here rather than as a task that mysteriously does
+    /// nothing.
+    ///
+    /// The bookkeeping is upstream's two switches over the handle, in its
+    /// order: run the work, re-arm this node's own join counter, then release
+    /// successors -- every one of them for an ordinary task, only the selected
+    /// ones for a conditioner. The module docs set out the semantics; [`Release`]
+    /// is what carries the first switch's answer to the second.
     ///
     /// Upstream's `_update_cache`/`TF_INVOKE_CONTINUATION` is not ported
     /// either: it keeps one ready successor out of the queue and jumps
@@ -431,7 +485,7 @@ impl WorkerThread {
         let (node, taskflow, topology) = unsafe { job.parts() };
         let graph = taskflow.graph();
 
-        match node.handle() {
+        let release = match node.handle() {
             // Upstream's `_invoke_static_task`, whose
             // `TF_EXECUTOR_EXCEPTION_HANDLER` is this `catch_unwind`: the
             // failure is stored on the topology and reported from `wait`,
@@ -443,29 +497,31 @@ impl WorkerThread {
                 if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| work.invoke())) {
                     topology.record_panic(payload);
                 }
+                Release::Strong
             }
             // Upstream's `std::monostate` case: a placeholder has no work, and
             // it still has successors to release.
-            Handle::Placeholder => {}
-            // Upstream's `_invoke_condition_task`/`_invoke_multi_condition_task`
-            // invoke the work and then schedule only the successors its return
-            // value names. That is issue #31's, and it cannot be half-done
-            // here: a conditioner's edge is deliberately *not* counted into
-            // the join counter by `Topology::set_up`, so the unconditional
-            // release below is wrong for precisely these two handles. So the
-            // run is refused rather than approximated -- the work is not
-            // invoked at all -- and refused through the channel the static arm
-            // above already uses. A bare `panic!` would be the worse failure:
-            // it would kill the worker with this job unfinished, and
-            // `RunHandle::drop` would then block for ever instead of saying
-            // anything.
-            Handle::Condition(_) | Handle::MultiCondition(_) => {
-                topology.record_panic(Box::new(
-                    "running a condition task is not supported yet: \
-                     conditional scheduling is issue #31",
-                ));
-            }
-        }
+            Handle::Placeholder => Release::Strong,
+            // Upstream's `_invoke_condition_task`, which is the static invoker
+            // plus a return value: the same exception handler, and `conds = {
+            // work() }` where the static one discards what it called. A panic
+            // is therefore recorded exactly as a static task's is, and the
+            // selection it leaves behind is empty -- which selects no
+            // successor and ends the branch. Cancelling the rest of the run
+            // instead is #32's, not this arm's.
+            Handle::Condition(work) => Release::Selected(
+                panic::catch_unwind(AssertUnwindSafe(|| work.invoke()))
+                    .map_err(|payload| topology.record_panic(payload))
+                    .ok(),
+            ),
+            // Upstream's `_invoke_multi_condition_task`, the same again over
+            // however many indices the body returns.
+            Handle::MultiCondition(work) => Release::SelectedMany(
+                panic::catch_unwind(AssertUnwindSafe(|| work.invoke()))
+                    .map_err(|payload| topology.record_panic(payload))
+                    .unwrap_or_default(),
+            ),
+        };
 
         // Upstream's comment, which is the whole reason this is a `fetch_add`
         // of the strong-dependency count rather than a `store`: the counter
@@ -479,13 +535,46 @@ impl WorkerThread {
             Ordering::Relaxed,
         );
 
-        for &successor in node.successors() {
-            let next = graph.node(successor);
-            if next.join_counter().fetch_sub(1, Ordering::AcqRel) == 1 {
-                // Counted on the topology before it is queued, or the run
-                // could look finished with a job still in flight.
-                topology.job_queued();
-                self.schedule(Job::new(successor, taskflow, topology));
+        // Upstream's second switch over the handle, which [`Release`] has
+        // already answered. Either arm counts a successor on the topology
+        // before queueing it, or the run could look finished with a job still
+        // in flight.
+        match release.selected() {
+            // Upstream's `default` arm: every successor, each the moment its
+            // last strong dependency is spent.
+            None => {
+                for &successor in node.successors() {
+                    let next = graph.node(successor);
+                    if next.join_counter().fetch_sub(1, Ordering::AcqRel) == 1 {
+                        topology.job_queued();
+                        self.schedule(Job::new(successor, taskflow, topology));
+                    }
+                }
+            }
+            // Upstream's `CONDITION`/`MULTI_CONDITION` arm: only the
+            // successors the body named, each scheduled outright rather than
+            // waited for. An index naming no successor is upstream's
+            // `cond >= 0 && static_cast<size_t>(cond) < _num_successors`
+            // failing, and is how a branch ends.
+            Some(conditions) => {
+                let num_successors = node.num_successors();
+                for &condition in conditions {
+                    let Some(index) = selected_successor(condition, num_successors) else {
+                        continue;
+                    };
+                    let successor = node.successors()[index];
+                    // Upstream's "zeroing the join counter for invariant": a
+                    // weak successor may be re-entered on a cycle before its
+                    // strong predecessors run again, so nothing is going to
+                    // decrement its counter to the zero that means ready. See
+                    // the module docs.
+                    graph
+                        .node(successor)
+                        .join_counter()
+                        .store(0, Ordering::Relaxed);
+                    topology.job_queued();
+                    self.schedule(Job::new(successor, taskflow, topology));
+                }
             }
         }
 
@@ -647,6 +736,62 @@ impl WorkerThread {
     }
 }
 
+/// What the work a worker has just run leaves its node's successors owed.
+///
+/// Upstream needs no such type: it declares one `SmallVector<int> conds` above
+/// its invoke `switch`, fills it in the two conditioner arms only, and then
+/// keys a second `switch` off the handle again to decide whether to read it --
+/// so "not a conditioner" and "a conditioner that selected nothing" are told
+/// apart by re-examining the handle rather than by the value. Here the value
+/// says which it is, which is what keeps the two passes over the handle from
+/// being able to disagree: a conditioner that panicked selects nothing, and
+/// that is a `Selected(None)`, never a `Strong`.
+enum Release {
+    /// Every successor, each once its own strong dependencies are spent: the
+    /// rule for every handle that is not a conditioner.
+    Strong,
+    /// Only the successor a [`Handle::Condition`] named, and none if it
+    /// panicked. An [`Option`] rather than a one-element `Vec` because this is
+    /// the arm on a cycle's hot path -- upstream's `SmallVector` holds its one
+    /// index inline, and a heap allocation per iteration of a loop would not.
+    Selected(Option<i32>),
+    /// Only the successors a [`Handle::MultiCondition`] named, empty if it
+    /// panicked.
+    SelectedMany(Vec<i32>),
+}
+
+impl Release {
+    /// The successor positions this release names, or `None` if it names no
+    /// positions at all because every successor is to be released instead.
+    ///
+    /// The two cases cannot be confused for one another, which is the whole
+    /// point of the type: `Some(&[])` is a branch that ended, `None` is an
+    /// ordinary task.
+    fn selected(&self) -> Option<&[i32]> {
+        match self {
+            Self::Strong => None,
+            Self::Selected(condition) => Some(condition.as_slice()),
+            Self::SelectedMany(conditions) => Some(conditions),
+        }
+    }
+}
+
+/// Narrows one index a conditioner returned onto a successor position, or
+/// `None` if it names no successor.
+///
+/// Upstream's `cond >= 0 && static_cast<size_t>(cond) < node->_num_successors`,
+/// which is two guards rather than one because its cast would otherwise turn a
+/// negative index into a huge positive one. `usize::try_from` is the same two
+/// guards with the cast removed: a negative `i32` fails the conversion and an
+/// out-of-range one fails the filter. That a bad index quietly selects nothing
+/// is upstream's behaviour and is load-bearing -- `return -1` is how a
+/// conditional branch is written to end.
+fn selected_successor(condition: i32, num_successors: usize) -> Option<usize> {
+    usize::try_from(condition)
+        .ok()
+        .filter(|index| *index < num_successors)
+}
+
 /// Maps a raw draw onto the queues other than `id`.
 ///
 /// Upstream's trick, in two lines: a remainder over one fewer queue than there
@@ -719,6 +864,49 @@ mod tests {
             assert_ne!(victim, 2);
             assert!(victim < 5);
         }
+    }
+
+    /// The index filter is upstream's two guards, and the range it has to
+    /// cover is `test_control_flow.cpp`'s own: `multiple_branches` draws its
+    /// branch indices from `-10..=110` against a node with 100 successors, so
+    /// both ends of that range have to select nothing.
+    #[test]
+    fn only_an_in_range_index_selects_a_successor() {
+        for condition in -10..=110 {
+            let selected = selected_successor(condition, 100);
+            let expected = (0..100)
+                .contains(&condition)
+                .then(|| usize::try_from(condition).expect("a non-negative i32 fits in a usize"));
+            assert_eq!(selected, expected, "index {condition}");
+        }
+    }
+
+    /// The extremes, which the range above does not reach: upstream's
+    /// `return -1` ends a branch, and no index selects a successor of a node
+    /// that has none.
+    #[test]
+    fn no_index_selects_anything_without_successors() {
+        assert_eq!(selected_successor(-1, 2), None);
+        assert_eq!(selected_successor(i32::MIN, 2), None);
+        assert_eq!(selected_successor(i32::MAX, 2), None);
+        for condition in [i32::MIN, -1, 0, 1, i32::MAX] {
+            assert_eq!(selected_successor(condition, 0), None, "index {condition}");
+        }
+    }
+
+    /// `Release` exists to keep "release everything" and "release nothing"
+    /// apart, so that is the property worth pinning: a conditioner that
+    /// selected nothing must not read as an ordinary task.
+    #[test]
+    fn a_conditioner_that_selected_nothing_is_not_a_strong_release() {
+        assert_eq!(Release::Strong.selected(), None);
+        assert_eq!(Release::Selected(None).selected(), Some(&[][..]));
+        assert_eq!(Release::SelectedMany(Vec::new()).selected(), Some(&[][..]));
+        assert_eq!(Release::Selected(Some(3)).selected(), Some(&[3][..]));
+        assert_eq!(
+            Release::SelectedMany(vec![3, -1]).selected(),
+            Some(&[3, -1][..])
+        );
     }
 
     /// Two threads must not share a stream, or two workers would walk the same
