@@ -44,7 +44,10 @@ pub mod graph;
 pub mod task;
 pub mod taskflow;
 
+pub use crate::executor::Executor;
 pub use crate::executor::queue::{Buffers, Thief, WorkerQueue};
+pub use crate::executor::rng::{Xorshift32, Xorshift64};
+pub use crate::executor::worker::{Worker, WorkerInterface};
 pub use crate::flow_builder::{Callables, FlowBuilder};
 pub use crate::graph::{Graph, Handle, Node, Task, Work};
 pub use crate::task::{TaskMut, TaskRef, TaskType};

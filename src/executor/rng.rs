@@ -1,0 +1,198 @@
+//! Translated from `Xorshift` in `taskflow/utility/math.hpp` (Taskflow v4.1.0).
+//!
+//! The one random number the scheduler needs: which queue to try stealing from
+//! next. A worker draws one per failed steal, so the generator sits on the
+//! hottest path in the executor and upstream answers that with a dozen lines of
+//! xorshift over a single machine word -- no distributions, no seeding
+//! ceremony, one register of state per worker.
+//!
+//! That is also why there is no `rand` here. The README's dependency policy
+//! admits a runtime crate only when it replaces something upstream hand-wrote
+//! *and* is better tested than our own port of it would be; a twelve-line
+//! integer recurrence with a known-answer test is neither.
+//!
+//! Neither generator is cryptographic and neither is meant to be. Victim
+//! selection wants decorrelated low bits and nothing else: an adversary who
+//! predicts the next victim gains the ability to make a worker steal from an
+//! empty queue, which is what already happens most of the time anyway.
+
+/// What a zero seed becomes.
+///
+/// Upstream requires a non-zero seed and documents that a zero one "results in
+/// a degenerated generator that always returns zero" -- a worker whose victim
+/// is always queue 0. We fold instead of trusting the caller, because the
+/// executor seeds from a thread-id hash it does not choose. The constant is the
+/// 32-bit golden-ratio word, picked only for having bits in both halves.
+const ZERO_SEED_32: u32 = 0x9E37_79B9;
+
+/// What a zero seed becomes, for [`Xorshift64`]. The 64-bit golden-ratio word,
+/// for the same reason as [`ZERO_SEED_32`].
+const ZERO_SEED_64: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Marsaglia's 32-bit xorshift, over one word of state.
+///
+/// ```
+/// use rustflow::Xorshift32;
+///
+/// let mut rng = Xorshift32::new(12345);
+/// let first = rng.next_u32();
+/// assert_ne!(first, rng.next_u32());
+///
+/// // Same seed, same sequence: a scheduling bug stays reproducible.
+/// assert_eq!(Xorshift32::new(12345).next_u32(), first);
+/// ```
+#[derive(Debug, Clone)]
+pub struct Xorshift32 {
+    state: u32,
+}
+
+impl Xorshift32 {
+    /// Creates a generator from `seed`, folding a zero seed to
+    /// [`ZERO_SEED_32`].
+    #[must_use]
+    pub const fn new(seed: u32) -> Self {
+        Self {
+            state: if seed == 0 { ZERO_SEED_32 } else { seed },
+        }
+    }
+
+    /// Draws the next value.
+    ///
+    /// The shift triple `13, 17, 5` is upstream's, which is Marsaglia's: it is
+    /// one of the triples that gives the recurrence its full period of
+    /// `2^32 - 1`, so this is not a place to substitute nicer-looking numbers.
+    ///
+    /// Named `next_u32` rather than `next` so that the type is not mistaken for
+    /// an infinite [`Iterator`], which is the one thing it would be easy to
+    /// mistake it for.
+    pub fn next_u32(&mut self) -> u32 {
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 17;
+        self.state ^= self.state << 5;
+        self.state
+    }
+}
+
+/// Marsaglia's 64-bit xorshift with upstream's multiplicative output stage.
+///
+/// ```
+/// use rustflow::Xorshift64;
+///
+/// let mut rng = Xorshift64::new(12345);
+/// assert_ne!(rng.next_u64(), rng.next_u64());
+/// ```
+#[derive(Debug, Clone)]
+pub struct Xorshift64 {
+    state: u64,
+}
+
+/// Upstream's output multiplier, applied to the 64-bit state.
+///
+/// A bare xorshift is linear over GF(2) and its low bits are visibly weak; one
+/// odd multiply mixes the high bits down, which is why upstream's own comment
+/// calls it "a multiplicative output transformation to improve distribution".
+const OUTPUT_MULTIPLIER: u64 = 0x2545_F491_4F6C_DD1D;
+
+impl Xorshift64 {
+    /// Creates a generator from `seed`, folding a zero seed to
+    /// [`ZERO_SEED_64`].
+    #[must_use]
+    pub const fn new(seed: u64) -> Self {
+        Self {
+            state: if seed == 0 { ZERO_SEED_64 } else { seed },
+        }
+    }
+
+    /// Draws the next value.
+    ///
+    /// The shift triple is `13, 7, 17` here, not the 32-bit one: each width has
+    /// its own full-period triples.
+    pub fn next_u64(&mut self) -> u64 {
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        // Wrapping, because the multiply is a mixing step and not arithmetic:
+        // upstream's unsigned product discards the high word the same way.
+        self.state.wrapping_mul(OUTPUT_MULTIPLIER)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    /// A known answer, hand-computed from the recurrence, so that a mistyped
+    /// shift constant fails here rather than quietly costing the scheduler its
+    /// period. Seed 1 is the easiest case to redo by hand: `1 ^ (1 << 13)` is
+    /// `0x2001`, whose top 15 bits are zero, so the right shift contributes
+    /// nothing and the last step is `0x2001 ^ (0x2001 << 5)`.
+    #[test]
+    fn the_32_bit_recurrence_is_marsaglias() {
+        assert_eq!(Xorshift32::new(1).next_u32(), 0x0004_2021);
+    }
+
+    /// The same, for the 64-bit state and its output multiply: the state after
+    /// one round is `0x4082_2041`, and the value returned is that times
+    /// [`OUTPUT_MULTIPLIER`].
+    #[test]
+    fn the_64_bit_recurrence_carries_upstreams_output_stage() {
+        assert_eq!(Xorshift64::new(1).next_u64(), 0xBAFA_CF62_4F01_C45D);
+        assert_eq!(
+            Xorshift64::new(1).next_u64(),
+            0x4082_2041_u64.wrapping_mul(OUTPUT_MULTIPLIER)
+        );
+    }
+
+    /// A zero seed is the one input that breaks the recurrence -- zero is a
+    /// fixed point of every xorshift -- so it must not survive construction.
+    #[test]
+    fn a_zero_seed_does_not_degenerate() {
+        let mut rng = Xorshift32::new(0);
+        assert_ne!(rng.next_u32(), 0);
+        assert_ne!(rng.next_u32(), 0);
+
+        let mut rng = Xorshift64::new(0);
+        assert_ne!(rng.next_u64(), 0);
+        assert_ne!(rng.next_u64(), 0);
+    }
+
+    /// The state never reaches zero from a non-zero seed, which is the property
+    /// the full period rests on, and the draws do not collide early.
+    #[test]
+    fn a_short_run_neither_stalls_nor_repeats() {
+        const DRAWS: usize = 10_000;
+
+        let mut rng = Xorshift32::new(0xDEAD_BEEF);
+        let mut seen = HashSet::with_capacity(DRAWS);
+        for _ in 0..DRAWS {
+            assert!(seen.insert(rng.next_u32()), "the 32-bit sequence repeated");
+        }
+
+        let mut rng = Xorshift64::new(0xDEAD_BEEF_CAFE_F00D);
+        let mut seen = HashSet::with_capacity(DRAWS);
+        for _ in 0..DRAWS {
+            assert!(seen.insert(rng.next_u64()), "the 64-bit sequence repeated");
+        }
+    }
+
+    /// Victim selection takes a remainder of a draw, so the low bits are the
+    /// ones that matter: a generator whose `% n` never reaches some residue
+    /// would leave a queue permanently unstolen-from.
+    #[test]
+    fn the_low_bits_cover_every_residue() {
+        for queues in 2..=16_u32 {
+            let mut rng = Xorshift32::new(queues);
+            let mut seen = HashSet::new();
+            for _ in 0..1000 {
+                seen.insert(rng.next_u32() % queues);
+            }
+            assert_eq!(
+                seen.len(),
+                usize::try_from(queues).expect("a small count fits in a usize"),
+                "{queues} queues were not all reachable"
+            );
+        }
+    }
+}
