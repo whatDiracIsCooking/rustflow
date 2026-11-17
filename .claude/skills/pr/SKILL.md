@@ -15,9 +15,9 @@ Drive the current changes all the way to `main` in one pass. Each step has a
 gotcha; follow them in order.
 
 **Where to run it.** From the host, every step works. From inside the
-devcontainer it works too, but only on the **main checkout** and only with
-GH_TOKEN exported on the host -- check both before starting, because each
-failure lands mid-skill:
+devcontainer it works too, on the **main checkout** or on a worktree created
+from in there, and only with GH_TOKEN exported on the host -- check both before
+starting, because each failure lands mid-skill:
 
 - `gh auth status` must show a token. The image ships `gh` but no credentials;
   `docker/compose.yaml` forwards GH_TOKEN only when the host has it set, and
@@ -28,11 +28,14 @@ failure lands mid-skill:
   time -- which it does only when GH_TOKEN is present. Without it, `git push`
   fails with `ssh: not found`.
 - step 3's `devtools/devcontainer.sh check` is host-only (no `docker` in the
-  container). Run the three `cargo` commands directly instead.
-- git does not work **at all** in a `.claude/worktrees/` checkout mounted into
-  the container: its `.git` is a file naming an absolute host path, so every
-  git command dies with `fatal: not a git repository`. Worktree work commits
-  and pushes from the host.
+  container). Run the four `cargo` commands directly instead.
+- a `.claude/worktrees/` checkout created on the **host** is unusable from
+  inside the container: its `.git` is a file naming an absolute host path, so
+  every git command dies with `fatal: not a git repository`, and that worktree
+  has to commit and push from the host. One created *in* the container names
+  `gitdir: /workspace/.git/worktrees/<name>` instead and git works in it
+  throughout, push and `gh pr create` included -- so `cat` the `.git` file
+  before assuming which case you are in.
 
 ## 1. Commit the relevant changes
 
@@ -71,7 +74,7 @@ git push -u origin <branch>
   nothing about correctness. Run the gate yourself first and read its output:
 
   ```bash
-  devtools/devcontainer.sh check   # fmt --check, clippy -D warnings, test
+  devtools/devcontainer.sh check   # fmt --check, clippy -D warnings, test, deny
   ```
 
   Pushing on a red gate is how a branch reaches review broken; if `check`
@@ -125,9 +128,12 @@ branch ever does survive a merge.
 
 - **Wait for CI — unless it's disabled.** `.github/workflows/ci.yml` runs
   `cargo fmt --all --check`, `cargo clippy --all-targets --all-features --
-  -D warnings`, then `cargo test --all-features` on every PR — the same three
-  commands as `devtools/devcontainer.sh check`, in the same container image, so
-  a local green should mean a remote green.
+  -D warnings`, then `cargo test --all-features` on every PR — the first three
+  commands of `devtools/devcontainer.sh check`, in the same container image, so
+  a local green should mean a remote green. The gate's fourth command,
+  `cargo deny check`, is a separate `deny` job in that same workflow rather
+  than a fourth step, for the reason given beside it; the workflow is green
+  only when both jobs are, which is also what `automerge` waits on.
   Check with `gh pr checks <number> --watch` before merging, and do not merge
   red. If `ci.yml` is manually disabled (`gh workflow list --all`), there is no
   check to wait for — `gh pr checks` will show nothing — so merge on the

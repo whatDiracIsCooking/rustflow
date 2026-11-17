@@ -21,9 +21,10 @@ below is a property of *this* repo; none of it is generic Rust advice.
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
+cargo deny check
 ```
 
-Run all three and read the output before reporting back. Partial greens are
+Run all four and read the output before reporting back. Partial greens are
 not green, and `-D warnings` means a *warning* is a failure.
 
 - **Inside the devcontainer** (the usual case) run those commands directly.
@@ -31,8 +32,16 @@ not green, and `-D warnings` means a *warning* is a failure.
   `docker/compose.yaml` are host-only -- do not try them.
 - `CARGO_TARGET_DIR=/target` in the container, so build output never appears
   in `./target`. An empty `./target` is not a sign that nothing built.
-- CI (`.github/workflows/ci.yml`) runs those same three commands in the same
-  image, so a local green should mean a remote green.
+- **`cargo deny check`** reads `deny.toml` -- licenses, RustSec advisories,
+  duplicate crate versions, crate sources -- and the binary comes from the
+  image, pinned by `ARG CARGO_DENY_VERSION` in the root `Dockerfile` the same
+  way the toolchain is. So `command not found` here means the container was
+  built before that arg existed: rebuild the image rather than installing
+  cargo-deny yourself or concluding the gate is three steps.
+- CI (`.github/workflows/ci.yml`) runs the first three commands in the same
+  image, so a local green should mean a remote green. The fourth is a separate
+  `deny` job on a plain runner rather than a fourth step there -- its comment
+  says why -- which means the workflow is green only when *both* jobs are.
 
 ## Lints that will bite
 

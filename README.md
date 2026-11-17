@@ -3,8 +3,12 @@
 A Rust port of [Taskflow](https://github.com/taskflow/taskflow), a C++
 task-parallel programming system built around task dependency graphs.
 
-**Status: scaffolding.** The toolchain, container setup and CI gate are in
-place and verified. No upstream API is ported yet.
+**Status: the static graph is in; the executor is being ported.** Those are
+steps 1 and 2 of "Order of work" at the end of this file, which is where the
+status is kept rather than duplicated here: each step is a GitHub milestone, so
+the closed ones are what is merged and the open one is where the work is. The
+toolchain, container setup and CI gate all of it rides on were in place and
+verified first.
 
 ## Getting a toolchain
 
@@ -111,13 +115,17 @@ trust cannot carry over on its own, and until it is accepted Claude Code
 ignores the whole `permissions.allow` list in `.claude/settings.json`. Two
 fixups come with the copy, both explained where they happen in that script.
 
-**Two things the container cannot do.** `docker` is not installed in it, so
-`devtools/devcontainer.sh` and `docker/compose.yaml` are host-only — from
-inside, run the four `cargo` commands of the gate directly. And git does not
-work inside a `.claude/worktrees/` checkout mounted into the container: a
-worktree's `.git` is a *file* holding an absolute host path, which resolves to
-nothing under `/workspace`. The devcontainer is for the main checkout; worktree
-work does its git from the host.
+**One thing the container cannot do, and one trap.** `docker` is not installed
+in it, so `devtools/devcontainer.sh` and `docker/compose.yaml` are host-only —
+from inside, run the four `cargo` commands of the gate directly. The trap is a
+`.claude/worktrees/` checkout created on the **host**: a worktree's `.git` is a
+*file* holding the absolute path of its git dir, and a host path resolves to
+nothing under `/workspace`, so every git command in there dies with `fatal: not
+a git repository`. Create the worktree from *inside* the container and its
+`.git` reads `gitdir: /workspace/.git/worktrees/<name>`, which does resolve —
+git then works fully in it, `push` and `gh pr create` included, which is how
+the PRs so far have been shipped. Which half made a worktree is not visible
+from its path, so `cat` that `.git` file when you inherit one.
 
 ### Two things that will bite otherwise
 

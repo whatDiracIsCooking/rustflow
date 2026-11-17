@@ -42,13 +42,18 @@ def main() -> None:
             "`gh auth status` before relying on it. `git push` works only when "
             "GH_TOKEN was forwarded (no ssh client is installed, so this "
             "repo's SSH remote goes over an HTTPS rewrite that "
-            "devtools/container-bootstrap.sh sets up) and never from a mounted "
-            ".claude/worktrees/ checkout, whose .git names a host path. "
+            "devtools/container-bootstrap.sh sets up). In a "
+            ".claude/worktrees/ checkout that holds only if the worktree was "
+            "created from in here, so that its .git reads `gitdir: "
+            "/workspace/.git/worktrees/<name>`; one created on the host names "
+            "a host path that resolves to nothing under /workspace, and every "
+            "git command in it fails. "
             "`docker` is not available here: devtools/devcontainer.sh and "
             "docker/compose.yaml are host-only, so do not try to run them "
-            "from in here. The gate "
-            "is `cargo fmt --all --check && cargo clippy --all-targets "
-            "--all-features -- -D warnings && cargo test --all-features`."
+            "from in here. The gate is `cargo fmt --all --check && cargo "
+            "clippy --all-targets --all-features -- -D warnings && cargo test "
+            "--all-features && cargo deny check` -- all four, the last from "
+            "the image's pinned cargo-deny."
         )
     else:
         context = (
