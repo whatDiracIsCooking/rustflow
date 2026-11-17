@@ -82,9 +82,8 @@
 //!
 //! The inner run's own payload slot is still read, as a backstop, because one
 //! kind of failure has no node to walk up from and lands there instead: this
-//! run's policy callbacks, which a corun gives nothing to do, and a node kind
-//! the executor refuses rather than runs, which is the subflow and runtime
-//! handles until #50 and #51.
+//! run's policy callbacks, which a corun gives nothing to do, and anything a
+//! future node kind records against a topology directly.
 //!
 //! Which leaves the question of what to *do* with it, and both answers are
 //! wanted often enough that this module offers each by name:
@@ -124,8 +123,8 @@ use crate::taskflow::{Flow, Taskflow};
 /// handing back what the first task of it to fail panicked with.
 ///
 /// Upstream's `Executor::_corun_graph`, and the one primitive every blocking
-/// wait on a nested graph is built from: [`Executor::corun`] here, and
-/// `Subflow::join` (#50) and `Runtime::corun` (#51) when they land. Four
+/// wait on a nested graph is built from: [`Executor::corun`] here,
+/// `Subflow::join` (#50) and `Runtime::corun` (#51). Four
 /// steps, in upstream's order, and the order is the whole of it:
 ///
 /// 1. a graph with nothing to run is nothing to wait for, so this returns at
@@ -142,13 +141,13 @@ use crate::taskflow::{Flow, Taskflow};
 ///    to the caller. That is what gives the two shapes
 ///    [`Executor::corun`] and [`Executor::try_corun`] one implementation.
 ///
-/// The graph arrives as the share that owns it rather than as a `&Graph`,
-/// because a job of this graph has to own the storage its node indices
-/// resolve in and a reference cannot be owned. That share is one of the four
-/// kinds of graph owner `Shared::schedule_graph` takes since #74, and the one
-/// every caller of this has in hand: a corun of a whole taskflow. A corun of
-/// a graph some node owns -- `Subflow::join`, #50 -- widens this parameter
-/// the same way, in the issue that needs it.
+/// The graph arrives as whatever owns it rather than as a `&Graph`, because a
+/// job of this graph has to own the storage its node indices resolve in and a
+/// reference cannot be owned. It is any of the four kinds of graph owner
+/// `Shared::schedule_graph` takes since #74, which is what lets the two
+/// callers it has today share one implementation: [`Executor::corun`] hands
+/// over a share of a taskflow's storage, and `Subflow::join` (#50) the lease
+/// of the subgraph its own node owns.
 ///
 /// `worker` is upstream's `Worker&`: the real one when the caller is a
 /// dispatch arm inside `WorkerThread::invoke`, and a
@@ -157,7 +156,7 @@ use crate::taskflow::{Flow, Taskflow};
 /// same one.
 pub(crate) fn corun_graph(
     worker: &mut WorkerThread,
-    flow: &Arc<Flow>,
+    owner: &GraphOwner,
     topology: &Arc<Topology>,
     parent: &Arc<Nested>,
 ) -> Option<Box<dyn Any + Send>> {
@@ -166,18 +165,15 @@ pub(crate) fn corun_graph(
     // would queue no job, so nothing would ever drive the parent's counter
     // off zero and the wait below would be over before it began; returning
     // here says the same thing without taking a guard for it.
-    if !flow.has_source_task() {
+    if !owner.has_source_task() {
         return None;
     }
 
     {
         let _anchor = parent.base().anchor_explicitly();
-        worker.shared.schedule_graph(
-            Some(worker),
-            &GraphOwner::flow(flow),
-            topology,
-            &parent.as_parent(),
-        );
+        worker
+            .shared
+            .schedule_graph(Some(worker), owner, topology, &parent.as_parent());
         worker.corun_until(|| parent.outstanding() == 0);
     }
 
@@ -542,7 +538,12 @@ impl Executor {
             // upstream hands `_corun_graph`; `WorkerThread::corun_view` says
             // why the real one cannot be reached from a task body.
             let mut worker = WorkerThread::corun_view(Arc::clone(&self.shared), id);
-            payload = corun_graph(&mut worker, taskflow.flow(), run.topology(), run.anchor());
+            payload = corun_graph(
+                &mut worker,
+                &GraphOwner::flow(taskflow.flow()),
+                run.topology(),
+                run.anchor(),
+            );
 
             // The decrement every run gets, which for a corun is this frame's
             // rather than a tear-down's -- see `InnerRun::end`, which is the

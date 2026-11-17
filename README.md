@@ -331,6 +331,24 @@ the same split:
   executor captures an `Arc<Executor>`, as upstream's own
   `Runtime.ExternalGraph.Simple` captures a reference and as this crate's
   `corun` doctests already do.
+- **A subgraph is *leased* for the length of its run, and the last share of
+  the lease is what puts it back** (issues #74, #50). Running a graph needs
+  whatever owns it, because every job of a graph owns what it names, and a
+  `MutexGuard` is not something a job can own — so the subgraph is moved out
+  of that `Mutex` while it runs and held by its jobs through one shared
+  allocation. No lock is then on the scheduler's hot path, where upstream has
+  a plain `Graph&`; the price is that somebody has to put the graph back, and
+  it cannot be the frame waiting for the nested run. A job of a graph nested
+  *inside* a leased subgraph decrements the join counter of its parent node,
+  which is a node of that subgraph — so the counter is inside the lease, the
+  job holds the lease across the decrement that can end the subgraph's run,
+  and no holder can prove it is the last one. A `Drop` needs no such proof,
+  so that is where the graph goes home, and dropping it instead *is*
+  upstream's `clear()` for a subflow that was not retained. Two visible
+  consequences: a retained subgraph goes back under `try_lock`, never a
+  blocking one, because the thread holding the last share is a worker that
+  something else may be waiting for; and `retain(true)` is reliable set
+  *before* the join it is meant to keep, not after.
 
 ### Order of work
 

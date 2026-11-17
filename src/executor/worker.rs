@@ -463,10 +463,10 @@ impl WorkerThread {
     /// Upstream's `_invoke`. The four node kinds it can run itself are static,
     /// placeholder and the two conditioners; the four dynamic-tasking kinds
     /// each get one line here into the module that owns them. [`module`] runs
-    /// a composed taskflow as of #49 and an adopted graph as of #74, and
-    /// [`runtime`] runs a runtime task as of #51; [`subflow`] refuses the run
-    /// for now. Upstream's three remaining kinds, its semaphores and its
-    /// observers are each a later milestone, and none of them is silently
+    /// a composed taskflow as of #49 and an adopted graph as of #74,
+    /// [`runtime`] runs a runtime task as of #51 and [`subflow`] a subflow
+    /// task as of #50. Upstream's three remaining kinds, its semaphores and
+    /// its observers are each a later milestone, and none of them is silently
     /// absent: the `match` below is exhaustive over
     /// [`Handle`], so a new kind arrives as a compile error here rather than
     /// as a task that mysteriously does nothing.
