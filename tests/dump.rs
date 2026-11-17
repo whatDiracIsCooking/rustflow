@@ -22,6 +22,27 @@
 //! done**: there is no `graphviz` in the container either. It stays an open
 //! item, and it was never part of the gate.
 //!
+//! The nested-graph goldens added for issue #46 come from the same reading of
+//! the same four functions, and carry the same caveat: the module-stack loop
+//! of the top-level `_dump` (lines 441-477), the `MODULE` branch of the
+//! per-graph one (lines 569-588) and the `SUBFLOW`/`ADOPTED_MODULE` branch of
+//! the per-node one (lines 518-551). **No `dot` parse and no C++ run back
+//! them either.**
+//!
+//! Those three branches are also where the identifier substitution has to go
+//! further than #11's, because every graph numbers its own nodes from zero
+//! while upstream's addresses were unique across all of them. The scheme
+//! `src/dump.rs` documents and these goldens pin: the top-level graph keeps
+//! the bare `p<index>`, a module graph with id 1 is `cluster_p1` and holds
+//! `p1_0`, `p1_1`, ..., and the subgraph of a node `p0` is `cluster_p0_sub`
+//! and holds `p0_sub_0`, `p0_sub_1`, ... Upstream's cluster names are
+//! addresses too -- a graph's for a module, the owning *node's* for a subflow
+//! -- so the `_sub` component is this port's, and it is what keeps the two
+//! families from colliding: without it a subflow hanging off the top graph's
+//! `p1` and module graph 1 would both claim `cluster_p1` and `p1_0`. Every
+//! case below runs its document through `assert_unique_node_ids`, since a
+//! collision is exactly the kind of thing a golden read by eye does not catch.
+//!
 //! The conditioner goldens added for issue #30 come from the same reading and
 //! carry the same caveat: the `CONDITION`/`MULTI_CONDITION` case of the shape
 //! `switch` (line 497) and the `_is_conditioner()` branch of the successor
@@ -37,9 +58,70 @@
 //! and so print the same line -- and `src/dump.rs`'s
 //! `a_static_handle_dumps_like_a_placeholder` asserts it. A conditioner is the
 //! exception: its handle is exactly what the shape and the edge style key off,
-//! so those cases build a real `Handle::Condition`.
+//! so those cases build a real `Handle::Condition`. So are the four handles of
+//! #45, for the same reason, and a subflow's subgraph is built by hand on top
+//! of that: a body builds one while it runs, the executor does not run a
+//! subflow task until #50, and a dump never looks at the body anyway.
 
-use rustflow::{Handle, Task, Taskflow, Work};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+
+use rustflow::{Graph, Handle, SubflowWork, Task, Taskflow, Work};
+
+/// Asserts that no identifier is declared twice in `dot`.
+///
+/// The identifiers are the one part of the output this port invents rather
+/// than copies, and nesting is where an invented scheme can collide -- see the
+/// module docs above for the scheme and for the collision it is shaped to
+/// avoid. A node declaration is the only line that opens a `[` without being
+/// an edge, which is what this reads.
+///
+/// The empty-taskflow case is the one golden that cannot be checked this way,
+/// having no declarations at all, and the trailing assertion is what keeps a
+/// case from passing because the parsing above found nothing.
+fn assert_unique_node_ids(dot: &str) {
+    let mut seen = HashSet::new();
+    for line in dot.lines() {
+        let line = line.trim();
+        if line.contains("->") || !line.ends_with("];") {
+            continue;
+        }
+        let Some((id, _)) = line.split_once('[') else {
+            continue;
+        };
+        assert!(seen.insert(id), "the id {id} is declared twice in\n{dot}");
+    }
+    assert!(!seen.is_empty(), "no node declaration found in\n{dot}");
+}
+
+/// A graph of `names.len()` placeholders, which is what a subflow body would
+/// have built had the executor run one yet.
+fn child_graph(names: &[&str]) -> Graph {
+    let mut graph = Graph::new();
+    for name in names {
+        graph.add_named_node(*name, Handle::Placeholder);
+    }
+    graph
+}
+
+/// A subflow handle over a subgraph built by hand. The body is the one part of
+/// a subflow task a dump never reads.
+fn subflow_handle(subgraph: Graph) -> Handle {
+    Handle::Subflow {
+        work: SubflowWork::new(|_| {}),
+        subgraph: Mutex::new(subgraph),
+    }
+}
+
+/// A taskflow named `name` holding one placeholder named `task`, as the target
+/// of a module task.
+fn target(name: &str, task: &str) -> Arc<Taskflow> {
+    let mut taskflow = Taskflow::with_name(name);
+    taskflow
+        .graph_mut()
+        .add_named_node(task, Handle::Placeholder);
+    Arc::new(taskflow)
+}
 
 /// Upstream:
 ///
@@ -97,6 +179,7 @@ fn one_unnamed_node_falls_back_to_its_id() {
             "}\n",
         )
     );
+    assert_unique_node_ids(&taskflow.dump());
 }
 
 /// Upstream:
@@ -151,6 +234,7 @@ fn a_named_diamond_dumps_each_node_with_its_own_edges() {
             "}\n",
         )
     );
+    assert_unique_node_ids(&taskflow.dump());
 }
 
 /// `Display` is the same document, so `{taskflow}` and `println!` need no
@@ -179,6 +263,7 @@ fn display_writes_the_same_document() {
         )
     );
     assert_eq!(taskflow.dump(), taskflow.to_string());
+    assert_unique_node_ids(&taskflow.dump());
 }
 
 /// The graph-level entry point emits the cluster body alone -- upstream's
@@ -207,6 +292,7 @@ fn a_graph_dumps_only_the_cluster_body() {
     );
     // And it is literally the document minus the wrapper.
     assert!(taskflow.dump().contains(&body));
+    assert_unique_node_ids(&taskflow.dump());
 }
 
 /// Upstream:
@@ -253,6 +339,7 @@ fn a_conditioner_dumps_as_a_diamond_with_dashed_position_labels() {
             "}\n",
         )
     );
+    assert_unique_node_ids(&taskflow.dump());
 }
 
 /// Upstream:
@@ -300,6 +387,7 @@ fn a_static_task_keeps_its_plain_edges_beside_a_conditioner() {
             "}\n",
         )
     );
+    assert_unique_node_ids(&taskflow.dump());
 }
 
 /// Upstream:
@@ -349,4 +437,379 @@ fn a_conditioner_self_loop_dumps_as_a_dashed_edge_to_itself() {
             "}\n",
         )
     );
+    assert_unique_node_ids(&taskflow.dump());
+}
+
+/// Upstream:
+///
+/// ```cpp
+/// tf::Taskflow target("target");
+/// target.emplace([](){}).name("x");
+///
+/// tf::Taskflow taskflow("composer");
+/// tf::Task named = taskflow.composed_of(target);
+/// named.name("call-target");
+/// tf::Task unnamed = taskflow.composed_of(target);
+/// named.precede(unnamed);
+/// std::cout << taskflow.dump();
+/// ```
+///
+/// One target composed twice: `Dumper::visited` is keyed by the graph, so the
+/// second module task finds an id instead of handing out a new one, and the
+/// document holds two `box3d` nodes over one cluster. The cluster's label
+/// comes from whichever task visited first -- the named one here -- and the
+/// unnamed task falls back to its own id plus the ` [m1]` that says which
+/// cluster it means.
+#[test]
+fn two_module_tasks_on_one_target_share_one_cluster() {
+    let target = target("target", "x");
+
+    let mut taskflow = Taskflow::with_name("composer");
+    let graph = taskflow.graph_mut();
+    let named = graph.add_named_node("call-target", Handle::Module(Arc::clone(&target)));
+    let unnamed = graph.add_node(Handle::Module(Arc::clone(&target)));
+    graph.add_edge(named, unnamed);
+
+    assert_eq!(
+        taskflow.dump(),
+        concat!(
+            "digraph Taskflow {\n",
+            "  compound=true;\n",
+            "  subgraph cluster_p0 {\n",
+            "    label=\"Taskflow: composer\";\n",
+            "    p0[shape=box3d, color=blue, label=\"call-target\"];\n",
+            "    p0 -> p1;\n",
+            "    p1[shape=box3d, color=blue, label=\"p1 [m1]\"];\n",
+            "  }\n",
+            "    subgraph cluster_p1 {\n",
+            "      label=\"call-target\";\n",
+            "      p1_0[label=\"x\" ];\n",
+            "    }\n",
+            "}\n",
+        )
+    );
+    assert_unique_node_ids(&taskflow.dump());
+}
+
+/// Upstream:
+///
+/// ```cpp
+/// tf::Taskflow f0("f0");
+/// f0.emplace([](){}).name("leaf");
+///
+/// tf::Taskflow f1("f1");
+/// f1.composed_of(f0).name("call-f0");
+///
+/// tf::Taskflow f2("f2");
+/// f2.composed_of(f1).name("call-f1");
+/// std::cout << f2.dump();
+/// ```
+///
+/// A module graph's own module tasks push in their turn, so the stack carries
+/// the composition down as far as it goes: three graphs, three clusters, and
+/// ids 0, 1, 2 in the order they were first reached. The deepening indentation
+/// of the sibling clusters is upstream's too -- it writes a module cluster at
+/// the level of the task that composed it, which makes a sibling *look*
+/// nested; the braces are where the nesting really is.
+#[test]
+fn a_two_level_composition_dumps_a_cluster_per_graph_in_visit_order() {
+    let f0 = target("f0", "leaf");
+
+    let mut f1 = Taskflow::with_name("f1");
+    f1.graph_mut()
+        .add_named_node("call-f0", Handle::Module(Arc::clone(&f0)));
+    let f1 = Arc::new(f1);
+
+    let mut f2 = Taskflow::with_name("f2");
+    f2.graph_mut()
+        .add_named_node("call-f1", Handle::Module(Arc::clone(&f1)));
+
+    assert_eq!(
+        f2.dump(),
+        concat!(
+            "digraph Taskflow {\n",
+            "  compound=true;\n",
+            "  subgraph cluster_p0 {\n",
+            "    label=\"Taskflow: f2\";\n",
+            "    p0[shape=box3d, color=blue, label=\"call-f1\"];\n",
+            "  }\n",
+            "    subgraph cluster_p1 {\n",
+            "      label=\"call-f1\";\n",
+            "      p1_0[shape=box3d, color=blue, label=\"call-f0\"];\n",
+            "    }\n",
+            "      subgraph cluster_p2 {\n",
+            "        label=\"call-f0\";\n",
+            "        p2_0[label=\"leaf\" ];\n",
+            "      }\n",
+            "}\n",
+        )
+    );
+    assert_unique_node_ids(&f2.dump());
+}
+
+/// Upstream:
+///
+/// ```cpp
+/// tf::Taskflow a("a");
+/// a.emplace([](){}).name("ax");
+/// tf::Taskflow b("b");
+/// b.emplace([](){}).name("bx");
+///
+/// tf::Taskflow taskflow("two");
+/// taskflow.composed_of(a).name("call-a");
+/// taskflow.composed_of(b).name("call-b");
+/// std::cout << taskflow.dump();
+/// ```
+///
+/// `Dumper::stack` is a stack, and upstream's loop pops it, so two targets
+/// composed by one graph write their clusters in the reverse of the order they
+/// were pushed: `cluster_p2` before `cluster_p1`. The ids are still visit
+/// order -- `a` was reached first and is 1 -- which is the asymmetry worth
+/// pinning, since reading either half alone suggests the other.
+#[test]
+fn two_module_targets_dump_their_clusters_in_reverse_push_order() {
+    let a = target("a", "ax");
+    let b = target("b", "bx");
+
+    let mut taskflow = Taskflow::with_name("two");
+    let graph = taskflow.graph_mut();
+    graph.add_named_node("call-a", Handle::Module(Arc::clone(&a)));
+    graph.add_named_node("call-b", Handle::Module(Arc::clone(&b)));
+
+    assert_eq!(
+        taskflow.dump(),
+        concat!(
+            "digraph Taskflow {\n",
+            "  compound=true;\n",
+            "  subgraph cluster_p0 {\n",
+            "    label=\"Taskflow: two\";\n",
+            "    p0[shape=box3d, color=blue, label=\"call-a\"];\n",
+            "    p1[shape=box3d, color=blue, label=\"call-b\"];\n",
+            "  }\n",
+            "    subgraph cluster_p2 {\n",
+            "      label=\"call-b\";\n",
+            "      p2_0[label=\"bx\" ];\n",
+            "    }\n",
+            "    subgraph cluster_p1 {\n",
+            "      label=\"call-a\";\n",
+            "      p1_0[label=\"ax\" ];\n",
+            "    }\n",
+            "}\n",
+        )
+    );
+    assert_unique_node_ids(&taskflow.dump());
+}
+
+/// Upstream:
+///
+/// ```cpp
+/// tf::Taskflow taskflow("dynamic");
+/// tf::Task spawner = taskflow.emplace([](tf::Subflow& sf){
+///   tf::Task left = sf.emplace([](){});
+///   tf::Task right = sf.emplace([](){});
+///   left.name("left");
+///   right.name("right");
+///   left.precede(right);
+///   sf.retain(true);                  // or the subgraph is cleared on join
+/// });
+/// spawner.name("spawner");
+/// tf::Task after = taskflow.emplace([](){});
+/// after.name("after");
+/// spawner.precede(after);
+/// tf::Executor().run(taskflow).wait();  // the children exist only after a run
+/// std::cout << taskflow.dump();
+/// ```
+///
+/// The nested half of the format, in one document: the cluster sits *inside*
+/// the owning node's cluster, after that node's own edges, and carries
+/// `color=blue` and a `Subflow: <name>` label. What follows it is upstream's
+/// one cluster-level join edge -- from the subgraph's first node, not from all
+/// of them -- dashed, blue, and clipped to the cluster boundary by `ltail`,
+/// which is what the document's `compound=true` is there for.
+#[test]
+fn a_subflow_subgraph_dumps_as_a_nested_cluster_with_a_join_edge() {
+    let mut subgraph = child_graph(&["left", "right"]);
+    subgraph.add_edge(Task::new(0), Task::new(1));
+
+    let mut taskflow = Taskflow::with_name("dynamic");
+    let graph = taskflow.graph_mut();
+    let spawner = graph.add_named_node("spawner", subflow_handle(subgraph));
+    let after = graph.add_named_node("after", Handle::Placeholder);
+    graph.add_edge(spawner, after);
+
+    assert_eq!(
+        taskflow.dump(),
+        concat!(
+            "digraph Taskflow {\n",
+            "  compound=true;\n",
+            "  subgraph cluster_p0 {\n",
+            "    label=\"Taskflow: dynamic\";\n",
+            "    p0[label=\"spawner\" ];\n",
+            "    p0 -> p1;\n",
+            "    subgraph cluster_p0_sub {\n",
+            "      label=\"Subflow: spawner\";\n",
+            "      color=blue;\n",
+            "      p0_sub_0[label=\"left\" ];\n",
+            "      p0_sub_0 -> p0_sub_1;\n",
+            "      p0_sub_1[label=\"right\" ];\n",
+            "    }\n",
+            "    p0_sub_0 -> p0 [ltail=cluster_p0_sub style=dashed color=blue];\n",
+            "    p1[label=\"after\" ];\n",
+            "  }\n",
+            "}\n",
+        )
+    );
+    assert_unique_node_ids(&taskflow.dump());
+}
+
+/// Upstream:
+///
+/// ```cpp
+/// tf::Graph g;
+/// tf::FlowBuilder builder{g};
+/// builder.emplace([](){}).name("a");
+/// builder.emplace([](){}).name("b");
+///
+/// tf::Taskflow taskflow("adopted");
+/// taskflow.adopt(std::move(g));     // left unnamed
+/// std::cout << taskflow.dump();
+/// ```
+///
+/// An adopted module shares the subflow's branch of upstream's per-node
+/// `_dump` and differs from it in exactly one word of the label. The node is
+/// unnamed here, so both fallbacks inside a nested cluster show up at once:
+/// the cluster is labelled with the owning node's id and the children with
+/// their own.
+#[test]
+fn an_adopted_module_subgraph_dumps_as_a_nested_cluster() {
+    let mut taskflow = Taskflow::with_name("adopted");
+    taskflow
+        .graph_mut()
+        .add_node(Handle::AdoptedModule(child_graph(&["a", "b"])));
+
+    assert_eq!(
+        taskflow.dump(),
+        concat!(
+            "digraph Taskflow {\n",
+            "  compound=true;\n",
+            "  subgraph cluster_p0 {\n",
+            "    label=\"Taskflow: adopted\";\n",
+            "    p0[label=\"p0\" ];\n",
+            "    subgraph cluster_p0_sub {\n",
+            "      label=\"AdoptedModule: p0\";\n",
+            "      color=blue;\n",
+            "      p0_sub_0[label=\"a\" ];\n",
+            "      p0_sub_1[label=\"b\" ];\n",
+            "    }\n",
+            "    p0_sub_0 -> p0 [ltail=cluster_p0_sub style=dashed color=blue];\n",
+            "  }\n",
+            "}\n",
+        )
+    );
+    assert_unique_node_ids(&taskflow.dump());
+}
+
+/// Upstream:
+///
+/// ```cpp
+/// tf::Taskflow taskflow("dynamic");
+/// taskflow.emplace([](tf::Subflow& sf){
+///   sf.emplace([](){});             // no retain(true), and no run either
+/// }).name("spawner");
+/// std::cout << taskflow.dump();
+/// ```
+///
+/// Upstream guards the whole branch with `if(!g.empty())`, so a subflow task
+/// whose subgraph holds nothing dumps as a plain node and nothing else: no
+/// cluster, no `color=blue`, no join edge. That is what a subflow looks like
+/// before the run that builds it, and after a run that joined it without
+/// `retain(true)` -- which is why upstream's `dump` documentation says to do
+/// both.
+#[test]
+fn an_empty_subflow_subgraph_dumps_no_cluster() {
+    let mut taskflow = Taskflow::with_name("dynamic");
+    taskflow
+        .graph_mut()
+        .add_named_node("spawner", subflow_handle(Graph::new()));
+
+    assert_eq!(
+        taskflow.dump(),
+        concat!(
+            "digraph Taskflow {\n",
+            "  compound=true;\n",
+            "  subgraph cluster_p0 {\n",
+            "    label=\"Taskflow: dynamic\";\n",
+            "    p0[label=\"spawner\" ];\n",
+            "  }\n",
+            "}\n",
+        )
+    );
+    assert_unique_node_ids(&taskflow.dump());
+}
+
+/// Upstream:
+///
+/// ```cpp
+/// tf::Taskflow target("target");
+/// target.emplace([](){}).name("x");
+///
+/// tf::Taskflow taskflow("mixed");
+/// tf::Task composed = taskflow.composed_of(target);   // left unnamed
+/// tf::Task spawner = taskflow.emplace([](tf::Subflow& sf){
+///   sf.emplace([](){}).name("left");
+///   sf.emplace([](){}).name("right");
+///   sf.retain(true);
+/// });
+/// spawner.name("spawner");
+/// composed.precede(spawner);
+/// tf::Executor().run(taskflow).wait();
+/// std::cout << taskflow.dump();
+/// ```
+///
+/// The case the identifier scheme is shaped around, and the reason the `_sub`
+/// component exists at all. Upstream names a module cluster after the graph's
+/// address and a subflow cluster after the owning *node's*, which cannot
+/// collide; the small ids that stand in for both here can. A module graph that
+/// is given id 1 and a subflow hanging off the top graph's `p1` would each
+/// claim `cluster_p1` and `p1_0` under the obvious scheme -- so the subflow's
+/// are `cluster_p1_sub` and `p1_sub_0` instead, and the two families cannot
+/// meet. The unnamed module task also shows the cluster-label fallback the
+/// first case did not: with no task name to borrow, the cluster is labelled
+/// `m1`.
+#[test]
+fn a_module_graph_and_a_subflow_keep_their_identifiers_apart() {
+    let target = target("target", "x");
+
+    let mut taskflow = Taskflow::with_name("mixed");
+    let graph = taskflow.graph_mut();
+    let composed = graph.add_node(Handle::Module(Arc::clone(&target)));
+    let spawner = graph.add_named_node("spawner", subflow_handle(child_graph(&["left", "right"])));
+    graph.add_edge(composed, spawner);
+
+    assert_eq!(
+        taskflow.dump(),
+        concat!(
+            "digraph Taskflow {\n",
+            "  compound=true;\n",
+            "  subgraph cluster_p0 {\n",
+            "    label=\"Taskflow: mixed\";\n",
+            "    p0[shape=box3d, color=blue, label=\"p0 [m1]\"];\n",
+            "    p0 -> p1;\n",
+            "    p1[label=\"spawner\" ];\n",
+            "    subgraph cluster_p1_sub {\n",
+            "      label=\"Subflow: spawner\";\n",
+            "      color=blue;\n",
+            "      p1_sub_0[label=\"left\" ];\n",
+            "      p1_sub_1[label=\"right\" ];\n",
+            "    }\n",
+            "    p1_sub_0 -> p1 [ltail=cluster_p1_sub style=dashed color=blue];\n",
+            "  }\n",
+            "    subgraph cluster_p1 {\n",
+            "      label=\"m1\";\n",
+            "      p1_0[label=\"x\" ];\n",
+            "    }\n",
+            "}\n",
+        )
+    );
+    assert_unique_node_ids(&taskflow.dump());
 }
