@@ -3,17 +3,50 @@
 //!
 //! # Status
 //!
-//! The static task graph is the first slice: a [`Taskflow`] owns a [`Graph`]
-//! of [`Node`]s, each addressed by a [`Task`] index into that graph's arena
-//! and built through the [`FlowBuilder`] API. Condition tasks are graph
-//! citizens as of M3's first slice -- a [`Handle::Condition`] or
+//! What the crate exposes is a static task graph and the work-stealing
+//! executor that runs it. A [`Taskflow`] owns a [`Graph`] of [`Node`]s, each
+//! addressed by a [`Task`] index into that graph's arena and built through
+//! the [`FlowBuilder`] API, and [`dump`] writes the result out as Graphviz
+//! DOT. Condition tasks are graph citizens too -- a [`Handle::Condition`] or
 //! [`Handle::MultiCondition`] holds the callable whose return value picks
-//! successors, and a dependency on one counts as weak -- but nothing branches
-//! on that yet: the work-stealing [`Executor`] runs a static graph and hands
-//! back a [`RunHandle`] to wait on, and it refuses a graph holding a
-//! conditioner rather than guessing at the branch. Which slice comes next is
-//! the README's "Order of work" section, which is the sequence the whole port
-//! follows.
+//! successors, and a dependency on one counts as weak, because a task
+//! preceded by a conditioner may never be chosen and so cannot be waited for
+//! the way a strong dependency is. The executor branches on them: it runs the
+//! body like any other task's and then schedules only the successors the
+//! return value names, outright and with their join counters zeroed rather
+//! than decremented, since a branch can re-enter a successor long before its
+//! strong predecessors come round again. An index naming no successor at all
+//! selects nothing, which is upstream's behaviour and is how a branch is
+//! written to end, and a node's own counter is re-armed before any successor
+//! is queued, which is what lets a conditioner point back at itself and loop.
+//!
+//! [`Executor`] is a fixed pool of worker threads over per-worker queues,
+//! with shared overflow buffers for the threads outside the pool that submit
+//! to it and a notifier that idles a worker which has run out of anywhere to
+//! steal from, which is
+//! [`NonblockingNotifier`](executor::notifier::NonblockingNotifier) unless a
+//! caller asks for the other one. [`Executor::run`], [`Executor::run_n`] and
+//! [`Executor::run_until`] submit a graph for one run, a fixed number of
+//! them, or as many as a predicate keeps asking for, and each hands back a
+//! [`RunHandle`]: wait on it for a [`RunError`], poll it as a [`Future`], or
+//! just drop it, which blocks until the run is over so that a queued job can
+//! never outlive the borrow it was scheduled under. The `_with` variant of
+//! each attaches a callback that the last job of a run calls, the `run_owned`
+//! family takes the taskflow by value for a caller with no borrow to lend,
+//! [`Executor::corun`] and [`Executor::corun_until`] let a worker wait on a
+//! nested run by working on it rather than parking -- which is what keeps
+//! nesting from starving the pool of the very threads the inner run needs --
+//! and [`Executor::wait_for_all`] blocks until the executor is carrying no
+//! run at all.
+//!
+//! What is missing is everything that interferes with a run already under
+//! way. Nothing cancels one, and a panicking task is caught where upstream
+//! catches an exception and reported through the handle while the rest of
+//! that run still executes -- so a failure is something a caller is told
+//! about at the end, not something that stops the graph. The README's "Order
+//! of work" section is the sequence the whole port follows, and reading what
+//! is next there beats a list here that would go stale the week after it was
+//! written.
 //!
 //! The port follows **Taskflow v4.1.0** (commit `45366fe5`, 2026-06-19). See
 //! the README's "Upstream pin" section before translating anything.
