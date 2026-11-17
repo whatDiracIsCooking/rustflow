@@ -9,8 +9,11 @@
 //! citizens as of M3's first slice -- a [`Handle::Condition`] or
 //! [`Handle::MultiCondition`] holds the callable whose return value picks
 //! successors, and a dependency on one counts as weak -- but nothing branches
-//! on that yet. The work-stealing executor that runs the graph, conditionally
-//! or otherwise, is still to come.
+//! on that yet: the work-stealing [`Executor`] runs a static graph and hands
+//! back a [`RunHandle`] to wait on, and it refuses a graph holding a
+//! conditioner rather than guessing at the branch. Which slice comes next is
+//! the README's "Order of work" section, which is the sequence the whole port
+//! follows.
 //!
 //! The port follows **Taskflow v4.1.0** (commit `45366fe5`, 2026-06-19). See
 //! the README's "Upstream pin" section before translating anything.
