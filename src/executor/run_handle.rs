@@ -49,18 +49,21 @@ use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::{Arc, PoisonError};
+use std::sync::{Arc, PoisonError, Weak};
 use std::task::{Context, Poll};
 
-use crate::executor::topology::Topology;
+use crate::executor::topology::{Cancellable, Topology};
 use crate::executor::worker::WorkerThread;
 use crate::executor::{Executor, Shared};
 use crate::taskflow::Taskflow;
 
 /// Why a run did not finish cleanly.
 ///
-/// One variant so far, and the enum is `#[non_exhaustive]` because
-/// cancellation is a later milestone and will be the second.
+/// One variant so far, and the enum is `#[non_exhaustive]` because later
+/// milestones have more ways for a run to fail. Cancellation is deliberately
+/// not one of them: a cancelled run completes *normally*, so
+/// [`RunHandle::wait`] reports `Ok(())` for it, exactly as upstream's
+/// `fu.get()` does not throw after a `fu.cancel()`.
 #[non_exhaustive]
 pub enum RunError {
     /// A task panicked, carrying what it panicked with.
@@ -72,9 +75,10 @@ pub enum RunError {
     /// the failure continuing to propagate on *this* thread -- can hand it to
     /// [`std::panic::resume_unwind`].
     ///
-    /// Only the first panicking task of a run is reported; the rest of the
-    /// run still completes, since cancelling the remaining tasks is a later
-    /// milestone.
+    /// Only the first panicking task of a run is reported, and the rest of the
+    /// run still runs: a panic that cancels the remainder of its own run is
+    /// issue #32, which sets the `EXCEPTION` bit of the run's estate word that
+    /// [`RunHandle::cancel`] sets `CANCELLED` in.
     Panicked(Box<dyn Any + Send>),
 }
 
@@ -151,7 +155,115 @@ pub struct RunHandle<'a> {
     borrow: PhantomData<(&'a Executor, &'a Taskflow)>,
 }
 
+/// The right to cancel a run, with no lifetime attached.
+///
+/// Handed out by [`RunHandle::canceller`], and `Clone + Send + Sync +
+/// 'static`, so it can be captured by a task body, stored in a struct or sent
+/// to another thread.
+///
+/// Upstream needs no such type: its `tf::Future` *is* the cancel token, and
+/// its test suite cancels a run from a task of another taskflow by capturing
+/// the future by reference. A task body here is `'static` -- see
+/// [`Work`](crate::Work) -- so it cannot capture a [`RunHandle`], which
+/// borrows the executor and the taskflow the run is of. This is the part of
+/// the handle that *can* be captured.
+///
+/// See [`RunHandle::cancel`] for what cancelling does and does not promise,
+/// and the [`executor`](crate::executor) module docs for the whole of it.
+#[derive(Clone)]
+pub struct Canceller {
+    /// The run's cancellation state, or what is left of it.
+    ///
+    /// `Weak`, because a token may outlive the run's topology: the topology is
+    /// freed when the [`RunHandle`] that owns it is dropped, and nothing stops
+    /// a token outliving that. Upstream's `std::weak_ptr<Topology>`, and a
+    /// failed upgrade here is its failed `lock()`.
+    state: Weak<Cancellable>,
+}
+
+impl Canceller {
+    /// Cancels the run, reporting `false` if it has already finished.
+    ///
+    /// Upstream's `tf::Future::cancel` through a `weak_ptr` whose referent may
+    /// be gone, which is the one difference from [`RunHandle::cancel`]: this
+    /// reports `false` both for a run that has finished and for one whose
+    /// handle has since been dropped. Everything else -- non-preemptive,
+    /// harmless twice, and the run still completing normally -- is the same,
+    /// and [`RunHandle::cancel`] says it.
+    pub fn cancel(&self) -> bool {
+        self.state
+            .upgrade()
+            .is_some_and(|state| Cancellable::cancel(&state))
+    }
+}
+
+impl fmt::Debug for Canceller {
+    /// Hand-written because `Weak`'s own prints `(Weak)`, and what is worth
+    /// seeing is whether there is still a run on the other end of it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Canceller")
+            .field("live", &(self.state.strong_count() > 0))
+            .finish()
+    }
+}
+
 impl<'a> RunHandle<'a> {
+    /// Cancels this run, reporting `false` if it has already finished.
+    ///
+    /// Upstream's `tf::Future::cancel`, promise for promise: the executor
+    /// stops scheduling tasks of this run onwards, and tasks already running
+    /// are left to finish, cancellation being non-preemptive. So a cancelled
+    /// run is one that stops *early*, by however much the pool had not got to
+    /// yet, and "none of it had started" and "all of it ran" are both possible
+    /// outcomes of a cancellation that raced the run.
+    ///
+    /// The run then completes normally. [`RunHandle::wait`] returns `Ok(())`,
+    /// as upstream's `fu.get()` does not throw; the on-finish callback still
+    /// runs; and a `run_n` or `run_until` run does not go round again however
+    /// many rounds its predicate had left. A run that was cancelled is
+    /// therefore indistinguishable afterwards from one whose tasks did
+    /// nothing, which is upstream's behaviour and the decision issue #29 took;
+    /// a `was_cancelled` query is a follow-up if anyone needs one.
+    ///
+    /// Cancelling twice is harmless and reports `true` twice: the answer is
+    /// about the run, not about this caller. The `false` is upstream's
+    /// `weak_ptr::lock()` failing, and it means the run was over before the
+    /// call -- nothing was cancelled because there was nothing left to cancel.
+    ///
+    /// ```
+    /// use rustflow::prelude::*;
+    /// use rustflow::Executor;
+    ///
+    /// let executor = Executor::new(4);
+    /// let mut taskflow = Taskflow::new();
+    /// for _ in 0..1000 {
+    ///     taskflow.emplace(|| std::thread::sleep(std::time::Duration::from_millis(1)));
+    /// }
+    ///
+    /// let run = executor.run(&taskflow);
+    /// assert!(run.cancel(), "the run had not finished");
+    ///
+    /// // A cancelled run completes normally; what it does not do is finish
+    /// // the work it had not started.
+    /// run.wait().expect("no task panicked");
+    /// ```
+    pub fn cancel(&self) -> bool {
+        self.topology.cancel()
+    }
+
+    /// A token that cancels this run from anywhere, including from a task
+    /// body.
+    ///
+    /// The lifetime-free half of [`RunHandle::cancel`]; see [`Canceller`] for
+    /// why it exists. Any number may be handed out, and each of them cancels
+    /// the one run this handle is for.
+    #[must_use]
+    pub fn canceller(&self) -> Canceller {
+        Canceller {
+            state: Arc::downgrade(self.topology.cancellable()),
+        }
+    }
+
     /// Blocks until the run finishes, and reports whether a task panicked.
     ///
     /// Upstream's `tf::Future::get`, which rethrows the stored exception on
@@ -613,9 +725,15 @@ impl Shared {
             return;
         }
 
-        // Upstream's case 2: the final run of this topology. The callback
-        // first, as upstream calls `_on_finish()` first, so that a waiter
-        // released below has already seen whatever the callback did.
+        // Upstream's case 2: the final run of this topology -- which is where
+        // a cancelled run arrives, since `run_again` answers no for one. Every
+        // line below therefore runs for a cancelled run too, and that is the
+        // point: cancelling stops the *scheduling*, not the accounting, so the
+        // callback still fires, the next queued run of this taskflow still
+        // starts, and the waiter is still released with `Ok(())`.
+        //
+        // The callback first, as upstream calls `_on_finish()` first, so that a
+        // waiter released below has already seen whatever the callback did.
         topology.carry_out_callback();
 
         // Then the next run of this taskflow, if one queued up behind this
@@ -666,6 +784,24 @@ impl WorkerThread {
     pub(crate) fn tear_down_topology(&self, taskflow: &Taskflow, topology: &Topology) {
         self.shared
             .tear_down_topology(Some(self), taskflow, topology);
+    }
+
+    /// Accounts for one job of `topology` having finished, ending the run if it
+    /// was the last.
+    ///
+    /// Upstream's `_tear_down_nonasync` for a top-level node. It is the tail of
+    /// `WorkerThread::invoke` and the whole of what a job skipped by the
+    /// cancelled early-out at the top of that method still owes: the join
+    /// counters have to reach zero for the run to finish at all, which is why
+    /// upstream's cancelled branch goes to `_tear_down_invoke` rather than
+    /// simply returning.
+    ///
+    /// **The last thing the caller may do with either argument**, for the
+    /// reason [`Shared::tear_down_topology`] gives.
+    pub(crate) fn finish_job(&self, taskflow: &Taskflow, topology: &Topology) {
+        if topology.job_finished() {
+            self.tear_down_topology(taskflow, topology);
+        }
     }
 }
 
@@ -762,6 +898,70 @@ mod tests {
         let taskflow = Taskflow::new();
         let handle = executor.run(&taskflow);
         assert!(format!("{handle:?}").contains("RunHandle"));
+    }
+
+    /// A [`Canceller`] is the whole reason the estate word has an allocation
+    /// of its own, so the bounds it is for are worth asserting rather than
+    /// assuming: a task body is `FnMut() + Send + 'static`, and a token that
+    /// missed any of these could not be captured by one.
+    #[test]
+    fn a_canceller_is_clone_send_sync_and_static() {
+        fn clone_send_sync_static<T: Clone + Send + Sync + 'static>() {}
+        clone_send_sync_static::<Canceller>();
+
+        let executor = Executor::new(1);
+        let mut taskflow = Taskflow::new();
+        taskflow.emplace(|| {});
+
+        let handle = executor.run(&taskflow);
+        let canceller = handle.canceller();
+        assert_eq!(format!("{canceller:?}"), "Canceller { live: true }");
+        handle.wait().expect("no task panicked");
+    }
+
+    /// A run that was over before the handle was handed out has nothing to
+    /// cancel -- the empty, sourceless and already-true-predicate cases, which
+    /// all come back from `RunHandle::finished`. Upstream's `EmptyFuture` is
+    /// the same answer to the same question from the other end: a future with
+    /// no topology at all.
+    #[test]
+    fn cancelling_a_run_that_never_started_reports_false() {
+        let executor = Executor::new(2);
+        let empty = Taskflow::new();
+
+        let handle = executor.run(&empty);
+        let canceller = handle.canceller();
+        assert!(!handle.cancel(), "nothing was ever scheduled");
+        assert!(!canceller.cancel());
+
+        // And the same for a graph with work but no round to run it in.
+        let mut taskflow = Taskflow::new();
+        taskflow.emplace(|| panic!("never reached"));
+        let handle = executor.run_n(&taskflow, 0);
+        assert!(!handle.cancel());
+    }
+
+    /// A token may outlive the run's topology, which is what the `Weak` is
+    /// for: the handle owns the topology and frees it when it is dropped, and
+    /// a token left over reports `false` rather than reaching freed memory.
+    /// Upstream's failed `weak_ptr::lock()`, exactly.
+    #[test]
+    fn a_canceller_outlives_its_handle_and_then_reports_false() {
+        let executor = Executor::new(2);
+        let mut taskflow = Taskflow::new();
+        taskflow.emplace(|| {});
+
+        let canceller = {
+            let handle = executor.run(&taskflow);
+            let canceller = handle.canceller();
+            handle.wait().expect("no task panicked");
+            canceller
+        };
+
+        assert!(!canceller.cancel(), "the run is gone");
+        assert_eq!(format!("{canceller:?}"), "Canceller { live: false }");
+        // Still `false` for a clone made after the run went away.
+        assert!(!canceller.clone().cancel());
     }
 
     /// The repeat predicate is the whole of `run_n`, so its shape is worth

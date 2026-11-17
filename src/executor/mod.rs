@@ -11,18 +11,48 @@
 //!   work;
 //! - [`rng`] the one random number the steal loop needs;
 //! - [`worker`] a worker and the scheduling loop it runs;
-//! - `topology` one run of one taskflow, and the job a queue carries -- the
-//!   one module here that is crate-private, since a caller has no business
-//!   with a run's internals;
+//! - `topology` one run of one taskflow, the job a queue carries, and the
+//!   run's cancellation bits -- the one module here that is crate-private,
+//!   since a caller has no business with a run's internals;
 //! - [`run_handle`] the `run` family itself -- `run`, `run_n`, `run_until` and
 //!   the owning half of each -- the tear-down that decides whether a finished
-//!   run goes round again, and the handle whose borrow is this port's answer to
-//!   upstream's "do not mutate a running taskflow".
+//!   run goes round again, the handle whose borrow is this port's answer to
+//!   upstream's "do not mutate a running taskflow", and the
+//!   [`Canceller`](crate::Canceller) that cancels a run from outside it.
 //!
 //! What is left here is what the *executor* owns: the worker array, the
 //! buffers, the notifier, the thread-id map, and the lifecycle -- spawn the
 //! workers, hand them the shared state, join them on drop. See each submodule
 //! for what it does and does not owe to upstream.
+//!
+//! # Cancelling a run
+//!
+//! [`RunHandle::cancel`](crate::RunHandle::cancel) and
+//! [`Canceller::cancel`](crate::Canceller::cancel) are upstream's
+//! `tf::Future::cancel`, and the whole of what they promise is that *the
+//! executor stops scheduling tasks of that run onwards*. Cancellation is not
+//! preemptive: a task already running is left to finish, and nothing
+//! interrupts, polls or asks it to stop early. The three pieces are spread
+//! over three modules on purpose, since each belongs with the state it reads:
+//!
+//! - cancelling sets a bit in the run's estate word -- upstream's
+//!   `ESTATE::CANCELLED`, which lives in `topology` in an allocation a
+//!   lifetime-free token can hold a `Weak` to;
+//! - a job of a cancelled run is skipped at the top of
+//!   [`WorkerThread::invoke`](worker::WorkerThread), which is upstream's
+//!   `_is_parent_cancelled` early-out, and torn down without being run so that
+//!   the run's join counters still reach zero;
+//! - a cancelled run does not go round again, which is the cancellation half
+//!   of upstream's `!tpg->cancelled() && !tpg->_predicate()` in the tear-down
+//!   in [`run_handle`].
+//!
+//! So a cancelled run *completes*, normally and promptly: its callback fires,
+//! the next queued run of its taskflow starts, and a
+//! [`wait`](crate::RunHandle::wait) on it returns `Ok(())` exactly as
+//! upstream's `fu.get()` does not throw. What it does not do is run the work
+//! the pool had not got to yet. How much that is depends on the race between
+//! the call and the pool, which is why upstream's own documentation says "we
+//! may still see some tasks complete their executions or none".
 
 pub mod corun;
 pub mod notifier;
