@@ -1,16 +1,29 @@
 //! Translated from `unittests/test_control_flow.cpp` (Taskflow v4.1.0).
 //!
-//! The cases ported here are the two the conditional-scheduling issue names:
-//! `LoopCond`, a conditioner that closes a cycle on itself, and
-//! `MultipleBranches`, a multi-condition task that fans out to an arbitrary
-//! subset of a hundred successors. Both run at 1..=4 workers: that is
-//! upstream's own sweep for `LoopCond`, and the four of its eight that say
-//! something distinct for `MultipleBranches`, whose fan-out is the same
-//! whether four workers share it or eight. The rest of that file -- the
-//! coin-flip, subflow, module and cancellation cases -- arrives with the
-//! milestones that make those node kinds runnable.
+//! Every case of that file that this port can run honestly is here, each at
+//! upstream's own sweep of worker counts: `LoopCond` and `MultipleBranches`
+//! arrived with the conditional-scheduling issue (#31), and `FlipCoinCond`,
+//! `CyclicCond`, `BTreeCondition`, `Cond2Cond`, `MultipleLoops`,
+//! `MultiCondBinaryTree` and `MultiCond.MultipleRuns` with issue #33, once
+//! there was a scheduler to drive them. `MultipleBranches` keeps the four of
+//! its eight worker counts that say something distinct, its fan-out being the
+//! same whether four workers share it or eight.
 //!
-//! Two standing adaptations, because the port is not quite where upstream is:
+//! Four of upstream's cases are **not** here, each because it needs a node
+//! kind this port does not have yet rather than because it is awkward:
+//!
+//! - `DynamicBTreeCondition`, `NestedCond` and `CondSubflow` build their
+//!   graphs from inside a running task through a `tf::Subflow`, which is M4's.
+//! - `HierCondition` composes three taskflows with `composed_of`, so it needs
+//!   M4's module tasks as well as its subflows.
+//!
+//! None of the four is approximated by a static or condition graph of the same
+//! shape: a control-flow case that reports green while testing something else
+//! is worse than an absent one. Upstream's two `Cond.Types`/`MultiCond.Types`
+//! cases are `static_assert`s on its callable traits, and they are already
+//! ported, in `tests/flow_builder.rs` with the rest of the builder's surface.
+//!
+//! Three standing adaptations, because the port is not quite where upstream is:
 //!
 //! - **A dropped handle is a waited-for run.** `loop_cond` ends with four bare
 //!   `run(taskflow)` calls, a `run_n(taskflow, 10)` and a `wait_for_all()`,
@@ -21,13 +34,19 @@
 //!   The observable is unchanged either way -- fifteen runs of a hundred
 //!   iterations is `state == 1500`.
 //! - **`::rand()` is not a dependency.** `multiple_branches` draws its branch
-//!   set from the crate's own [`Xorshift32`] instead, seeded per worker count
-//!   and with the seed in every assertion message, so a failure reproduces
-//!   exactly. The draw itself is upstream's: one per index over `-10..=110`,
-//!   kept when `draw % 10 == 0`.
+//!   set, and `flip_coin_cond` its coins, from the crate's own [`Xorshift32`]
+//!   instead, seeded per worker count by [`seed_for`] and with the seed in
+//!   every assertion message, so a failure reproduces exactly. The draws
+//!   themselves are upstream's.
+//! - **A `REQUIRE` inside a task body is a panic.** Upstream's assertions in
+//!   task bodies are doctest's, which record a failure and carry on; here they
+//!   are `assert!`s, whose panic the executor stores on the topology and
+//!   reports from `wait`. [`run`] is what turns that back into a failed test,
+//!   so a case whose graph asserts must go through it rather than dropping its
+//!   handle.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 
 use rustflow::prelude::*;
 use rustflow::{Executor, RunError, Xorshift32};
@@ -46,6 +65,12 @@ fn counted(taskflow: &mut Taskflow, counter: &Counter) -> Task {
     taskflow.emplace(move || {
         counter.fetch_add(1, Ordering::Relaxed);
     })
+}
+
+/// A seed per worker count, so that the two seeded cases below do not all draw
+/// the same sequence and any one of their cases can be re-run on its own.
+fn seed_for(workers: usize) -> u32 {
+    0x5EED_0000 + u32::try_from(workers).expect("a small worker count")
 }
 
 /// Runs `taskflow` to completion, turning a panicking task body -- which is
@@ -174,6 +199,512 @@ fn loop_cond_4_workers() {
 }
 
 // ----------------------------------------------------------------------------
+// Testcase: FlipCoinCond
+// ----------------------------------------------------------------------------
+
+/// Upstream's `rounds`: how many times the coin-flip graph is run.
+const ROUNDS: usize = 10_000;
+
+/// Upstream's `std::rand() % 2`, drawn from the crate's own generator.
+///
+/// `0` advances the chain and `1` sends it back to the start, which is the
+/// order every coin task below is wired in.
+fn flip(rng: &mut Xorshift32) -> i32 {
+    i32::from(!rng.next_u32().is_multiple_of(2))
+}
+
+/// Adds one of upstream's bare coin tasks: a conditioner that flips and
+/// nothing else, with a generator of its own drawn from `seeds`.
+fn coin(taskflow: &mut Taskflow, seeds: &mut Xorshift32) -> Task {
+    let mut rng = Xorshift32::new(seeds.next_u32());
+    taskflow.emplace_condition(move || flip(&mut rng))
+}
+
+/// Upstream's `flip_coin_cond(unsigned w)`.
+///
+/// Five conditioners in a chain, each of which either advances to the next or
+/// sends the token back to `B`, and `B` counts the attempts. A round ends only
+/// when all five coins come up 0 in a row, so the number of attempts per round
+/// is geometric with mean 32, and the assertion is on the mean over ten
+/// thousand rounds.
+///
+/// It is the one case in this file whose statistic could in principle fail on
+/// a fair coin -- the band upstream asserts is about three standard errors
+/// wide -- so the generators are seeded and the whole case is deterministic:
+/// the graph holds a single token at every instant, so each conditioner draws
+/// its own sequence in its own order whatever the worker count, and the total
+/// below is a fixed function of `seed` alone.
+///
+/// Upstream's ten thousand rounds are kept, which is some 640000 task
+/// invocations and makes this the heaviest case in the file by an order of
+/// magnitude. It is still a fifth of a second, pinned to one core or not, so
+/// it stays in the default set rather than earning an `#[ignore]`.
+fn flip_coin_cond(workers: usize, seed: u32) {
+    let mut taskflow = Taskflow::new();
+
+    // Upstream's `steps`, reset by `A` once per round, and its `total_steps`,
+    // accumulated by `G` across rounds.
+    let steps = Arc::new(AtomicUsize::new(0));
+    let total_steps = Arc::new(AtomicUsize::new(0));
+
+    // One generator per coin task, all drawn from one seed rather than
+    // hand-picked, so that no two of the five are accidentally in step.
+    let mut seeds = Xorshift32::new(seed);
+
+    let a = {
+        let steps = Arc::clone(&steps);
+        taskflow.emplace(move || steps.store(0, Ordering::Relaxed))
+    };
+    let b = {
+        let steps = Arc::clone(&steps);
+        let mut rng = Xorshift32::new(seeds.next_u32());
+        taskflow.emplace_condition(move || {
+            steps.fetch_add(1, Ordering::Relaxed);
+            flip(&mut rng)
+        })
+    };
+    let c = coin(&mut taskflow, &mut seeds);
+    let d = coin(&mut taskflow, &mut seeds);
+    let e = coin(&mut taskflow, &mut seeds);
+    let f = coin(&mut taskflow, &mut seeds);
+    let g = {
+        let steps = Arc::clone(&steps);
+        let total_steps = Arc::clone(&total_steps);
+        taskflow.emplace(move || {
+            total_steps.fetch_add(steps.load(Ordering::Relaxed), Ordering::Relaxed);
+        })
+    };
+
+    taskflow.task(a).precede([b]);
+    taskflow.task(b).precede([c, b]);
+    taskflow.task(c).precede([d, b]);
+    taskflow.task(d).precede([e, b]);
+    taskflow.task(e).precede([f, b]);
+    taskflow.task(f).precede([g, b]);
+
+    let executor = Executor::new(workers);
+    executor
+        .run_n(&taskflow, ROUNDS)
+        .wait()
+        .expect("a task of this taskflow panicked");
+
+    // Upstream's `REQUIRE(std::fabs(average_steps - 32.0) < 1.0)`, in
+    // integers: the mean is within one of 32 exactly when the total is within
+    // `ROUNDS` of `32 * ROUNDS`, and an integer comparison says so without
+    // asking what a `usize` rounds to.
+    let total = total_steps.load(Ordering::Relaxed);
+    assert!(
+        total.abs_diff(32 * ROUNDS) < ROUNDS,
+        "seed {seed}, {workers} worker(s): {total} attempts over {ROUNDS} rounds \
+         is not within one of 32 per round"
+    );
+}
+
+#[test]
+fn flip_coin_cond_1_worker() {
+    flip_coin_cond(1, seed_for(1));
+}
+
+#[test]
+fn flip_coin_cond_2_workers() {
+    flip_coin_cond(2, seed_for(2));
+}
+
+#[test]
+fn flip_coin_cond_3_workers() {
+    flip_coin_cond(3, seed_for(3));
+}
+
+#[test]
+fn flip_coin_cond_4_workers() {
+    flip_coin_cond(4, seed_for(4));
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: CyclicCond
+// ----------------------------------------------------------------------------
+
+/// Upstream's `total_iteration`: how many times the cycle goes round, and how
+/// many branches the conditioner that drives it has.
+const TOTAL_ITERATION: usize = 1000;
+
+/// Upstream's `cyclic_cond(unsigned w)`.
+///
+/// ```text
+///       ____________________
+///       |                  |
+///       v                  |
+///  S -> A -> branch -> many branches -> T
+/// ```
+///
+/// `branch` returns `sel++`, so iteration `i` selects the `i`th of its
+/// thousand successors; each of those marks itself passed and goes back to `A`
+/// until the iteration count is spent, when it goes to `T` instead. So the
+/// property is a strong one: every branch is taken exactly once, in order, and
+/// the single node that leaves the cycle is the thousandth.
+fn cyclic_cond(workers: usize) {
+    let executor = Executor::new(workers);
+    let mut flow = Taskflow::new();
+
+    let s = flow.emplace(|| {});
+
+    let num_iterations = Arc::new(AtomicUsize::new(0));
+    let a = {
+        let num_iterations = Arc::clone(&num_iterations);
+        flow.emplace(move || {
+            num_iterations.fetch_add(1, Ordering::Relaxed);
+        })
+    };
+    flow.task(s).precede([a]);
+
+    // Upstream's `std::vector<bool> pass`, one flag per branch, and its
+    // `pass_T`.
+    let pass: Arc<Vec<AtomicBool>> = Arc::new(
+        (0..TOTAL_ITERATION)
+            .map(|_| AtomicBool::new(false))
+            .collect(),
+    );
+    let pass_t = Arc::new(AtomicBool::new(false));
+
+    let t = {
+        let num_iterations = Arc::clone(&num_iterations);
+        let pass_t = Arc::clone(&pass_t);
+        flow.emplace(move || {
+            assert_eq!(
+                num_iterations.load(Ordering::Relaxed),
+                TOTAL_ITERATION,
+                "`T` runs only after the cycle is spent"
+            );
+            pass_t.store(true, Ordering::Relaxed);
+        })
+    };
+    // Upstream's `sel` is an `int` captured by reference; a conditioner's body
+    // is `FnMut`, so the state it is the only reader and writer of lives in
+    // the closure instead of in an `Arc`.
+    let branch = {
+        let mut sel = 0;
+        flow.emplace_condition(move || {
+            let selected = sel;
+            sel += 1;
+            selected
+        })
+    };
+    flow.task(a).precede([branch]);
+
+    for index in 0..TOTAL_ITERATION {
+        let branch_task = {
+            let num_iterations = Arc::clone(&num_iterations);
+            let pass = Arc::clone(&pass);
+            flow.emplace_condition(move || {
+                assert!(
+                    !pass[index].swap(true, Ordering::Relaxed),
+                    "branch {index} was taken twice"
+                );
+                // 0 is `A`, which closes the cycle; 1 is `T`, which leaves it.
+                i32::from(num_iterations.load(Ordering::Relaxed) >= TOTAL_ITERATION)
+            })
+        };
+        flow.task(branch).precede([branch_task]);
+        flow.task(branch_task).precede([a, t]);
+    }
+
+    run(&executor, &flow);
+
+    assert!(
+        pass_t.load(Ordering::Relaxed),
+        "{workers} worker(s): the cycle never reached `T`"
+    );
+    for (index, passed) in pass.iter().enumerate() {
+        assert!(
+            passed.load(Ordering::Relaxed),
+            "{workers} worker(s): branch {index} was never taken"
+        );
+    }
+}
+
+#[test]
+fn cyclic_cond_1_worker() {
+    cyclic_cond(1);
+}
+
+#[test]
+fn cyclic_cond_2_workers() {
+    cyclic_cond(2);
+}
+
+#[test]
+fn cyclic_cond_3_workers() {
+    cyclic_cond(3);
+}
+
+#[test]
+fn cyclic_cond_4_workers() {
+    cyclic_cond(4);
+}
+
+#[test]
+fn cyclic_cond_5_workers() {
+    cyclic_cond(5);
+}
+
+#[test]
+fn cyclic_cond_6_workers() {
+    cyclic_cond(6);
+}
+
+#[test]
+fn cyclic_cond_7_workers() {
+    cyclic_cond(7);
+}
+
+#[test]
+fn cyclic_cond_8_workers() {
+    cyclic_cond(8);
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: BTreeCondition
+// ----------------------------------------------------------------------------
+
+/// Upstream's `BTreeCondition`, for one worker count.
+///
+/// A complete binary tree of `level` levels whose levels alternate: an even
+/// level counts, an odd one decides. A static task releases both its
+/// successors, so each counted level doubles; a conditioner takes one of its
+/// two -- 0 on even `j`, 1 on odd -- so each decided level does not. The
+/// counted levels therefore see 1, 2, 4, ... tasks and the total is
+/// `2^((level + 1) / 2) - 1`, which is upstream's assertion and is wrong by a
+/// factor of two the moment a weak edge releases a successor it did not name.
+///
+/// Upstream writes this as a single case over both loops, `w` and `level`. It
+/// is split per worker count here, as the rest of this file is, so that a
+/// failure names its worker count without a message; the executor is hoisted
+/// out of the `level` loop for the same reason upstream's is not -- it has
+/// eight worker counts' worth of thread spawning to amortise and we have one.
+fn btree_condition(workers: usize) {
+    let executor = Executor::new(workers);
+
+    for level in 1..12 {
+        let mut flow = Taskflow::new();
+        let counter = counter();
+        let mut previous: Vec<Task> = Vec::new();
+
+        for depth in 0..level {
+            let mut tasks = Vec::new();
+            for index in 0..(1_usize << depth) {
+                if depth % 2 == 0 {
+                    tasks.push(counted(&mut flow, &counter));
+                } else if index % 2 == 0 {
+                    tasks.push(flow.emplace_condition(|| 0));
+                } else {
+                    tasks.push(flow.emplace_condition(|| 1));
+                }
+            }
+
+            for (index, &parent) in previous.iter().enumerate() {
+                flow.task(parent)
+                    .precede([tasks[2 * index], tasks[2 * index + 1]]);
+            }
+            previous = tasks;
+        }
+
+        run(&executor, &flow);
+
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            (1_usize << ((level + 1) / 2)) - 1,
+            "{workers} worker(s), {level} level(s)"
+        );
+    }
+}
+
+#[test]
+fn btree_condition_1_worker() {
+    btree_condition(1);
+}
+
+#[test]
+fn btree_condition_2_workers() {
+    btree_condition(2);
+}
+
+#[test]
+fn btree_condition_3_workers() {
+    btree_condition(3);
+}
+
+#[test]
+fn btree_condition_4_workers() {
+    btree_condition(4);
+}
+
+#[test]
+fn btree_condition_5_workers() {
+    btree_condition(5);
+}
+
+#[test]
+fn btree_condition_6_workers() {
+    btree_condition(6);
+}
+
+#[test]
+fn btree_condition_7_workers() {
+    btree_condition(7);
+}
+
+#[test]
+fn btree_condition_8_workers() {
+    btree_condition(8);
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: Cond2Cond
+// ----------------------------------------------------------------------------
+
+/// Upstream's `cond2cond(unsigned w)`.
+///
+/// ```text
+///         ______
+///        |      |
+///        v      |
+///   S -> A -> cond1 -> cond2 -> D
+///              |         |
+///              -> B      -> (back to cond1, and to A)
+/// ```
+///
+/// Two conditioners in series, the second of which branches back into the
+/// first as well as into the task that precedes both of them. What it pins is
+/// the successor *positions*: `cond1` returns 0 on its first visit of a round
+/// and 1 afterwards, so `B` -- its third successor, and the one upstream fills
+/// with `REQUIRE(false)` -- must never run, while the three visits of `A`, four
+/// of `cond1` and three of `cond2` per round are what say each branch went
+/// where it was told.
+///
+/// The edges are added in upstream's order, not in a tidier one, because that
+/// order *is* the test: a conditioner's return value is an index into the
+/// successor list in the order the edges were added.
+fn cond2cond(workers: usize) {
+    const REPEAT: usize = 10;
+
+    let mut flow = Taskflow::new();
+
+    let num_visit_a = counter();
+    let num_visit_c1 = counter();
+    let num_visit_c2 = counter();
+
+    // Upstream's two `int`s, shared because `D` resets what the conditioners
+    // bump.
+    let iteration_c1 = Arc::new(AtomicUsize::new(0));
+    let iteration_c2 = Arc::new(AtomicUsize::new(0));
+
+    let s = flow.emplace(|| {});
+    let a = counted(&mut flow, &num_visit_a);
+    flow.task(s).precede([a]);
+
+    let cond1 = {
+        let num_visit_c1 = Arc::clone(&num_visit_c1);
+        let iteration_c1 = Arc::clone(&iteration_c1);
+        flow.emplace_condition(move || {
+            num_visit_c1.fetch_add(1, Ordering::Relaxed);
+            let iteration = iteration_c1.fetch_add(1, Ordering::Relaxed) + 1;
+            i32::from(iteration != 1)
+        })
+    };
+    flow.task(a).precede([cond1]);
+    flow.task(cond1).precede([a]);
+
+    let cond2 = {
+        let num_visit_c2 = Arc::clone(&num_visit_c2);
+        let iteration_c2 = Arc::clone(&iteration_c2);
+        flow.emplace_condition(move || {
+            num_visit_c2.fetch_add(1, Ordering::Relaxed);
+            let iteration = iteration_c2.fetch_add(1, Ordering::Relaxed);
+            i32::try_from(iteration).expect("a handful of iterations per round")
+        })
+    };
+    flow.task(cond1).precede([cond2]);
+    flow.task(cond2).precede([cond1, a]);
+
+    // Upstream's `B`, whose body is `REQUIRE(false)`: a panicking task body is
+    // what a failed assertion inside one is, and `run` below reports it.
+    let b = flow.emplace(|| panic!("`B` is never the selected branch"));
+    flow.task(cond1).precede([b]);
+
+    let d = {
+        let iteration_c1 = Arc::clone(&iteration_c1);
+        let iteration_c2 = Arc::clone(&iteration_c2);
+        flow.emplace(move || {
+            iteration_c1.store(0, Ordering::Relaxed);
+            iteration_c2.store(0, Ordering::Relaxed);
+        })
+    };
+    flow.task(cond2).precede([d]);
+
+    let executor = Executor::new(workers);
+    executor
+        .run_n(&flow, REPEAT)
+        .wait()
+        .expect("a task of this taskflow panicked");
+
+    assert_eq!(
+        num_visit_a.load(Ordering::Relaxed),
+        3 * REPEAT,
+        "{workers} worker(s): visits of `A`"
+    );
+    assert_eq!(
+        num_visit_c1.load(Ordering::Relaxed),
+        4 * REPEAT,
+        "{workers} worker(s): visits of `cond1`"
+    );
+    assert_eq!(
+        num_visit_c2.load(Ordering::Relaxed),
+        3 * REPEAT,
+        "{workers} worker(s): visits of `cond2`"
+    );
+}
+
+#[test]
+fn cond2cond_1_worker() {
+    cond2cond(1);
+}
+
+#[test]
+fn cond2cond_2_workers() {
+    cond2cond(2);
+}
+
+#[test]
+fn cond2cond_3_workers() {
+    cond2cond(3);
+}
+
+#[test]
+fn cond2cond_4_workers() {
+    cond2cond(4);
+}
+
+#[test]
+fn cond2cond_5_workers() {
+    cond2cond(5);
+}
+
+#[test]
+fn cond2cond_6_workers() {
+    cond2cond(6);
+}
+
+#[test]
+fn cond2cond_7_workers() {
+    cond2cond(7);
+}
+
+#[test]
+fn cond2cond_8_workers() {
+    cond2cond(8);
+}
+
+// ----------------------------------------------------------------------------
 // Testcase: MultipleBranches
 // ----------------------------------------------------------------------------
 
@@ -225,12 +756,6 @@ fn multiple_branches(workers: usize, seed: u32) {
     );
 }
 
-/// A seed per worker count, so the four cases do not all draw the same branch
-/// set and any one of them can be re-run on its own.
-fn seed_for(workers: usize) -> u32 {
-    0x5EED_0000 + u32::try_from(workers).expect("a small worker count")
-}
-
 #[test]
 fn multiple_branches_1_worker() {
     multiple_branches(1, seed_for(1));
@@ -249,6 +774,268 @@ fn multiple_branches_3_workers() {
 #[test]
 fn multiple_branches_4_workers() {
     multiple_branches(4, seed_for(4));
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: MultipleLoops
+// ----------------------------------------------------------------------------
+
+/// Adds one of upstream's `multiple_loops` nodes: a multi-conditioner that
+/// opens both of its branches once and then loops on the first ten times.
+///
+/// The `bool` and the `int` are upstream's init-captures, one pair per node,
+/// and they stay in the closure for the reason `cyclic_cond`'s `sel` does --
+/// the node is the only reader and writer, and only one instance of it is ever
+/// runnable.
+fn self_loop(taskflow: &mut Taskflow, counter: &Counter) -> Task {
+    let counter = Arc::clone(counter);
+    let mut first = true;
+    let mut rounds = 0;
+    taskflow.emplace_multi_condition(move || {
+        if first {
+            first = false;
+            return vec![0, 1];
+        }
+        counter.fetch_add(1, Ordering::Relaxed);
+        rounds += 1;
+        // -1 names no successor, which is how this node's loop ends.
+        vec![if rounds < 10 { 0 } else { -1 }]
+    })
+}
+
+/// Upstream's `multiple_loops(unsigned W)`.
+///
+/// Four self-looping multi-conditioners in a chain, `B -> C -> D -> E`, each
+/// wired as `precede(itself, the next one)`. The first visit of each returns
+/// `{0, 1}`, which is the case's point: one body selects two successors at
+/// once, one of them itself, so the node is re-entered *while* the chain
+/// carries on past it and the four loops are live together. Ten counted
+/// iterations each is upstream's `counter == 40`, and `E`, which has only
+/// itself as a successor, is where the `{0, 1}` of an index with no successor
+/// has to select nothing.
+fn multiple_loops(workers: usize) {
+    let executor = Executor::new(workers);
+    let mut taskflow = Taskflow::new();
+
+    let counter = counter();
+    let a = taskflow.emplace(|| {});
+    let b = self_loop(&mut taskflow, &counter);
+    let c = self_loop(&mut taskflow, &counter);
+    let d = self_loop(&mut taskflow, &counter);
+    let e = self_loop(&mut taskflow, &counter);
+
+    taskflow.task(a).precede([b]);
+    taskflow.task(b).precede([b, c]);
+    taskflow.task(c).precede([c, d]);
+    taskflow.task(d).precede([d, e]);
+    taskflow.task(e).precede([e]);
+
+    run(&executor, &taskflow);
+
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        40,
+        "{workers} worker(s): ten counted iterations of each of the four loops"
+    );
+}
+
+#[test]
+fn multiple_loops_1_worker() {
+    multiple_loops(1);
+}
+
+#[test]
+fn multiple_loops_2_workers() {
+    multiple_loops(2);
+}
+
+#[test]
+fn multiple_loops_3_workers() {
+    multiple_loops(3);
+}
+
+#[test]
+fn multiple_loops_4_workers() {
+    multiple_loops(4);
+}
+
+#[test]
+fn multiple_loops_5_workers() {
+    multiple_loops(5);
+}
+
+#[test]
+fn multiple_loops_6_workers() {
+    multiple_loops(6);
+}
+
+#[test]
+fn multiple_loops_7_workers() {
+    multiple_loops(7);
+}
+
+#[test]
+fn multiple_loops_8_workers() {
+    multiple_loops(8);
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: MultiCondBinaryTree
+// ----------------------------------------------------------------------------
+
+/// Upstream's `N`: the depth of the tree, and the number of runs of it.
+const BINARY_TREE_LEVELS: usize = 10;
+
+/// Upstream's `binary_tree(unsigned w)`.
+///
+/// A thousand-node heap of multi-conditioners, every one of which counts
+/// itself and returns `{0, 1}`. Nothing here is a static task and nothing is
+/// ever waited for: the whole tree is driven by weak edges, so a node that was
+/// released by a strong dependency it does not have, or released twice,
+/// shows up directly in the count. Ten runs of it is upstream's
+/// `((1 << N) - 1) * N`.
+fn binary_tree(workers: usize) {
+    let mut taskflow = Taskflow::new();
+    let executor = Executor::new(workers);
+
+    let counter = counter();
+    let tasks: Vec<Task> = (1..(1_usize << BINARY_TREE_LEVELS))
+        .map(|_| {
+            let counter = Arc::clone(&counter);
+            taskflow.emplace_multi_condition(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                vec![0, 1]
+            })
+        })
+        .collect();
+
+    // The heap's edges, left child first so that the `{0, 1}` above names
+    // both. A leaf names neither, which is the out-of-range rule again.
+    for (index, &parent) in tasks.iter().enumerate() {
+        let left = index * 2 + 1;
+        let right = left + 1;
+        if let Some(&child) = tasks.get(left) {
+            taskflow.task(parent).precede([child]);
+        }
+        if let Some(&child) = tasks.get(right) {
+            taskflow.task(parent).precede([child]);
+        }
+    }
+
+    executor
+        .run_n(&taskflow, BINARY_TREE_LEVELS)
+        .wait()
+        .expect("a task of this taskflow panicked");
+
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        ((1_usize << BINARY_TREE_LEVELS) - 1) * BINARY_TREE_LEVELS,
+        "{workers} worker(s): every node of the tree runs once per run"
+    );
+}
+
+#[test]
+fn multi_cond_binary_tree_1_worker() {
+    binary_tree(1);
+}
+
+#[test]
+fn multi_cond_binary_tree_2_workers() {
+    binary_tree(2);
+}
+
+#[test]
+fn multi_cond_binary_tree_3_workers() {
+    binary_tree(3);
+}
+
+#[test]
+fn multi_cond_binary_tree_4_workers() {
+    binary_tree(4);
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: MultiCond.MultipleRuns
+// ----------------------------------------------------------------------------
+
+/// Upstream's `multi_cond_multiple_runs(unsigned W)`.
+///
+/// ```text
+///   init  ----------------> yes
+///   cond1 -> tempTask1 ---->
+///   cond2 -> tempTask2 ---->
+/// ```
+///
+/// `yes` has three strong dependencies and only ever collects two of them:
+/// `cond1` returns 0 and releases `tempTask1`, while `cond2` returns 1 and it
+/// has a single successor, so `tempTask2` never runs. A conditioner's edge
+/// being weak is what makes that a deadlock-free end to the run rather than a
+/// hang, and `flag` staying false through one, two and three rounds is what
+/// says the unreleased strong dependency is not quietly forgotten between
+/// runs.
+fn multi_cond_multiple_runs(workers: usize) {
+    let executor = Executor::new(workers);
+    let mut taskflow = Taskflow::new();
+
+    let flag = Arc::new(AtomicBool::new(false));
+
+    let init = taskflow.emplace(|| {});
+    let cond1 = taskflow.emplace_condition(|| 0);
+    let cond2 = taskflow.emplace_condition(|| 1);
+    let yes = {
+        let flag = Arc::clone(&flag);
+        taskflow.emplace(move || flag.store(true, Ordering::Relaxed))
+    };
+    // Upstream's `no`, which it declares and never wires to anything.
+    let _no = taskflow.emplace(|| {});
+
+    let temp_task1 = taskflow.emplace(|| {});
+    let temp_task2 = taskflow.emplace(|| {});
+    taskflow.task(cond2).precede([temp_task2]);
+    taskflow.task(temp_task2).precede([yes]);
+    taskflow.task(init).precede([yes]);
+
+    taskflow.task(cond1).precede([temp_task1]);
+    taskflow.task(temp_task1).precede([yes]);
+
+    // Not upstream's, and the mechanism the rest of the case rests on: all
+    // three of `yes`'s dependencies are strong, because the conditioners
+    // precede the temporaries rather than `yes` itself.
+    assert_eq!(taskflow.task_ref(yes).num_strong_dependencies(), 3);
+    assert_eq!(taskflow.task_ref(yes).num_weak_dependencies(), 0);
+
+    assert!(!flag.load(Ordering::Relaxed));
+    for rounds in 1..=3 {
+        executor
+            .run_n(&taskflow, rounds)
+            .wait()
+            .expect("a task of this taskflow panicked");
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "{workers} worker(s), {rounds} round(s): `yes` ran with a strong \
+             dependency unreleased"
+        );
+    }
+}
+
+#[test]
+fn multi_cond_multiple_runs_1_worker() {
+    multi_cond_multiple_runs(1);
+}
+
+#[test]
+fn multi_cond_multiple_runs_2_workers() {
+    multi_cond_multiple_runs(2);
+}
+
+#[test]
+fn multi_cond_multiple_runs_3_workers() {
+    multi_cond_multiple_runs(3);
+}
+
+#[test]
+fn multi_cond_multiple_runs_4_workers() {
+    multi_cond_multiple_runs(4);
 }
 
 // ----------------------------------------------------------------------------
