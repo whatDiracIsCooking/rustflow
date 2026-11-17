@@ -3,9 +3,12 @@
 A Rust port of [Taskflow](https://github.com/taskflow/taskflow), a C++
 task-parallel programming system built around task dependency graphs.
 
-**Status: steps 1 to 4 are in** — the static graph, the work-stealing
-executor, condition tasks and cancellation, and dynamic tasking: subflows,
-runtime tasks and module composition. Those are steps of "Order of work" at
+**Status: steps 1 to 5 are in** — the static graph, the work-stealing
+executor, condition tasks and cancellation, dynamic tasking (subflows,
+runtime tasks and module composition), and step 5's async family: async and
+dependent-async tasks submitted from the executor, from a runtime task or from
+a task group, with and without a handle on the result; task groups; and
+semaphores. Those are steps of "Order of work" at
 the end of this file, which is where the status is kept rather than duplicated
 here: each step is a GitHub milestone, so its issues are what is merged and
 what is not, and a milestone still open after the feature it names works is
@@ -18,9 +21,9 @@ block in the crate is in `src/executor/notifier.rs`, where a worker about to
 park publishes its thread handle into the lock-free waiter stack and the
 notifier that pops it reads it back. The scheduler itself has none — it was
 the ownership discipline described under "A run owns the graph it walks" below
-that removed the last one, and every slice of dynamic tasking since has stayed
-inside it, which is worth saying out loud because a work-stealing scheduler is
-not where a reader expects to find that.
+that removed the last one, and every slice of dynamic tasking and of the async
+family since has stayed inside it, which is worth saying out loud because a
+work-stealing scheduler is not where a reader expects to find that.
 
 ## Getting a toolchain
 
@@ -244,7 +247,8 @@ the same split:
   storage and of the run it belongs to. Upstream is less careful here than
   this, not more: its nodes hold a raw `Topology*`, its topologies a
   `Taskflow&`, and its `tf::Future` only a `weak_ptr`, so nothing owns a
-  taskflow on its behalf at all.
+  taskflow on its behalf at all. Which share a waiting thread is *released by*
+  took two more goes and has an entry of its own below (#109, #112).
 
   The consequences are the point. A leaked handle leaks rather than dangling;
   an edit of a running taskflow panics (`Arc::get_mut` finds the run's shares)
@@ -292,12 +296,17 @@ the same split:
   that graph** (issue #48), not to the run. Upstream calls the thing that is
   waiting an *anchor* and finds it by walking the failing node's parent chain;
   the walk is ported as it stands, including the priority — an explicit anchor
-  (a frame blocked right now in an `Executor::corun`, a `Subflow::join` or a
-  `Runtime::corun`) beats an implicit one (a node that preempted itself and
-  means to read its payload slot when it is resumed, which a runtime task does
-  and no other node kind here does) beats the run, which is every chain's root
-  and is anchored by definition. Two decisions came out of it that upstream
-  does not have to make.
+  (a frame blocked right now in an `Executor::corun`, a `Subflow::join`, a
+  `Runtime::corun` or a `TaskGroup::corun`, and since the async family also a
+  free node whose runtime-shaped body hands back a handle, which is anchored
+  for its whole life because the waiter is whoever holds that handle) beats an
+  implicit one (a node that preempted itself and means to read its payload
+  slot when it is resumed — a runtime task, a free node with a runtime-shaped
+  body, or a task group's anchor, which carries the bit from the moment the
+  group is opened) beats the run, which is every chain's root and is anchored
+  by definition. The one root that is *not* an anchor is the sentinel run a
+  free async task's job names; the entry on it below says why. Two decisions
+  came out of #48 that upstream does not have to make.
 
   The payload slot is **on the node**, as upstream's `_exception_ptr` is, even
   though a chain of parents in this port is a chain of `Nested` allocations
@@ -346,7 +355,9 @@ the same split:
   pretend otherwise: an index this graph does not have panics as any stale
   index does, and an index that happens to be live here schedules *this*
   graph's node at it. Scheduling a task of a graph that is not running is the
-  caller's error upstream too.
+  caller's error upstream too. One case did become checkable, and the entry on
+  bypassed dependencies below has it: a target the run has already *entered*
+  is refused rather than resumed early (#107).
 - **A runtime or subflow handle cannot hand back the executor** (issues #50,
   #51). Upstream's `tf::Runtime` and `tf::Subflow` hold an `Executor&`, and
   this port's cannot, because the two are not the same object here: upstream's
@@ -366,7 +377,11 @@ the same split:
   `algorithm/` headers at the pinned tag, 25 are `rt.executor().num_workers()`
   in the algorithms of step 6 below, and the twenty-sixth is `scan.hpp`
   calling `rt.executor().corun_until(..)`. So step 6 is the moment to revisit
-  this — when that scan is ported, and not before.
+  this — when that scan is ported, and not before. A `TaskGroup` is the one
+  handle that *does* have an `executor()`, and for the reason this entry
+  gives rather than against it: a group is opened by a call on the `Executor`
+  value itself, so the borrow it keeps is the caller's own and no
+  back-pointer is involved.
 - **A subgraph is *leased* for the length of its run, and the last share of
   the lease is what puts it back** (issues #74, #50). Running a graph needs
   whatever owns it, because every job of a graph owns what it names, and a
@@ -385,17 +400,258 @@ the same split:
   blocking one, because the thread holding the last share is a worker that
   something else may be waiting for; and `retain(true)` is reliable set
   *before* the join it is meant to keep, not after.
+- **`async` is `spawn`, and nothing else in the family is renamed** (issue
+  #88). `async` is a reserved word in Rust 2024, so upstream's value-returning
+  `async` is `spawn` on every surface that has one — the executor, a
+  `Runtime`, a `TaskGroup` — and the other three names are kept verbatim,
+  `silent_async`, `dependent_async` and `silent_dependent_async` all being
+  legal identifiers. A body that is handed the scheduler rather than nothing
+  takes a `_runtime` suffix, as `emplace_runtime` already did, which is how
+  eight submitting forms come out of four names. Upstream's `TaskParams`
+  overloads collapse onto the unnamed forms: they differ only in the name they
+  give the node, and the observers that would read one are step 6.
+- **An async task is one `Arc`-owned free-standing node, and its job names a
+  sentinel run** (issues #86, #105). Upstream's async node is an ordinary
+  `Node` out of its object pool with `_topology == nullptr`, held alive by a
+  reference count packed into the low 24 bits of the node's state word. A
+  `Node` here is a slot in a `Graph`'s arena and has no way to exist outside
+  one, so an async task owns a one-node arena and the `Arc` around it *is*
+  upstream's count: handles share it, every queued job of the node shares it,
+  and the node goes when the last share goes — no second counter to keep in
+  step and no recycle call to get right. That leaves the null topology, which
+  every job in the scheduler reaches through without asking whether it is
+  there. Making the field an `Option` would have put a `None` case into the
+  worker's dispatch, into every arm that schedules a nested graph, into the
+  corun path and into the tear-down, so a free node's job names one
+  process-wide **sentinel** run instead — one that never finishes, is never
+  cancelled, is nobody's to wait on and holds no taskflow. The one thing the
+  sentinel must not be is an *anchor*: a panic whose parent chain roots there
+  ends the walk rather than being delivered, because claiming it would set the
+  exception bit of a run that every async task in the process reads on its way
+  in. That is #105, where one failed `silent_async` skipped every async task
+  submitted after it for the life of the process and the next `wait_for_all`
+  never returned.
+
+  What the shape costs was measured rather than argued: an externally
+  submitted async task is ~440 ns, of which 87% is the three heap blocks the
+  node is. [`BENCHMARKS.md`](BENCHMARKS.md) has the ablations under "The #125
+  attribution", including the one that would get 3% of it back and why that is
+  not this design's bill.
+- **`AsyncTask` is that `Arc`, so `use_count` counts the executor's shares
+  too** (issues #86, #91). Upstream's handle is a `Node*` plus `_incref` and
+  `_decref` on every copy, move and destruction; here it is an
+  `Option<Arc<AsyncNode>>`, so `Clone` and `Drop` *are* the counting. What the
+  packing bought upstream is given up on purpose: a 24-bit ceiling on owners
+  and a count only a dependent-async node may be asked for, against an `Arc`'s
+  word in the same allocation, with no ceiling and no new mechanism for a
+  reader to learn. The visible consequence is `use_count`, which answers
+  handles **plus** the shares the scheduler holds — a queued or running task is
+  named by a job, and a job is a share like any other. Upstream's count
+  includes exactly the same thing, which its own documentation says from the
+  other side, so the number agrees; it is only more obvious here where it
+  comes from.
+- **A free node's successor list is a `Mutex`, and its join counter starts at
+  one** (issue #91). Three decisions one protocol forces, because a
+  dependent-async graph is built one task at a time *while the tasks already
+  submitted are running*. First, upstream guards a node's `_edges` with the
+  `ESTATE::LOCKED` spin bit and sets `ESTATE::FINISHED` in the same word, so
+  that naming a dependency and finishing one cannot interleave; here both live
+  behind one `Mutex` on the node, which is the same statement — the critical
+  section is a push or a `mem::take` and never user code, so what the two
+  differ in is only whether the loser of the race spins or parks, and parking
+  is the better answer when the holder can be descheduled. Second, upstream
+  knows how many dependencies there are before it looks at any of them, by
+  `std::distance` on a random-access iterator pair; a Rust `IntoIterator` may
+  be single-pass, so the counter starts at one for the submission itself and
+  that guard is spent with everything already met in one final `fetch_sub`.
+  Without it a task whose first dependency finished early could run and
+  *finish* before its second was named. Third, the count against the parent is
+  taken once at submission rather than beside the push, because the push may
+  happen on another thread at any time after the first dependency is named —
+  which is upstream's arrangement too, from the other side: its
+  `Runtime::dependent_async` raises the counter itself before calling the
+  internal form.
+- **`Executor::drop` waits for free async tasks on a second counter** (issues
+  #88, #115). Upstream's destructor calls `wait_for_all`, which waits for
+  every kind of work at once; this port can tell two kinds apart and must. A
+  run in flight is a run some `RunHandle` borrows the executor for, so the only
+  way to reach `Drop` with one outstanding is to have *leaked* that handle —
+  and the documented answer to a leaked handle is that the pool still comes
+  down. An async task is the other way round: its handle is `'static`, dropping
+  one detaches and a `silent_async` has none at all, so nothing but the
+  executor's own destructor can keep the pool alive long enough to run a queued
+  body. Waiting on `num_topologies` would have cost the leaked handle its
+  answer, so there are two counts: a free async task is in both, and
+  `Executor::drop` waits on the narrower one. The foot-gun that comes with the
+  wait is upstream's too — dropping the last share of an executor from inside
+  one of its own async tasks deadlocks. A *parented* async task is in neither
+  count (#115): a child of a runtime body or of a task group is accounted for
+  by the join counter of the parent that is waiting for it, so
+  `wait_for_all` does not wait for one. Counting it in both was a real bug
+  rather than a tidiness question — a child counted at submission and
+  uncounted nowhere left `wait_for_all` and `Drop` waiting for ever.
+- **A failure out of a free node goes where the submission promised, and
+  nowhere else** (issues #88, #91, #105). A `spawn` body's panic goes into its
+  own handle, because the body the node runs is the wrapper the handle was
+  built with — upstream's `std::packaged_task`, whose executor's own exception
+  handler never sees such a failure either, the packaged task having swallowed
+  it first. A `silent_async`'s has no handle and no anchor: the
+  payload lands on the node the task is, where upstream parks it too, and goes
+  with the node one share later. A *silent dependent-async*'s lands in the same
+  place and is readable, because that node is still named by an `AsyncTask`
+  handle: `AsyncTask::take_panic` is upstream's `exception_ptr()` on the same
+  node, and the tear-down parks the payload before it sets `FINISHED` so that a
+  caller who sees `is_done` can take it. None of the three cancels anything,
+  which is the sentinel's third property above.
+
+  A free node that has a *parent* — a runtime body's child, a group's — moves
+  the destination rather than the mechanism: the walk takes its parent links
+  first, and only the root reached through them decides the case. That is also
+  why the walk carries a run along rather than reading
+  the failing job's own — a child spawned under a node of a real run holds the
+  sentinel on its own job while the chain above it roots at the run that is
+  actually waiting (#105, #115).
+- **One place in the crate builds an `AsyncHandle`, and a submission belongs
+  to the shared state rather than to the `Executor`** (issues #90, #92).
+  Upstream's handle-returning form is a `std::packaged_task<R()>` plus the
+  `get_future()` beside it, and the port keeps them a *pair*: one call wraps
+  the body and hands back the wrapper together with the handle its outcome
+  will arrive at, because a promise and a future are two ends of one slot and
+  handing out either alone is not a thing a caller should have to arrange. A
+  runtime-shaped task needs only the handle end — its outcome is decided on
+  the entry that *finishes* the node, out of the node's payload slot rather
+  than out of a return value — so that half is a second constructor on the
+  same seam rather than a second way of making a handle. And the submitting
+  code lives on the executor's shared state, with the public `Executor`
+  methods two lines over it: a `Runtime` body holds the worker's share of that
+  state and no `Executor` at all, for the reason the entry above on
+  `rt.executor()` gives, so a submission that lived on the `Executor` would
+  have been a submission a task body could not make.
+- **Semaphore waiters are jobs, and an over-release is the releasing task's own
+  failure** (issues #87, #89). Upstream's waiting list holds `Node*` and leaves
+  the caller to keep those nodes alive; here it holds the crate's unit of
+  queued work, which owns the run, the graph and the node it names for as long
+  as it sits in the list — and a task keeps an `Arc<Semaphore>` where upstream
+  stores the address of one, since a graph cannot promise that an object it
+  only points at outlives it. Three consequences are decisions in their own
+  right. A parked job is *not* finished, so nothing is counted down and the run
+  stays exactly as outstanding as it was. The jobs a release wakes go to the
+  shared buffers rather than into the worker's continuation slot: that slot is
+  for a successor of *this* node's graph counted against *this* node's parent,
+  and a woken job may belong to another graph and another run entirely, while a
+  release wakes a whole set where the slot holds one. And releasing past the
+  maximum, which is upstream's `TF_THROW` out of the worker loop, is here a
+  failure of the task that did it — delivered to the same anchor a panic in its
+  body would reach, surfaced from `wait` as `RunError::Panicked`, with the
+  semaphore's counter left alone and the jobs woken by that task's *earlier*
+  successful releases still queued, since dropping those would leave their
+  counts outstanding for ever.
+
+  One interaction is **recorded rather than fixed**, because it is upstream's:
+  a job parked on a semaphore when its run is cancelled stays parked. Nothing
+  sweeps a waiting list, so that job runs only when some other task releases,
+  and until then the run's join counter never reaches zero — the one way a
+  cancelled run does not complete promptly. The order of the two hooks bounds
+  it, the cancellation check coming before the acquire, and `Semaphore::reset`
+  is not the rescue either: it drops the waiting list, which unschedules those
+  tasks for good. The executor's module docs have the race that is left.
+- **A task group has no implicit join on drop** (issue #93). Upstream's
+  `TaskGroup` has no destructor, so a group that goes out of scope with work
+  outstanding dangles the `NodeBase` its children are still counting down —
+  undefined behaviour, which upstream's own documentation says in as many
+  words. This port mirrors the *behaviour* without the undefined half: the
+  anchor is an `Arc` shared with every child rather than a value on the opening
+  frame, so an unjoined group is merely unjoined — the children run, their
+  counts land on an anchor that is still alive, and the last share goes with
+  the last child, taking a payload nobody came for with it. A `Drop` that
+  coruns was the alternative and is declined deliberately: it would put a wait
+  on the one path a caller cannot see, cannot opt out of and cannot handle a
+  failure from, including an unwind, where coruning inside a `Drop` risks a
+  second panic and an abort. `TaskGroup::corun` is where the join and the
+  failure both live.
+
+  A group's children are also queued in the shared buffers where a runtime
+  body's go onto the submitting worker's own queue, and that stays true even
+  for a group that could name its worker: `corun` on a group runs without the
+  owning end of that queue, so its pops are steals from the first-in end, and
+  pushing LIFO against a FIFO waiter would hand the corun the oldest
+  outstanding subtree rather than the child it just spawned. What that leaves
+  is a **stack-depth** ceiling, not a correctness one — every child still runs
+  — and `src/task_group.rs` has where the cliff is, with the test inputs kept a
+  factor of two inside it.
+- **A bypassed dependency may not re-enter a task the run has entered**
+  (issues #98, #107). A join counter can be driven to zero by something other
+  than its dependencies — `Runtime::schedule` stores a zero, and a conditioner
+  zeroes the successor it selects — so a later strong release can arrive at a
+  counter that is already zero. Upstream's bare `fetch_sub` on a `size_t`
+  wraps it to `SIZE_MAX`, which is silent and not benign: a wrapped counter
+  never equals the one a `Runtime::corun` waits for nor the zero a parent waits
+  for, so a bypassed node that later coruns or preempts hangs. The decrement
+  therefore **floors at zero**, which keeps the counter's meaning and loses no
+  release upstream delivers. The other half the floor cannot reach is a bypass
+  that lands on a node already *entered* — one whose count is one reference per
+  piece of its own outstanding work rather than a dependency count — because
+  spending one of those resumes the node before that work is done. Both
+  bypasses ask the question before they touch the counter and both are
+  **refused**: `Runtime::schedule` panics on an entered target, and a strong
+  release onto one is dropped and recorded as the failure of the task that
+  released it, so the run answers with a reported failure where it used to
+  hang. A task that has *finished* and re-armed its counter is a different
+  case and is not diagnosed: it simply runs a second time, which is the
+  caller's own doing and stays upstream's rule to keep rather than this port's
+  check — schedule a task the graph cannot otherwise reach.
+- **A run's waiter is released by the last share of its storage hold** (issues
+  #109, #112). Two rules used to carry the promise that a `wait` returning
+  means the taskflow is editable: a job gives up its share of the storage
+  before the decrement that can end the run, and the tear-down drops the run's
+  own share before releasing the waiter. The pair does not add up, because a
+  node that *preempts* is dequeued as a job and that job is then copied three
+  times — onto the frame inside the dispatch arm, into the parent its nested
+  graph is scheduled under, and as the job the last child re-queues to resume
+  it — and only the third copy is ever finished. The other two are dropped by
+  frames that have moved on, and nothing orders those instructions against the
+  resumed node ending the run, so a `wait` could return, and on CI did, with a
+  copy still holding the storage and the caller's next `emplace` panicking.
+  Eliminating the copies is not available: the join counter a child decrements
+  lives in the parent node, inside what one of those copies keeps alive. So the
+  release of the waiter moved instead — the run's hold on the storage is one
+  allocation every job of the run's graph shares, and its `Drop` releases the
+  storage, then the executor's count, then the waiter, in that order. One
+  waiter cannot be released that way, and takes the same hold from the other
+  side: a `corun` frame parks nowhere, so it *owns* the hold and waits for
+  `Arc::get_mut` to call it unique, which is the one question no mere holder of
+  a share can answer (#112). The rule the two shapes share — a thread is woken
+  only by the drop of the last hold on whatever it will touch next — is since
+  #138 and #141 a debug assertion and a loom model rather than a paragraph.
+- **A task body's async child is queued on the worker running the body**
+  (issue #119). Upstream's `_schedule_async_task` branches on whether the
+  submitting thread is one of its workers, and the port takes that branch on
+  whether the caller was *handed* its worker rather than by looking the thread
+  up — the owning end of a worker's queue lives in the `WorkerThread` frame
+  that called the body, and a frame cannot be named by the code it called. So
+  `Executor::spawn` from inside a task body still goes to the shared buffers,
+  and a `Runtime`'s eight forms, which are given the scheduler, push onto the
+  worker's own queue. The difference is not a micro-optimisation: that queue is
+  LIFO, so a body that spawns a child and then coruns gets *that child* back
+  rather than the oldest job in the pool, and each nested corun that picks up
+  somebody else's work adds a frame without retiring one. The port's
+  `Runtime.Fibonacci` overflowed a worker's stack in under a second with the
+  children in the buffers; with this branch it computes upstream's own
+  `fib(25)` at one to four workers, which is the input that test ships.
 
 ### Performance
 
 Every measured number this port has is in [`BENCHMARKS.md`](BENCHMARKS.md) —
-four of upstream's benchmarks ported to criterion with a rayon baseline in the
+six of upstream's benchmarks ported to criterion with a rayon baseline in the
 role TBB's flow graph plays upstream, the machine and the load it was under
-recorded beside them, and after the four tables the per-decision measurements
-behind #40, #74 and the `Work` question. They are kept there rather than
-repeated here, so each figure has one owner. Benchmarks are deliberately
-outside the gate: a benchmark answers "how fast", which is not a pass or a
-fail, so what CI holds the suite to is that it still compiles.
+recorded beside them, and after the tables the per-decision measurements: #40
+and #74 on what a job owns, the continuation #62 did not port, the `Work`
+question, external submission (#60), a task body's own queue (#119), the
+spill-buffer count (#102) and what a free async task costs (#125). They are
+kept there rather than repeated here, so each figure has one owner.
+Benchmarks are deliberately outside the gate: a benchmark answers "how fast",
+which is not a pass or a fail, so what CI holds the suite to is that it still
+compiles.
 
 Two of those results are bad, and both are tracked rather than filed away,
 because the honest state of play is more useful than a table of the shapes
@@ -406,7 +662,17 @@ that happen to look good:
   overflow buffers, and from there one steal at a time, so a graph that is
   nothing but independent sources is distributed entirely by stealing:
   `embarrassing_parallelism` at 65536 tasks and 24 workers measures about 5x
-  rayon on the same box in the same run.
+  rayon on the same box in the same run. One obvious lever is **settled**:
+  more spill buffers are worth 4 to 6% here and the count stays
+  `bit_width(num_workers)` all the same, because it is also every worker's
+  victim space and the spin budget before one parks — at 48 buffers a
+  thousand-link chain costs 26% more and a task group's recursion 18%, and
+  there is no count in between that is a free win. #102 is that measurement;
+  it also found #60's *stated* reason for declining the change wrong, since
+  what pays is not the shapes that steal from worker queues but the shapes
+  with one source task and nothing to steal, which pay per run.
+  A free async task submitted the same way costs ~440 ns, 87% of it the node
+  it allocates (#125), and that too is the design rather than a tuning gap.
 - **The continuation optimisation** (issue #62). Upstream's `_update_cache` /
   `TF_INVOKE_CONTINUATION` keeps one ready successor out of the queue and
   resumes it on the worker that just finished its predecessor, so a chain runs

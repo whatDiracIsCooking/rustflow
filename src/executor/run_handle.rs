@@ -65,9 +65,12 @@
 //!   it cannot survive.
 //! - [`Executor::wait_for_all`] is not what makes dropping an executor safe:
 //!   an executor with a run in flight is one some handle borrows, so only the
-//!   leaked-handle case above can reach `Drop` at all. It is here because
-//!   upstream has it and because the async run handle will need the count it
-//!   reads.
+//!   leaked-handle case above can reach `Drop` at all. What it is *for* is
+//!   the work that has no borrowing handle, which the crate has had since
+//!   #88: a free async task is counted in the same count as a run, so this is
+//!   the one call that waits for one, and dropping the executor waits for
+//!   that kind of work alone -- on a second count of its own, so that the
+//!   leaked-handle promise above survives. `executor::async` has the split.
 //!
 //! # The `run` family
 //!
@@ -99,7 +102,12 @@ use crate::executor::{Executor, Shared};
 use crate::graph::Node;
 use crate::taskflow::{Flow, Taskflow};
 
-/// Why a run did not finish cleanly.
+/// Why a run did not finish cleanly -- and, since the async family, also what
+/// an [`AsyncHandle`](crate::AsyncHandle)'s `wait`, a
+/// [`TaskGroup::try_corun`](crate::TaskGroup) and a `Runtime::try_corun`
+/// report about the work *they* were waiting for. One type for one question,
+/// whoever is asking, which is why [`CorunError::Run`](crate::CorunError)
+/// carries this rather than restating it.
 ///
 /// One variant so far, and the enum is `#[non_exhaustive]` because later
 /// milestones have more ways for a run to fail. Cancellation is deliberately
@@ -694,15 +702,24 @@ impl Executor {
         }
     }
 
-    /// Blocks until no run is in flight on this executor. Upstream's
-    /// `wait_for_all`.
+    /// Blocks until this executor is carrying nothing: no run, and no free
+    /// async task. Upstream's `wait_for_all`.
     ///
     /// Upstream's destructor calls this so that a detached future cannot
-    /// outlive the pool. Nothing here needs it for that -- a [`RunHandle`]
-    /// borrows the executor and blocks on drop, so a run in flight is already
-    /// a run whose handle is alive and whose borrow keeps the executor around.
-    /// What it answers is the question upstream's `num_topologies` answers:
-    /// is the executor idle.
+    /// outlive the pool. For a *run* nothing here needs it for that -- a
+    /// [`RunHandle`] borrows the executor and blocks on drop, so a run in
+    /// flight is already a run whose handle is alive and whose borrow keeps
+    /// the executor around. For an async task it is the whole answer, and the
+    /// reason this is not only a diagnostic: an
+    /// [`Executor::silent_async`](crate::Executor::silent_async) hands out no
+    /// handle at all and an [`AsyncHandle`](crate::AsyncHandle) that is
+    /// dropped detaches, so this call and
+    /// [`Executor`]'s own `Drop` are the two things that wait for such a
+    /// task. The two counts behind that are `executor::async`'s to explain,
+    /// including why `Drop` waits on the narrower of them (#88) and why a
+    /// child of a [`Runtime`](crate::Runtime) body or of a
+    /// [`TaskGroup`](crate::TaskGroup) is in neither (#115) -- the parent
+    /// waiting for it accounts for it instead.
     ///
     /// Once it returns, every taskflow whose runs it waited for is editable,
     /// as it is after a `wait`: the decrement that wakes this is performed by

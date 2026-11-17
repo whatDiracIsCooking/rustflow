@@ -420,9 +420,13 @@ impl AsyncWork {
 /// What a node does when the executor reaches it.
 ///
 /// Upstream is a `std::variant` of eleven alternatives (subflow, module,
-/// async, ...). This port grows one variant per milestone, so the enum is
-/// `#[non_exhaustive]`: adding the rest must not break callers outside the
-/// crate.
+/// async, ...) and this port has ten of them: the one still missing is
+/// upstream's `NonpreemptiveRuntime`, the second of its two runtime shapes.
+/// The enum stays `#[non_exhaustive]` all the same, because arriving at that
+/// eleventh must not break callers outside the crate -- and because a variant
+/// here is not a variant a caller can usefully construct for itself:
+/// [`Handle::Async`] and [`Handle::DependentAsync`] are handles the
+/// *executor* makes, as their own docs say.
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub enum Handle {
@@ -712,12 +716,14 @@ impl NodeBase {
     /// `NSTATE::IMPLICITLY_ANCHORED`, which marks a node that preempted
     /// itself and will look at its slot when it is resumed.
     ///
-    /// Runtime tasks are the one node kind that sets it: `executor::runtime`
-    /// takes `PREEMPTED | IMPLICITLY_ANCHORED` together on a first entry, so
-    /// the implicit case of the walk is reached by a running graph and not
-    /// only by the unit test written for it. A node that a subflow or a
-    /// module merely preempted is no anchor, which is upstream's arrangement
-    /// too.
+    /// `executor::runtime` is what sets it, taking
+    /// `PREEMPTED | IMPLICITLY_ANCHORED` together on a first entry -- so it
+    /// is on a runtime task (#51) and on a free node whose body is handed a
+    /// `Runtime` (#90), the two kinds that go through that entry. A
+    /// `TaskGroup`'s anchor carries it from the moment the group is opened
+    /// instead, for its whole life rather than for one nested run (#93). A
+    /// node that a subflow or a module merely preempted is no anchor, which
+    /// is upstream's arrangement too.
     pub(crate) fn is_implicitly_anchored(&self) -> bool {
         self.nstate.load(Ordering::Relaxed) & Node::IMPLICITLY_ANCHORED != 0
     }
@@ -974,7 +980,8 @@ impl Node {
     /// explicitly waiting for a graph -- see the
     /// [`executor`](crate::executor) module docs for the three kinds and the
     /// order they are tried in. Upstream sets it on a runtime task's node for
-    /// as long as that body's own children are running, which is #51.
+    /// as long as that body's own children are running, which is #51, and on
+    /// a task group's anchor for the whole life of the group, which is #93.
     pub const IMPLICITLY_ANCHORED: u32 = 0x1000_0000;
 
     /// Upstream's `NSTATE::STRONG_DEPENDENCIES_MASK`: which bits of the
