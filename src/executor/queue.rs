@@ -182,13 +182,26 @@ impl<T: Send> Buffers<T> {
         self.buffers.len()
     }
 
-    /// Returns `true` if every buffer was empty at the moment of the call.
+    /// Returns the index of the first buffer that was not empty, or `None` if
+    /// they all were.
     ///
     /// The buffers are not read atomically with respect to each other, so this
     /// is a hint -- the same hint upstream checks before a worker commits to
-    /// sleeping.
+    /// sleeping. The *index* is the part that matters to the caller: a worker
+    /// that finds work here points its sticky victim at the buffer holding it
+    /// rather than at the first buffer, which is what upstream does when it
+    /// walks the buffers one at a time.
+    #[must_use]
+    pub fn first_nonempty(&self) -> Option<usize> {
+        self.buffers.iter().position(|buffer| !buffer.is_empty())
+    }
+
+    /// Returns `true` if every buffer was empty at the moment of the call.
+    ///
+    /// As much of a hint as [`first_nonempty`](Self::first_nonempty), which is
+    /// what it asks.
     pub fn is_empty(&self) -> bool {
-        self.buffers.iter().all(|buffer| buffer.is_empty())
+        self.first_nonempty().is_none()
     }
 
     /// Returns the index of the buffer [`push`](Self::push) routes `item` to.
@@ -460,6 +473,27 @@ mod tests {
         }
 
         assert!(buffers.is_empty());
+    }
+
+    #[test]
+    fn the_first_nonempty_buffer_is_the_one_holding_work() {
+        let buffers = Buffers::new(32);
+        assert_eq!(buffers.first_nonempty(), None);
+        assert!(buffers.is_empty());
+
+        // Find an item that routes to a buffer other than the first, so that
+        // the answer distinguishes "some buffer" from "buffer zero".
+        let item = (0..1024_usize)
+            .find(|item| buffers.buffer_of(item) > 0)
+            .expect("the routing reaches every buffer");
+        let index = buffers.buffer_of(&item);
+
+        buffers.push(item);
+        assert_eq!(buffers.first_nonempty(), Some(index));
+        assert!(!buffers.is_empty());
+
+        assert_eq!(buffers.steal_from(index), Some(item));
+        assert_eq!(buffers.first_nonempty(), None);
     }
 
     #[test]
