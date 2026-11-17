@@ -22,6 +22,7 @@
 //! workers, hand them the shared state, join them on drop. See each submodule
 //! for what it does and does not owe to upstream.
 
+pub mod corun;
 pub mod notifier;
 pub mod queue;
 pub mod rng;
