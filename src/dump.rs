@@ -40,7 +40,12 @@
 //! `todo!()` naming #30 rather than a guess at the format, and #30 then
 //! replaced both with the diamond shape and the dashed, position-labelled
 //! edge upstream writes. So a graph holding a conditioner dumps like any
-//! other now; only the module and subflow clusters above are still missing.
+//! other now.
+//!
+//! The four dynamic-tasking handles are at the same stage as of #45: each arm
+//! below is a `todo!()` naming #46, which owns the cluster format, so dumping
+//! a graph that holds a subflow, runtime or module task panics until that
+//! issue lands.
 
 use core::fmt;
 
@@ -224,6 +229,12 @@ fn node_shape(handle: &Handle) -> &'static str {
         Handle::Condition(_) | Handle::MultiCondition(_) => {
             "shape=diamond color=black fillcolor=aquamarine style=filled"
         }
+        Handle::Subflow { .. } | Handle::Runtime(_) => {
+            todo!("the subflow and runtime node shapes are issue #46's")
+        }
+        Handle::Module(_) | Handle::AdoptedModule(_) => {
+            todo!("the module node shape is issue #46's")
+        }
     }
 }
 
@@ -240,6 +251,12 @@ fn edge_attributes(handle: &Handle, position: usize) -> String {
         Handle::Placeholder | Handle::Static(_) => String::new(),
         Handle::Condition(_) | Handle::MultiCondition(_) => {
             format!(" [style=dashed label=\"{position}\"]")
+        }
+        Handle::Subflow { .. }
+        | Handle::Runtime(_)
+        | Handle::Module(_)
+        | Handle::AdoptedModule(_) => {
+            todo!("issue #46 writes the edges leaving a dynamic task: {position}")
         }
     }
 }

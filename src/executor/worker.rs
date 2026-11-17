@@ -455,11 +455,13 @@ impl WorkerThread {
     /// becomes runnable next.
     ///
     /// Upstream's `_invoke`, restricted to the four node kinds it can run --
-    /// static, placeholder and the two conditioners. Upstream's six other
-    /// kinds, its semaphores and its observers are each a later milestone, and
-    /// none of them is silently absent: the `match` below is exhaustive over
-    /// [`Handle`], so a new kind arrives as a compile error here rather than as
-    /// a task that mysteriously does nothing.
+    /// static, placeholder and the two conditioners. The four dynamic-tasking
+    /// kinds are graph citizens as of #45 and each has an arm below that
+    /// refuses the run; upstream's three remaining kinds, its semaphores and
+    /// its observers are each a later milestone, and none of them is silently
+    /// absent: the `match` below is exhaustive over [`Handle`], so a new kind
+    /// arrives as a compile error here rather than as a task that mysteriously
+    /// does nothing.
     ///
     /// The bookkeeping is upstream's two switches over the handle, in its
     /// order: run the work, re-arm this node's own join counter, then release
@@ -535,6 +537,63 @@ impl WorkerThread {
                     .map_err(|payload| topology.record_panic(payload))
                     .unwrap_or_default(),
             ),
+            // The four dynamic-tasking handles, which #45 made graph citizens
+            // and nothing here can run yet. Each of them needs a piece of the
+            // scheduler that does not exist: a subflow or a module node is the
+            // *parent* of a nested graph, so running one means scheduling that
+            // graph and leaving this node preempted until its children are
+            // done, and a runtime node hands its body the scheduler itself.
+            // None of that can be approximated from here, so each arm refuses
+            // the run instead of guessing, through the channel the static arm
+            // above already uses for a task that fails -- and the work is not
+            // invoked at all.
+            //
+            // A bare `panic!` would be the worse failure rather than the
+            // louder one, which is what #28 established when the conditioner
+            // arms sat here: it unwinds into `WorkerThread::run`'s
+            // `catch_unwind` with this job never counted as finished, so
+            // `Topology::join` never completes and `RunHandle::drop` blocks
+            // for ever. A hang says less than an error does.
+            //
+            // The refusal is louder than #28's was, though, and deliberately
+            // so: `Topology::record_panic` sets `EXCEPTION` beside `CAUGHT` as
+            // of #32, and `EXCEPTION` is half of `Topology::cancelled`, so
+            // refusing one node now cancels the rest of the run -- every task
+            // the run had not started is skipped. That is the better of the
+            // two failures available here, since `wait` still hands back the
+            // payload rather than hanging, but it is no longer "one task
+            // refused, the others ran".
+            //
+            // It is also why the unconditional release below may treat a
+            // refused node as an ordinary one, rather than needing the
+            // preemption special case #47 gives these kinds. The successors
+            // are counted on the topology and queued exactly as a static
+            // task's are, and every one of them then takes the early-out at
+            // the top of this method, because the run it belongs to is
+            // cancelled by the line above. So the join counters still reach
+            // zero -- which is the only way the run finishes at all -- and no
+            // successor of a refused node runs its body.
+            Handle::Subflow { .. } => {
+                topology.record_panic(Box::new(
+                    "running a subflow task is not supported yet: \
+                     subflow tasks are issue #50",
+                ));
+                Release::Strong
+            }
+            Handle::Runtime(_) => {
+                topology.record_panic(Box::new(
+                    "running a runtime task is not supported yet: \
+                     runtime tasks are issue #51",
+                ));
+                Release::Strong
+            }
+            Handle::Module(_) | Handle::AdoptedModule(_) => {
+                topology.record_panic(Box::new(
+                    "running a module task is not supported yet: \
+                     module tasks are issue #49",
+                ));
+                Release::Strong
+            }
         };
 
         // Upstream's comment, which is the whole reason this is a `fetch_add`

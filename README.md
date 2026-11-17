@@ -252,6 +252,18 @@ the same split:
 - **Per-node runtime state stays in the node** as atomics, matching upstream's
   join counter and state words, so runs of one taskflow serialise exactly as
   they do upstream.
+- **A module task shares its target, `Arc<Taskflow>`.** Upstream's
+  `composed_of` stores a bare `Graph&` and leaves the caller to keep the
+  composed taskflow alive for as long as any run of the composing one may be
+  in flight — an obligation a safe Rust API cannot state, so the module owns a
+  share of its target instead. `adopt(Graph)` is the owned form of the same
+  thing, for a graph with no other owner.
+- **A subflow's subgraph lives in a `Mutex<Graph>` inside the node's handle,**
+  because the body builds it through a node the run only *borrows*: a worker
+  reaches its node as `&Node`, so the graph it writes needs interior
+  mutability of its own. The `Subflow` handle holds the guard for the body's
+  duration, which cannot deadlock one — a nested subflow locks its own node's
+  graph, so no body ever takes the same lock twice.
 
 ### Order of work
 

@@ -37,29 +37,36 @@
 //!   [`TaskRef::is_empty`] asks whether the node is indistinguishable from a
 //!   freshly created placeholder -- no work, no edges -- which keeps upstream's
 //!   documented pair `task.reset(); assert(task.empty())` true.
-//! - Semaphores, `exception_ptr()`, `dump()`, `composed_of()`, `adopt()` and
-//!   `for_each_subflow_task()` wait for the milestones that give them meaning.
-//!   So does the rest of the `work()` overload set: upstream dispatches one
-//!   `work()` over five callable shapes, and with no overloading here each
-//!   shape is its own method -- [`TaskMut::work`],
-//!   [`TaskMut::condition_work`] and [`TaskMut::multi_condition_work`] are the
-//!   three whose node kinds exist.
+//! - Semaphores, `exception_ptr()`, `dump()` and `for_each_subflow_task()`
+//!   wait for the milestones that give them meaning, and so does the
+//!   `composed_of()`/`adopt()` pair that upstream has on `tf::Task` as well as
+//!   on its builder: the builder forms are
+//!   [`FlowBuilder::composed_of`](crate::FlowBuilder::composed_of) and
+//!   [`FlowBuilder::adopt`](crate::FlowBuilder::adopt), and turning an
+//!   existing task into a module has no caller in this port yet.
+//! - Upstream dispatches one `work()` over five callable shapes, and with no
+//!   overloading here each shape is its own method: [`TaskMut::work`],
+//!   [`TaskMut::condition_work`], [`TaskMut::multi_condition_work`],
+//!   [`TaskMut::subflow_work`] and [`TaskMut::runtime_work`] are all five.
 
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use std::hash::DefaultHasher;
 
-use crate::graph::{Graph, Handle, Task, Work};
+use std::sync::Mutex;
+
+use crate::graph::{Graph, Handle, RuntimeWork, SubflowWork, Task, Work};
+use crate::runtime::Runtime;
+use crate::subflow::Subflow;
 use crate::taskflow::Taskflow;
 
 /// What a task does when the executor reaches it, as a flat enumeration.
 ///
-/// This is upstream's `tf::TaskType`, kept complete even though only
-/// [`TaskType::Placeholder`], [`TaskType::Static`] and [`TaskType::Condition`]
-/// can be built yet: the variants name the port's own roadmap, and the DOT
-/// output and the profiler want the whole set. Upstream's `UNDEFINED` is kept
-/// for the same reason, though nothing can produce it while every [`Handle`]
-/// variant maps to a type of its own.
+/// This is upstream's `tf::TaskType`, kept complete even though
+/// [`TaskType::Async`] cannot be built yet: the variants name the port's own
+/// roadmap, and the DOT output and the profiler want the whole set. Upstream's
+/// `UNDEFINED` is kept for the same reason, though nothing can produce it
+/// while every [`Handle`] variant maps to a type of its own.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum TaskType {
     /// A task with no work attached, upstream's `PLACEHOLDER`.
@@ -119,6 +126,12 @@ fn task_type_of(handle: &Handle) -> TaskType {
         // multi-condition task reports `condition` as well. The handle is what
         // tells the two apart; see [`Handle::is_multi_condition`].
         Handle::Condition(_) | Handle::MultiCondition(_) => TaskType::Condition,
+        Handle::Subflow { .. } => TaskType::Subflow,
+        Handle::Runtime(_) => TaskType::Runtime,
+        // And both module forms fold together the same way, for the same
+        // reason: upstream's `TaskType` has no name for the adopted one, so
+        // `ADOPTED_MODULE` reports `MODULE` there too.
+        Handle::Module(_) | Handle::AdoptedModule(_) => TaskType::Module,
     }
 }
 
@@ -407,6 +420,45 @@ impl<'a> TaskMut<'a> {
         self
     }
 
+    /// Makes this task a subflow task running `callable`, replacing whatever
+    /// work was there.
+    ///
+    /// Upstream's `work()` arm for a `SubflowTaskLike` callable. The body is
+    /// handed the [`Subflow`] it builds into; see
+    /// [`FlowBuilder::emplace_subflow`](crate::FlowBuilder::emplace_subflow)
+    /// for what that means and what still refuses to run one.
+    ///
+    /// The node gets a fresh, empty subgraph: replacing the work of a task
+    /// that was already a subflow task drops the graph the previous body
+    /// built, which is the same thing the next entry to that node would have
+    /// done anyway.
+    pub fn subflow_work<C>(&mut self, callable: C) -> &mut Self
+    where
+        C: for<'b> FnMut(&mut Subflow<'b>) + Send + 'static,
+    {
+        self.graph.node_mut(self.task).set_handle(Handle::Subflow {
+            work: SubflowWork::new(callable),
+            subgraph: Mutex::new(Graph::new()),
+        });
+        self
+    }
+
+    /// Makes this task a runtime task running `callable`, replacing whatever
+    /// work was there.
+    ///
+    /// Upstream's `work()` arm for a `RuntimeTaskLike` callable. The body is
+    /// handed the [`Runtime`] it runs on; see
+    /// [`FlowBuilder::emplace_runtime`](crate::FlowBuilder::emplace_runtime).
+    pub fn runtime_work<C>(&mut self, callable: C) -> &mut Self
+    where
+        C: for<'b> FnMut(&mut Runtime<'b>) + Send + 'static,
+    {
+        self.graph
+            .node_mut(self.task)
+            .set_handle(Handle::Runtime(RuntimeWork::new(callable)));
+        self
+    }
+
     /// Makes this task precede each of `tasks`, upstream's variadic
     /// `precede(Ts&&...)`.
     ///
@@ -673,6 +725,82 @@ mod tests {
         // The task type cannot tell the two apart; the handle can.
         assert!(taskflow.graph().node(t[0]).handle().is_condition());
         assert!(taskflow.graph().node(t[1]).handle().is_multi_condition());
+    }
+
+    /// Every dynamic-tasking handle reports the task type upstream's `type()`
+    /// switch gives it, with the two module forms sharing one name because
+    /// upstream's `TaskType` has no second one.
+    #[test]
+    fn the_dynamic_tasking_handles_report_their_task_types() {
+        let (mut taskflow, t) = taskflow_of(4);
+        taskflow.task(t[0]).subflow_work(|_| {});
+        taskflow.task(t[1]).runtime_work(|_| {});
+        taskflow
+            .graph_mut()
+            .node_mut(t[2])
+            .set_handle(Handle::Module(Arc::new(Taskflow::new())));
+        taskflow
+            .graph_mut()
+            .node_mut(t[3])
+            .set_handle(Handle::AdoptedModule(Graph::new()));
+
+        let types: Vec<TaskType> = t
+            .iter()
+            .map(|task| taskflow.task_ref(*task).task_type())
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                TaskType::Subflow,
+                TaskType::Runtime,
+                TaskType::Module,
+                TaskType::Module
+            ]
+        );
+        let names: Vec<&str> = types.iter().map(|kind| kind.as_str()).collect();
+        assert_eq!(names, vec!["subflow", "runtime", "module", "module"]);
+
+        for task in &t {
+            let handle = taskflow.task_ref(*task);
+            assert!(handle.has_work());
+            assert!(!handle.is_empty());
+            // None of the four is a conditioner, so none of them makes a
+            // dependency on it weak.
+            assert_eq!(handle.num_weak_dependencies(), 0);
+        }
+    }
+
+    /// The two new setters are upstream's remaining `work()` arms: they
+    /// replace whatever was there, in either direction, and leave the graph
+    /// around the node alone.
+    #[test]
+    fn the_dynamic_tasking_setters_replace_the_work_in_place() {
+        let (mut taskflow, t) = taskflow_of(3);
+        taskflow.task(t[1]).succeed([t[0]]).precede([t[2]]);
+
+        taskflow.task(t[1]).work(|| {}).subflow_work(|_| {});
+        assert_eq!(taskflow.task_ref(t[1]).task_type(), TaskType::Subflow);
+        let Handle::Subflow { subgraph, .. } = taskflow.graph().node(t[1]).handle() else {
+            panic!("subflow_work left something else behind");
+        };
+        // A fresh subflow task comes with an empty graph of its own.
+        assert!(subgraph.lock().expect("uncontended").is_empty());
+
+        taskflow.task(t[1]).runtime_work(|_| {});
+        assert_eq!(taskflow.task_ref(t[1]).task_type(), TaskType::Runtime);
+        assert!(taskflow.graph().node(t[1]).handle().is_runtime());
+
+        // Back to a static task, with the edges and the name where they were.
+        taskflow.task(t[1]).work(|| {});
+        assert_eq!(taskflow.task_ref(t[1]).task_type(), TaskType::Static);
+        assert_eq!(taskflow.task_ref(t[1]).name(), "b");
+        assert_eq!(taskflow.task_ref(t[1]).num_predecessors(), 1);
+        assert_eq!(taskflow.task_ref(t[1]).num_successors(), 1);
+
+        // And `reset_work` drops either of them as readily as static work,
+        // subgraph and all.
+        taskflow.task(t[1]).subflow_work(|_| {}).reset();
+        assert!(taskflow.task_ref(t[1]).is_empty());
     }
 
     /// The setters are upstream's `work()` arms, so they replace whatever was

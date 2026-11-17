@@ -94,6 +94,8 @@ pub mod dump;
 pub mod executor;
 pub mod flow_builder;
 pub mod graph;
+pub mod runtime;
+pub mod subflow;
 pub mod task;
 pub mod taskflow;
 
@@ -104,7 +106,9 @@ pub use crate::executor::rng::{Xorshift32, Xorshift64};
 pub use crate::executor::run_handle::{Canceller, RunError, RunHandle};
 pub use crate::executor::worker::{Worker, WorkerInterface};
 pub use crate::flow_builder::{Callables, FlowBuilder};
-pub use crate::graph::{Graph, Handle, Node, Task, Work};
+pub use crate::graph::{Graph, Handle, Node, RuntimeWork, SubflowWork, Task, Work};
+pub use crate::runtime::Runtime;
+pub use crate::subflow::Subflow;
 pub use crate::task::{TaskMut, TaskRef, TaskType};
 pub use crate::taskflow::Taskflow;
 
@@ -124,6 +128,8 @@ pub use crate::taskflow::Taskflow;
 pub mod prelude {
     pub use crate::flow_builder::FlowBuilder;
     pub use crate::graph::{Graph, Handle, Task, Work};
+    pub use crate::runtime::Runtime;
+    pub use crate::subflow::Subflow;
     pub use crate::taskflow::Taskflow;
 }
 
