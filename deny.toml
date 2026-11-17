@@ -77,6 +77,19 @@ unused-allowed-license = "allow"
 # question and not merely bloat -- types from different copies do not unify,
 # and the duplicate is invisible in `Cargo.toml`. Fix it by moving the
 # dependency that pulled the second copy, not with a `skip` entry here.
+#
+# What it does *not* reach is a duplicate that only a dev-dependency pulls in,
+# because cargo-deny scopes this check to non-dev edges unless
+# `multiple-versions-include-dev = true` is set. That default is kept
+# deliberately rather than by omission: `criterion`'s tree does carry two
+# majors of `syn` (one under `zerocopy-derive`, one under `serde_derive`), and
+# two copies of a proc macro's parser, in a build of a benchmark binary that
+# the library never links, is not the correctness question the paragraph above
+# is about. Turning the key on names that duplicate as an error for the rest of
+# time; the narrower reading is that the check exists for what the crate
+# *ships*, which is the same judgement `[graph] targets` above makes about
+# `loom`. The cost is the same too: the duplicate is on record here and
+# nowhere else.
 multiple-versions = "deny"
 # A `*` requirement pins nothing, leaving Cargo.lock as the only record of
 # what we build against.

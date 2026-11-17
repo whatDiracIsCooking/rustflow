@@ -12,6 +12,7 @@
 #   devtools/devcontainer.sh claude [ARGS] Claude Code inside it
 #   devtools/devcontainer.sh check         fmt + clippy + test + deny (the CI gate)
 #   devtools/devcontainer.sh test [ARGS]   cargo test
+#   devtools/devcontainer.sh bench [ARGS]  cargo bench (the criterion suite)
 #   devtools/devcontainer.sh rebuild       rebuild the image after a Dockerfile edit
 #   devtools/devcontainer.sh down          stop it (volumes survive)
 #   devtools/devcontainer.sh nuke          stop it AND drop every volume
@@ -117,6 +118,17 @@ case "$cmd" in
                 cargo deny check'
         ;;
     test)    in_dev "cargo test --all-features $*" ;;
+    # Not part of `check`, deliberately: a benchmark answers "how fast", which
+    # is not a pass/fail, and criterion's own statistics need a quiet machine
+    # to mean anything -- see BENCHMARKS.md. What CI holds the suite to is that
+    # it still compiles, which `cargo clippy --all-targets` in the gate above
+    # already does.
+    #
+    # ARGS land where `cargo bench`'s own do: a bare word is forwarded to the
+    # criterion harness as an id filter (`bench linear_chain`), and anything
+    # after `--` is a harness option -- `bench -- --save-baseline mutex` then
+    # `bench -- --baseline mutex` being how a before/after pair is collected.
+    bench)   in_dev "cargo bench --all-features $*" ;;
     fmt)     in_dev 'cargo fmt --all' ;;
     rebuild) ensure_claude_config_dir \
                  && dc build --no-cache dev \
