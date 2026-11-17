@@ -143,9 +143,9 @@ impl AsyncTask {
     /// than its state word, and the case it exists for is upstream's own: a
     /// **silent** async task has no future and no frame waiting on it, so a
     /// panic out of its body has nowhere to be delivered and is parked on the
-    /// node -- `Job::record_panic`'s last case, the one that was ported
-    /// before anything could reach it. This hands it back to whoever still
-    /// holds a handle.
+    /// node -- `Job::record_panic`'s last case, which such a task is the one
+    /// thing that reaches. This hands it back to whoever still holds a
+    /// handle.
     ///
     /// It is not the `Task::exception_ptr` the README declines to port, and
     /// the difference is which failure the slot holds. A *graph* node's slot

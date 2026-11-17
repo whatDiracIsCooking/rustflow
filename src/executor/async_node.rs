@@ -178,9 +178,10 @@ impl AsyncNode {
     /// The node's own slot, which is the `NodeBase` one every node has. For a
     /// free node it holds what upstream's `exception_ptr()` reads: the one
     /// failure of the one task this node is, parked here because a silent
-    /// task's chain of parents roots at neither a run nor a waiting frame and
-    /// there is nothing above it to deliver to -- `Job::record_panic`'s last
-    /// case, which was ported before anything could reach it.
+    /// task's chain of parents roots at neither a run anybody can wait for
+    /// nor a waiting frame, so there is nothing above it to deliver to --
+    /// `Job::record_panic`'s last case, which a parentless free node is the
+    /// one thing in the crate to reach (#105).
     pub(crate) fn take_panic(&self) -> Option<Box<dyn Any + Send>> {
         self.node().base().take_panic()
     }
