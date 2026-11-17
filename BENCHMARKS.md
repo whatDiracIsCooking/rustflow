@@ -176,6 +176,9 @@ threads, and we turn it into 9.5 ms, a 3.8x one. Every task here is pushed by
 the calling thread into the shared overflow buffers rather than onto a worker's
 own queue, so all 65536 of them are distributed by stealing; that is the first
 thing to look at, and it is a scheduling question rather than a `Work` one.
+**#60 took it apart** -- see "The #60 finding" below for where the 9.5 ms goes,
+which of it came back, and why the rest is the architecture rather than a
+tuning gap.
 
 These rows predate #40 too, which cost this shape 2.4% at 65536 tasks and 24
 workers and 7% at 4096 -- an order of magnitude less than the chain, because
@@ -456,3 +459,203 @@ fraction of it, or an `UnsafeCell` with a `debug_assert`-grade check gets the
 assertion back, the question is open again. The patch used here is 20 lines
 against `Work` alone; nothing in `src/executor/` had to change for it, which is
 the one genuinely reassuring thing the experiment established.
+
+## The #60 finding: external submission costs ~100 ns a task, and 14 ns of it was a hash
+
+The `embarrassing_parallelism` table above leaves 9.5 ms of run against rayon's
+1.9 ms with no explanation, and #60 is where that was taken apart. The headline:
+**the gap is the per-task handoff itself, not the routing, the buffer count or
+the notifier**, and of the ~110 ns a source task cost end to end exactly one
+component turned out to be reducible -- the `DefaultHasher` run that routed each
+job to a buffer, now gone from the bulk path (see `Buffers::push_bulk`).
+
+Everything below was measured with temporary counters and harnesses inside
+`src/executor/queue.rs`; none of that instrumentation is in the shipped code,
+and the atomics it added are a cost the measured figures carry but the crate
+does not. **Three other agents were building and testing on this box
+throughout** -- load average 4.7 to 16.0 across the runs below, named per table
+-- so every comparison here is either a ratio inside one process or a counter
+that does not depend on wall clock at all. #18's figures above are untouched.
+
+### The four hypotheses the issue listed, and what the counters say
+
+**1. "Is the hash distributing at all?" -- yes, and that was the first thing
+killed.** 65536 sources of one taskflow, 24 workers, 5 buffers, counting which
+buffer each `Buffers::push` landed in. Two runs, i.e. two different `Topology`
+and `Flow` allocations:
+
+| | buffer 0 | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|---|
+| run A | 13257 | 13074 | 13058 | 13231 | 12916 |
+| run B | 13149 | 13225 | 13144 | 12997 | 13021 |
+
+A perfectly even deal is 13107.2. The worst cell is 1.5% off it, so the derived
+`Hash` plus upstream's shift-and-remainder reduction spreads consecutive task
+indices as well as anything could -- the concern that two of a `Job`'s three
+hashed fields are constant within a run is answered: `DefaultHasher` is
+SipHash-1-3 and mixes the index alone fine.
+
+**2. "Does stealing find the work?" -- yes, essentially first time.** The same
+runs counted steal outcomes per buffer: 65536 successful steals against 450 to
+1121 empty attempts and 3410 to 8597 crossbeam `Steal::Retry`s. That is **1.01
+to 1.02 buffer attempts per job and 0.05 to 0.13 retries per job**: the workers
+are not thrashing on contended queue heads and they are not sweeping empty
+queues. Whatever the cost is, it is not the search.
+
+**3. "Does the notifier wake enough workers?" -- it already wakes everybody**,
+and waking them *earlier* is worse. `notify_n(65536)` with 24 waiter slots takes
+`NonblockingNotifier::notify_n`'s `n >= self.waiters.len()` branch, which is
+`notify_all`. Two variants of waking earlier were measured against the shipped
+"push everything, then notify": a `notify_all` before the pushes, and a
+`notify_all` every 4096 pushes. Medians of 8 runs, interleaved, 65536 tasks at
+24 workers:
+
+| | notify after (shipped) | notify first | notify every 4096 |
+|---|---|---|---|
+| empty task body, warm pool | 6.02 ms | 13.66 ms | 13.66 ms |
+| 543 ns task body, warm pool | 7.40 ms | 13.52 ms | 14.18 ms |
+| 543 ns task body, pool parked 20 ms first | 8.82 ms | 18.19 ms | 19.56 ms |
+
+Roughly **twice as slow**, and the mechanism is visible in hypothesis 5 below:
+a woken worker's first act is to sweep the buffers, and those are the cache
+lines the producer is still pushing into. Upstream's commented-out experiment in
+`_bulk_schedule` says waking first "does not show any benefit"; here it is
+actively harmful, and the `bulk_schedule` doc now records that.
+
+**4. "How many buffers are there?" -- 5 for 24 workers, and more buffers do help
+a little.** 65536 sources at 24 workers, dealt round-robin, medians of 8
+interleaved runs:
+
+| buffers | empty task body | 543 ns task body |
+|---|---|---|
+| 5 (`bit_width(24)`, shipped) | 6.42 ms | 7.44 ms |
+| 12 | 5.95 ms | 6.68 ms |
+| 24 | 5.90 ms | 6.62 ms |
+| 48 | 5.58 ms | 6.41 ms |
+
+**Declined, deliberately.** The buffer count is not a property of this path
+alone: `Shared::num_queues` is every worker's victim space in every shape, so
+going from 5 buffers to 48 would make 48 of 72 possible victims a queue that
+only an external submitter ever fills -- paid by `graph_traversal` and
+`binary_tree`, which push their successors onto worker queues and would draw
+empty victims instead. Buying 10% on one shape with a slower steal loop
+everywhere needs its own issue and its own measurement of the other three
+shapes, not a line in this one.
+
+### 5. What it actually costs: ~100 ns a task, and more workers do not help
+
+The decisive measurement is the shape with **no task body at all** -- 65536
+`emplace`d closures that do nothing -- because then the wall clock is pure
+scheduler. Medians of 4 runs each, rayon's `par_iter` over the same count in the
+same process as the load control (its body does one `fetch_add`, ours does
+nothing, so if anything this flatters neither side):
+
+| workers | rustflow | per job | rayon |
+|---|---|---|---|
+| 1 | 6.08 ms | 93 ns | 0.16 ms |
+| 2 | 22.88 ms | 349 ns | 0.56 ms |
+| 4 | 13.54 ms | 207 ns | 1.34 ms |
+| 8 | 9.82 ms | 150 ns | 1.29 ms |
+| 16 | 6.74 ms | 103 ns | 1.16 ms |
+| 24 | 7.32 ms | 112 ns | 1.26 ms |
+
+**That column does not come down.** 24 workers cost *more* per job than one
+does, which is the whole finding: the per-task cost of an externally submitted
+graph is not work that parallelises, it is cache-coherence traffic that gets
+worse as more cores join in. (The 2-worker row is 3x its neighbours and is not
+explained; it reproduces, and it deserves its own look.)
+
+Two harnesses split that ~100 ns, both with 65536 items and 24 consumer threads:
+
+- **The bare handoff** -- one producer pushing plain `usize`s into the buffers
+  while 24 thieves take them one at a time, no `Job`, no `Arc`, no task body --
+  costs **87 to 91 ns an item** (5.7 to 5.9 ms). The executor adds almost
+  nothing to it.
+- **The shared counters a job carries** -- three `Arc` clone/drop pairs and two
+  read-modify-writes on one shared counter, which is what `Job` plus
+  `Parent::count_queued` and `Job::finish` do per task -- cost 15 ns a job on
+  one thread and **63 ns a job across 24**, i.e. ~8 ns per contended atomic.
+  That is the same figure #40 measured for its two refcounts (~9 ns) from the
+  other direction.
+
+So the budget is: ~60 ns of contended refcount and join-counter traffic, ~30 ns
+of queue traffic moving the job from the producer's cache line to a consumer's,
+and 14 ns of hash. The producer side of it alone -- materialise a `Job`, hash
+it, push it -- is **36 to 41 ns a job measured at one worker** (the time for
+`Executor::run` to return), rising to 46-103 ns at 24 workers as thieves pull on
+the same lines. For 65536 sources that is a 2.4 to 6.7 ms single-threaded phase
+during which 24 workers, which could retire a 543 ns task every 23 ns between
+them, are starved by a producer that emits one every ~77 ns.
+
+### The change: deal the batch, hash nothing
+
+`Buffers::push_bulk` deals a batch round-robin and hashes nothing, which is
+upstream's `_bulk_spill_round_robin` rather than its `_bulk_spill`; single
+`Buffers::push` still hashes, since one item has nothing to deal. Interleaved
+A/B in one process with both paths compiled in, **the order of the two swapped
+every round**, 20 samples per id, medians, run only (the taskflow is built once
+outside the loop); load average 4.7 to 8.1:
+
+| id | hashed (before) | dealt (after) | change | rayon, same loop | ratio before -> after |
+|---|---|---|---|---|---|
+| 1 worker, 4096 | 2.768 ms | 2.719 ms | −1.8% | 3.198 ms | 0.87x -> 0.85x |
+| 1 worker, 65536 | 42.634 ms | 40.620 ms | −4.7% | 35.984 ms | 1.18x -> 1.13x |
+| 24 workers, 4096 | 752 µs | 561 µs | **−25.3%** | 429 µs | 1.75x -> 1.31x |
+| 24 workers, 65536 | 7.917 ms | 6.705 ms | **−15.3%** | 3.000 ms | 2.64x -> 2.23x |
+
+A method note worth keeping, because it nearly produced a wrong answer: with
+the two paths always measured in the same order within a round, the 4096-task
+row read **+61%** instead of −25%. At half a millisecond a run, whichever path
+follows rayon's turn finds the pool in a different state from the one that
+follows a rustflow run, and only alternating the order cancels it.
+
+The criterion suite was then run before and after on all four shapes, adjacent
+runs, load average 9.3 rising to 16.0 -- build *and* run, so these are the ids
+the tables above quote:
+
+| id | before | after | rayon before -> after |
+|---|---|---|---|
+| `embarrassing/24w/65536` | 15.73 ms | 11.81 ms | 2.51 -> 2.04 ms |
+| `embarrassing/24w/4096` | 1.025 ms | 916 µs | 304 -> 167 µs |
+| `embarrassing/1w/65536` | 46.20 ms | 45.53 ms | 36.08 -> 35.67 ms |
+| `linear_chain/24w/16384` | 4.329 ms | 4.330 ms | n/a |
+| `binary_tree/24w/65536` | 14.13 ms | 15.26 ms | 1.042 -> 1.022 ms |
+| `graph_traversal/24w/56759` | 6.161 ms | 6.873 ms | 2.438 -> 2.387 ms |
+
+The rayon column moved by 5 to 45% between those two runs, which is what this
+box's load does over four minutes, and that is the reason the A/B table above is
+the one to read. The other three shapes **cannot** be affected by more than a
+rounding error and were not expected to be: a chain and a tree have exactly one
+source task, and a 128x128 level graph has 128, so the change removes one hash
+per run from the first two and 128 from the third -- under 2 µs of a 6 ms run.
+Their rows here are the load, not the patch.
+
+### What is left is architectural, and it is not a queue tweak
+
+After the change a 65536-task flat graph is ~2.2x rayon rather than ~2.6x, with
+~95 ns of per-task cost left. None of it is reachable from this module:
+
+- **~60 ns is the shared counters a `Job` carries** -- #40's refcounts plus the
+  parent's join counter up and down. That section explains why they are there
+  and what would get them back (upstream's `_update_cache` continuation, which
+  keeps one successor out of the queue entirely).
+- **~35 ns is the handoff**, and the producer pays ~40 ns of it before any
+  consumer is involved. That is the hard floor: **65536 sources cannot be
+  submitted from one thread for less than ~2.6 ms**, which is already more than
+  rayon's whole 1.9-3.0 ms run. No consumer-side cleverness can fix a
+  producer-bound path, and the measurement says so directly -- replacing the
+  one-at-a-time steal with crossbeam's `steal_batch_and_pop` in the bare-handoff
+  harness made it *slower* (10.25 ms against 5.94 at 5 buffers, 7.29 against
+  5.85 at 24), because batching helps a consumer that is behind and these
+  consumers are starved.
+
+The difference from rayon is therefore structural rather than a tuning gap:
+`(0..n).into_par_iter()` never materialises n work items. It splits an index
+*range* recursively, so the number of cross-thread handoffs is O(log n) and no
+per-item write ever touches a line another core owns, while upstream's design --
+which this port follows -- queues one node per task and hands each one across a
+core boundary. Closing the rest of this gap means giving the scheduler a
+splittable source range, i.e. something `tf::Taskflow` does not have and
+`tf::TaskGroup`'s `for_each` is the nearest thing to; it is a milestone, not a
+patch. **That is the recorded cost of the architecture, with the numbers above
+as the evidence.**

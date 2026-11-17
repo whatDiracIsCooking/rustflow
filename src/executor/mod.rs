@@ -371,18 +371,26 @@ impl Shared {
     /// waking. A worker scheduling its own successors uses
     /// [`WorkerThread::schedule`](crate::executor::worker::WorkerThread) and
     /// its own queue instead.
+    ///
+    /// The batch is dealt round-robin by [`Buffers::push_bulk`] rather than
+    /// hashed item by item, which is upstream's `_bulk_spill_round_robin`
+    /// rather than its `_bulk_spill`; that method records what #60 measured,
+    /// and `BENCHMARKS.md` records what remains. For a graph of 65536 sources
+    /// this call *is* the run's critical path -- the producer materialises and
+    /// pushes every job while 24 workers wait on it -- so the per-item cost
+    /// here is worth more than it looks.
     pub(crate) fn bulk_schedule(&self, jobs: impl IntoIterator<Item = Job>) {
-        let mut num_jobs = 0;
-        for job in jobs {
-            self.buffers.push(job);
-            num_jobs += 1;
-        }
+        let num_jobs = self.buffers.push_bulk(jobs);
 
         // Notified after the pushes, as upstream notifies: a worker woken
         // before its work is visible would sweep the queues, find nothing and
         // go back to sleep. Upstream's commented-out experiment in
         // `_bulk_schedule` is exactly this trade, and it records that waking
-        // first bought nothing.
+        // first bought nothing. #60 measured it here too, on 65536 sources and
+        // 24 workers, both as upstream wrote it and as a `notify_all` every
+        // 4096 pushes: either way the run took close to twice as long, because
+        // the woken workers sweep the queues and the cache lines they sweep are
+        // the ones the producer is still pushing into.
         if num_jobs > 0 {
             self.notifier.notify_n(num_jobs);
         }
