@@ -44,6 +44,13 @@ not green, and `-D warnings` means a *warning* is a failure.
   `deny` job on a plain runner rather than a fourth step there -- its comment
   says why -- which means the workflow is green only when *both* jobs are.
 
+**Never wait in a loop.** Run a gate command in the foreground and read its
+output. No `until`/`while` + `sleep` poll -- not on `pgrep`, not on a log
+file, not on `gh pr checks`. Such a loop has hung this repo's agents twice: a
+`pgrep -f "<pattern>"` matches the waiting shell's own command line, so it
+never exits, and a caller is not woken while you run. If you are genuinely
+blocked on something outside your control, say so and stop.
+
 ## Lints that will bite
 
 `Cargo.toml` turns several lints on crate-wide, and `-D warnings` promotes
@@ -69,8 +76,14 @@ A module translated closely from upstream **must** name its source on the
 first line of its own `//!` doc comment:
 
 ```rust
-//! Translated from `taskflow/core/executor.hpp`.
+//! Translated from `taskflow/core/executor.hpp` (Taskflow v4.1.0).
 ```
+
+**The version is part of the line**, not decoration: upstream rewrites its
+scheduler between major versions, so a bare "translated from `executor.hpp`"
+is not an auditable claim. Take the version from the README's "Upstream pin"
+section rather than from this file -- the pin is repo-wide and moving it is
+its own change.
 
 Silence therefore means "this module is our own design", so never add that
 line to a module you invented, and never omit it from one you translated --
@@ -79,6 +92,21 @@ attribution" section.
 
 Upstream's `3rd-party/` directory is under separate terms: nothing may be
 ported out of it under `LICENSE-TASKFLOW`. Stop and ask instead.
+
+## Reading the upstream file
+
+**Upstream is not vendored in this repo** -- there is no local checkout to
+`Read` or `Grep`, and you have no `WebFetch`. So never write a "Translated
+from" line from memory of what a header contains; fetch the real file at the
+pinned tag with `curl` instead:
+
+```sh
+curl -sSfL https://raw.githubusercontent.com/taskflow/taskflow/<tag>/taskflow/core/executor.hpp
+```
+
+`<tag>` is the README's "Upstream pin" tag. Save it under your scratchpad if
+you need to read it more than once. If the fetch fails, say so and stop --
+a provenance line you guessed at is worse than no port.
 
 ## Porting posture
 
