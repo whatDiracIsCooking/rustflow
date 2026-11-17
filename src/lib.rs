@@ -50,7 +50,8 @@
 //! A panic still interferes with nothing: a panicking task is caught where
 //! upstream catches an exception and reported through the handle, while the
 //! rest of that run executes to the end, so a failure is something a caller
-//! is told about afterwards rather than something that stops the graph. The README's "Order of work" section is the sequence the whole port
+//! is told about afterwards rather than something that stops the graph.
+//! The README's "Order of work" section is the sequence the whole port
 //! follows, and reading what is next there beats a list here that would go
 //! stale the week after it was written.
 //!
