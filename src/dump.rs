@@ -35,11 +35,12 @@
 //! them: an exhaustive `match` on [`Handle`] is a better reminder than a stub,
 //! because adding the variant stops compiling until the branch is written.
 //!
-//! That is exactly what happened to the conditioner branches. The diamond node
-//! shape and the dashed, position-labelled condition edge are issue #30's, and
-//! the two handles they key off landed first, in #28 -- so each arm below is a
-//! `todo!()` naming #30 rather than a guess at the format. Dumping a graph
-//! that holds a conditioner therefore panics until that issue lands.
+//! That is exactly what happened to the conditioner branches, and it is how
+//! they were filled: the two handles landed first, in #28, leaving each arm a
+//! `todo!()` naming #30 rather than a guess at the format, and #30 then
+//! replaced both with the diamond shape and the dashed, position-labelled
+//! edge upstream writes. So a graph holding a conditioner dumps like any
+//! other now; only the module and subflow clusters above are still missing.
 
 use core::fmt;
 
@@ -221,7 +222,7 @@ fn node_shape(handle: &Handle) -> &'static str {
     match handle {
         Handle::Placeholder | Handle::Static(_) => "",
         Handle::Condition(_) | Handle::MultiCondition(_) => {
-            todo!("the conditioner node shape is issue #30's half of the DOT dump")
+            "shape=diamond color=black fillcolor=aquamarine style=filled"
         }
     }
 }
@@ -238,7 +239,7 @@ fn edge_attributes(handle: &Handle, position: usize) -> String {
     match handle {
         Handle::Placeholder | Handle::Static(_) => String::new(),
         Handle::Condition(_) | Handle::MultiCondition(_) => {
-            todo!("issue #30 labels the dashed edge leaving a conditioner: {position}")
+            format!(" [style=dashed label=\"{position}\"]")
         }
     }
 }
@@ -289,6 +290,27 @@ mod tests {
             .add_named_node("a", Handle::Placeholder);
 
         assert_eq!(with_work.dump(), placeholder.dump());
+    }
+
+    /// The two conditioner handles dump identically: upstream's shape `switch`
+    /// shares one case between `CONDITION` and `MULTI_CONDITION`, and its edge
+    /// branch asks `_is_conditioner()`, which is true of both.
+    #[test]
+    fn a_multi_condition_handle_dumps_like_a_condition() {
+        let mut one = Taskflow::with_name("t");
+        let graph = one.graph_mut();
+        let picker = graph.add_named_node("pick", Handle::Condition(Work::new(|| 0)));
+        let target = graph.add_named_node("then", Handle::Placeholder);
+        graph.add_edge(picker, target);
+
+        let mut many = Taskflow::with_name("t");
+        let graph = many.graph_mut();
+        let picker = graph.add_named_node("pick", Handle::MultiCondition(Work::new(Vec::new)));
+        let target = graph.add_named_node("then", Handle::Placeholder);
+        graph.add_edge(picker, target);
+
+        assert_eq!(one.dump(), many.dump());
+        assert!(one.dump().contains("p0 -> p1 [style=dashed label=\"0\"];"));
     }
 
     #[test]

@@ -22,14 +22,24 @@
 //! done**: there is no `graphviz` in the container either. It stays an open
 //! item, and it was never part of the gate.
 //!
+//! The conditioner goldens added for issue #30 come from the same reading and
+//! carry the same caveat: the `CONDITION`/`MULTI_CONDITION` case of the shape
+//! `switch` (line 497) and the `_is_conditioner()` branch of the successor
+//! loop (lines 507-509) of that same `_dump`, with `_is_conditioner()` itself
+//! at `taskflow/core/graph.hpp` lines 792-796. **No `dot` parse and no C++ run
+//! back them either.**
+//!
 //! One deliberate difference in how the graphs are *built*: upstream's
 //! snippets use `emplace`/`precede`, which is another issue's API, so these
-//! tests use the arena primitives and placeholder handles. That cannot change
-//! the output -- a placeholder and a static task both fall through upstream's
-//! shape `switch` to `default` and so print the same line -- and
-//! `src/dump.rs`'s `a_static_handle_dumps_like_a_placeholder` asserts it.
+//! tests use the arena primitives, and placeholder handles wherever the handle
+//! is not what is under test. That cannot change the output -- a placeholder
+//! and a static task both fall through upstream's shape `switch` to `default`
+//! and so print the same line -- and `src/dump.rs`'s
+//! `a_static_handle_dumps_like_a_placeholder` asserts it. A conditioner is the
+//! exception: its handle is exactly what the shape and the edge style key off,
+//! so those cases build a real `Handle::Condition`.
 
-use rustflow::{Handle, Task, Taskflow};
+use rustflow::{Handle, Task, Taskflow, Work};
 
 /// Upstream:
 ///
@@ -197,4 +207,146 @@ fn a_graph_dumps_only_the_cluster_body() {
     );
     // And it is literally the document minus the wrapper.
     assert!(taskflow.dump().contains(&body));
+}
+
+/// Upstream:
+///
+/// ```cpp
+/// tf::Taskflow taskflow("branch");
+/// auto [cond, yes, no] = taskflow.emplace(
+///   [](){ return 0; }, [](){}, [](){}
+/// );
+/// cond.name("cond");
+/// yes.name("yes");
+/// no.name("no");
+/// cond.precede(yes, no);
+/// std::cout << taskflow.dump();
+/// ```
+///
+/// Both halves of the conditioner format in one document: the diamond on the
+/// node line, and one dashed edge per successor labelled with the integer the
+/// condition returns to take it -- so the labels are positions in the
+/// successor list, `"0"` then `"1"`, and not the successors' own ids.
+#[test]
+fn a_conditioner_dumps_as_a_diamond_with_dashed_position_labels() {
+    let mut taskflow = Taskflow::with_name("branch");
+    let graph = taskflow.graph_mut();
+    let cond = graph.add_named_node("cond", Handle::Condition(Work::new(|| 0)));
+    let yes = graph.add_named_node("yes", Handle::Placeholder);
+    let no = graph.add_named_node("no", Handle::Placeholder);
+    graph.add_edge(cond, yes);
+    graph.add_edge(cond, no);
+
+    assert_eq!(
+        taskflow.dump(),
+        concat!(
+            "digraph Taskflow {\n",
+            "  compound=true;\n",
+            "  subgraph cluster_p0 {\n",
+            "    label=\"Taskflow: branch\";\n",
+            "    p0[label=\"cond\" shape=diamond color=black fillcolor=aquamarine style=filled];\n",
+            "    p0 -> p1 [style=dashed label=\"0\"];\n",
+            "    p0 -> p2 [style=dashed label=\"1\"];\n",
+            "    p1[label=\"yes\" ];\n",
+            "    p2[label=\"no\" ];\n",
+            "  }\n",
+            "}\n",
+        )
+    );
+}
+
+/// Upstream:
+///
+/// ```cpp
+/// tf::Taskflow taskflow("mixed");
+/// auto [init, cond, body] = taskflow.emplace(
+///   [](){}, [](){ return 0; }, [](){}
+/// );
+/// init.name("init");
+/// cond.name("cond");
+/// body.name("body");
+/// init.precede(cond);
+/// cond.precede(body);
+/// std::cout << taskflow.dump();
+/// ```
+///
+/// The dashed style is per *source* node, not per graph: upstream asks
+/// `node->_is_conditioner()` inside the successor loop, so a static task in a
+/// graph that also holds a conditioner still writes the bare `p0 -> p1;` of
+/// the M1 goldens above.
+#[test]
+fn a_static_task_keeps_its_plain_edges_beside_a_conditioner() {
+    let mut taskflow = Taskflow::with_name("mixed");
+    let graph = taskflow.graph_mut();
+    let init = graph.add_named_node("init", Handle::Static(Work::new(|| {})));
+    let cond = graph.add_named_node("cond", Handle::Condition(Work::new(|| 0)));
+    let body = graph.add_named_node("body", Handle::Placeholder);
+    graph.add_edge(init, cond);
+    graph.add_edge(cond, body);
+
+    assert_eq!(
+        taskflow.dump(),
+        concat!(
+            "digraph Taskflow {\n",
+            "  compound=true;\n",
+            "  subgraph cluster_p0 {\n",
+            "    label=\"Taskflow: mixed\";\n",
+            "    p0[label=\"init\" ];\n",
+            "    p0 -> p1;\n",
+            "    p1[label=\"cond\" shape=diamond color=black fillcolor=aquamarine style=filled];\n",
+            "    p1 -> p2 [style=dashed label=\"0\"];\n",
+            "    p2[label=\"body\" ];\n",
+            "  }\n",
+            "}\n",
+        )
+    );
+}
+
+/// Upstream:
+///
+/// ```cpp
+/// tf::Taskflow taskflow("do-while");
+/// auto [A, B, C] = taskflow.emplace(
+///   [](){}, [](){ return 0; }, [](){}
+/// );
+/// A.name("A");
+/// B.name("B");
+/// C.name("C");
+/// A.precede(B);
+/// B.precede(B, C);
+/// std::cout << taskflow.dump();
+/// ```
+///
+/// Upstream's do-while loop: the conditioner's first successor is itself. The
+/// dump has nothing to say about that -- it walks the successor list and
+/// labels by position either way -- which is the point of asserting it, since
+/// a self-loop is the one shape a reader expects the writer to special-case.
+#[test]
+fn a_conditioner_self_loop_dumps_as_a_dashed_edge_to_itself() {
+    let mut taskflow = Taskflow::with_name("do-while");
+    let graph = taskflow.graph_mut();
+    let a = graph.add_named_node("A", Handle::Placeholder);
+    let b = graph.add_named_node("B", Handle::Condition(Work::new(|| 0)));
+    let c = graph.add_named_node("C", Handle::Placeholder);
+    graph.add_edge(a, b);
+    graph.add_edge(b, b);
+    graph.add_edge(b, c);
+
+    assert_eq!(
+        taskflow.dump(),
+        concat!(
+            "digraph Taskflow {\n",
+            "  compound=true;\n",
+            "  subgraph cluster_p0 {\n",
+            "    label=\"Taskflow: do-while\";\n",
+            "    p0[label=\"A\" ];\n",
+            "    p0 -> p1;\n",
+            "    p1[label=\"B\" shape=diamond color=black fillcolor=aquamarine style=filled];\n",
+            "    p1 -> p1 [style=dashed label=\"0\"];\n",
+            "    p1 -> p2 [style=dashed label=\"1\"];\n",
+            "    p2[label=\"C\" ];\n",
+            "  }\n",
+            "}\n",
+        )
+    );
 }
