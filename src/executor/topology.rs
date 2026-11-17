@@ -155,6 +155,11 @@
 //!   Nothing with a uniqueness requirement sits behind that wake, so the
 //!   order is documented on `wait` rather than changed (#136).
 //!
+//! In debug builds the rule is also *asserted*, at [`Topology::finish`]: a
+//! run whose hold gates its completion is never finished while the topology
+//! still holds that hold (#141). So every wait in the suite checks the
+//! ordering, not only the two stress cases that sample it.
+//!
 //! A job addresses its node by [`Task`] index rather than by pointer, which is
 //! what keeps the node itself out of the question: it comes out of the graph
 //! through safe code, and a graph nobody can edit while a job names it cannot
@@ -2201,7 +2206,25 @@ impl Topology {
     /// the topology; it no longer is -- the worker calling this holds a share
     /// of its own -- and it stays because it costs nothing and keeps the
     /// ordering above to one rule instead of two.
+    ///
+    /// In debug builds the rule is asserted here (#141): a run whose hold
+    /// *gates* its completion is never finished while the topology still
+    /// holds that hold, because the waiter this wakes would find the storage
+    /// held. Every path to this call has emptied the slot first --
+    /// `release_flow` takes it, a corun frame takes it earlier, `nothing_to_run`
+    /// never had one -- so in the suite every `wait`, handle drop and
+    /// `wait_for_all` checks the ordering the stress cases in `tests/modules.rs`
+    /// sample. An ungated hold is exempt: a hand-built test topology may be
+    /// finished with one in place, and nothing waits on it through this slot.
     pub(crate) fn finish(&self) {
+        debug_assert!(
+            self.lock_storage()
+                .as_ref()
+                .is_none_or(|storage| !storage.gates_completion()),
+            "a run is finished only after its hold on the storage has left the topology: \
+             the thread this wakes may edit the taskflow at once (#138, #141)"
+        );
+
         // Before the lock, so that it is ordered before the unlock that
         // releases a waiter: a `cancel` that follows a `wait` -- or follows the
         // `join` in `RunHandle::drop` -- has to report that there was nothing
@@ -2953,6 +2976,40 @@ mod tests {
             "an ungated hold is released by `release_flow` rather than by its own drop"
         );
         drop(straggler);
+    }
+
+    /// The rule the two cases above rest on is asserted where a run is
+    /// finished, in debug builds (#141): a run whose hold gates its completion
+    /// may not be finished while the topology still holds that hold, because
+    /// the waiter it wakes would find the storage held. This is the one way
+    /// to trip it -- `finish` with no `release_flow` first -- and the case
+    /// exists so that the assertion is exercised rather than merely present.
+    ///
+    /// The unwind drops the topology, and with it the only share of the hold,
+    /// whose `Drop` takes the run out of the executor's count: that is what
+    /// lets `Executor::drop` return afterwards.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(
+        expected = "a run is finished only after its hold on the storage has left the topology"
+    )]
+    fn finishing_a_gated_run_that_still_holds_its_storage_is_caught() {
+        let executor = crate::Executor::new(1);
+        let shared = Arc::clone(&executor.shared);
+        shared.increment_topology();
+
+        let taskflow = Taskflow::new();
+        let topology = Topology::for_run(
+            || true,
+            || {},
+            Arc::clone(taskflow.flow()),
+            Arc::clone(&shared),
+        );
+        assert!(topology.storage().is_some(), "the run holds its own share");
+
+        // The tear-down's last two acts, in the wrong order: the slot still
+        // holds the run's share.
+        topology.finish();
     }
 
     /// A waker that counts, in place of a runtime.

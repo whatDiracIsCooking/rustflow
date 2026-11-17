@@ -411,16 +411,19 @@ impl InnerRun {
     /// `executor::topology` gives: by the time this frame returns, its
     /// caller may edit the taskflow again.
     ///
-    /// For a run whose graph was scheduled the share is already gone --
+    /// One call does both, because a corun's hold releases nobody:
+    /// `Topology::release_flow` drops whatever the slot holds and then, for a
+    /// hold that does not gate completion, finishes the run itself. For a run
+    /// whose graph was scheduled the slot is already empty --
     /// [`InnerRun::take_hold`] took it, and the frame dropped it once no job
-    /// held a copy -- so the first line here finds nothing and the second is
-    /// what finishes the run. A run with no graph to schedule still holds it,
-    /// and the two lines are then the tear-down's own pair.
+    /// held a copy -- so `release_flow` finds nothing and finishes. A run
+    /// with no graph to schedule still holds it, and `release_flow` is then
+    /// the tear-down's own pair in one. A second `finish` here used to follow
+    /// and did nothing, by idempotency rather than by design (#141).
     ///
     /// Idempotent, so that [`Drop`] can call it after the frame already has.
     fn end(&self) {
         self.topology.release_flow();
-        self.topology.finish();
     }
 
     /// Blocks until the run is over and hands back whatever reached the
