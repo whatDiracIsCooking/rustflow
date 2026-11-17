@@ -1,18 +1,41 @@
 //! Translated from `taskflow/core/runtime.hpp` (Taskflow v4.1.0).
 //!
 //! The executor's half of runtime tasking: upstream's `_invoke_runtime_task`
-//! and the `std::function<void(Runtime&)>` overload of
-//! `_invoke_runtime_task_impl`, which that header defines out of line, plus
-//! the scheduling methods of `tf::Runtime` -- `schedule`, `corun`,
-//! `corun_all` and `is_cancelled`. The `RUNTIME` arm of `_invoke` in
-//! `taskflow/core/executor.hpp` is one line into [`invoke`] below, as the
-//! module arm is into [`module`](crate::executor::module). The shell of
-//! [`Runtime`](crate::Runtime) is `src/runtime.rs`, which says what the
-//! handle holds and why it cannot hand back an executor.
+//! and **both** overloads of `_invoke_runtime_task_impl`, which that header
+//! defines out of line, plus the scheduling methods of `tf::Runtime` --
+//! `schedule`, `corun`, `corun_all` and `is_cancelled`. The `RUNTIME` arm of
+//! `_invoke` in `taskflow/core/executor.hpp` is one line into [`invoke`]
+//! below, as the module arm is into [`module`](crate::executor::module). The
+//! shell of [`Runtime`](crate::Runtime) is `src/runtime.rs`, which says what
+//! the handle holds and why it cannot hand back an executor.
 //!
-//! Upstream's `void(Runtime&, bool)` overload is the async shape -- the
-//! second entry calls the body again with `true` so it can clean up after
-//! its children -- and belongs with the `rt.async` family in milestone 5.
+//! # Three body shapes, one protocol
+//!
+//! A runtime task of a graph is one of them. The other two are the
+//! runtime-shaped *async* bodies: upstream's
+//! `std::function<void(tf::Runtime&)>` and
+//! `std::function<void(tf::Runtime&, bool)>` alternatives, which are cases 1
+//! and 2 of `_invoke_async_task` in `taskflow/core/executor.hpp` and which it
+//! dispatches to the very same pair of `_invoke_runtime_task_impl`
+//! overloads. [`invoke_async`] is that dispatch, and the submitting calls are
+//! the `is_runtime_task_v<F>` branches of `_async` and `_silent_async` in
+//! `taskflow/core/async.hpp` -- ported as [`Executor::spawn_runtime`] and
+//! [`Executor::silent_async_runtime`] in the second `impl Executor` block
+//! below rather than beside the plain forms in `executor::async`, because
+//! what is interesting about them is the protocol in the next section and not
+//! the submission, which is `executor::async`'s own
+//! `Executor::schedule_async_task` called with one more argument.
+//!
+//! The `void(Runtime&, bool)` shape is the one that is *called* twice.
+//! Upstream hands one lambda a `reentered` flag: `false` to run the user's
+//! body, `true` to read `rt._node->_exception_ptr` into the promise behind
+//! the future. This port splits that into the two `FnOnce`s
+//! [`AsyncWork::Reentrant`] holds, for the reason that variant's own docs
+//! give, and [`invoke_async`] runs `body` on the first entry and `complete`
+//! on the entry that **finishes** the node -- the second one when the body
+//! left work outstanding, the first one when it did not. That is upstream's
+//! `work(rt, true)` after its `if`/`else`: exactly once, whichever branch
+//! got there.
 //!
 //! # A runtime task is the parent of its own children
 //!
@@ -42,6 +65,45 @@
 //! by the next `set_up_graph` of that graph, which is upstream's behaviour
 //! too.
 //!
+//! # What a failure under each of the three shapes reaches
+//!
+//! Upstream constructs the node of the handle-returning async form
+//! `ESTATE::EXPLICITLY_ANCHORED` and the silent one `ESTATE::NONE`, and that
+//! one argument is the whole of the difference in what a caller sees:
+//!
+//! - [`Executor::spawn_runtime`]'s node is explicitly anchored from the
+//!   moment it is constructed, rather than for the length of a wait as
+//!   [`Runtime::try_corun`]'s guard is. So the panic walk stops *there* for
+//!   anything that fails under it -- the body itself, and from #92 a child
+//!   the body spawned -- and leaves the payload in the node's own slot.
+//!   `complete` reads that slot on the finishing entry and hands it to
+//!   [`AsyncHandle::wait`](crate::AsyncHandle::wait) as
+//!   [`RunError::Panicked`], which is upstream's `set_exception`.
+//!
+//!   One wrinkle, and it is upstream's too: a [`Runtime::corun`] inside such
+//!   a body takes the explicit-anchor *guard* over the same bit, and that
+//!   guard clears the bit on the way out -- upstream's
+//!   `ExplicitAnchorGuard` destructor is an unconditional
+//!   `fetch_and(~EXPLICITLY_ANCHORED)`, not a restore. It costs nothing,
+//!   because the node that has just lost the explicit bit still carries the
+//!   implicit one for as long as it is entered, and both anchors are the
+//!   same `NodeBase`: a later failure under it lands in the same slot, which
+//!   is the slot `complete` reads.
+//! - [`Executor::silent_async_runtime`]'s node carries no estate bit and is
+//!   an anchor only in the implicit sense above, only while it is entered.
+//!   A payload that lands in its slot is dropped with the node, because
+//!   there is no handle to read it from -- the answer
+//!   [`Executor::silent_async`](crate::Executor::silent_async) gives for a
+//!   plain body, and upstream's.
+//! - A runtime task of a graph is neither: its failure goes up the chain to
+//!   whatever is waiting for that graph, which for a top-level task is the
+//!   run.
+//!
+//! What a free node must never do is claim the sentinel run at the root of
+//! its chain, which is issue #105 and is `Job::record_panic`'s to get right
+//! rather than this module's: the two submitting calls below pass
+//! [`Parent::Run`] over that sentinel, exactly as the plain forms do.
+//!
 //! # Why the arm answers with a boolean rather than the state word
 //!
 //! Upstream returns a `bool` from `_invoke_runtime_task_impl` and says why in
@@ -58,15 +120,18 @@
 //!
 //! [`Runtime::corun`] waits for the node's join counter to come back to
 //! **one** -- the body's own reference, the one step 1 added -- which is
-//! upstream's predicate exactly. Until milestone 5 gives a `Runtime` the
-//! `async` family, nothing can leave a child under a runtime node: a task
-//! this body `schedule`s is counted against the node's *parent*, not against
-//! the node, so it is a sibling rather than a child. So in this milestone
-//! every corun returns at once and the preemption branch of [`invoke`] is
-//! unreachable from the public API. Both are ported in full all the same, and
-//! the cases at the bottom of this file drive the counter by hand to reach
-//! them: an unreachable branch that is never exercised is how a latent hang
-//! gets shipped.
+//! upstream's predicate exactly. Until #92 gives a `Runtime` the `async`
+//! family, nothing can leave a child under a runtime node of any of the three
+//! shapes: a task the body `schedule`s is counted against the node's
+//! *parent*, not against the node, so it is a sibling rather than a child.
+//! So every corun still returns at once and the preemption branch is still
+//! unreachable from the public API -- a `spawn_runtime` body has no more way
+//! to spawn a child than a graph's runtime task does, which is why #90 is a
+//! blocker of #92 rather than the other way round. The protocol is ported in
+//! full all the same, and the cases at the bottom of this file drive the
+//! counter by hand to reach the preempted branch of each shape: an
+//! unreachable branch that is never exercised is how a latent hang gets
+//! shipped.
 //!
 //! # Scheduling a sibling, and the same-graph limit
 //!
@@ -89,15 +154,18 @@
 //! `fetch_sub`. That is issue #98, and [`Runtime::schedule`] works through
 //! what the floor fixes and what stays the caller's precondition.
 
+use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::Runtime;
+use crate::executor::Executor;
+use crate::executor::r#async::{AsyncHandle, ESTATE_NONE};
 use crate::executor::run_handle::RunError;
-use crate::executor::topology::Job;
+use crate::executor::topology::{Cancellable, Job, Parent};
 use crate::executor::worker::{Release, Worker, WorkerThread};
-use crate::graph::{AsyncWork, Node, RuntimeWork, Task};
+use crate::graph::{AsyncWork, Node, OnceWork, RuntimeWork, Task};
 
 /// The two bits a runtime task holds while its own work is outstanding:
 /// upstream's `NSTATE::PREEMPTED | NSTATE::IMPLICITLY_ANCHORED`, which it
@@ -116,12 +184,87 @@ const ENTERED: u32 = Node::PREEMPTED | Node::IMPLICITLY_ANCHORED;
 ///
 /// A panic out of the body is recorded exactly as a static task's is, through
 /// [`Job::record_panic`]: delivered to whatever is waiting for the graph this
-/// node is part of, and cancelling the rest of that graph. The bookkeeping
-/// below still runs, because the node has been entered and the counters have
-/// to balance whatever the body did -- which is upstream's arrangement too,
-/// its exception handler being a statement inside the first entry rather than
-/// a return.
+/// node is part of, and cancelling the rest of that graph. The bookkeeping in
+/// [`enter`] still runs, because the node has been entered and the counters
+/// have to balance whatever the body did -- which is upstream's arrangement
+/// too, its exception handler being a statement inside the first entry rather
+/// than a return.
 pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &RuntimeWork) -> Option<Release> {
+    // Called *through* the slot rather than taken out of it, which is the one
+    // way a graph's runtime task differs from the two async shapes below: a
+    // graph may be run any number of times, so its body is a `FnMut` that
+    // stays where it is. `RuntimeWork::invoke` is what arbitrates the one
+    // worker per node that promise rests on.
+    enter(worker, job, |runtime| work.invoke(runtime))
+}
+
+/// Runs a runtime-shaped async body: upstream's cases 1 and 2 of
+/// `_invoke_async_task`, which are the two `_invoke_runtime_task_impl`
+/// overloads over the body of a free-standing node.
+///
+/// The answer is [`invoke`]'s answer and means the same thing, which is why
+/// the `ASYNC` arm in `executor::async` can hand both shapes straight here:
+/// `Some` for a node that is finished, `None` for one that is preempted and
+/// whose counters its second entry will settle. The module docs' first
+/// section has which upstream function each arm is, and its anchor section
+/// has what a failure under each reaches.
+pub(crate) fn invoke_async(
+    worker: &mut WorkerThread,
+    job: &Job,
+    work: &AsyncWork,
+) -> Option<Release> {
+    match work {
+        // Upstream's case 0, which is `executor::async`'s own arm: both
+        // callers -- the `ASYNC` arm and #91's `DEPENDENT_ASYNC` one -- match
+        // the two runtime-shaped alternatives before calling here, exactly as
+        // upstream's two switches do. Named rather than quietly handled,
+        // because a third caller that forgot to would otherwise run a plain
+        // body under a protocol that preempts its node.
+        AsyncWork::Plain(_) => {
+            unreachable!("a plain async body is not a runtime-shaped one: see `executor::async`")
+        }
+        // Upstream's case 1, the silent shape: one entry's worth of body and
+        // no second call, because nobody is waiting for an answer.
+        AsyncWork::Runtime(body) => enter(worker, job, |runtime| take_and_run(body, runtime)),
+        // Upstream's case 2. The `complete` half is its `work(rt, true)`,
+        // after the `if`/`else` and therefore on the entry that finished the
+        // node -- never on an entry that preempted it, which is what the `?`
+        // says: `None` is a node whose children are still running, and a
+        // promise fulfilled then would be fulfilled before the work it is a
+        // promise about was done.
+        AsyncWork::Reentrant { body, complete } => {
+            let release = enter(worker, job, |runtime| take_and_run(body, runtime))?;
+
+            // Upstream's `auto& eptr = rt._node->_exception_ptr; eptr ?
+            // p.set_exception(eptr) : p.set_value()`, with the node reached
+            // through the job because that is the one thing the second entry
+            // has -- upstream reaches it through the `Runtime` it rebuilds,
+            // which this half of the body needs for nothing else.
+            //
+            // `None` would mean the slot had already been spent, which takes
+            // a node entered twice without being preempted in between; doing
+            // nothing is the one answer to that which cannot fulfil one
+            // promise twice.
+            if let Some(complete) = complete.take() {
+                complete(job.node().base().take_panic());
+            }
+            Some(release)
+        }
+    }
+}
+
+/// Runs `body` on the node `job` is for under upstream's preemption protocol:
+/// the shared half of both `_invoke_runtime_task_impl` overloads, which differ
+/// in nothing else.
+///
+/// The module docs' protocol section is the argument for every line of this,
+/// and the answer is the `bool` upstream returns inverted into the
+/// `Option<Release>` the dispatch wants: `None` is upstream's `true`.
+fn enter(
+    worker: &mut WorkerThread,
+    job: &Job,
+    body: impl FnOnce(&mut Runtime<'_>),
+) -> Option<Release> {
     let node = job.node();
 
     // Upstream's `if((node->_nstate & NSTATE::PREEMPTED) == 0)`: the first
@@ -140,7 +283,7 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &RuntimeWork) -
         // not finished starting.
         node.join_counter().fetch_add(1, Ordering::Release);
 
-        run_body(worker, job, node, work);
+        run_body(worker, job, node, body);
 
         // Upstream's `fetch_sub(1, acq_rel) == 1`: this reference spent, and
         // the question of whether anything else holds one. The acquire half
@@ -171,9 +314,14 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &RuntimeWork) -
 /// what the closure captured.
 ///
 /// A function of its own so that the mutable borrow the handle takes of the
-/// worker's scheduling loop ends where the body does, which is before the arm
-/// above spends the node's own reference.
-fn run_body(worker: &mut WorkerThread, job: &Job, node: &Node, work: &RuntimeWork) {
+/// worker's scheduling loop ends where the body does, which is before
+/// [`enter`] spends the node's own reference.
+fn run_body(
+    worker: &mut WorkerThread,
+    job: &Job,
+    node: &Node,
+    body: impl FnOnce(&mut Runtime<'_>),
+) {
     // The worker record the handle hands back, taken through a share of the
     // executor's state rather than through `worker`: the handle holds that
     // value mutably, so a borrow of the record *out of* it would alias the
@@ -183,54 +331,173 @@ fn run_body(worker: &mut WorkerThread, job: &Job, node: &Node, work: &RuntimeWor
     let record: &Worker = &shared.workers[worker.id];
 
     let mut runtime = Runtime::new(record, node, job, worker);
-    if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| work.invoke(&mut runtime))) {
+    if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| body(&mut runtime))) {
         job.record_panic(payload);
     }
 }
 
-/// Refuses to run a runtime-shaped async body, which is issue #90.
+/// The slot an async task's runtime-shaped body sits in until the one worker
+/// that runs it takes it out: [`AsyncWork::Runtime`]'s payload and the `body`
+/// half of [`AsyncWork::Reentrant`].
 ///
-/// The two shapes are upstream's `void(Runtime&)` and `void(Runtime&, bool)`
-/// alternatives -- cases 1 and 2 of its `_invoke_async_task`, which both go
-/// to the `_invoke_runtime_task_impl` [`invoke`] above is the other overload
-/// of. They land here rather than in `executor::async` so that #90 is a
-/// change to this module, which owns everything that hands a body a
-/// [`Runtime`], and not to the module that owns submission.
+/// Spelled out rather than named, because `graph`'s own alias for it is
+/// private to that module.
+type AsyncRuntimeSlot = OnceWork<dyn for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static>;
+
+/// Takes an async task's body out of `slot` and runs it against `runtime`.
 ///
-/// Nothing can reach this today. An async node is created only by
-/// `AsyncNode::new`, which is crate-private, and the submitting calls that
-/// use it -- `Executor::spawn` and `Executor::silent_async` -- build a plain
-/// body whatever their own body returns; a runtime-shaped handle in a
-/// taskflow's *graph* is refused one step earlier, by `executor::async`
-/// itself. So this is the seam and the issue marker rather than a path with
-/// behaviour, and what little behaviour it has is chosen to keep the
-/// scheduler's books straight:
-///
-/// - the refusal is parked on the node's own payload slot, which is the one
-///   anchor a free node always has -- `Job::record_panic`'s last case. The
-///   walk that function performs is deliberately not used, for the reason
-///   `executor::async` sets out: the chain above a parentless free node roots
-///   at the sentinel run every async task in the process shares, and marking
-///   that would cancel every async task submitted afterwards;
-/// - the answer is `Some(Release::Strong)` rather than `None`, because `None`
-///   means the node was preempted and something will resume it, which nothing
-///   here does -- and because the arm that called this only runs the
-///   tear-down for an answer that is `Some`, so a `None` here would leak the
-///   counters a submission raised.
-pub(crate) fn invoke_async(
-    _worker: &mut WorkerThread,
-    job: &Job,
-    _work: &AsyncWork,
-) -> Option<Release> {
-    let base = job.node().base();
-    if base.claim_panic() {
-        base.keep_panic(Box::new(
-            "a runtime-shaped async body cannot be run yet: `spawn_runtime` and \
-             `silent_async_runtime` are issue #90",
-        ));
+/// Taken rather than called through, because an async body is a `FnOnce` and
+/// a `FnOnce` cannot be called through a shared reference -- the same step
+/// the plain arm in `executor::async` takes, and `None` means the same thing
+/// there as here: a body already spent, which one submission and one job
+/// cannot reach, and which doing nothing is the only answer to that cannot
+/// run a body twice.
+fn take_and_run(slot: &AsyncRuntimeSlot, runtime: &mut Runtime<'_>) {
+    if let Some(body) = slot.take() {
+        body(runtime);
+    }
+}
+
+impl Executor {
+    /// Runs `body` on this executor as soon as a worker picks it up, handing
+    /// it the scheduler, and hands back a handle on its completion.
+    ///
+    /// Upstream's `async` over a `[](tf::Runtime&){}` body -- the
+    /// `is_runtime_task_v<F>` branch of `_async` -- under
+    /// [`Executor::spawn`]'s name, for the reason `executor::async` gives.
+    /// Everything that call says about where the body runs, about dropping
+    /// the handle to detach and about awaiting it as a
+    /// [`Future`] holds here too.
+    ///
+    /// What is different is the body and the answer. The body is handed a
+    /// [`Runtime`], so it can do what a runtime task of a graph can do --
+    /// [`Runtime::schedule`] has the one limit, and from #92 it will also be
+    /// able to spawn children of its own and [`Runtime::corun`] on them. The
+    /// handle therefore carries no value: `AsyncHandle<()>` where
+    /// [`Executor::spawn`] carries whatever the body returned, because what
+    /// there is to report about a runtime-shaped task is **whether anything
+    /// under it failed**. That is upstream's own shape -- a
+    /// `std::promise<void>` -- and it is what the second entry exists for.
+    ///
+    /// # What a caller sees
+    ///
+    /// [`AsyncHandle::wait`] answers `Ok(())` once the body *and* everything
+    /// it spawned are done, and `Err(`[`RunError::Panicked`]`(payload))` if
+    /// the body panicked or (from #92) anything it spawned did. Only the
+    /// first such failure is reported, as everywhere else in the crate; the
+    /// node is an explicit anchor from the moment it is created, which is
+    /// what makes it the thing the panic walk stops at, and the module docs'
+    /// anchor section says why that is a construction argument rather than a
+    /// guard -- and what one `corun` inside the body does to it.
+    ///
+    /// ```
+    /// use rustflow::{Executor, Runtime};
+    ///
+    /// let executor = Executor::new(2);
+    ///
+    /// // The body is handed the scheduler rather than returning a value.
+    /// let task = executor.spawn_runtime(|runtime: &mut Runtime<'_>| {
+    ///     assert_eq!(runtime.num_workers(), 2);
+    ///     runtime.corun();
+    /// });
+    /// task.wait().expect("the body did not panic");
+    ///
+    /// // A panic out of it is this handle's failure and nobody else's.
+    /// let failed = executor.spawn_runtime(|_: &mut Runtime<'_>| panic!("not today"));
+    /// let error = failed.wait().expect_err("the body panicked");
+    /// assert_eq!(error.to_string(), "a task panicked: not today");
+    ///
+    /// // And the executor is unharmed by it.
+    /// assert_eq!(executor.spawn(|| 1).wait().expect("no panic"), 1);
+    /// ```
+    pub fn spawn_runtime<F>(&self, body: F) -> AsyncHandle<()>
+    where
+        F: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
+    {
+        // Upstream's `std::promise<void> p; auto fu{p.get_future()};`. The
+        // wrapper half of that seam -- `AsyncHandle::for_body`, which is what
+        // `Executor::spawn` uses -- is deliberately not: a runtime-shaped
+        // task's outcome is decided on its finishing entry out of the node's
+        // payload slot, not by what the body returned, so what this needs is
+        // the writing end of the slot and no wrapper at all.
+        let (handle, delivery) = AsyncHandle::pending();
+
+        // Upstream's `reentered` branch in full: `eptr ?
+        // p.object.set_exception(eptr) : p.object.set_value()`.
+        let complete = move |payload: Option<Box<dyn Any + Send>>| {
+            delivery.deliver(match payload {
+                Some(payload) => Err(RunError::Panicked(payload)),
+                None => Ok(()),
+            });
+        };
+
+        self.schedule_async_task(
+            AsyncWork::reentrant(body, complete),
+            &Parent::Run,
+            // Upstream's `ESTATE::EXPLICITLY_ANCHORED` argument, and the one
+            // place in the crate that bit is set other than by a waiting
+            // frame's guard: there *is* a waiter here -- whoever holds the
+            // handle -- and it is waiting for the whole of what runs under
+            // this node, for as long as the node exists.
+            Cancellable::EXPLICITLY_ANCHORED,
+        );
+        handle
     }
 
-    Some(Release::Strong)
+    /// Runs `body` on this executor as soon as a worker picks it up, handing
+    /// it the scheduler, with no handle on it at all.
+    ///
+    /// Upstream's `silent_async` over a `[](tf::Runtime&){}` body -- the
+    /// `is_runtime_task_v<F>` branch of `_silent_async` -- and the cheaper
+    /// half of the pair, for
+    /// [`Executor::silent_async`](crate::Executor::silent_async)'s reason:
+    /// there is no slot to deliver into, so a submission costs the node and
+    /// the body and nothing else. There is no second entry either, which is
+    /// upstream's case 1 against case 2: the node finishes when the body and
+    /// everything under it are done, and nothing is reported.
+    ///
+    /// # What a caller sees
+    ///
+    /// Nothing, which is what "silent" means. A panic out of `body` -- or
+    /// (from #92) out of anything it spawned -- is **dropped**, as a
+    /// [`Executor::silent_async`](crate::Executor::silent_async) body's is
+    /// and for the same reason: the payload lands in the node's own slot and
+    /// goes with the node, because no handle was ever handed out to read it
+    /// from. The default panic hook still prints it, so a silent task that
+    /// fails is not an invisible one. [`Executor::wait_for_all`] is the one
+    /// thing that waits for such a task, as it is for every free node.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    ///
+    /// use rustflow::{Executor, Runtime};
+    ///
+    /// let executor = Executor::new(4);
+    /// let counter = Arc::new(AtomicUsize::new(0));
+    ///
+    /// for _ in 0..100 {
+    ///     let counter = Arc::clone(&counter);
+    ///     executor.silent_async_runtime(move |runtime: &mut Runtime<'_>| {
+    ///         // Nothing was spawned, so this returns at once -- and the
+    ///         // node finishes on its first entry.
+    ///         runtime.corun();
+    ///         counter.fetch_add(1, Ordering::Relaxed);
+    ///     });
+    /// }
+    ///
+    /// executor.wait_for_all();
+    /// assert_eq!(counter.load(Ordering::Relaxed), 100);
+    /// ```
+    pub fn silent_async_runtime<F>(&self, body: F)
+    where
+        F: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
+    {
+        // Upstream's `_silent_async`, whose runtime branch and whose static
+        // branch are one call with one `ESTATE::NONE`: the shape of the body
+        // is the whole difference, and `AsyncWork` is where it is said.
+        self.schedule_async_task(AsyncWork::runtime(body), &Parent::Run, ESTATE_NONE);
+    }
 }
 
 impl Runtime<'_> {
@@ -441,12 +708,67 @@ impl Runtime<'_> {
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, OnceLock};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::Executor;
+    use crate::executor::async_node::AsyncNode;
     use crate::executor::queue::WorkerQueue;
-    use crate::executor::topology::{Cancellable, GraphOwner, Parent, Topology, set_up_graph};
+    use crate::executor::topology::{GraphOwner, Topology, set_up_graph};
     use crate::prelude::*;
+
+    /// How long a case waits for a worker to deliver before it gives up.
+    ///
+    /// The deadline `tests/basics.rs` and `executor::async` both keep, for
+    /// the reason they give: nothing here passes because of this number, and
+    /// the only thing that reaches it is a side that is never going to
+    /// arrive.
+    const GIVE_UP_AFTER: Duration = Duration::from_secs(120);
+
+    /// A free-standing async node of `work` and the job that runs it,
+    /// accounted for as a submission accounts for one but **not** queued.
+    ///
+    /// `Executor::schedule_async_task` is the real submission and takes the
+    /// same three steps before its push; what the cases below need that it
+    /// cannot give them is the node itself, so that the state words can be
+    /// read after the entry that finished it. The `increment_async` is not
+    /// optional bookkeeping: the tear-down in `executor::async` decrements
+    /// both counters for a parentless free node, and a job invoked without
+    /// that increment would drive `num_asyncs` below zero and leave the
+    /// executor's own `Drop` waiting for ever.
+    fn free_async(executor: &Executor, work: AsyncWork, estate: u32) -> (Arc<AsyncNode>, Job) {
+        executor.shared.increment_async();
+
+        let node = AsyncNode::new("", Handle::Async(work));
+        node.node()
+            .base()
+            .estate()
+            .fetch_or(estate, Ordering::Relaxed);
+        let job = Job::free(&node, &Parent::Run);
+        Parent::Run.count_queued(Topology::free_standing(), 1);
+
+        (node, job)
+    }
+
+    /// The state bits of a free node, masked to the two an entry sets.
+    fn free_entered(node: &Arc<AsyncNode>) -> u32 {
+        node.node().base().nstate().load(Ordering::Relaxed) & ENTERED
+    }
+
+    /// Waits for `handle` to have an outcome, failing rather than hanging if
+    /// it never gets one.
+    ///
+    /// [`AsyncHandle::wait`] has no deadline of its own, so a regression in
+    /// the delivery below -- a `complete` that never ran, or ran on the wrong
+    /// entry -- would park this thread for ever instead of failing the case.
+    /// Spinning on `is_done` first is what turns that into an assertion.
+    fn spin_until_done<R>(what: &str, handle: &AsyncHandle<R>) {
+        let deadline = Instant::now() + GIVE_UP_AFTER;
+        while !handle.is_done() {
+            assert!(Instant::now() < deadline, "gave up waiting for {what}");
+            thread::yield_now();
+        }
+    }
 
     /// A worker thread with a queue nobody else holds the other end of, for
     /// driving the scheduler one job at a time from the test thread.
@@ -921,5 +1243,263 @@ mod tests {
             "the node finished like a static task, so the run's accounting \
              balanced"
         );
+    }
+
+    /// A payload in a `spawn_runtime` node's own slot is what that task
+    /// reports, which is the whole of what its second entry is for: the node
+    /// is an explicit anchor for its whole life, so the walk in
+    /// `Job::record_panic` leaves a failure under it right there, and
+    /// `complete` hands that slot to the handle.
+    ///
+    /// The payload is put there the way
+    /// `a_panic_under_an_implicit_anchor_comes_back_from_a_corun` puts one --
+    /// claim the slot, then fill it -- because the walk cannot be driven from
+    /// a body that has no children to fail until #92. What it stands in for
+    /// is exactly that: a child's failure, delivered here by the walk,
+    /// collected by the entry that finishes the node.
+    #[test]
+    fn a_payload_on_a_spawn_runtime_node_comes_back_from_its_handle() {
+        let executor = Executor::new(2);
+
+        let handle = executor.spawn_runtime(|runtime: &mut Runtime<'_>| {
+            let base = runtime.node.base();
+            assert!(
+                base.is_explicitly_anchored(),
+                "upstream constructs this node ESTATE::EXPLICITLY_ANCHORED, so \
+                 a failure under it stops here rather than going up the chain"
+            );
+            assert!(
+                base.is_implicitly_anchored(),
+                "and it is the entered runtime node it also is"
+            );
+
+            assert!(base.claim_panic(), "the slot is this caller's");
+            base.keep_panic(Box::new("boom"));
+        });
+
+        spin_until_done("the spawn_runtime task to deliver", &handle);
+        let error = handle
+            .wait()
+            .expect_err("the payload under this anchor is the task's failure");
+        assert_eq!(error.to_string(), "a task panicked: boom");
+
+        let RunError::Panicked(payload) = error;
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"boom"),
+            "the payload keeps its identity, as a run's does"
+        );
+
+        executor.wait_for_all();
+        assert_eq!(
+            executor.num_topologies(),
+            0,
+            "and the task was accounted for exactly once"
+        );
+    }
+
+    /// A `silent_async_runtime` body that spawns nothing finishes on its
+    /// first entry: both bits come off, the node is torn down like a plain
+    /// async task's, and the counters a submission raised come back down
+    /// without a second entry ever happening.
+    ///
+    /// Driven by hand rather than submitted, for the reason `free_async`
+    /// gives: a submission hands back no node, and the node's state words
+    /// after the entry are the observable. The estate is left clear, which is
+    /// upstream's `ESTATE::NONE` for this form and is asserted from inside
+    /// the body -- it is what makes the difference between this shape and
+    /// the one above.
+    #[test]
+    fn a_silent_async_runtime_body_that_spawns_nothing_finishes_on_its_first_entry() {
+        let executor = Executor::new(1);
+        let mut worker = test_worker(&executor);
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let work = AsyncWork::runtime({
+            let runs = Arc::clone(&runs);
+            move |runtime: &mut Runtime<'_>| {
+                runs.fetch_add(1, Ordering::Relaxed);
+
+                let base = runtime.node.base();
+                assert!(
+                    base.is_implicitly_anchored(),
+                    "an entered runtime node is an anchor of last resort, \
+                     whichever of the three shapes it is"
+                );
+                assert!(
+                    !base.is_explicitly_anchored(),
+                    "but nobody is waiting for this one: upstream constructs \
+                     the silent form ESTATE::NONE"
+                );
+
+                runtime.try_corun().expect("nothing was spawned to fail");
+            }
+        });
+        let (node, job) = free_async(&executor, work, ESTATE_NONE);
+
+        worker.invoke(job);
+
+        assert_eq!(runs.load(Ordering::Relaxed), 1, "the body ran once");
+        assert_eq!(
+            free_entered(&node),
+            0,
+            "both bits came off on the first entry: nothing was outstanding"
+        );
+        assert_eq!(
+            node.node().join_counter().load(Ordering::Relaxed),
+            0,
+            "and the body's own reference was the last one"
+        );
+        assert!(
+            worker.pop().is_none(),
+            "a free node has no successors, so nothing was left queued"
+        );
+        assert_eq!(
+            executor.num_topologies(),
+            0,
+            "the tear-down ran on that one entry, so the counters the \
+             submission raised are back down"
+        );
+    }
+
+    /// A `silent_async_runtime` body that panics is reported to nobody and
+    /// must cost nobody: the payload is parked on the node and goes with it,
+    /// the executor is still usable, and -- the part that matters -- the
+    /// sentinel run every free node's job claims to be part of takes no part
+    /// in it.
+    ///
+    /// That last one is issue #105's, re-asserted here because this
+    /// submission is a new way onto that walk: a payload claimed on the
+    /// sentinel would set the `EXCEPTION` bit `Job::is_parent_cancelled`
+    /// reads, so every async task submitted afterwards -- for the life of the
+    /// process -- would be skipped unrun, and a skipped job never reaches the
+    /// counters, so no later `wait_for_all` would return either. Everything
+    /// downstream of that hangs rather than fails, which is why the sentinel
+    /// is asserted on directly rather than inferred from the task below.
+    #[test]
+    fn a_silent_async_runtime_body_that_panics_leaves_the_executor_usable() {
+        let executor = Executor::new(2);
+
+        executor.silent_async_runtime(|_: &mut Runtime<'_>| panic!("parked on the node"));
+        executor.wait_for_all();
+
+        assert!(
+            !Topology::free_standing().cancelled(),
+            "the run every free node shares took no part in that failure"
+        );
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        executor.silent_async_runtime({
+            let ran = Arc::clone(&ran);
+            move |_: &mut Runtime<'_>| {
+                ran.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        executor.wait_for_all();
+
+        assert_eq!(
+            ran.load(Ordering::Relaxed),
+            1,
+            "a silent failure must not cancel the next async task"
+        );
+        assert_eq!(executor.num_topologies(), 0, "and both were accounted for");
+    }
+
+    /// The preemption branch of the reentrant shape, which the public API
+    /// cannot reach until #92 gives a `Runtime` the `async` family: the body
+    /// raises its own node's join counter, exactly as a child spawned under
+    /// the node would, so the first entry is not the last reference. The
+    /// node is left preempted with nothing delivered and nothing accounted
+    /// for; a hand-driven decrement to zero is the last child's tear-down,
+    /// and the second entry clears the bits, runs `complete` and finishes
+    /// the task.
+    ///
+    /// That `complete` runs **once** is the half of upstream's
+    /// `work(rt, true)` that is easiest to get wrong in this shape: a second
+    /// call would fulfil one promise twice, and a call on the preempted
+    /// entry would fulfil it before the work it is a promise about was done.
+    #[test]
+    fn a_reentrant_body_that_leaves_work_outstanding_completes_on_its_second_entry() {
+        let executor = Executor::new(1);
+        let mut worker = test_worker(&executor);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let completions = Arc::new(AtomicUsize::new(0));
+
+        let work = AsyncWork::reentrant(
+            {
+                let runs = Arc::clone(&runs);
+                move |runtime: &mut Runtime<'_>| {
+                    runs.fetch_add(1, Ordering::Relaxed);
+                    // What `rt.silent_async` will do (#92): one more
+                    // reference to the node, held by work that has not
+                    // finished.
+                    runtime.node.join_counter().fetch_add(1, Ordering::Relaxed);
+                }
+            },
+            {
+                let completions = Arc::clone(&completions);
+                move |payload: Option<Box<dyn Any + Send>>| {
+                    assert!(payload.is_none(), "nothing failed under this node");
+                    completions.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+        );
+        // Explicitly anchored, as `spawn_runtime` constructs it: this is that
+        // node, minus the submission that would have hidden it.
+        let (node, job) = free_async(&executor, work, Cancellable::EXPLICITLY_ANCHORED);
+        // The job the node was dequeued as, which is what the last child
+        // re-queues to resume it.
+        let resume = job.clone();
+
+        worker.invoke(job);
+
+        assert_eq!(runs.load(Ordering::Relaxed), 1, "the body ran once");
+        assert_eq!(free_entered(&node), ENTERED, "the node is preempted");
+        assert_eq!(
+            node.node().join_counter().load(Ordering::Relaxed),
+            1,
+            "one piece of spawned work is still outstanding"
+        );
+        assert_eq!(
+            completions.load(Ordering::Relaxed),
+            0,
+            "a preempted entry delivers nothing: the task is not over"
+        );
+        assert_eq!(
+            executor.num_topologies(),
+            1,
+            "and it is not accounted for either -- the second entry is what \
+             finishes the task"
+        );
+        assert!(worker.pop().is_none(), "nothing was queued by that entry");
+
+        // The tear-down of the last child, by hand: `WorkerThread::finish_job`
+        // reads the parent's state word before the decrement and, finding
+        // `PREEMPTED`, re-queues the job above.
+        assert_eq!(
+            node.node().join_counter().fetch_sub(1, Ordering::AcqRel),
+            1,
+            "the last child drives the counter to zero"
+        );
+        worker.invoke(resume);
+
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            1,
+            "the second entry resumes the node rather than running the body \
+             again"
+        );
+        assert_eq!(
+            completions.load(Ordering::Relaxed),
+            1,
+            "and runs the completion, once"
+        );
+        assert_eq!(free_entered(&node), 0, "the second entry clears both bits");
+        assert_eq!(
+            executor.num_topologies(),
+            0,
+            "the counters the submission raised came back down on that entry"
+        );
+        assert!(worker.pop().is_none(), "so nothing was left queued");
     }
 }
