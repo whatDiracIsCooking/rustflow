@@ -124,8 +124,8 @@ use crate::taskflow::{Flow, Taskflow};
 ///
 /// Upstream's `Executor::_corun_graph`, and the one primitive every blocking
 /// wait on a nested graph is built from: [`Executor::corun`] here,
-/// `Subflow::join` (#50) and `Runtime::corun` (#51). Four
-/// steps, in upstream's order, and the order is the whole of it:
+/// `Subflow::join` (#50) and `Runtime::corun` (#51). Four steps, in
+/// upstream's order, and the order is the whole of it:
 ///
 /// 1. a graph with nothing to run is nothing to wait for, so this returns at
 ///    once -- upstream's `if(g.empty()) return`;
@@ -138,8 +138,8 @@ use crate::taskflow::{Flow, Taskflow};
 ///    from costing the pool a thread;
 /// 4. the guard is dropped and the payload taken, which is upstream's
 ///    `p->_rethrow_exception()` with the decision of what to do about it left
-///    to the caller. That is what gives the two shapes
-///    [`Executor::corun`] and [`Executor::try_corun`] one implementation.
+///    to the caller. That is what gives the two shapes [`Executor::corun`]
+///    and [`Executor::try_corun`] one implementation.
 ///
 /// The graph arrives as whatever owns it rather than as a `&Graph`, because a
 /// job of this graph has to own the storage its node indices resolve in and a
