@@ -113,6 +113,17 @@ use crate::executor::topology::Job;
 use crate::executor::{r#async, dependent_async, module, runtime, subflow};
 use crate::graph::{Handle, Node};
 
+/// What a strong release that lands on a node some bypass has already entered
+/// reports, instead of resuming that node: issue #107, and the successor arm
+/// of [`WorkerThread::invoke_one`] is where it is read.
+///
+/// A `&'static str` payload, which is what a `panic!` with a literal message
+/// produces and what [`RunError`](crate::RunError) renders first -- the same
+/// shape `executor::module`'s own refusal uses.
+const REENTERED: &str = "a task was released while it was already running: a \
+                         bypassed dependency may not re-enter a task the run \
+                         has already entered";
+
 /// A worker of an [`Executor`](crate::Executor), as every thread but its own
 /// sees it.
 ///
@@ -768,6 +779,33 @@ impl WorkerThread {
             None => {
                 for &successor in node.successors() {
                     let next = graph.node(successor);
+                    // Issue #107, which is the other half of the bypass and
+                    // the one the floor cannot reach: an *entered* successor
+                    // -- see `is_entered` -- is a node something bypassed the
+                    // dependencies of, and the count it is holding is its own
+                    // outstanding work's rather than its dependencies'.
+                    // Spending one of those is not a release the node is
+                    // owed: it resumes the node before that work is done, and
+                    // takes the counter past the zero the work needs to
+                    // resume it at all. So the release is reported rather than
+                    // delivered, through the path a panicking body takes --
+                    // which leaves every reference the node holds intact, so
+                    // whatever it is waiting for still resumes it and the run
+                    // still finishes, with the failure rather than without it.
+                    //
+                    // The read is before the decrement, which is
+                    // `WorkerThread::finish_job`'s order and makes the same
+                    // trade: a node that preempts itself after this read is a
+                    // release this misses, and nothing here reports a node
+                    // that was *not* entered -- a node still owing a strong
+                    // dependency cannot have been entered by anything but a
+                    // bypass. [`Runtime::schedule`](crate::Runtime::schedule)
+                    // has which orderings this sees and which one stays the
+                    // caller's precondition.
+                    if is_entered(next) {
+                        job.record_panic(Box::new(REENTERED));
+                        continue;
+                    }
                     // `update` is a compare-exchange loop where upstream has
                     // one `fetch_sub`, and that cost is deliberate: the
                     // cheaper shape -- subtract, then add the one back when
@@ -1064,6 +1102,52 @@ impl Release {
 fn strong_dependencies(node: &Node) -> usize {
     usize::try_from(node.nstate().load(Ordering::Relaxed) & Node::STRONG_DEPENDENCIES_MASK)
         .expect("a u32 always fits in a usize on a 32-bit target or wider")
+}
+
+/// Whether `node` has been **entered**: a node of a kind that preempts itself,
+/// carrying the `PREEMPTED` bit that kind's arm sets while its own nested work
+/// is outstanding.
+///
+/// Issue #107's question, and the one thing a strong release or a
+/// [`Runtime::schedule`](crate::Runtime::schedule) has to know before it
+/// touches a join counter: whether the count is a dependency count, which
+/// those two may spend and zero, or one reference per piece of outstanding
+/// work, which they may not.
+///
+/// It takes both halves, because neither answers it. The bit alone does not:
+/// `Node::nstate` is public, so a caller may set it on any node at all --
+/// `tests/basics.rs` sets each state bit on a *static* node from a
+/// predecessor's body, to pin that a state bit is never read as a dependency
+/// count -- and on a kind that never preempts there is no nested work for the
+/// bit to be about, so the count under it is exactly what it looks like. The
+/// kind alone does not either: a subflow or module task carries no reference
+/// of anybody's until the entry that preempts it sets the bit. The handle is
+/// read only when the bit is set, which is what keeps this off the cost of
+/// every release.
+pub(crate) fn is_entered(node: &Node) -> bool {
+    node.nstate().load(Ordering::Relaxed) & Node::PREEMPTED != 0 && preempts_itself(node.handle())
+}
+
+/// Whether a node of this kind is one the scheduler may leave `PREEMPTED`:
+/// the four dynamic-tasking handles, which are the four arms of the dispatch
+/// above that can answer `None`.
+///
+/// An exhaustive match rather than one arm and a wildcard, for
+/// [`WorkerThread::invoke_one`]'s own reason: a handle added later has to
+/// answer this question here rather than inherit an answer.
+fn preempts_itself(handle: &Handle) -> bool {
+    match handle {
+        Handle::Subflow { .. }
+        | Handle::Runtime(_)
+        | Handle::Module(_)
+        | Handle::AdoptedModule(_) => true,
+        Handle::Static(_)
+        | Handle::Placeholder
+        | Handle::Condition(_)
+        | Handle::MultiCondition(_)
+        | Handle::Async(_)
+        | Handle::DependentAsync(_) => false,
+    }
 }
 
 /// Narrows one index a conditioner returned onto a successor position, or

@@ -151,8 +151,12 @@
 //! that zero to `SIZE_MAX`, which is a counter no corun predicate and no
 //! resume ever matches again; this port floors the decrement at zero
 //! instead, the one departure its successor arm makes from upstream's bare
-//! `fetch_sub`. That is issue #98, and [`Runtime::schedule`] works through
-//! what the floor fixes and what stays the caller's precondition.
+//! `fetch_sub`. That is issue #98. What the floor cannot make harmless is the
+//! *order*, which is issue #107: the same arm now refuses a strong release
+//! onto a node that has already preempted itself, as [`Runtime::schedule`]
+//! refuses a target that has, and the method's docs work through all three
+//! orderings -- the two that are reported and the one second run that stays
+//! the caller's own doing.
 
 use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
@@ -164,7 +168,7 @@ use crate::executor::Executor;
 use crate::executor::r#async::{AsyncHandle, ESTATE_NONE};
 use crate::executor::run_handle::RunError;
 use crate::executor::topology::{Cancellable, Job, Parent};
-use crate::executor::worker::{Release, Worker, WorkerThread};
+use crate::executor::worker::{Release, Worker, WorkerThread, is_entered};
 use crate::graph::{AsyncWork, Node, OnceWork, RuntimeWork, Task};
 
 /// The two bits a runtime task holds while its own work is outstanding:
@@ -528,11 +532,13 @@ impl Runtime<'_> {
     /// index happens to be live in this one would schedule this graph's node
     /// at that index. What is checked is every index this graph does not
     /// have, which panics as any stale index does, and the README records the
-    /// decision. Upstream has two unchecked caveats of its own here -- that
-    /// only the parent worker of the runtime may call this, which the
+    /// decision. Upstream has one more unchecked caveat of its own here --
+    /// that only the parent worker of the runtime may call this, which the
     /// `&mut self` on a handle that cannot leave its own invocation is this
-    /// port's answer to, and that scheduling a *runtime* task is "currently
-    /// not supported", which this port does not diagnose either.
+    /// port's answer to. Its other, that scheduling a *runtime* task is
+    /// "currently not supported", is half-diagnosed as of issue #107: a
+    /// runtime task that is **entered** is refused below, and one that is
+    /// not is an ordinary target.
     ///
     /// # A bypassed dependency is still an edge
     ///
@@ -549,26 +555,68 @@ impl Runtime<'_> {
     /// zero stored here is the zero the target is dequeued with, and the
     /// departure is noted where the floor is.
     ///
-    /// What the floor does not and cannot do is make the *order* harmless.
-    /// If the target has already run and re-armed its counter to its strong
-    /// dependency count by the time that predecessor releases it, the
-    /// release is an ordinary one and the target runs again -- a second run
-    /// for a plain task, and for a task that preempts itself (a runtime,
-    /// module or subflow task) a reference taken from under an invocation
-    /// that was counting on it. Upstream neither diagnoses that nor
-    /// survives it, and its own answer is the rule its `ConditionalTasking`
-    /// page states for the other bypass: **schedule a task the graph cannot
-    /// otherwise reach.** Upstream's example gates the target's one strong
-    /// predecessor behind a condition that is never taken, and this crate's
-    /// `Runtime.Schedule.ModuleTask` port is built the same way.
+    /// What the floor does not and cannot do is make the *order* harmless,
+    /// and the order has three outcomes. Which one a caller gets turns on
+    /// what the target was doing when the bypass reached it a second time --
+    /// the second `schedule`, or the predecessor's release:
+    ///
+    /// 1. **Its body is running.** Two workers in one body is the one class
+    ///    of this the work handles arbitrate themselves:
+    ///    [`Work::invoke`](crate::Work::invoke) takes the body with
+    ///    `try_lock` and panics rather than blocking, naming the invariant.
+    ///    A bypassed *dependency* cannot reach it -- the target's counter is
+    ///    the zero stored here for as long as its body runs, so the
+    ///    floored decrement queues nothing -- but a second `schedule`
+    ///    racing the first one's run can, and that is what the panic is for.
+    /// 2. **It has preempted itself**: a runtime, module or subflow task
+    ///    whose nested work is outstanding, which is upstream's dangerous
+    ///    half. The body has returned, so no lock is held and nothing
+    ///    arbitrates; what the node is holding instead is one join-counter
+    ///    reference per piece of outstanding work, and a bypass that spends
+    ///    or zeroes those resumes the node before its own children are done.
+    ///    Both bypasses are therefore **refused and reported** rather than
+    ///    delivered: this method panics on an *entered* target, and the
+    ///    successor arm of the dispatch drops a strong release onto one,
+    ///    recording it as the failure of the task that released. "Entered"
+    ///    is the `PREEMPTED` bit on a node of a kind whose arm sets it,
+    ///    which is `executor::worker`'s `is_entered` and which that function
+    ///    argues is both halves of one question. Each asks it before it
+    ///    touches the counter, so a node that preempts itself in the window
+    ///    after that read is not seen -- and nothing turns a node that was
+    ///    never entered into a refusal, since a node still owing a strong
+    ///    dependency cannot have been entered by anything but a bypass.
+    /// 3. **It has finished and re-armed** its counter to its strong
+    ///    dependency count. Then the predecessor's release is an *ordinary*
+    ///    one: the decrement reaches zero legitimately and the target runs
+    ///    **a second time**, which is the caller's own doing and is not
+    ///    diagnosed. Nothing on a plain node records that it has already
+    ///    run, the second run is strictly after the first, and so the lock
+    ///    in (1) is free by then and has nothing to report. Upstream neither
+    ///    diagnoses this nor survives it, and its own answer is the rule its
+    ///    `ConditionalTasking` page states for the other bypass:
+    ///    **schedule a task the graph cannot otherwise reach.** Upstream's
+    ///    example gates the target's one strong predecessor behind a
+    ///    condition that is never taken, and this crate's
+    ///    `Runtime.Schedule.ModuleTask` port is built the same way.
+    ///
+    /// A conditioner is the other bypass and reaches (2) and (3) the same
+    /// way, since the arm that selects a successor stores the same zero this
+    /// method does. The refusal above covers the release it is given, not
+    /// the selection: a conditioner that selects a node of its own nested
+    /// work stays upstream's rule rather than this port's check.
     ///
     /// # Panics
     ///
     /// Panics if `task` is not a live task of this runtime task's own graph
     /// -- out of range, erased, or a task of another graph with an index this
     /// one does not have. The panic is
-    /// [`Graph::node`](crate::Graph::node)'s, and reaches the caller as the
-    /// failure of this runtime task, since it happens inside the body.
+    /// [`Graph::node`](crate::Graph::node)'s.
+    ///
+    /// Panics if `task` names a node that has already preempted itself,
+    /// which is case (2) above.
+    ///
+    /// Either reaches the caller as the failure of this runtime task, since
+    /// it happens inside the body.
     pub fn schedule(&mut self, task: Task) {
         // Upstream's comment, and the invariant it names: "when scheduling a
         // task, the task must have zero dependency (join counter is 0) or we
@@ -581,6 +629,25 @@ impl Runtime<'_> {
         // the docs above work through -- it is issue #98, and the release arm
         // is where the answer to it lives.
         let target = self.job.graph().node(task);
+
+        // Issue #107, and the one case this call can see for itself: the
+        // store below would wipe a count that is not a dependency count at
+        // all -- a preempted node's counter holds one reference per piece of
+        // nested work still outstanding, and work that finished against a
+        // zeroed counter would drive it past zero rather than resume the
+        // node. Refused before anything is written, so a body that schedules
+        // a node it should not have scheduled fails *as a body*: the panic is
+        // this runtime task's, through `run_body`'s handler, rather than the
+        // hang the store would have left. `is_entered` is the same question
+        // the successor arm asks before its own decrement, asked here of the
+        // same node; the docs above have the two orderings neither of them
+        // can see.
+        assert!(
+            !is_entered(target),
+            "a task that is already running cannot be scheduled: a bypassed \
+             dependency may not re-enter a task the run has already entered"
+        );
+
         target.join_counter().store(0, Ordering::Relaxed);
 
         // Before the push, as every other count of a queued job is: the job
@@ -610,15 +677,18 @@ impl Runtime<'_> {
     ///
     /// Being an *equality* rather than a `<=`, the predicate is only as good
     /// as the guarantee that nothing drives the counter below the reference
-    /// the first entry added. Two things make that guarantee, and together
-    /// they are issue #98: the successor arm of `WorkerThread::invoke_one`
-    /// floors its decrement at zero, so a node whose counter was zeroed by
-    /// [`Runtime::schedule`] or by a conditioner still enters its body at
-    /// exactly one rather than at `usize::MAX + 1`; and the one remaining
-    /// way to lose the reference -- a strong predecessor releasing this node
-    /// after it had re-armed, while this body runs -- is the precondition
-    /// [`Runtime::schedule`] documents, since a runtime task the graph
-    /// cannot otherwise reach has no such predecessor.
+    /// the first entry added. Two things in the successor arm of
+    /// `WorkerThread::invoke_one` make that guarantee. It floors its
+    /// decrement at zero, which is issue #98, so a node whose counter was
+    /// zeroed by [`Runtime::schedule`] or by a conditioner still enters its
+    /// body at exactly one rather than at `usize::MAX + 1`; and it drops
+    /// altogether a strong release onto a node that has already preempted
+    /// itself, which is issue #107 and the one remaining way to lose the
+    /// reference --
+    /// a predecessor releasing this node while this body runs, after
+    /// something bypassed the dependency it was owed. That release is
+    /// reported as the releasing task's failure instead, so what used to be
+    /// a corun that never terminated is a run that answers.
     ///
     /// The node is explicitly anchored for the length of the wait, which is
     /// what makes a failure under it *this frame's*: the panic walk in
@@ -1243,6 +1313,357 @@ mod tests {
             "the node finished like a static task, so the run's accounting \
              balanced"
         );
+    }
+
+    /// The job that runs `task` under the same run as `source`, counted
+    /// against that run but **not** queued: how the three cases below hold a
+    /// predecessor's job back until the order they are about has been
+    /// reached.
+    ///
+    /// Counted here rather than at the invoke because that is the order every
+    /// real queueing takes, and because a held-back job the run was never
+    /// told about would let the run finish -- and tear its own topology down
+    /// -- halfway through the case.
+    fn held_back_job(source: &Job, topology: &Arc<Topology>, task: Task) -> Job {
+        Parent::Run.count_queued(topology, 1);
+        source.successor(task)
+    }
+
+    /// Issue #107's third ordering, which is the one no check sees: a plain
+    /// task the graph says runs once, run twice.
+    ///
+    /// `target` is bypassed by `schedule` *and* has a strong predecessor the
+    /// bypass does not remove, and here that predecessor runs **after** the
+    /// scheduled task has finished and re-armed its own counter. The release
+    /// is then an ordinary one -- the counter is at its armed value, the
+    /// decrement reaches zero legitimately -- so the target is queued and run
+    /// again. This case pins that second run as what the caller gets, which
+    /// is what [`Runtime::schedule`]'s docs now say it is: the caller's own
+    /// doing, for a graph upstream's rule says not to build.
+    ///
+    /// It is also the answer to #107's first question, which was whether
+    /// `Work::invoke`'s `try_lock` already reports this. It cannot, and the
+    /// two runs here are why: the second starts after the first has
+    /// returned, so the lock is free and there is nothing to contend for.
+    /// The ordering that *would* contend -- a release arriving while the body
+    /// runs -- is the one #98's floor turns into no release at all, since a
+    /// bypassed node's counter is the stored zero for as long as its body
+    /// runs and a floored decrement of zero queues nothing.
+    ///
+    /// The order is fixed rather than raced for: every job is invoked from
+    /// this thread, and the conditioner is what keeps `gate` out of the
+    /// scheduler until the case wants it -- it selects the runtime task and
+    /// never `gate`, whose job is built by hand and invoked last. Nothing
+    /// here waits for anything, so a regression fails an assertion rather
+    /// than wedging the suite.
+    #[test]
+    fn a_predecessor_releasing_after_the_scheduled_task_ran_runs_it_twice() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let mut taskflow = Taskflow::new();
+
+        let target = {
+            let runs = Arc::clone(&runs);
+            taskflow.emplace(move || {
+                runs.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        let gate = taskflow.emplace(|| {});
+        let rt = taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
+            runtime.schedule(target);
+        });
+        // The conditioner selects its first successor and nothing else, so
+        // `gate` is reachable only through the job this case builds by hand.
+        let entry = taskflow.emplace_condition(|| 0);
+        taskflow.task(entry).precede([rt, gate]);
+        taskflow.task(gate).precede([target]);
+
+        let executor = Executor::new(1);
+        let mut worker = test_worker(&executor);
+        let topology = run_of(&taskflow, {
+            let finished = Arc::clone(&finished);
+            move || finished.store(true, Ordering::Relaxed)
+        });
+        let entry_job = source_job(&taskflow, &topology);
+        let gate_job = held_back_job(&entry_job, &topology, gate);
+
+        worker.invoke(entry_job);
+
+        let target_node = taskflow.graph().node(target);
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            0,
+            "the scheduled task went on the queue rather than running as the \
+             conditioner's continuation, which is the runtime task"
+        );
+
+        let job = worker.pop().expect("the scheduled task is queued");
+        worker.invoke(job);
+
+        assert_eq!(runs.load(Ordering::Relaxed), 1, "the bypass ran it once");
+        assert_eq!(
+            target_node.join_counter().load(Ordering::Relaxed),
+            1,
+            "and its own arm re-armed it to its one strong dependency, which \
+             is the value that makes the release below an ordinary one"
+        );
+        assert!(worker.pop().is_none(), "nothing else is queued");
+
+        worker.invoke(gate_job);
+
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            2,
+            "the predecessor's release reached zero legitimately, so the \
+             target ran a second time -- `try_lock` had nothing to report, \
+             because the first run was over"
+        );
+        assert_eq!(
+            target_node.join_counter().load(Ordering::Relaxed),
+            1,
+            "the second run re-armed it again"
+        );
+        assert!(
+            worker.pop().is_none(),
+            "the second run was the continuation"
+        );
+        assert!(
+            finished.load(Ordering::Relaxed),
+            "and it was accounted for like any other released successor, so \
+             the run finished rather than losing a count to it"
+        );
+    }
+
+    /// Issue #107's dangerous ordering, refused: the bypassed task has
+    /// *preempted itself* by the time its strong predecessor releases it, so
+    /// the count that release would spend is a reference its own outstanding
+    /// work is holding.
+    ///
+    /// Delivering it would resume the node with that work still running --
+    /// successors released early, and the counter past the zero the work
+    /// needs to resume it, which is a run that never finishes. `try_lock`
+    /// cannot report that one either, and this is the shape that settles it:
+    /// the body has already returned, so no lock is held, and the resumption
+    /// would take the dispatch's `PREEMPTED` fast path, which does not touch
+    /// the body at all. So the successor arm drops the release and records it
+    /// as the failure of the task that released, leaving every reference the
+    /// node holds intact -- which is what lets the outstanding work still
+    /// resume it and the run still finish, with the failure rather than
+    /// without it.
+    ///
+    /// The body stands its outstanding work up the way
+    /// `a_body_that_leaves_work_outstanding_is_preempted_and_resumed` does,
+    /// by raising the node's own counter, and the case spends that reference
+    /// by hand afterwards. So the order is fixed, nothing waits, and the
+    /// regression this guards against fails an assertion instead of wedging
+    /// the suite: the resumption that would hang the run is the one the case
+    /// drives itself.
+    #[test]
+    fn a_release_onto_a_task_that_has_preempted_itself_is_refused() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let mut taskflow = Taskflow::new();
+
+        let other = {
+            let runs = Arc::clone(&runs);
+            taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                // What `rt.silent_async` will do: one more reference to the
+                // node, held by work that has not finished.
+                runtime.node.join_counter().fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        let after = {
+            let released = Arc::clone(&released);
+            taskflow.emplace(move || {
+                released.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        let gate = taskflow.emplace(|| {});
+        let rt = taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
+            runtime.schedule(other);
+        });
+        let entry = taskflow.emplace_condition(|| 0);
+        taskflow.task(entry).precede([rt, gate]);
+        taskflow.task(gate).precede([other]);
+        taskflow.task(other).precede([after]);
+
+        let executor = Executor::new(1);
+        let mut worker = test_worker(&executor);
+        let topology = run_of(&taskflow, {
+            let finished = Arc::clone(&finished);
+            move || finished.store(true, Ordering::Relaxed)
+        });
+        let entry_job = source_job(&taskflow, &topology);
+        let gate_job = held_back_job(&entry_job, &topology, gate);
+
+        worker.invoke(entry_job);
+
+        let other_node = taskflow.graph().node(other);
+        let job = worker.pop().expect("the scheduled runtime task is queued");
+        // The job the node was dequeued as, which is what the outstanding
+        // work re-queues to resume it.
+        let resume = job.clone();
+        worker.invoke(job);
+
+        assert_eq!(runs.load(Ordering::Relaxed), 1, "the body ran once");
+        assert_eq!(entered(&taskflow, other), ENTERED, "and preempted itself");
+        assert_eq!(
+            other_node.join_counter().load(Ordering::Relaxed),
+            1,
+            "holding the one reference its outstanding work owns"
+        );
+
+        worker.invoke(gate_job);
+
+        assert_eq!(
+            other_node.join_counter().load(Ordering::Relaxed),
+            1,
+            "the strong release was dropped rather than delivered, so the \
+             reference the outstanding work owns is still there"
+        );
+        assert_eq!(
+            entered(&taskflow, other),
+            ENTERED,
+            "and the node is still preempted, since nothing resumed it"
+        );
+        assert_eq!(
+            released.load(Ordering::Relaxed),
+            0,
+            "its successor was not released early"
+        );
+        assert!(worker.pop().is_none(), "nor was a resumption queued");
+        assert!(
+            !finished.load(Ordering::Relaxed),
+            "and the run is not over: the preempted node still owes it"
+        );
+
+        // The outstanding work finishing, by hand, as the preemption cases
+        // above drive it: `WorkerThread::finish_job` reads the parent's state
+        // word before this decrement and, finding `PREEMPTED`, re-queues the
+        // job the node was dequeued as.
+        assert_eq!(
+            other_node.join_counter().fetch_sub(1, Ordering::AcqRel),
+            1,
+            "the refused release left this the last reference"
+        );
+        worker.invoke(resume);
+
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            1,
+            "the resumption is the entry the node was waiting for, and it \
+             runs no body"
+        );
+        assert_eq!(entered(&taskflow, other), 0, "it clears both bits");
+        assert_eq!(
+            released.load(Ordering::Relaxed),
+            0,
+            "the successor it releases is skipped, because the refusal \
+             cancelled the run as any task's failure does"
+        );
+        assert!(
+            finished.load(Ordering::Relaxed),
+            "and the run finished rather than hanging, which is the whole \
+             point of dropping that release instead of spending it"
+        );
+        assert!(
+            payload_of(&topology).contains("already running"),
+            "the run reports the invariant by name"
+        );
+    }
+
+    /// The same hazard from the other direction, and the one `schedule`
+    /// itself can see: a target that has already preempted itself is refused
+    /// before the zero is stored.
+    ///
+    /// Storing it would wipe the references the node's outstanding work is
+    /// holding rather than bypass a dependency count, which is the hang
+    /// upstream's own "we currently do not support scheduling a runtime
+    /// task" leaves to the caller. The panic is the body's, so it is
+    /// reported the way any failing task is -- as the run's failure, with
+    /// the runtime task still finishing -- and the target is left exactly as
+    /// it was found.
+    ///
+    /// The target's state is set up by hand rather than reached through a
+    /// second worker, which is what keeps the order fixed: a case that raced
+    /// a live preemption against a `schedule` could only ever *sometimes*
+    /// reach the state it is about. `set_up_graph` clears both words at the
+    /// start of every run, so this is the state a node of a run that reached
+    /// the preemption branch is in, written directly.
+    #[test]
+    fn scheduling_a_task_that_has_preempted_itself_is_refused() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let mut taskflow = Taskflow::new();
+
+        let other = {
+            let runs = Arc::clone(&runs);
+            taskflow.emplace_runtime(move |_: &mut Runtime<'_>| {
+                runs.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        let rt = taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
+            runtime.schedule(other);
+        });
+        let entry = taskflow.emplace_condition(|| 0);
+        taskflow.task(entry).precede([rt, other]);
+
+        let executor = Executor::new(1);
+        let mut worker = test_worker(&executor);
+        let topology = run_of(&taskflow, {
+            let finished = Arc::clone(&finished);
+            move || finished.store(true, Ordering::Relaxed)
+        });
+
+        // A node that has reached the preemption branch: both bits, and one
+        // reference per piece of work still outstanding.
+        let other_node = taskflow.graph().node(other);
+        other_node.nstate().fetch_or(ENTERED, Ordering::Relaxed);
+        other_node.join_counter().fetch_add(1, Ordering::Relaxed);
+
+        worker.invoke(source_job(&taskflow, &topology));
+
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            0,
+            "the target was not entered a second time"
+        );
+        assert_eq!(
+            other_node.join_counter().load(Ordering::Relaxed),
+            1,
+            "and the refusal wrote nothing: the reference its outstanding \
+             work owns is untouched"
+        );
+        assert!(
+            worker.pop().is_none(),
+            "nothing was queued, so the count `schedule` takes against the \
+             parent was not taken either"
+        );
+        assert!(
+            finished.load(Ordering::Relaxed),
+            "the runtime task finished through the panic path, so the run's \
+             accounting balanced and `wait` would answer"
+        );
+        assert!(
+            payload_of(&topology).contains("already running"),
+            "with the invariant named in the payload"
+        );
+    }
+
+    /// What a hand-driven run reports, as the string `RunError` would render.
+    ///
+    /// The `join` cannot block: the tear-down fires the run's callback and
+    /// fills the completion slot in that order, both inside the `invoke` that
+    /// ended the run and therefore on this thread, so a case that has
+    /// asserted the callback ran is asking for a slot that is already full.
+    fn payload_of(topology: &Arc<Topology>) -> String {
+        let payload = topology.join().expect("the run reports a failure");
+        payload
+            .downcast_ref::<&str>()
+            .expect("both refusals are literal messages")
+            .to_string()
     }
 
     /// A payload in a `spawn_runtime` node's own slot is what that task
