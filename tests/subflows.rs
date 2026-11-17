@@ -1,22 +1,26 @@
 //! Translated from `unittests/test_subflows.cpp` (Taskflow v4.1.0).
 //!
-//! The cases that need nothing but subflow tasking, which is all of that file
-//! except two families: `MultipleSubflowRuns` and its `Predicate` variant,
-//! which need the run family's `run_n`/`run_until` and belong to #54, and
-//! `DetachedSubflow` with `TreeSubflow`, which are commented out upstream
-//! because `Subflow::detach` is gone from v4 -- so they are not ported at all
-//! rather than ported from a dead header.
+//! Every case of that file this port can run is here. One family is not
+//! ported at all -- `DetachedSubflow` and `TreeSubflow`, which are commented
+//! out upstream because `Subflow::detach` is gone from v4, so they would be
+//! ported from a dead header.
 //!
 //! What is here is `JoinedSubflow` (both subcases, at 1..=8 workers),
-//! `FibSubflow` (at upstream's worker counts) and `Subflow.BitState` (at
-//! 1..=4) -- none of them slow enough to be worth an `#[ignore]`, the whole
-//! file being well under a second -- plus two cases of this port's own at the
-//! end. Both are about the lease: the subgraph a body retained is still in
-//! the node after the run, which is what a DOT dump of a subflow is for, and
-//! it is still in the *right* node when the subflow task is one graph down,
-//! inside a composed taskflow or an adopted graph.
+//! `FibSubflow` (at upstream's worker counts), the three `MultipleSubflowRuns`
+//! families -- the interleaved one, `ChangedTaskflow` and `Predicate`, each at
+//! 1..=8 and all three added by #54, which is where subflows and the run
+//! family are driven together -- and `Subflow.BitState` (at 1..=4). None of
+//! them is slow enough to be worth an `#[ignore]`: the whole file is a
+//! quarter of a second in a debug build.
 //!
-//! Four adaptations, none of which changes what is asserted:
+//! Two cases of this port's own close the file. Both are about the lease: the
+//! subgraph a body retained is still in the node after the run, which is what
+//! a DOT dump of a subflow is for, and it is still in the *right* node when
+//! the subflow task is one graph down, inside a composed taskflow or an
+//! adopted graph.
+//!
+//! Four adaptations, none of which changes what is asserted, and the
+//! `MultipleSubflowRuns` cases name two more of their own:
 //!
 //! - **`fb.reduce` becomes one static task.** Upstream's `Complex` subcase
 //!   sums ten `1`s with `tf::Taskflow::reduce`, which is an algorithm rather
@@ -46,7 +50,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rustflow::prelude::*;
-use rustflow::{Executor, Node, SubflowWork, TaskMut};
+use rustflow::{Executor, Node, RunHandle, SubflowWork, TaskMut};
 
 /// A counter shared with the task bodies that bump it.
 type Counter = Arc<AtomicUsize>;
@@ -383,6 +387,271 @@ fn a_recursive_subflow_computes_fibonacci() {
             6765,
             "{workers} worker(s): fib(20)"
         );
+    }
+}
+
+// ----------------------------------------------------------------------------
+// MultipleSubflowRuns
+// ----------------------------------------------------------------------------
+
+/// The four tasks all three `MultipleSubflowRuns` cases build: `A -> {B, C}`,
+/// `{B, C} -> D`, where `B` is a subflow task that counts itself and spawns
+/// three children of its own with `B1, B2 -> B3`.
+///
+/// Seven bodies run per run of it, which is the arithmetic behind every
+/// assertion in the three cases below, and the three children are rebuilt from
+/// scratch on every entry to `B` -- which is the point of running one
+/// subflow-bearing taskflow a thousand times.
+fn multiple_runs_diamond(taskflow: &mut Taskflow, counted: &Counter) -> (Task, Task, Task, Task) {
+    let a = {
+        let counted = Arc::clone(counted);
+        taskflow.emplace(move || {
+            bump(&counted);
+        })
+    };
+    let b = {
+        let counted = Arc::clone(counted);
+        taskflow.emplace_subflow(move |subflow: &mut Subflow<'_>| {
+            bump(&counted);
+            let mut child = || {
+                let counted = Arc::clone(&counted);
+                subflow.emplace(move || {
+                    bump(&counted);
+                })
+            };
+            let b1 = child();
+            let b2 = child();
+            let b3 = child();
+            subflow.linearize([b1, b3]);
+            subflow.linearize([b2, b3]);
+        })
+    };
+    let c = {
+        let counted = Arc::clone(counted);
+        taskflow.emplace(move || {
+            bump(&counted);
+        })
+    };
+    let d = {
+        let counted = Arc::clone(counted);
+        taskflow.emplace(move || {
+            bump(&counted);
+        })
+    };
+
+    taskflow.task(a).precede([b, c]);
+    taskflow.task(b).precede([d]);
+    taskflow.task(c).precede([d]);
+
+    (a, b, c, d)
+}
+
+/// Upstream's `multiple_subflow_runs(W)`: a thousand runs of that diamond,
+/// interleaved three ways, and `count == 7000` at the end.
+///
+/// Four hundred and ninety-nine runs are issued without waiting -- every
+/// other one of them with an on-finish callback that asserts the running
+/// total -- then a five hundredth is issued and waited for, which is
+/// upstream's "synchronise the first 500 runs", and five hundred more are
+/// asked for in one `run_n`. The callbacks
+/// are what make it more than a stress test: `count == (i+1)*7` inside the
+/// callback of the `i`-th run can only hold if runs of one taskflow are
+/// serialised and a callback sees the whole of its own run and none of the
+/// next, which is the contract a queued re-run has.
+///
+/// Two adaptations, neither of which changes what is asserted:
+///
+/// - **`fu.valid()` and `fu.wait_for(1s) == ready` have no analogue.** They
+///   are `std::future`'s own surface -- a moved-from future is invalid, and a
+///   ready one answers without blocking -- where a
+///   [`RunHandle`](rustflow::RunHandle) is a handle to a run and is never in
+///   either state. What upstream is really asserting is that every one of the
+///   five hundred runs is over by the time `wait_for_all` returns, and this
+///   port says that with `num_topologies() == 0`, which
+///   [`RunHandle::wait`](rustflow::RunHandle::wait) documents as the stronger
+///   claim: a run that is accounted for cannot block a `wait_for_all`.
+/// - **The handles are drained afterwards rather than dropped.** A dropped
+///   handle discards the run's result, and these runs carry assertions in
+///   their callbacks, so each handle is waited for in turn -- after
+///   `wait_for_all`, so the waiting is upstream's and the `wait` is only how
+///   a failed callback is reported.
+fn multiple_subflow_runs(workers: usize) {
+    let context = format!("{workers} worker(s)");
+    let executor = Executor::new(workers);
+    let mut taskflow = Taskflow::new();
+    let counted = counter();
+    multiple_runs_diamond(&mut taskflow, &counted);
+
+    let mut handles: Vec<RunHandle<'_>> = Vec::with_capacity(500);
+    for i in 0..500 {
+        if i == 499 {
+            // Upstream's `run(taskflow).get()` -- the five hundredth run, and
+            // the barrier the four hundred and ninety-nine before it are
+            // queued behind -- then five hundred more.
+            executor
+                .run(&taskflow)
+                .wait()
+                .unwrap_or_else(|error| panic!("{context}: {error}"));
+            handles.push(executor.run_n(&taskflow, 500));
+        } else if i % 2 == 1 {
+            handles.push(executor.run(&taskflow));
+        } else {
+            let counted = Arc::clone(&counted);
+            handles.push(executor.run_with(&taskflow, move || {
+                assert_eq!(
+                    count(&counted),
+                    (i + 1) * 7,
+                    "{workers} worker(s): run {i} sees its own seven tasks and no more"
+                );
+            }));
+        }
+    }
+
+    executor.wait_for_all();
+    assert_eq!(
+        executor.num_topologies(),
+        0,
+        "{context}: every run is accounted for"
+    );
+
+    for (index, handle) in handles.into_iter().enumerate() {
+        handle
+            .wait()
+            .unwrap_or_else(|error| panic!("{context}: handle {index}: {error}"));
+    }
+
+    assert_eq!(count(&counted), 7000, "{context}");
+}
+
+/// Upstream's eight `MultipleSubflowRuns` cases, which are one helper at one
+/// through eight workers.
+#[test]
+fn interleaved_runs_of_a_subflow_bearing_taskflow_count_every_body() {
+    for workers in 1..=8 {
+        multiple_subflow_runs(workers);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// MultipleSubflowRuns.ChangedTaskflow
+// ----------------------------------------------------------------------------
+
+/// Upstream's `multiple_subflow_runs_with_changed_taskflow(W)`: the same
+/// diamond, run ten times, then edited and run ten times again, twice over.
+///
+/// The two tasks appended between the runs do nothing, so the count goes up by
+/// seventy each time whatever is added -- which is the assertion: a taskflow
+/// that grew a node between runs is re-run from a graph of the new size, with
+/// the subflow node's own state reset along with everything else. The last of
+/// the three runs is the one upstream leaves to `wait_for_all`, and so does
+/// this.
+fn multiple_subflow_runs_with_changed_taskflow(workers: usize) {
+    let context = format!("{workers} worker(s)");
+    let executor = Executor::new(workers);
+    let mut taskflow = Taskflow::new();
+    let counted = counter();
+    let (_, _, _, d) = multiple_runs_diamond(&mut taskflow, &counted);
+
+    executor
+        .run_n(&taskflow, 10)
+        .wait()
+        .unwrap_or_else(|error| panic!("{context}: {error}"));
+    assert_eq!(count(&counted), 70, "{context}: ten runs of seven tasks");
+
+    let e = taskflow.emplace(|| {});
+    taskflow.task(d).precede([e]);
+    executor
+        .run_n(&taskflow, 10)
+        .wait()
+        .unwrap_or_else(|error| panic!("{context}: {error}"));
+    assert_eq!(count(&counted), 140, "{context}: ten more");
+
+    let f = taskflow.emplace(|| {});
+    taskflow.task(e).precede([f]);
+    let handle = executor.run_n(&taskflow, 10);
+    executor.wait_for_all();
+    handle
+        .wait()
+        .unwrap_or_else(|error| panic!("{context}: {error}"));
+    assert_eq!(count(&counted), 210, "{context}: ten more again");
+}
+
+/// Upstream's eight `MultipleSubflowRuns.ChangedTaskflow` cases.
+#[test]
+fn a_subflow_bearing_taskflow_edited_between_runs_runs_at_its_new_size() {
+    for workers in 1..=8 {
+        multiple_subflow_runs_with_changed_taskflow(workers);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// MultipleSubflowRuns.Predicate
+// ----------------------------------------------------------------------------
+
+/// Upstream's `[run=10]() mutable { return run-- == 0; }`.
+///
+/// Asked once before the first run and once after each, so it ends the run
+/// after ten of them -- the eleventh call is the one that compares zero.
+fn ten_runs() -> impl FnMut() -> bool + Send + 'static {
+    let mut remaining = 10_i32;
+    move || {
+        let compared = remaining;
+        remaining -= 1;
+        compared == 0
+    }
+}
+
+/// Upstream's on-finish callback: seventy bodies ran, and the counter goes
+/// back to zero for the next `run_until`.
+fn seventy_then_reset(counted: &Counter, context: String) -> impl FnOnce() + Send + 'static {
+    let counted = Arc::clone(counted);
+    move || {
+        assert_eq!(count(&counted), 70, "{context}: ten runs of seven tasks");
+        counted.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Upstream's `multiple_subflow_runs_with_predicate(W)`: three `run_until`s
+/// over the same diamond, each stopped by a ten-run predicate and each
+/// resetting the counter from its callback.
+///
+/// What the three in a row are for is the predicate's own state: the second
+/// and third `run_until` get a fresh one, so a port that left a run counter on
+/// the topology rather than in the predicate would stop short or not at all.
+/// The callback's `count == 70` is the same assertion three times and it is
+/// upstream's.
+///
+/// One adaptation: upstream drops the middle handle on the floor and lets its
+/// per-taskflow queue line the three up. Dropping a handle here waits too, but
+/// it also discards the run's result -- and this run's assertion is *in* its
+/// callback -- so the middle one is waited for like the other two. The three
+/// are serialised either way.
+fn multiple_subflow_runs_with_predicate(workers: usize) {
+    let context = format!("{workers} worker(s)");
+    let executor = Executor::new(workers);
+    let mut taskflow = Taskflow::new();
+    let counted = counter();
+    multiple_runs_diamond(&mut taskflow, &counted);
+
+    for round in 0..3 {
+        let context = format!("{context}: round {round}");
+        executor
+            .run_until_with(
+                &taskflow,
+                ten_runs(),
+                seventy_then_reset(&counted, context.clone()),
+            )
+            .wait()
+            .unwrap_or_else(|error| panic!("{context}: {error}"));
+        assert_eq!(count(&counted), 0, "{context}: the callback reset it");
+    }
+}
+
+/// Upstream's eight `MultipleSubflowRuns.Predicate` cases.
+#[test]
+fn a_predicate_stops_a_run_of_a_subflow_bearing_taskflow_after_ten() {
+    for workers in 1..=8 {
+        multiple_subflow_runs_with_predicate(workers);
     }
 }
 
