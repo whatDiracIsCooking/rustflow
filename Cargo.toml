@@ -21,6 +21,10 @@ crossbeam-utils = "=0.8.23"
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
+# `cfg(loom)` is set by hand -- see `tests/loom_notifier.rs` -- rather than by a
+# Cargo feature, because a feature would let `--all-features` pull the loom
+# model into the normal gate, where it does not belong.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [lints.clippy]
 # A work-stealing scheduler is exactly the kind of code where an `as` cast or a
@@ -29,3 +33,13 @@ missing_docs = "warn"
 cast_possible_truncation = "warn"
 cast_sign_loss = "warn"
 undocumented_unsafe_blocks = "warn"
+
+# loom is the one dependency the notifier's `cfg(loom)` build pulls in, and the
+# target expression is how it stays out of every other build: `cfg(loom)` is set
+# by `RUSTFLAGS`, never by a feature, so a normal `cargo build` -- and the
+# gate's -- resolves without it. It has to be a dependency of the *library*
+# rather than a dev-dependency, because the atomics it replaces are the
+# library's own; `tests/loom_notifier.rs` says what to run. Pinned exactly, for
+# the same reason the runtime dependencies are.
+[target.'cfg(loom)'.dependencies]
+loom = "=0.7.3"
