@@ -23,9 +23,10 @@
 //!
 //! - a [`Job`] holds an `Arc<Topology>`, so the run it belongs to outlives
 //!   it;
-//! - a [`Job`] holds an `Arc<Flow>` -- the taskflow's storage, which is the
-//!   graph it walks and the queue of runs of that graph -- so the nodes it
-//!   addresses outlive it too;
+//! - a [`Job`] holds a [`GraphOwner`] -- whatever owns the graph it walks,
+//!   which for a top-level node is the taskflow's storage: the graph itself
+//!   and the queue of runs of it -- so the nodes it addresses outlive it
+//!   too;
 //! - a [`Topology`] holds a share of that same storage for the length of the
 //!   run, which is what the thread that ends a run tears it down through.
 //!
@@ -66,6 +67,76 @@
 //! what keeps the node itself out of the question: it comes out of the graph
 //! through safe code, and a graph nobody can edit while a job names it cannot
 //! invalidate an index either.
+//!
+//! # The four graphs a job can walk
+//!
+//! Upstream settles this before a job exists. `_schedule_graph` takes a
+//! `Graph&`, every node of that graph then holds nothing but its own state
+//! and its own pointers, and what keeps the reference valid is the same
+//! sentence of documentation as the rest. A port whose jobs own what they
+//! name has to say instead *who owns* each graph the scheduler can be asked
+//! to run, and the four answers are not one shape: that choice is
+//! [`GraphOwner`], and issue #74 is where it was made once rather than three
+//! times over the hottest struct in the crate.
+//!
+//! Two of the four are a share of a taskflow's storage -- the run's own
+//! graph, and the target of a module task composed of an `Arc<Taskflow>` --
+//! which is why a module task was schedulable (#49) before this field was
+//! widened at all. The other two live *inside* the handle of the node they
+//! hang off, an adopted module's `Graph` and a subflow's `Mutex<Graph>`, so
+//! the only thing that names one is the owner of the *outer* graph plus that
+//! node's index as a path. [`Inside`] is that path, and it is recursive
+//! because the nesting is: a subflow of an adopted module of a composed
+//! taskflow is three links. It cannot close into a cycle, because a graph a
+//! node owns cannot contain the node that owns it.
+//!
+//! What this buys is the thing a `Graph&` cannot say. A job of an adopted
+//! module's graph used to resolve its [`Task`] against the *root* arena --
+//! silently, against whatever node happened to sit at that index -- which is
+//! why the arm that ran one refused the run until this landed.
+//!
+//! # Why a subgraph comes out of its lock to be run
+//!
+//! The subflow is the one of the four that needs more than a path, because a
+//! `Mutex<Graph>` cannot be read without a guard. Three ways to answer that
+//! were on the table and only one of them schedules a graph whose jobs can
+//! run at the same time as each other:
+//!
+//! - **lock per access.** A guard is exclusive, so the jobs of one subgraph
+//!   would run one at a time. It is worse than it sounds: the work a node
+//!   runs *is* in the node, so `WorkerThread::invoke` holds its graph for the
+//!   length of the body, and the guard would be held across user code rather
+//!   than taken for a lookup. A body that coruns its own subgraph --
+//!   `Subflow::join`, which is #50 -- holds that same guard while it waits,
+//!   which turns the serialisation into a deadlock. [`Taskflow::dump`] meets
+//!   this lock too and answers it with `try_lock`-and-skip; a scheduler has
+//!   no such answer available, because a graph it declines to read is a run
+//!   that never finishes.
+//! - **hold one guard for the length of the nested run.** The same two costs
+//!   with the lock held longer, and it does not type-check either: a
+//!   `MutexGuard` carries the lifetime of the mutex it came from, and a job
+//!   outlives every frame that could lend it one -- which is the argument the
+//!   parent chain already rests on.
+//! - **take the graph out while you have the guard**, which is what
+//!   [`Inside`] does. The subgraph is moved out of its lock for the length of
+//!   its run and held by every job of it through that one shared allocation,
+//!   so resolving a node of a subgraph costs exactly what resolving a node of
+//!   a module's target costs, and no lock is on the hot path at all.
+//!
+//! Taking it needs `&mut Graph`, and that is the whole of what happens if the
+//! body that owns the guard is still running: a caller cannot ask for the
+//! lease without exclusive access to the subgraph, so either the body hands
+//! it over out of its own guard or the body has finished and dropped the
+//! guard before the dispatch arm takes the lock. The scheduler never
+//! contends for it, and there is no `try_lock` to lose. What a concurrent
+//! dump sees in the meantime is a subgraph with nothing in it, which is what
+//! it already shows for a subgraph whose lock is held, so the lease adds no
+//! observable of its own.
+//!
+//! Putting the graph back where it came from is #50's, along with the
+//! clear-unless-`RETAIN_SUBFLOW` rule that decides whether it goes back at
+//! all; what this module owes it is the shape, and [`Inside`] is also the
+//! path a restore would resolve the destination lock through.
 //!
 //! # Why a parent travels with the job
 //!
@@ -117,7 +188,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Poll, Waker};
 
-use crate::graph::{Graph, Node, NodeBase, Task};
+use crate::graph::{Graph, Handle, Node, NodeBase, Task};
 use crate::task::TaskRef;
 use crate::taskflow::Flow;
 
@@ -127,45 +198,97 @@ use crate::taskflow::Flow;
 /// Upstream's queues hold a bare `Node*` because a `Node` knows its own
 /// topology and its own parent; a node here is a slot in an arena that knows
 /// nothing about the run it is taking part in, so the job carries both
-/// instead. The four fields are a [`Task`] index, one share each of the run
-/// and of the taskflow's storage, and the [`Parent`] this job's graph was
-/// scheduled under -- which is what the module docs' two arguments cost, and
-/// what buys a queue of jobs that cannot dangle.
+/// instead. The four fields are a [`Task`] index, a [`GraphOwner`] for the
+/// graph that index is into, a share of the run, and the [`Parent`] this
+/// job's graph was scheduled under -- which is what the module docs'
+/// arguments cost, and what buys a queue of jobs that cannot dangle.
 ///
 /// `Clone` because resuming a preempted node means queueing the job it was
 /// dequeued as a second time, and because the parent chain shares the job of
 /// each parent with every child under it. Every field is a handle, so a clone
 /// is an index and two or three atomic increments -- the third being the
 /// parent's, for a job of a nested graph.
+///
+/// Five words, of which the owner is two: a tag and one pointer. It was four
+/// before #74, when the only thing a job could name was a taskflow's storage
+/// and one pointer said which; `BENCHMARKS.md` has what the fifth cost on
+/// the two shapes built to measure the scheduler and nothing else.
 #[derive(Clone)]
 pub(crate) struct Job {
     /// Which task of the graph to run.
     task: Task,
-    /// The storage whose graph `task` indexes.
+    /// Who owns the graph `task` indexes, which is the whole of what makes
+    /// that index resolvable: one of the four kinds the module docs set out.
     ///
-    /// Held by the job as well as by the topology so that the scheduling path
-    /// reaches the graph without taking a lock: the run's own share has to be
-    /// *takeable* -- see [`Topology::release_flow`] -- and therefore lives
-    /// behind a mutex, which is no place for a hot path to go.
+    /// The job holds its own owner rather than reading the run's, and for a
+    /// top-level node the two are the same `Arc<Flow>`: the run's share has
+    /// to be *takeable* -- see [`Topology::release_flow`] -- and therefore
+    /// lives behind a mutex, which is no place for a hot path to go.
     ///
-    /// This is the one field a nested graph widens. Upstream's node knows
-    /// which of the four graphs it lives in through the pointer the arena
-    /// hands out; here the job owns the graph it walks, and two of the four
-    /// kinds are already an `Arc<Flow>`: the run's own graph, and the target
-    /// of a module task composed `Arc<Taskflow>`, whose storage is this field
-    /// for every job of it (#49). The other two -- a subflow's subgraph and an
-    /// adopted module's graph -- live *inside* the handle of the node they
-    /// hang off, so naming one takes the outer share plus that node's index
-    /// as a path, which is the widening issue #74 makes once rather than three
-    /// times. [`Job::graph`] is the single place that resolves whichever it
-    /// is.
-    flow: Arc<Flow>,
+    /// This is the field #74 widened, and what it widened from is where the
+    /// shape came from: it was an `Arc<Flow>`, which already covered two of
+    /// the four kinds, and the other two needed a path rather than a share.
+    /// [`Job::graph`] is the single place that resolves whichever it is, and
+    /// nothing above it has to know which it was.
+    owner: GraphOwner,
     /// The run `task` is part of.
     topology: Arc<Topology>,
     /// What this job's graph was scheduled under: the run itself for a
     /// top-level node, or a [`Nested`] parent for a node of a nested graph or
     /// of a corun.
     parent: Parent,
+}
+
+/// Which graph a [`Job`]'s [`Task`] indexes, and what keeps that graph alive:
+/// upstream's `Graph&`, as a choice of owner rather than a reference.
+///
+/// Two variants for the four kinds of graph the scheduler can run, because
+/// what differs between the four is only who owns them, and on that question
+/// they pair up. The module docs have the argument in full, including why the
+/// subflow's is the one that cannot be read where it lies.
+///
+/// `Clone` because every job of a graph holds an owner of its own, so
+/// scheduling a graph of `n` sources clones this `n` times: one atomic
+/// increment each, whichever variant it is.
+#[derive(Clone)]
+pub(crate) enum GraphOwner {
+    /// A taskflow's storage, which is two of the four kinds: the graph of the
+    /// run itself, and the target of a module task composed of an
+    /// `Arc<Taskflow>`.
+    Flow(Arc<Flow>),
+    /// A graph that one node of another graph owns, which is the other two:
+    /// an adopted module's graph, and a subflow's subgraph.
+    Inside(Arc<Inside>),
+}
+
+/// A graph owned by one node of another graph, named by that node.
+///
+/// Upstream needs nothing here: the arena hands out a `Graph&` and the node
+/// it came out of is no longer part of the question. Here it is the whole of
+/// the question, because that graph is *inside* the node's handle -- so the
+/// only thing that names it is whoever owns the graph the node is in, plus
+/// the node's own index. One allocation per nested graph scheduled, shared by
+/// every job of it.
+///
+/// The chain is a chain of owners up to the run's own storage, and every link
+/// of it is owning, which is the same statement the parent chain makes: a job
+/// of a subflow of an adopted module keeps all three graphs alive because it
+/// holds the innermost. It cannot be a cycle -- a graph a node owns cannot
+/// contain the node that owns it -- so the recursion terminates at a
+/// [`GraphOwner::Flow`] after as many links as the graph has nesting levels.
+pub(crate) struct Inside {
+    /// Who owns the graph the owning node lives in: the next link up.
+    owner: GraphOwner,
+    /// The owning node's index in that graph.
+    node: Task,
+    /// The graph itself, when it could not be left where it lies: a subflow's
+    /// subgraph, moved out of the `Mutex` the body built it behind so that
+    /// the jobs of it need no guard. `None` for an adopted module's graph,
+    /// which the path above reads in place.
+    ///
+    /// The module docs say why a lock is not an option for a graph that is
+    /// being run, and who may take this out of it.
+    leased: Option<Graph>,
 }
 
 /// What the jobs of one graph count down to: upstream's `NodeBase* _parent`.
@@ -320,13 +443,108 @@ impl Nested {
     }
 }
 
+impl GraphOwner {
+    /// The graph of a taskflow's storage: a run's own graph, or a module
+    /// task's target.
+    ///
+    /// A share rather than the `&Arc<Flow>` the caller has, because every
+    /// job built over it keeps one and the caller's own goes out of scope.
+    pub(crate) fn flow(flow: &Arc<Flow>) -> Self {
+        Self::Flow(Arc::clone(flow))
+    }
+
+    /// The graph this owner names.
+    ///
+    /// Upstream's `Graph&`, resolved rather than passed: one branch for a
+    /// taskflow's storage, and for a graph a node owns either the lease or a
+    /// step up the path -- which is a node lookup and a match per level of
+    /// nesting, and nothing at all for the top-level case every static graph
+    /// is.
+    ///
+    /// Every borrow it hands out is derived from `&self`, which is what keeps
+    /// the whole of this safe: the owner holds the graph, or holds the owner
+    /// that holds the node that holds the graph, up to a share of a
+    /// taskflow's storage.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a node on the path is not a live node of its graph, which
+    /// cannot happen for an owner the scheduler built -- see [`Job::node`],
+    /// whose panic is the same one for the same reason.
+    pub(crate) fn graph(&self) -> &Graph {
+        match self {
+            Self::Flow(flow) => flow.graph(),
+            Self::Inside(inside) => inside.graph(),
+        }
+    }
+
+    /// Whether the graph this names has a task a run could start at.
+    ///
+    /// `Flow::has_source_task` over any owner, which is the question every
+    /// arm that runs a nested graph asks before scheduling one: a graph with
+    /// nothing to start at queues no job, so a node preempted for it would
+    /// never be resumed and the run would hang. It walks the graph, as that
+    /// method does and for the reason it gives -- a walk is cheaper than the
+    /// allocation collecting the sources would need.
+    pub(crate) fn has_source_task(&self) -> bool {
+        self.graph()
+            .iter()
+            .any(|(_, node)| node.num_predecessors() == 0)
+    }
+
+    /// The address that identifies the graph this owner names, for the hash
+    /// and the `Debug` a job needs.
+    ///
+    /// The allocation this owner holds a share of, which is one per graph
+    /// either way: the taskflow's storage for a graph that is a taskflow's,
+    /// and the path allocation for a graph a node owns. Every job of one
+    /// scheduled graph therefore agrees on it, because they all hold clones
+    /// of the one owner the scheduling path built.
+    ///
+    /// A pointer rather than the resolved graph's own address, because the
+    /// caller is on the path that pushes a job to the shared buffers and a
+    /// path walk is not what a hash is for.
+    fn identity(&self) -> *const () {
+        match self {
+            Self::Flow(flow) => Arc::as_ptr(flow).cast(),
+            Self::Inside(inside) => Arc::as_ptr(inside).cast(),
+        }
+    }
+}
+
+impl Inside {
+    /// The graph this node owns.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the owning node is not a live node of its graph, as
+    /// [`GraphOwner::graph`] says.
+    fn graph(&self) -> &Graph {
+        // The lease first: a graph that had to come out of its lock to be run
+        // is the one thing the path below cannot read in place.
+        if let Some(leased) = &self.leased {
+            return leased;
+        }
+
+        match self.owner.graph().node(self.node).handle() {
+            Handle::AdoptedModule(graph) => graph,
+            // Unreachable for an owner the scheduler built: it was made from
+            // the very handle the dispatch arm was holding, and a handle can
+            // only be replaced through `&mut Taskflow`, which no run allows.
+            // A subflow's handle does not reach here either -- its graph is
+            // the lease above.
+            handle => unreachable!("a nested graph hangs off {handle:?}, which owns none"),
+        }
+    }
+}
+
 impl Job {
-    /// Builds the job that runs `task` of `flow`'s graph as part of
+    /// Builds the job that runs `task` of `owner`'s graph as part of
     /// `topology`, under `parent`.
-    fn new(task: Task, flow: &Arc<Flow>, topology: &Arc<Topology>, parent: &Parent) -> Self {
+    fn new(task: Task, owner: &GraphOwner, topology: &Arc<Topology>, parent: &Parent) -> Self {
         Self {
             task,
-            flow: Arc::clone(flow),
+            owner: owner.clone(),
             topology: Arc::clone(topology),
             parent: parent.clone(),
         }
@@ -342,22 +560,41 @@ impl Job {
     /// what it needs is the topology's *share*, and `self: &Arc<Self>` is not
     /// a receiver Rust has.
     pub(crate) fn sources<'a>(
-        flow: &'a Arc<Flow>,
+        owner: &'a GraphOwner,
         topology: &'a Arc<Topology>,
         parent: &'a Parent,
     ) -> impl Iterator<Item = Self> + 'a {
-        flow.graph()
+        owner
+            .graph()
             .iter()
             .filter(|(_, node)| node.num_predecessors() == 0)
-            .map(move |(task, _)| Self::new(task, flow, topology, parent))
+            .map(move |(task, _)| Self::new(task, owner, topology, parent))
     }
 
-    /// The graph this job's node lives in.
-    ///
-    /// One owner to resolve today, which is the root graph of the run; see the
-    /// `flow` field for what the nested kinds will add here.
+    /// The graph this job's node lives in, whichever of the four kinds it is:
+    /// [`GraphOwner::graph`] is the resolution and the `owner` field is why
+    /// there is one.
     pub(crate) fn graph(&self) -> &Graph {
-        self.flow.graph()
+        self.owner.graph()
+    }
+
+    /// The owner of a graph this job's *own* node owns: the job's own owner
+    /// plus its task index, which is the only thing that names an adopted
+    /// module's graph or a subflow's subgraph.
+    ///
+    /// This is what a dispatch arm hands to
+    /// `Shared::schedule_graph` for the two kinds whose graph is not a share
+    /// of anything -- where the `Handle::Module` arm hands over the
+    /// `Arc<Flow>` its own handle holds. `leased` is the graph itself for a
+    /// subgraph that had to come out of its lock, and `None` for a graph the
+    /// path can read where it lies; the module docs say which is which and
+    /// why.
+    pub(crate) fn graph_inside(&self, leased: Option<Graph>) -> GraphOwner {
+        GraphOwner::Inside(Arc::new(Inside {
+            owner: self.owner.clone(),
+            node: self.task,
+            leased,
+        }))
     }
 
     /// The node to run.
@@ -367,7 +604,9 @@ impl Job {
     /// Panics if the job's task is not a live node of the graph, which cannot
     /// happen for a job built by the scheduler: a node can only be erased
     /// through `&mut Taskflow`, and `Taskflow::graph_mut` refuses while a
-    /// share of the storage -- this job's own, for one -- is outstanding.
+    /// share of the storage -- this job's own, for one -- is outstanding. The
+    /// same holds of every node on the path to a nested graph, which this
+    /// resolves through.
     pub(crate) fn node(&self) -> &Node {
         self.graph().node(self.task)
     }
@@ -539,13 +778,13 @@ impl Job {
     /// of its own graph, so every handle is cloned from the ones already in
     /// hand rather than looked up again.
     pub(crate) fn successor(&self, task: Task) -> Self {
-        Self::new(task, &self.flow, self.topology_share(), &self.parent)
+        Self::new(task, &self.owner, self.topology_share(), &self.parent)
     }
 
     /// Spends this job, handing back what the worker still owes: the parent to
     /// count down and the run to account the job to.
     ///
-    /// The job's own share of the taskflow's storage is released here, and
+    /// The job's own share of whatever owns its graph is released here, and
     /// *here* is the point: the caller's next move is to decrement the join
     /// counter that may end the run, and a share still outstanding when the
     /// waiting thread is released would be a share outstanding when that
@@ -554,17 +793,22 @@ impl Job {
     /// of this value, so nothing can touch them afterwards. See the module
     /// docs, which also say why the share a nested job keeps through its
     /// parent chain is not the same question.
+    ///
+    /// For a job of a nested graph the owner released here is the path or the
+    /// lease rather than a share of the taskflow -- and that is the same rule
+    /// one level in: the last job of a subgraph gives the lease up before the
+    /// counter that resumes the node the subgraph came out of.
     pub(crate) fn finish(self) -> Finished {
         let Self {
             task: _,
-            flow,
+            owner,
             topology,
             parent,
         } = self;
 
         // Before the caller's `job_finished`, which is the whole reason this
         // method exists rather than letting the job fall out of scope.
-        drop(flow);
+        drop(owner);
         Finished { parent, topology }
     }
 }
@@ -628,13 +872,13 @@ impl Finished {
 
 impl core::fmt::Debug for Job {
     /// Hand-written because the derived one would print the whole graph: a
-    /// job's share of the storage is an owning handle, not a field worth
-    /// expanding. The two addresses are what identifies a job, as upstream's
-    /// `Node*` identifies its own.
+    /// job's owner is an owning handle, not a field worth expanding. The two
+    /// addresses are what identifies a job, as upstream's `Node*` identifies
+    /// its own.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Job")
             .field("task", &self.task)
-            .field("flow", &Arc::as_ptr(&self.flow))
+            .field("owner", &self.owner.identity())
             .field("topology", &Arc::as_ptr(&self.topology))
             .field("parent", &self.parent)
             .finish()
@@ -645,11 +889,11 @@ impl std::hash::Hash for Job {
     /// Hand-written for the same reason [`Debug`](core::fmt::Debug) is, and it
     /// has one caller: `Buffers::push` routes a job to one of the shared
     /// overflow buffers by its hash, where upstream hashes the `Node*` it is
-    /// about to push. The two allocation addresses stand in for that pointer,
-    /// and the task index is what separates two jobs of one run.
+    /// about to push. The owner's allocation and the run's stand in for that
+    /// pointer, and the task index is what separates two jobs of one run.
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.task.hash(state);
-        Arc::as_ptr(&self.flow).hash(state);
+        self.owner.identity().hash(state);
         Arc::as_ptr(&self.topology).hash(state);
     }
 }
@@ -1346,6 +1590,12 @@ const _: () = {
     // parent with every job under it: a `Nested` holds one, and `Arc<Nested>`
     // is `Send` only if what it holds is both.
     assert_send_sync::<Job>();
+    // The owner is what a job hands a `&Graph` out of, and one of its two
+    // variants owns a `Graph` outright -- a subflow's subgraph, leased for
+    // the length of its run -- so the graph itself has to be shareable
+    // across threads rather than merely reachable through storage that is.
+    assert_send_sync::<GraphOwner>();
+    assert_send_sync::<Graph>();
     assert_send_sync::<Nested>();
     assert_send_sync::<Topology>();
     assert_send_sync::<Flow>();
@@ -1366,6 +1616,7 @@ mod tests {
     use crate::Executor;
     use crate::executor::queue::WorkerQueue;
     use crate::executor::worker::WorkerThread;
+    use crate::graph::SubflowWork;
     use crate::prelude::*;
 
     /// A run that runs its graph exactly once and has nothing to call
@@ -1520,7 +1771,8 @@ mod tests {
         set_up_graph(taskflow.graph());
 
         let topology = run_of(taskflow.flow());
-        let sources: Vec<Task> = Job::sources(taskflow.flow(), &topology, &Parent::Run)
+        let owner = GraphOwner::flow(taskflow.flow());
+        let sources: Vec<Task> = Job::sources(&owner, &topology, &Parent::Run)
             .map(|job| job.task)
             .collect();
         assert_eq!(sources, vec![a]);
@@ -1815,18 +2067,22 @@ mod tests {
         let spawner = outer.emplace(|| {});
         let flow = Arc::clone(outer.flow());
         let topology = run_of(&flow);
+        let owner = GraphOwner::flow(&flow);
         set_up_graph(flow.graph());
 
         // The parent: the job the spawner node was dequeued as, which is what
         // a preempting arm will have in hand.
-        let parent = Nested::new(Some(Job::new(spawner, &flow, &topology, &Parent::Run)));
+        let parent = Nested::new(Some(Job::new(spawner, &owner, &topology, &Parent::Run)));
         assert_eq!(parent.outstanding(), 0, "the spawner is a source");
 
         let counter = Arc::new(AtomicUsize::new(0));
         let inner = fan(3, &counter);
-        executor
-            .shared
-            .schedule_graph(Some(&worker), inner.flow(), &topology, &parent.as_parent());
+        executor.shared.schedule_graph(
+            Some(&worker),
+            &GraphOwner::flow(inner.flow()),
+            &topology,
+            &parent.as_parent(),
+        );
 
         assert_eq!(parent.outstanding(), 3, "one per source of the inner graph");
         assert_eq!(
@@ -1856,8 +2112,9 @@ mod tests {
         let spawner = outer.emplace(|| {});
         let flow = Arc::clone(outer.flow());
         let topology = run_of(&flow);
+        let owner = GraphOwner::flow(&flow);
         set_up_graph(flow.graph());
-        let parent = Nested::new(Some(Job::new(spawner, &flow, &topology, &Parent::Run)));
+        let parent = Nested::new(Some(Job::new(spawner, &owner, &topology, &Parent::Run)));
 
         // What a preempting arm does before it schedules the nested graph.
         flow.graph()
@@ -1867,9 +2124,12 @@ mod tests {
 
         let counter = Arc::new(AtomicUsize::new(0));
         let inner = fan(2, &counter);
-        executor
-            .shared
-            .schedule_graph(Some(&worker), inner.flow(), &topology, &parent.as_parent());
+        executor.shared.schedule_graph(
+            Some(&worker),
+            &GraphOwner::flow(inner.flow()),
+            &topology,
+            &parent.as_parent(),
+        );
 
         let first = worker.pop().expect("a source of the inner graph");
         let second = worker.pop().expect("the other source");
@@ -1920,9 +2180,12 @@ mod tests {
 
         let topology = run_of(inner.flow());
         let anchor = Nested::new(None);
-        executor
-            .shared
-            .schedule_graph(Some(&worker), inner.flow(), &topology, &anchor.as_parent());
+        executor.shared.schedule_graph(
+            Some(&worker),
+            &GraphOwner::flow(inner.flow()),
+            &topology,
+            &anchor.as_parent(),
+        );
         assert_eq!(anchor.outstanding(), 1, "one source");
 
         // The worker's own loop, by hand: a chain, so the second job is only
@@ -1963,13 +2226,14 @@ mod tests {
         let (grandparent, parent_task) = outer.emplace_n((|| {}, || {}));
         let flow = Arc::clone(outer.flow());
         let topology = run_of(&flow);
+        let owner = GraphOwner::flow(&flow);
         set_up_graph(flow.graph());
 
-        let grandparent_job = Job::new(grandparent, &flow, &topology, &Parent::Run);
+        let grandparent_job = Job::new(grandparent, &owner, &topology, &Parent::Run);
         let outer_parent = Nested::new(Some(grandparent_job));
         let parent = Nested::new(Some(Job::new(
             parent_task,
-            &flow,
+            &owner,
             &topology,
             &outer_parent.as_parent(),
         )));
@@ -1983,9 +2247,12 @@ mod tests {
 
         let counter = Arc::new(AtomicUsize::new(0));
         let inner = fan(3, &counter);
-        executor
-            .shared
-            .schedule_graph(Some(&worker), inner.flow(), &topology, &parent.as_parent());
+        executor.shared.schedule_graph(
+            Some(&worker),
+            &GraphOwner::flow(inner.flow()),
+            &topology,
+            &parent.as_parent(),
+        );
         assert_eq!(parent.outstanding(), 3);
 
         while let Some(job) = worker.pop() {
@@ -2035,15 +2302,25 @@ mod tests {
             let (root, middle) = outer.emplace_n((|| {}, || {}));
             let flow = Arc::clone(outer.flow());
             let topology = run_of(&flow);
+            let owner = GraphOwner::flow(&flow);
             set_up_graph(flow.graph());
 
-            let above = Nested::new(Some(Job::new(root, &flow, &topology, root_parent)));
-            let parent = Nested::new(Some(Job::new(middle, &flow, &topology, &above.as_parent())));
+            let above = Nested::new(Some(Job::new(root, &owner, &topology, root_parent)));
+            let parent = Nested::new(Some(Job::new(
+                middle,
+                &owner,
+                &topology,
+                &above.as_parent(),
+            )));
 
             let inner = fan(jobs, &Arc::new(AtomicUsize::new(0)));
             set_up_graph(inner.flow().graph());
-            let jobs =
-                Job::sources(inner.flow(), &topology, &parent.as_parent()).collect::<Vec<_>>();
+            let jobs = Job::sources(
+                &GraphOwner::flow(inner.flow()),
+                &topology,
+                &parent.as_parent(),
+            )
+            .collect::<Vec<_>>();
             assert!(!jobs.is_empty(), "a chain needs a job to fail");
 
             // Everything the jobs need is owned by the jobs: the inner
@@ -2203,5 +2480,162 @@ mod tests {
                 Some("boom")
             );
         });
+    }
+
+    /// The index every one of the four cases below resolves, which is task 1
+    /// of a two-node graph -- live in the nested arena and live in the outer
+    /// one, with a different node behind it. That is the whole point of the
+    /// collision: a job that resolved against the wrong graph would find a
+    /// node rather than a panic, and run it.
+    const NESTED: Task = Task::new(1);
+
+    /// A two-node graph whose nodes are named `<what>-0` and `<what>-1`.
+    fn named_pair(what: &str) -> Graph {
+        let mut graph = Graph::new();
+        graph.add_named_node(format!("{what}-0"), Handle::Placeholder);
+        graph.add_named_node(format!("{what}-1"), Handle::Placeholder);
+        graph
+    }
+
+    /// A taskflow whose graph is `root-0` and `root-1`, the second carrying
+    /// `handle`: the node a nested graph hangs off.
+    fn nesting(handle: Handle) -> Taskflow {
+        let mut taskflow = Taskflow::new();
+        taskflow
+            .graph_mut()
+            .add_named_node("root-0", Handle::Placeholder);
+        taskflow.graph_mut().add_named_node("root-1", handle);
+        taskflow
+    }
+
+    /// The first of the four kinds: a job of the run's own graph resolves in
+    /// the taskflow's own arena, which is the only kind there was before #74.
+    #[test]
+    fn a_job_of_the_runs_own_graph_resolves_in_the_taskflows_arena() {
+        let taskflow = nesting(Handle::Placeholder);
+        let topology = run_of(taskflow.flow());
+        let owner = GraphOwner::flow(taskflow.flow());
+
+        let job = Job::new(NESTED, &owner, &topology, &Parent::Run);
+
+        assert_eq!(job.node().name(), "root-1");
+        assert!(std::ptr::eq(job.graph(), taskflow.graph()));
+    }
+
+    /// The second: a job of a module's target resolves in the *target's*
+    /// arena, through the share the handle holds. This is the kind #49 could
+    /// already schedule, and it is here so that all four are pinned in one
+    /// place.
+    #[test]
+    fn a_job_of_a_modules_target_resolves_in_the_targets_arena() {
+        let mut target = Taskflow::new();
+        *target.graph_mut() = named_pair("target");
+        let target = Arc::new(target);
+        let taskflow = nesting(Handle::Module(Arc::clone(&target)));
+        let topology = run_of(taskflow.flow());
+
+        // What `module::invoke` hands the scheduling path: the storage of the
+        // taskflow its own handle holds.
+        let owner = GraphOwner::flow(target.flow());
+        let job = Job::new(NESTED, &owner, &topology, &Parent::Run);
+
+        assert_eq!(job.node().name(), "target-1");
+        assert_eq!(
+            taskflow.graph().node(NESTED).name(),
+            "root-1",
+            "the same index names another node in the composing graph"
+        );
+    }
+
+    /// The third, and the one that was broken: a job of an adopted module's
+    /// graph resolves *inside the handle* of the node that owns it, reached
+    /// as the module node's own owner plus its index.
+    ///
+    /// Without that path there is nothing to resolve against but the outer
+    /// owner, which answers with the composing graph's node at the same index
+    /// -- `root-1` here -- and says nothing about having done so. That is why
+    /// the arm that runs one refused the run until this landed.
+    #[test]
+    fn a_job_of_an_adopted_modules_graph_resolves_inside_its_handle() {
+        let taskflow = nesting(Handle::AdoptedModule(named_pair("adopted")));
+        let topology = run_of(taskflow.flow());
+        let root = GraphOwner::flow(taskflow.flow());
+
+        // The job the module node was dequeued as, which is what the arm that
+        // runs one has in hand, and the path it builds out of it.
+        let module = Job::new(NESTED, &root, &topology, &Parent::Run);
+        let owner = module.graph_inside(None);
+        let parent = Nested::new(Some(module));
+
+        let job = Job::new(NESTED, &owner, &topology, &parent.as_parent());
+
+        assert_eq!(job.node().name(), "adopted-1");
+        let Handle::AdoptedModule(adopted) = taskflow.graph().node(NESTED).handle() else {
+            panic!("the module node owns its graph");
+        };
+        assert!(
+            std::ptr::eq(job.graph(), adopted),
+            "the graph is the handle's own, not a copy of it"
+        );
+        assert_eq!(
+            taskflow.graph().node(NESTED).name(),
+            "root-1",
+            "the silent answer the path replaces"
+        );
+    }
+
+    /// The fourth: a job of a subflow's subgraph resolves in the graph that
+    /// came *out* of the node's lock, which is the shape `executor::subflow`
+    /// lands on (#50) and the module docs argue for. The scheduling arm is
+    /// that issue's; what is pinned here is that the lease resolves and that
+    /// the lock holds nothing while its graph is out being run.
+    #[test]
+    fn a_job_of_a_subflows_subgraph_resolves_in_the_leased_graph() {
+        let taskflow = nesting(Handle::Subflow {
+            work: SubflowWork::new(|_: &mut Subflow<'_>| {}),
+            subgraph: Mutex::new(named_pair("sub")),
+        });
+        let topology = run_of(taskflow.flow());
+        let root = GraphOwner::flow(taskflow.flow());
+        let spawner = Job::new(NESTED, &root, &topology, &Parent::Run);
+
+        let Handle::Subflow { subgraph, .. } = taskflow.graph().node(NESTED).handle() else {
+            panic!("the subflow node owns its subgraph");
+        };
+
+        // What the arm does with the guard it holds: a `Mutex` is no place
+        // for the jobs of a running graph to look, so the graph comes out of
+        // it for the length of the run.
+        let leased = std::mem::take(&mut *subgraph.lock().expect("uncontended"));
+        let owner = spawner.graph_inside(Some(leased));
+        let parent = Nested::new(Some(spawner));
+
+        let job = Job::new(NESTED, &owner, &topology, &parent.as_parent());
+
+        assert_eq!(job.node().name(), "sub-1");
+        assert!(
+            subgraph.lock().expect("uncontended").is_empty(),
+            "the lock holds nothing while its graph is out being run"
+        );
+        assert_eq!(
+            taskflow.graph().node(NESTED).name(),
+            "root-1",
+            "the same index names another node in the graph the subflow hangs off"
+        );
+    }
+
+    /// A job is five words, of which the owner is two: a tag and a pointer.
+    /// It was four before #74, when the only graph a job could name was a
+    /// taskflow's storage.
+    ///
+    /// Pinned because one job is built per task on the hot path and goes
+    /// through a work-stealing deque by value, so a sixth word is a decision
+    /// to be measured rather than an accident -- `BENCHMARKS.md` has what the
+    /// fifth one cost.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn a_job_is_five_words() {
+        assert_eq!(size_of::<GraphOwner>(), 16, "a tag and one pointer");
+        assert_eq!(size_of::<Job>(), 40);
     }
 }

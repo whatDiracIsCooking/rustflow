@@ -17,6 +17,27 @@
 //! set `PREEMPTED` on the node and schedule the subgraph under it. The second
 //! entry clears the bit and clears the subgraph unless the body asked to
 //! retain it.
+//!
+//! # How the subgraph is named, which is settled
+//!
+//! One question that shape raises is not this issue's, because scheduling a
+//! graph needs whatever *owns* it and a subgraph is owned by the `Mutex` in
+//! [`Handle::Subflow`](crate::Handle::Subflow). Issue #74 answered it for all
+//! four kinds of nested graph at once: the subgraph is moved out of its lock
+//! for the length of its run and held by every job of it through one shared
+//! allocation, which `Job::graph_inside` builds from this node's own job and
+//! a `Some(graph)` where the adopted-module arm passes `None`. The
+//! `executor::topology` module docs have the three options that were on the
+//! table and why a lock on the hot path is not one of them -- it would
+//! serialise the jobs of one subgraph and deadlock a body that coruns its
+//! own.
+//!
+//! What is left for this issue is the policy rather than the shape: taking
+//! the lease needs `&mut Graph`, so the body's guard has to be given up or
+//! handed over first, and putting the graph back -- or not, which is
+//! upstream's clear-unless-`RETAIN_SUBFLOW` default -- happens once the
+//! nested run is over and the last share of the lease is the one the restorer
+//! holds.
 
 use std::sync::Mutex;
 

@@ -463,7 +463,7 @@ impl WorkerThread {
     /// Upstream's `_invoke`. The four node kinds it can run itself are static,
     /// placeholder and the two conditioners; the four dynamic-tasking kinds
     /// each get one line here into the module that owns them. [`module`] runs
-    /// a composed taskflow as of #49 and refuses an adopted graph until #74;
+    /// a composed taskflow as of #49 and an adopted graph as of #74;
     /// [`subflow`] and [`runtime`] refuse the run for now. Upstream's three
     /// remaining kinds, its
     /// semaphores and its observers are each a later milestone, and none of
@@ -563,8 +563,9 @@ impl WorkerThread {
             //
             // The two module arms are upstream's two forwarders, and each
             // hands over what its handle *owns* rather than the `Graph&`
-            // upstream resolves here: a nested graph is scheduled through the
-            // share that owns it, which only one of the two has. See
+            // upstream resolves here: a nested graph is scheduled through
+            // whatever owns it, which for one of the two is a share and for
+            // the other is a path through this very node (#74). See
             // [`module`].
             Handle::Subflow { work, subgraph } => subflow::invoke(self, &job, work, subgraph),
             Handle::Runtime(work) => runtime::invoke(self, &job, work),

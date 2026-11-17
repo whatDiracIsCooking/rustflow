@@ -13,23 +13,29 @@
 //!
 //! The handles differ only in who owns the target graph, which upstream can
 //! forget about the moment it has a `Graph&`. This port cannot: the jobs of a
-//! graph own what they name, so scheduling one needs the *share* that owns it
-//! rather than a reference into it -- `Shared::schedule_graph` takes an
-//! `Arc<Flow>`, and `Job::graph` resolves an index against it.
+//! graph own what they name, so scheduling one needs whatever *owns* the
+//! graph rather than a reference into it -- `Shared::schedule_graph` takes a
+//! `GraphOwner`, and `Job::graph` resolves an index against it.
 //!
-//! [`Handle::Module`](crate::Handle::Module) has such a share already: its
-//! target is an `Arc<Taskflow>`, whose storage is exactly what a run of that
-//! taskflow would be scheduled over, so [`invoke`] is upstream's forwarder
-//! with `Taskflow::flow` where upstream writes `.graph`.
-//! [`Handle::AdoptedModule`](crate::Handle::AdoptedModule) has none: its
-//! graph sits inline in the handle, inside the arena of the graph the module
-//! node is in, so the only thing that owns it is the *outer* share plus that
-//! node's own index as a path to follow. Naming a graph that way is issue
-//! #74, which widens a job's graph owner to all four kinds of nested graph
-//! at once rather than having the module, subflow and runtime arms each
-//! reshape it in turn.
-//! Until then [`invoke_adopted`] refuses the run as #47's stub did, and that
-//! is the one part of this module that is not a translation.
+//! [`Handle::Module`](crate::Handle::Module) owns a share: its target is an
+//! `Arc<Taskflow>`, whose storage is exactly what a run of that taskflow
+//! would be scheduled over, so [`invoke`] is upstream's forwarder with
+//! `Taskflow::flow` where upstream writes `.graph`.
+//! [`Handle::AdoptedModule`](crate::Handle::AdoptedModule) owns the graph
+//! itself: it sits inline in the handle, inside the arena of the graph the
+//! module node is in, so the only thing that names it is the *outer* owner
+//! plus that node's own index as a path to follow. `Job::graph_inside` is
+//! that path, which is issue #74 -- the widening of a job's graph owner to
+//! all four kinds of nested graph at once, rather than the module, subflow
+//! and runtime arms each reshaping the field in turn -- and [`invoke_adopted`]
+//! is a one-line forwarder over it, as upstream's is over its `Graph&`.
+//!
+//! What the path has to be right about is which arena an index means. A job
+//! of an adopted graph built over the *outer* owner would resolve its tasks
+//! against the composing taskflow's own nodes -- silently, against whatever
+//! sits at those indices -- which is why #49 refused the run rather than
+//! running one that way, and it is what
+//! `an_adopted_module_resolves_its_tasks_in_its_own_graph` below pins.
 //!
 //! # What running the target costs the node
 //!
@@ -55,9 +61,10 @@
 //! # The empty target, widened by one case
 //!
 //! Upstream returns early on `graph.empty()`. This port asks
-//! `Flow::has_source_task` instead, which is the same question widened to the
-//! graph that has nothing to *start* at: an empty one, or one whose every
-//! node is in a cycle. The widening is not cosmetic here. Scheduling a
+//! `GraphOwner::has_source_task` instead -- `Flow::has_source_task` over
+//! whichever kind of owner the target is -- which is the same question
+//! widened to the graph that has nothing to *start* at: an empty one, or one
+//! whose every node is in a cycle. The widening is not cosmetic here. Scheduling a
 //! sourceless graph queues no job at all, so nothing would ever drive the
 //! module node's join counter off zero, and a node left `PREEMPTED` with no
 //! child to resume it hangs the run. [`Executor::run`](crate::Executor::run)
@@ -134,10 +141,10 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use crate::executor::topology::{Job, Nested};
+use crate::executor::topology::{GraphOwner, Job, Nested};
 use crate::executor::worker::{Release, WorkerThread};
 use crate::graph::{Graph, Node};
-use crate::taskflow::{Flow, Taskflow};
+use crate::taskflow::Taskflow;
 
 /// Runs the module task `job` is for, against the taskflow it is composed of:
 /// upstream's `_invoke_module_task`.
@@ -152,38 +159,45 @@ use crate::taskflow::{Flow, Taskflow};
 /// share that owns it; the module docs say why the share is what the
 /// scheduling path needs.
 pub(crate) fn invoke(worker: &WorkerThread, job: &Job, target: &Arc<Taskflow>) -> Option<Release> {
-    invoke_impl(worker, job, target.flow())
+    invoke_impl(worker, job, &GraphOwner::flow(target.flow()))
 }
 
-/// Refuses to run the adopted module task `job` is for, where upstream's
-/// `_invoke_adopted_module_task` forwards it to the same `_impl`.
+/// Runs the adopted module task `job` is for, against the graph its own
+/// handle owns: upstream's `_invoke_adopted_module_task`.
 ///
-/// A graph the handle owns inline has no share to schedule it over, and
-/// naming one is issue #74; the module docs have that argument in full. The
-/// refusal is #47's and so is its channel: reporting it as a panic of this
-/// node is the loudest of the options that still terminate, since
-/// [`Job::record_panic`] cancels the rest of the run and hands the message to
-/// whoever waits. A bare `panic!` would unwind with this job never counted as
-/// finished, leaving a `wait` blocked for ever, and a hang says less than an
-/// error does.
-pub(crate) fn invoke_adopted(
-    _worker: &WorkerThread,
-    job: &Job,
-    _target: &Graph,
-) -> Option<Release> {
-    job.record_panic(Box::new(
-        "running an adopted module task is not supported yet: a job's graph \
-         owner is widened by issue #74",
-    ));
-    Some(Release::Strong)
+/// Upstream reaches the target as
+/// `std::get_if<Node::AdoptedModule>(&_handle)->graph` and this reaches it as
+/// the path `Job::graph_inside` builds -- this job's own owner plus this
+/// job's task index -- because a graph the handle owns inline is owned by
+/// nothing else. The module docs say why that is the whole difference between
+/// this forwarder and [`invoke`], and the refusal it replaces (#47's stub,
+/// kept by #49) is gone.
+///
+/// `target` is the graph the dispatch arm already had in hand, and it is
+/// taken as an argument for the assertion below rather than for the run: the
+/// path has to resolve to exactly that graph, and a port of a pointer walk
+/// should say so somewhere other than in prose. The check is a
+/// `debug_assert`, so the release build pays the one `Arc` the path costs and
+/// nothing else.
+pub(crate) fn invoke_adopted(worker: &WorkerThread, job: &Job, target: &Graph) -> Option<Release> {
+    // `None`: an adopted graph is read where it lies, which is the half of
+    // #74's widening that needs no lease -- see `executor::topology` for the
+    // half that does.
+    let owner = job.graph_inside(None);
+    debug_assert!(
+        std::ptr::eq(owner.graph(), target),
+        "an adopted module's path resolves to the graph its own handle owns"
+    );
+
+    invoke_impl(worker, job, &owner)
 }
 
-/// Upstream's `_invoke_module_task_impl`, over the share that owns the target
-/// graph rather than over a `Graph&`.
+/// Upstream's `_invoke_module_task_impl`, over whatever owns the target graph
+/// rather than over a `Graph&`.
 ///
 /// The three answers are upstream's three, in its order: nothing to do, the
 /// first entry, the second entry.
-fn invoke_impl(worker: &WorkerThread, job: &Job, target: &Arc<Flow>) -> Option<Release> {
+fn invoke_impl(worker: &WorkerThread, job: &Job, target: &GraphOwner) -> Option<Release> {
     // Upstream's `if(graph.empty()) return false`, widened to the graph with
     // nothing to start at -- see the module docs, which say why scheduling
     // one instead would hang the run rather than merely waste a walk.
@@ -401,25 +415,116 @@ mod tests {
         Arc::new(taskflow)
     }
 
-    /// The adopted handle still refuses, and names the issue that lifts it.
-    /// The refusal is reported as the run's failure rather than raised on a
-    /// worker thread or hung on.
+    /// An adopted graph runs the way a composed taskflow's does -- the whole
+    /// of it before the module node's successors -- which is what #74
+    /// replaced the refusal with. The same claim as
+    /// `a_module_runs_its_whole_target_before_its_successors`, over the
+    /// handle that owns its graph instead of sharing one.
     #[test]
-    fn an_adopted_module_task_refuses_the_run() {
-        let executor = Executor::new(2);
-        let mut taskflow = Taskflow::new();
-        let mut target = Graph::new();
-        target.add_node(Handle::Static(Work::new(|| {})));
-        taskflow.adopt(target);
+    fn an_adopted_module_runs_its_whole_graph_before_its_successors() {
+        for workers in 1..=3 {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::new(AtomicUsize::new(usize::MAX));
 
-        let error = executor
+            let mut taskflow = Taskflow::new();
+            let module = taskflow.adopt(adopted_chain(5, &counter));
+            let after = taskflow.emplace({
+                let counter = Arc::clone(&counter);
+                let seen = Arc::clone(&seen);
+                move || seen.store(counter.load(Ordering::Relaxed), Ordering::Relaxed)
+            });
+            taskflow.task(module).precede([after]);
+
+            Executor::new(workers)
+                .run(&taskflow)
+                .wait()
+                .expect("no task panicked");
+
+            assert_eq!(counter.load(Ordering::Relaxed), 5, "{workers} worker(s)");
+            assert_eq!(
+                seen.load(Ordering::Relaxed),
+                5,
+                "{workers} worker(s): the successor ran before the graph was done"
+            );
+        }
+    }
+
+    /// The adopted graph's tasks are resolved in *its* arena and not in the
+    /// composing graph's, which is the defect the refusal stood in for: both
+    /// arenas number from zero, so a job built over the outer owner would run
+    /// whatever the composing graph has at those indices -- starting with the
+    /// module node itself -- and would say nothing about it.
+    ///
+    /// The shape is the collision: three tasks in the adopted graph at
+    /// indices 0, 1 and 2, and three decoys in the composing graph at the
+    /// same three indices, each counting somewhere else. Every decoy runs
+    /// exactly once because it is a task of the run, and the adopted graph's
+    /// own three are what the module node runs.
+    #[test]
+    fn an_adopted_module_resolves_its_tasks_in_its_own_graph() {
+        let inside = Arc::new(AtomicUsize::new(0));
+        let outside = Arc::new(AtomicUsize::new(0));
+
+        let mut taskflow = Taskflow::new();
+        // Index 0 of the composing graph is the module node itself, which a
+        // resolution against the wrong arena would re-enter.
+        let module = taskflow.adopt(fan_of(3, &inside));
+        for _ in 0..3 {
+            let outside = Arc::clone(&outside);
+            taskflow.emplace(move || {
+                outside.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+
+        assert_eq!(module, Task::new(0), "the module node is index 0 of both");
+
+        Executor::new(2)
             .run(&taskflow)
             .wait()
-            .expect_err("an adopted module task is refused");
+            .expect("no task panicked");
+
         assert_eq!(
-            error.to_string(),
-            "a task panicked: running an adopted module task is not supported \
-             yet: a job's graph owner is widened by issue #74"
+            inside.load(Ordering::Relaxed),
+            3,
+            "the adopted graph's own three tasks ran"
         );
+        assert_eq!(
+            outside.load(Ordering::Relaxed),
+            3,
+            "each decoy ran once, as the task of the run that it is"
+        );
+    }
+
+    /// A graph of `tasks` tasks in a chain, each bumping `counter`: the
+    /// adopted form of [`chain`], built through the arena because
+    /// `FlowBuilder` is implemented for the types that *own* a graph and an
+    /// adopted one is owned by the node it is moved into.
+    fn adopted_chain(tasks: usize, counter: &Arc<AtomicUsize>) -> Graph {
+        let mut graph = Graph::new();
+        let tasks: Vec<Task> = (0..tasks)
+            .map(|_| {
+                let counter = Arc::clone(counter);
+                graph.add_node(Handle::Static(Work::new(move || {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                })))
+            })
+            .collect();
+        for pair in tasks.windows(2) {
+            graph.add_edge(pair[0], pair[1]);
+        }
+        graph
+    }
+
+    /// A graph of `tasks` independent tasks, each bumping `counter`, so that
+    /// every one of them is a source and the indices are 0..tasks.
+    fn fan_of(tasks: usize, counter: &Arc<AtomicUsize>) -> Graph {
+        let mut graph = Graph::new();
+        for _ in 0..tasks {
+            let counter = Arc::clone(counter);
+            graph.add_node(Handle::Static(Work::new(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            })));
+        }
+        graph
     }
 }
