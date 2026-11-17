@@ -142,8 +142,12 @@ or substantial portions of the Software."*
 source in its `//!` doc comment, on the first line:
 
 ```rust
-//! Translated from `taskflow/core/executor.hpp`.
+//! Translated from `taskflow/core/executor.hpp` (Taskflow v4.1.0).
 ```
+
+The version is part of the line. Upstream rewrites its scheduler between major
+versions, so "translated from `executor.hpp`" without saying which one is not
+an auditable claim.
 
 Blanket attribution in a LICENSE file is the legal minimum and tells you
 nothing useful a year later. The per-module line is what makes it auditable —
@@ -158,14 +162,62 @@ carries its own separate terms. Nothing ported out of there may ride on
 
 ## Porting notes
 
-The upstream API hands out `tf::Task` handles that alias into a graph the caller
-still owns and mutates, which does not survive translation to Rust's aliasing
-rules unchanged — so the graph representation is the first real design decision,
-not a transcription step.
+### Upstream pin
 
-Rough order of work, coarsest first:
+This port follows **Taskflow v4.1.0**, tag `v4.1.0`, commit
+`45366fe5bc4f2f8ec9aa590b40c504e296886865` (2026-06-19). Every "Translated
+from" line, every ported unit test and every benchmark comparison refers to that
+tree. Moving the pin is a deliberate, repo-wide change, not something one PR
+does on the side.
 
-1. **Static graph** — `Taskflow`, `Task`, dependency edges, topology checks.
-2. **Executor** — the work-stealing thread pool and its run/wait semantics.
-3. **Control flow** — conditional tasks, module tasks, subflows.
-4. **Beyond** — `cudaFlow` and the pipeline/dataflow modules, if ever.
+The v4 line is what we port, not v3: it is C++20, splits `NodeBase` out of
+`Node`, schedules in bulk into the work-stealing queues, defaults to the
+nonblocking notifier, and adds `TaskGroup` and adopted module tasks. Nothing
+from `cuda/` or `3rd-party/` is in scope.
+
+### Dependency policy
+
+Upstream's library core depends on nothing but the C++ standard library; its
+`3rd-party/` directory serves only tests, benchmarks and the profiler. We keep
+the same split:
+
+- A **runtime** dependency must replace something upstream hand-wrote *and* be
+  better tested than our own port of it would be. Today that admits
+  `crossbeam-deque` (the Chase-Lev deque behind `wsq.hpp`) and `crossbeam-utils`
+  (cache-line padding and backoff), and nothing else. Anything optional goes
+  behind a Cargo feature so the default build stays at those two.
+- **Dev** dependencies need only be useful: `loom` for the lock-free parts,
+  `criterion` for the ported benchmarks, `rayon` as the baseline those
+  benchmarks compare against, in the role TBB plays upstream.
+
+### Design decisions already taken
+
+- **Graph as an arena.** The upstream API hands out `tf::Task` handles that
+  alias into a graph the caller still owns and mutates, which does not survive
+  translation to Rust's aliasing rules. Here the taskflow owns a vector of
+  nodes and a `Task` is a `Copy` index. Dependency edits go through the
+  taskflow via a short-lived fluent borrow, so the graph is plain `Send + Sync`
+  with no `unsafe`, and a run can hold `&Taskflow` across worker threads.
+  Upstream's rule "do not mutate a taskflow while it runs" becomes a lifetime on
+  the run handle.
+- **Task bodies are `FnMut() + Send + 'static`.** Condition tasks create
+  cycles, so a body runs many times per run and upstream invokes it mutably;
+  the scheduler's one-worker-per-node guarantee is the safety argument.
+  Panics take the role of upstream's exceptions: caught per task, stored in the
+  topology, surfaced from `wait`.
+- **Per-node runtime state stays in the node** as atomics, matching upstream's
+  join counter and state words, so runs of one taskflow serialise exactly as
+  they do upstream.
+
+### Order of work
+
+Each step is a milestone of PR-sized issues; the upstream unit tests under
+`unittests/` are the acceptance oracle, translated per module.
+
+1. **Static graph** — `Taskflow`, `Task`, the flow builder, DOT dump.
+2. **Executor** — workers, deque, notifier, `run`/`run_n`/`wait_for_all`.
+3. **Control flow** — condition tasks, cancellation, panic propagation.
+4. **Dynamic tasking** — subflows, runtime tasks, module composition.
+5. **Async** — async and dependent-async tasks, task groups, semaphores.
+6. **Observers and algorithms** — partitioners, `for_each`, `reduce`, `sort`.
+7. **Pipelines** — the one family with no Rust equivalent.
