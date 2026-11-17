@@ -8,14 +8,13 @@
 //! conditioner branch all behave -- so these are assertions about the
 //! executor, not about the graph they are written on.
 //!
-//! Three cases upstream has are not here, because each needs something this
-//! port has not got. None of them is weakened into a lookalike: a starvation
-//! test that cannot starve is worse than no test, since it reports green while
-//! exercising nothing.
+//! Two cases upstream has are not here, because both need something this port
+//! has not got. Neither is weakened into a lookalike: a starvation test that
+//! cannot starve is worse than no test, since it reports green while
+//! exercising nothing. `SubflowStarvation` was a third until #54 -- it is
+//! `Starvation.Loop` built inside a subflow, so it waited on subflows (#50)
+//! and is now below with the rest.
 //!
-//! - **`SubflowStarvation`** is `Starvation.Loop` built inside a subflow.
-//!   Subflows are milestone 4 (#50), and the stress half of that milestone is
-//!   #54, which is where this case belongs.
 //! - **`Oversubscription`** and **`Continuation`** both assert that a chain of
 //!   tasks runs end to end on the *same* worker: `Continuation` compares
 //!   `this_worker_id()` across a thousand chained tasks, and
@@ -73,7 +72,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustflow::prelude::*;
-use rustflow::{Executor, Xorshift32};
+use rustflow::{Executor, TaskMut, Xorshift32};
 
 /// How long a spin waits for what it is spinning on before it gives up.
 ///
@@ -521,6 +520,195 @@ fn starvation_loop_7_workers() {
 #[test]
 fn starvation_loop_8_workers() {
     starvation_loop(8);
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: SubflowStarvation
+// ----------------------------------------------------------------------------
+
+/// Upstream's `subflow_starvation(W)`: `Starvation.Loop` again, built from
+/// inside a subflow body and run five times over.
+///
+/// Everything the outer case asserts is asserted here -- `set.count() == W`
+/// at the merge, after a hundred-task serial chain and a 1024-way fan-out
+/// whose branches each wait for every other worker -- and the subflow is what
+/// makes it a harder scheduling problem rather than the same one again. Three
+/// things are different about the queue this graph arrives in:
+///
+/// - the graph is scheduled by **a worker**, not by the test thread: the
+///   subgraph's one source goes onto that worker's own queue, and every
+///   release from then on onto the queue of whichever worker ran the task
+///   that released it -- so the 1024-way fan-out lands in one queue and has
+///   to be stolen out of it, where the outer case's run is submitted from
+///   outside the pool and handed to the shared buffers every worker polls.
+///   the same distinction `EmbarrasingStarvation` below is about;
+/// - the node the subgraph hangs on is **preempted**, not blocked: the arm
+///   that ran the body scheduled the subgraph and went back to the loop, so
+///   the worker that built the fan-out is one of the `W` the rendezvous waits
+///   for. A port that joined a subflow by parking the worker instead would
+///   starve here at every worker count, since `barrier` could then only reach
+///   `W - 1`;
+/// - the cycle inside the subgraph goes round five times and the whole
+///   subflow is re-entered five times by `run_n`, so the graph is built,
+///   scheduled, cleared and built again -- which is where a subgraph that
+///   came home to the wrong node, or did not come home at all, shows up as a
+///   count that is short by a chain.
+fn subflow_starvation(workers: usize) {
+    const L: usize = 100;
+    const B: usize = 1024;
+
+    assert!(B > workers, "upstream's `REQUIRE(B > W)`");
+
+    let executor = Arc::new(Executor::new(workers));
+    let mut taskflow = Taskflow::new();
+
+    let counter = shared_counter();
+    let barrier = shared_counter();
+    let involved = Involved::new();
+
+    // The body outlives this function, so it gets its own share of the
+    // executor rather than the one `run_n` below still needs.
+    let pool = Arc::clone(&executor);
+
+    taskflow.emplace_subflow(move |subflow: &mut Subflow<'_>| {
+        let merge = {
+            let counter = Arc::clone(&counter);
+            let barrier = Arc::clone(&barrier);
+            let involved = Arc::clone(&involved);
+            subflow.emplace(move || {
+                assert_eq!(barrier.load(Ordering::Relaxed), B, "{workers} worker(s)");
+                assert_eq!(
+                    counter.load(Ordering::Relaxed),
+                    L + B - 1,
+                    "{workers} worker(s)"
+                );
+                assert_eq!(
+                    involved.count(),
+                    workers,
+                    "{workers} worker(s): every worker runs a branch"
+                );
+                counter.store(0, Ordering::Relaxed);
+                barrier.store(0, Ordering::Relaxed);
+                involved.clear();
+            })
+        };
+
+        // Upstream's `[n=0]() mutable { return ++n >= 5 ? 1 : 0; }`. The
+        // state starts at zero on every entry to the subflow body, where the
+        // outer case's conditioner is one node that keeps its state for the
+        // length of a run -- which is the same thing said twice, since the
+        // body is what emplaces this node.
+        let cond = {
+            let mut n = 0;
+            subflow.emplace_condition(move || {
+                n += 1;
+                i32::from(n >= 5)
+            })
+        };
+
+        let stop = {
+            let counter = Arc::clone(&counter);
+            let barrier = Arc::clone(&barrier);
+            let involved = Arc::clone(&involved);
+            subflow.emplace(move || {
+                assert_eq!(barrier.load(Ordering::Relaxed), 0, "{workers} worker(s)");
+                assert_eq!(counter.load(Ordering::Relaxed), 0, "{workers} worker(s)");
+                assert_eq!(involved.count(), 0, "{workers} worker(s)");
+            })
+        };
+
+        // The chain, whose first task does not count, for the reason the
+        // outer case gives: the loop re-enters the chain at its *second*
+        // task, so a first task that counted would make the first iteration
+        // differ from the four after it.
+        let mut prev: Option<Task> = None;
+        let mut second: Option<Task> = None;
+        for l in 0..L {
+            let curr = if l == 0 {
+                subflow.emplace(|| {})
+            } else {
+                let counter = Arc::clone(&counter);
+                subflow.emplace(move || {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                })
+            };
+            if let Some(prev) = prev {
+                TaskMut::new(subflow.graph_mut(), curr).succeed([prev]);
+            }
+            if l == 1 {
+                second = Some(curr);
+            }
+            prev = Some(curr);
+        }
+        let curr = prev.expect("the chain has a hundred tasks");
+        let second = second.expect("the chain has a second task");
+
+        TaskMut::new(subflow.graph_mut(), cond).precede([second, stop]);
+
+        for _ in 0..B {
+            let executor = Arc::clone(&pool);
+            let counter = Arc::clone(&counter);
+            let barrier = Arc::clone(&barrier);
+            let involved = Arc::clone(&involved);
+            let branch = subflow.emplace(move || {
+                involved.record(&executor);
+
+                barrier.fetch_add(1, Ordering::Relaxed);
+                spin_until("every worker to reach the fan-out", || {
+                    barrier.load(Ordering::Relaxed) >= workers
+                });
+
+                counter.fetch_add(1, Ordering::Relaxed);
+            });
+            TaskMut::new(subflow.graph_mut(), branch)
+                .succeed([curr])
+                .precede([merge]);
+        }
+
+        TaskMut::new(subflow.graph_mut(), merge).precede([cond]);
+    });
+
+    run_n(&executor, &taskflow, 5);
+}
+
+#[test]
+fn subflow_starvation_1_worker() {
+    subflow_starvation(1);
+}
+
+#[test]
+fn subflow_starvation_2_workers() {
+    subflow_starvation(2);
+}
+
+#[test]
+fn subflow_starvation_3_workers() {
+    subflow_starvation(3);
+}
+
+#[test]
+fn subflow_starvation_4_workers() {
+    subflow_starvation(4);
+}
+
+#[test]
+fn subflow_starvation_5_workers() {
+    subflow_starvation(5);
+}
+
+#[test]
+fn subflow_starvation_6_workers() {
+    subflow_starvation(6);
+}
+
+#[test]
+fn subflow_starvation_7_workers() {
+    subflow_starvation(7);
+}
+
+#[test]
+fn subflow_starvation_8_workers() {
+    subflow_starvation(8);
 }
 
 // ----------------------------------------------------------------------------

@@ -1,27 +1,28 @@
 //! Translated from `unittests/test_control_flow.cpp` (Taskflow v4.1.0).
 //!
-//! Every case of that file that this port can run honestly is here, each at
-//! upstream's own sweep of worker counts: `LoopCond` and `MultipleBranches`
-//! arrived with the conditional-scheduling issue (#31), and `FlipCoinCond`,
-//! `CyclicCond`, `BTreeCondition`, `Cond2Cond`, `MultipleLoops`,
-//! `MultiCondBinaryTree` and `MultiCond.MultipleRuns` with issue #33, once
-//! there was a scheduler to drive them. `MultipleBranches` keeps the four of
-//! its eight worker counts that say something distinct, its fan-out being the
-//! same whether four workers share it or eight.
+//! Every case of that file is here, each at upstream's own sweep of worker
+//! counts: `LoopCond` and `MultipleBranches` arrived with the
+//! conditional-scheduling issue (#31), and `FlipCoinCond`, `CyclicCond`,
+//! `BTreeCondition`, `Cond2Cond`, `MultipleLoops`, `MultiCondBinaryTree` and
+//! `MultiCond.MultipleRuns` with issue #33, once there was a scheduler to
+//! drive them. `MultipleBranches` keeps the four of its eight worker counts
+//! that say something distinct, its fan-out being the same whether four
+//! workers share it or eight.
 //!
-//! Four of upstream's cases are **not** here, each because it needs a node
-//! kind this port does not have yet rather than because it is awkward:
+//! The last four arrived with #54, each because it needed a node kind this
+//! port did not have before milestone 4 rather than because it was awkward:
 //!
 //! - `DynamicBTreeCondition`, `NestedCond` and `CondSubflow` build their
-//!   graphs from inside a running task through a `tf::Subflow`, which is M4's.
-//! - `HierCondition` composes three taskflows with `composed_of`, so it needs
-//!   M4's module tasks as well as its subflows.
+//!   graphs from inside a running task through a `tf::Subflow` (#50).
+//! - `HierCondition` composes three taskflows with `composed_of`, one of them
+//!   from inside a subflow, so it needs module tasks (#49) as well.
 //!
-//! None of the four is approximated by a static or condition graph of the same
-//! shape: a control-flow case that reports green while testing something else
-//! is worse than an absent one. Upstream's two `Cond.Types`/`MultiCond.Types`
-//! cases are `static_assert`s on its callable traits, and they are already
-//! ported, in `tests/flow_builder.rs` with the rest of the builder's surface.
+//! None of the four was ever approximated by a static or condition graph of
+//! the same shape while it waited: a control-flow case that reports green
+//! while testing something else is worse than an absent one. Upstream's two
+//! `Cond.Types`/`MultiCond.Types` cases are `static_assert`s on its callable
+//! traits, and they are already ported, in `tests/flow_builder.rs` with the
+//! rest of the builder's surface.
 //!
 //! Three standing adaptations, because the port is not quite where upstream is:
 //!
@@ -43,13 +44,15 @@
 //!   are `assert!`s, whose panic the executor stores on the topology and
 //!   reports from `wait`. [`run`] is what turns that back into a failed test,
 //!   so a case whose graph asserts must go through it rather than dropping its
-//!   handle.
+//!   handle -- and the three cases that end on `wait_for_all` the way upstream
+//!   does hold their handles across it and drain them afterwards, so that the
+//!   waiting is still `wait_for_all`'s and a failed body is still reported.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 
 use rustflow::prelude::*;
-use rustflow::{Executor, RunError, Xorshift32};
+use rustflow::{Executor, RunError, TaskMut, Xorshift32};
 
 /// How many times a task body has run, shared with that body.
 type Counter = Arc<AtomicUsize>;
@@ -559,6 +562,299 @@ fn btree_condition_8_workers() {
 }
 
 // ----------------------------------------------------------------------------
+// Testcase: DynamicBTreeCondition
+// ----------------------------------------------------------------------------
+
+/// Upstream's `conditional_spawn(counter, max_depth, depth, subflow)`: two
+/// copies of `A -> cond -> {B, C}` per level, where `B` and `C` are subflow
+/// tasks that spawn the next level and `cond` takes exactly one of them.
+///
+/// A free function, as upstream's is, because the two subflow bodies it
+/// emplaces call it again with one more depth. Each level therefore runs
+/// `2 * (1 + f(depth + 1))` counting tasks, which is the arithmetic behind the
+/// case's one assertion.
+fn conditional_spawn(counter: &Counter, max_depth: i32, depth: i32, subflow: &mut Subflow<'_>) {
+    if depth >= max_depth {
+        return;
+    }
+
+    for _ in 0..2 {
+        let a = {
+            let counter = Arc::clone(counter);
+            subflow.emplace(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        let b = {
+            let counter = Arc::clone(counter);
+            subflow.emplace_subflow(move |subflow: &mut Subflow<'_>| {
+                conditional_spawn(&counter, max_depth, depth + 1, subflow);
+            })
+        };
+        let c = {
+            let counter = Arc::clone(counter);
+            subflow.emplace_subflow(move |subflow: &mut Subflow<'_>| {
+                conditional_spawn(&counter, max_depth, depth + 1, subflow);
+            })
+        };
+
+        // Upstream's `[depth](){ if(depth%2) return 1; else return 0; }`:
+        // odd levels go right, even levels left, so the tree is a path per
+        // branch rather than a doubling fan-out.
+        let cond = subflow.emplace_condition(move || i32::from(depth % 2 != 0));
+        TaskMut::new(subflow.graph_mut(), cond).precede([b, c]);
+        TaskMut::new(subflow.graph_mut(), a).precede([cond]);
+    }
+}
+
+/// Upstream's `DynamicBTreeCondition`, for one worker count.
+///
+/// One subflow task that counts itself and then spawns six levels of that
+/// recursion, run four times. `2^(max_depth+1) - 1` bodies per run is
+/// upstream's own count and it is what says both halves of the mechanism
+/// work: a conditioner inside a subgraph releases one successor out of two,
+/// and a subflow task inside a subgraph is joined by the level above it
+/// before that level's node finishes. Either failing changes the total.
+///
+/// Upstream writes this as a single case over `w`; it is split per worker
+/// count here, as the rest of this file is, so that a failure names its
+/// worker count without a message.
+fn dynamic_btree_condition(workers: usize) {
+    const MAX_DEPTH: i32 = 6;
+    const RUNS: usize = 4;
+
+    let executor = Executor::new(workers);
+    let counter = counter();
+
+    let mut flow = Taskflow::new();
+    flow.emplace_subflow({
+        let counter = Arc::clone(&counter);
+        move |subflow: &mut Subflow<'_>| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            conditional_spawn(&counter, MAX_DEPTH, 0, subflow);
+        }
+    });
+
+    executor
+        .run_n(&flow, RUNS)
+        .wait()
+        .expect("a task of this taskflow panicked");
+
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        ((1_usize << (MAX_DEPTH + 1)) - 1) * RUNS,
+        "{workers} worker(s)"
+    );
+}
+
+#[test]
+fn dynamic_btree_condition_1_worker() {
+    dynamic_btree_condition(1);
+}
+
+#[test]
+fn dynamic_btree_condition_2_workers() {
+    dynamic_btree_condition(2);
+}
+
+#[test]
+fn dynamic_btree_condition_3_workers() {
+    dynamic_btree_condition(3);
+}
+
+#[test]
+fn dynamic_btree_condition_4_workers() {
+    dynamic_btree_condition(4);
+}
+
+#[test]
+fn dynamic_btree_condition_5_workers() {
+    dynamic_btree_condition(5);
+}
+
+#[test]
+fn dynamic_btree_condition_6_workers() {
+    dynamic_btree_condition(6);
+}
+
+#[test]
+fn dynamic_btree_condition_7_workers() {
+    dynamic_btree_condition(7);
+}
+
+#[test]
+fn dynamic_btree_condition_8_workers() {
+    dynamic_btree_condition(8);
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: NestedCond
+// ----------------------------------------------------------------------------
+
+/// Upstream's `[&, repeat=0]() mutable { if(repeat++ < limit) return 0;
+/// repeat = 0; return 1; }`: the conditioner that drives one of the three
+/// nested loops.
+///
+/// It returns 0 `limit` times, then resets and returns 1 -- so the task it
+/// precedes runs `limit + 1` times per entry. The reset is what matters for
+/// the outermost of the three, which is one node for the whole of a ten-run
+/// `run_n`: a conditioner that kept its state would loop once and never
+/// again. The two inner ones are emplaced afresh on every entry to the
+/// subflow above them, so their state starts at zero either way.
+fn loop_back(limit: i32) -> impl FnMut() -> i32 + Send + 'static {
+    let mut repeat = 0;
+    move || {
+        if repeat < limit {
+            repeat += 1;
+            0
+        } else {
+            repeat = 0;
+            1
+        }
+    }
+}
+
+/// Upstream's `nested_cond(w)`: three condition loops one inside another, the
+/// middle one inside a subflow and the innermost inside a subflow of that.
+///
+/// The counter sits in the innermost loop's body, so the only thing that can
+/// produce upstream's `(inner+1)*(mid+1)*(outer+1)*repeat` is every level
+/// going round the right number of times *and* each level's subflow being
+/// joined before the conditioner above it runs. A middle loop that re-entered
+/// its subflow before the inner loop had finished would count too few; a
+/// subflow whose state survived an entry would count too many.
+fn nested_cond(workers: usize) {
+    const OUTER_LOOP: i32 = 3;
+    const MID_LOOP: i32 = 4;
+    const INNER_LOOP: i32 = 5;
+    const REPEAT: usize = 10;
+
+    let executor = Executor::new(workers);
+    let counter = counter();
+    let mut flow = Taskflow::new();
+
+    let s = flow.emplace(|| {});
+    let a = {
+        let counter = Arc::clone(&counter);
+        flow.emplace_subflow(move |subflow: &mut Subflow<'_>| {
+            //           ___________
+            //          |           |
+            //          v           |
+            //   S1 -> A1 -> B1 -> cond
+            let s1 = subflow.emplace(|| {});
+            let a1 = subflow.emplace(|| {});
+            TaskMut::new(subflow.graph_mut(), a1).succeed([s1]);
+
+            let b1 = {
+                let counter = Arc::clone(&counter);
+                subflow.emplace_subflow(move |subflow: &mut Subflow<'_>| {
+                    //           ___________
+                    //          |           |
+                    //          v           |
+                    //   S2 -> A2 -> B2 -> cond
+                    //          |
+                    //          -----> C, D, E
+                    let s2 = subflow.emplace(|| {});
+                    let a2 = subflow.emplace(|| {});
+                    TaskMut::new(subflow.graph_mut(), a2).succeed([s2]);
+
+                    let b2 = {
+                        let counter = Arc::clone(&counter);
+                        subflow.emplace(move || {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        })
+                    };
+                    TaskMut::new(subflow.graph_mut(), b2).succeed([a2]);
+
+                    let inner = subflow.emplace_condition(loop_back(INNER_LOOP));
+                    TaskMut::new(subflow.graph_mut(), inner)
+                        .name("cond")
+                        .succeed([b2])
+                        .precede([a2]);
+
+                    // Upstream's three redundant tasks: leaves of the
+                    // subgraph that nothing depends on, released afresh every
+                    // time `A2` runs. What they add to the case is work the
+                    // subgraph's own join has to wait for that is not on the
+                    // loop's chain -- a node a cycle re-releases has to be
+                    // counted again each time round.
+                    for name in ["C", "D", "E"] {
+                        let redundant = subflow.emplace(|| {});
+                        TaskMut::new(subflow.graph_mut(), redundant)
+                            .name(name)
+                            .succeed([a2]);
+                    }
+                })
+            };
+            TaskMut::new(subflow.graph_mut(), b1).succeed([a1]);
+
+            let mid = subflow.emplace_condition(loop_back(MID_LOOP));
+            TaskMut::new(subflow.graph_mut(), mid)
+                .name("cond")
+                .succeed([b1])
+                .precede([a1]);
+        })
+    };
+    flow.task(a).succeed([s]);
+
+    let outer = flow.emplace_condition(loop_back(OUTER_LOOP));
+    flow.task(outer).succeed([a]).precede([a]);
+
+    executor
+        .run_n(&flow, REPEAT)
+        .wait()
+        .expect("a task of this taskflow panicked");
+
+    let per_run = usize::try_from((INNER_LOOP + 1) * (MID_LOOP + 1) * (OUTER_LOOP + 1))
+        .expect("a small product");
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        per_run * REPEAT,
+        "{workers} worker(s)"
+    );
+}
+
+#[test]
+fn nested_cond_1_worker() {
+    nested_cond(1);
+}
+
+#[test]
+fn nested_cond_2_workers() {
+    nested_cond(2);
+}
+
+#[test]
+fn nested_cond_3_workers() {
+    nested_cond(3);
+}
+
+#[test]
+fn nested_cond_4_workers() {
+    nested_cond(4);
+}
+
+#[test]
+fn nested_cond_5_workers() {
+    nested_cond(5);
+}
+
+#[test]
+fn nested_cond_6_workers() {
+    nested_cond(6);
+}
+
+#[test]
+fn nested_cond_7_workers() {
+    nested_cond(7);
+}
+
+#[test]
+fn nested_cond_8_workers() {
+    nested_cond(8);
+}
+
+// ----------------------------------------------------------------------------
 // Testcase: Cond2Cond
 // ----------------------------------------------------------------------------
 
@@ -702,6 +998,393 @@ fn cond2cond_7_workers() {
 #[test]
 fn cond2cond_8_workers() {
     cond2cond(8);
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: HierCondition
+// ----------------------------------------------------------------------------
+
+/// Upstream's `c1`/`c2` loop, which `tf1` and `tf2` are each one copy of:
+/// `A` resets the shared counter, `B` checks that its own call count and that
+/// counter have stayed in step, and `C` drives the pair round a hundred times.
+///
+/// `B`'s `state` is the whole point of it. The taskflow this builds is
+/// composed twice over -- once directly by `tf3`, once from inside a subflow
+/// of `tf3` -- and a module task runs the *same* graph, so the same closure
+/// state, every time: `state % 100 == counter % 100` holds across every
+/// module run there is only if each run of the loop is a hundred iterations
+/// exactly and no two runs of it overlap.
+fn hierarchical_loop(name: &str, counter: &Arc<AtomicI64>, check_on_entry: bool) -> Taskflow {
+    let mut taskflow = Taskflow::with_name(name);
+
+    let a = {
+        let counter = Arc::clone(counter);
+        taskflow.emplace(move || {
+            // Upstream's `c2A` asserts the loop it is about to reset ran to
+            // its hundredth iteration; its `c1A` only resets.
+            if check_on_entry {
+                assert_eq!(
+                    counter.load(Ordering::Relaxed),
+                    100,
+                    "the loop before this one finished"
+                );
+            }
+            counter.store(0, Ordering::Relaxed);
+        })
+    };
+    let b = {
+        let counter = Arc::clone(counter);
+        let mut state = 0_i64;
+        taskflow.emplace(move || {
+            let called = state;
+            state += 1;
+            assert_eq!(
+                called % 100,
+                counter.load(Ordering::Relaxed) % 100,
+                "the module's own call count and the loop counter stay in step"
+            );
+        })
+    };
+    let c = {
+        let counter = Arc::clone(counter);
+        taskflow.emplace_condition(move || {
+            i32::from(counter.fetch_add(1, Ordering::Relaxed) + 1 >= 100)
+        })
+    };
+
+    taskflow.task(a).name("A").precede([b]);
+    taskflow.task(b).name("B").precede([c]);
+    taskflow.task(c).name("C").precede([b]);
+
+    taskflow
+}
+
+/// Upstream's `hierarchical_condition(w)`: a top-level taskflow of condition
+/// loops that also composes three taskflows, one of them from inside a
+/// subflow that composes it a second time.
+///
+/// Every assertion is upstream's, and between them they pin the one thing
+/// this case is for: a module task and a subflow task are *nodes*, so the
+/// graph above them does not continue until the whole graph below them has
+/// finished -- however many condition loops that graph ran. `grab`'s three
+/// assertions are the end of that chain: it runs when `mod0`, `mod1` and
+/// `sync` have, and it can only see `c1 == 100` if the module `sbf1` reached
+/// through a subflow ran its hundred iterations too.
+fn hierarchical_condition(workers: usize) {
+    let executor = Executor::new(workers);
+
+    let c1 = Arc::new(AtomicI64::new(0));
+    let c2 = Arc::new(AtomicI64::new(0));
+    let c2_repeat = Arc::new(AtomicI64::new(0));
+
+    // Upstream's `tf0("c0")`, which it composes without ever putting a task
+    // in it: a module task whose target has nothing to run.
+    let tf0 = Arc::new(Taskflow::with_name("c0"));
+    let tf1 = Arc::new(hierarchical_loop("c1", &c1, false));
+    let tf2 = Arc::new(hierarchical_loop("c2", &c2, true));
+
+    let mut tf3 = Taskflow::with_name("top");
+
+    let init = {
+        let c1 = Arc::clone(&c1);
+        let c2 = Arc::clone(&c2);
+        let c2_repeat = Arc::clone(&c2_repeat);
+        tf3.emplace(move || {
+            c1.store(0, Ordering::Relaxed);
+            c2.store(0, Ordering::Relaxed);
+            c2_repeat.store(0, Ordering::Relaxed);
+        })
+    };
+    tf3.task(init).name("init");
+
+    let loop1 = {
+        let c2 = Arc::clone(&c2);
+        tf3.emplace_condition(move || i32::from(c2.fetch_add(1, Ordering::Relaxed) + 1 >= 100))
+    };
+    tf3.task(loop1).name("loop1");
+
+    let loop2 = {
+        let c2 = Arc::clone(&c2);
+        let c2_repeat = Arc::clone(&c2_repeat);
+        tf3.emplace_condition(move || {
+            c2.store(0, Ordering::Relaxed);
+            i32::from(c2_repeat.fetch_add(1, Ordering::Relaxed) + 1 >= 100)
+        })
+    };
+    tf3.task(loop2).name("loop2");
+
+    let sync = {
+        let c2 = Arc::clone(&c2);
+        let c2_repeat = Arc::clone(&c2_repeat);
+        tf3.emplace(move || {
+            assert_eq!(c2.load(Ordering::Relaxed), 0, "loop2 reset c2");
+            assert_eq!(
+                c2_repeat.load(Ordering::Relaxed),
+                100,
+                "loop2 went round a hundred times"
+            );
+            c2_repeat.store(0, Ordering::Relaxed);
+        })
+    };
+    tf3.task(sync).name("sync");
+
+    let grab = {
+        let c1 = Arc::clone(&c1);
+        let c2 = Arc::clone(&c2);
+        let c2_repeat = Arc::clone(&c2_repeat);
+        tf3.emplace(move || {
+            assert_eq!(
+                c1.load(Ordering::Relaxed),
+                100,
+                "both modules of c1 ran their hundred iterations"
+            );
+            assert_eq!(c2.load(Ordering::Relaxed), 0);
+            assert_eq!(c2_repeat.load(Ordering::Relaxed), 0);
+        })
+    };
+    tf3.task(grab).name("grab");
+
+    let mod0 = tf3.composed_of(Arc::clone(&tf0));
+    tf3.task(mod0).name("module0");
+    let mod1 = tf3.composed_of(Arc::clone(&tf1));
+    tf3.task(mod1).name("module1");
+
+    let sbf1 = tf3.emplace_subflow({
+        let tf1 = Arc::clone(&tf1);
+        move |subflow: &mut Subflow<'_>| {
+            let sbf1_1 = subflow.emplace(|| {});
+            TaskMut::new(subflow.graph_mut(), sbf1_1).name("sbf1_1");
+            let module1 = subflow.composed_of(Arc::clone(&tf1));
+            TaskMut::new(subflow.graph_mut(), module1)
+                .name("module1")
+                .succeed([sbf1_1]);
+            let sbf1_2 = subflow.emplace(|| {});
+            TaskMut::new(subflow.graph_mut(), sbf1_2)
+                .name("sbf1_2")
+                .succeed([module1]);
+            subflow.join().expect("a fresh subflow is joinable");
+        }
+    });
+    tf3.task(sbf1).name("sbf1");
+
+    let mod2 = tf3.composed_of(Arc::clone(&tf2));
+    tf3.task(mod2).name("module2");
+
+    tf3.task(init).precede([mod0, sbf1, loop1]);
+    tf3.task(loop1).precede([loop1, mod2]);
+    tf3.task(loop2).succeed([mod2]).precede([loop1, sync]);
+    tf3.task(mod0).precede([grab]);
+    tf3.task(sbf1).precede([mod1]);
+    tf3.task(mod1).precede([grab]);
+    tf3.task(sync).precede([grab]);
+
+    // Upstream's `run`, `run_n(10)` and `wait_for_all`. The handles are held
+    // across the wait so that `wait_for_all` is what waits, and drained
+    // afterwards so that an assertion inside a task body is reported rather
+    // than dropped with its run.
+    let handles = [executor.run(&tf3), executor.run_n(&tf3, 10)];
+    executor.wait_for_all();
+    for handle in handles {
+        handle
+            .wait()
+            .unwrap_or_else(|error| panic!("{workers} worker(s): {error}"));
+    }
+}
+
+#[test]
+fn hier_condition_1_worker() {
+    hierarchical_condition(1);
+}
+
+#[test]
+fn hier_condition_2_workers() {
+    hierarchical_condition(2);
+}
+
+#[test]
+fn hier_condition_3_workers() {
+    hierarchical_condition(3);
+}
+
+#[test]
+fn hier_condition_4_workers() {
+    hierarchical_condition(4);
+}
+
+#[test]
+fn hier_condition_5_workers() {
+    hierarchical_condition(5);
+}
+
+#[test]
+fn hier_condition_6_workers() {
+    hierarchical_condition(6);
+}
+
+#[test]
+fn hier_condition_7_workers() {
+    hierarchical_condition(7);
+}
+
+#[test]
+fn hier_condition_8_workers() {
+    hierarchical_condition(8);
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: CondSubflow
+// ----------------------------------------------------------------------------
+
+/// Upstream's `data[i] = i*(i+1)/2*123`, which is nothing but a value that
+/// depends on `i` in a way a stray zero or a repeated index cannot imitate.
+fn triangular(i: usize) -> usize {
+    i * (i + 1) / 2 * 123
+}
+
+/// Upstream's `condition_subflow(W)`: a condition task that sends the run
+/// back into one subflow task a thousand times, each entry building a
+/// one-task subgraph for the index the counter has reached.
+///
+/// Upstream's `num_tasks() == 4` before and after is the case's own
+/// statement that the subgraph is cleared rather than accumulated -- a
+/// thousand entries that each kept their child would be a thousand tasks. It
+/// holds here by construction rather than by policy, because a subgraph is a
+/// `Graph` inside its node's handle and not part of the taskflow's own arena,
+/// so the dump is asserted beside it: no subflow cluster in it is the
+/// observable that a retained subgraph would break, and it is the same claim
+/// upstream's count makes.
+fn condition_subflow(workers: usize) {
+    const I: usize = 1000;
+
+    let context = format!("{workers} worker(s)");
+    let executor = Executor::new(workers);
+
+    let data: Arc<Vec<AtomicUsize>> = Arc::new((0..I).map(|_| AtomicUsize::new(0)).collect());
+    let i = Arc::new(AtomicUsize::new(0));
+
+    let mut taskflow = Taskflow::new();
+
+    let init = {
+        let i = Arc::clone(&i);
+        taskflow.emplace(move || i.store(0, Ordering::Relaxed))
+    };
+    taskflow.task(init).name("init");
+
+    let subflow = {
+        let data = Arc::clone(&data);
+        let i = Arc::clone(&i);
+        taskflow.emplace_subflow(move |subflow: &mut Subflow<'_>| {
+            // Upstream's `[&, i]`: the index is captured by value as it
+            // stands when the *body* runs, which is what makes each entry's
+            // subgraph a different one.
+            let index = i.load(Ordering::Relaxed);
+            let data = Arc::clone(&data);
+            let child = subflow.emplace(move || {
+                assert!(index < I, "the conditioner stops at I");
+                data[index].store(triangular(index), Ordering::Relaxed);
+            });
+            TaskMut::new(subflow.graph_mut(), child).name(index.to_string());
+        })
+    };
+    taskflow.task(subflow).name("subflow");
+
+    let cond = {
+        let i = Arc::clone(&i);
+        taskflow.emplace_condition(move || i32::from(i.fetch_add(1, Ordering::Relaxed) + 1 >= I))
+    };
+    taskflow.task(cond).name("cond");
+
+    let stop = taskflow.emplace(|| {});
+    taskflow.task(stop).name("stop");
+
+    taskflow.task(init).precede([subflow]);
+    taskflow.task(subflow).precede([cond]);
+    taskflow.task(cond).precede([subflow, stop]);
+
+    assert_eq!(taskflow.num_tasks(), 4, "{context}: before the run");
+    run(&executor, &taskflow);
+    assert_eq!(taskflow.num_tasks(), 4, "{context}: after the run");
+    assert!(
+        !taskflow.dump().contains("Subflow: subflow"),
+        "{context}: the subgraph of the last entry was cleared"
+    );
+
+    for j in 0..I {
+        assert_eq!(
+            data[j].load(Ordering::Relaxed),
+            triangular(j),
+            "{context}: entry {j} of the first run"
+        );
+        data[j].store(0, Ordering::Relaxed);
+    }
+
+    // Upstream's `run_n(1)`, `run_n(10)`, `run_n(100)` and `wait_for_all`:
+    // a hundred and eleven more runs of the thousand-entry loop, queued
+    // behind each other on the one taskflow.
+    let handles = [
+        executor.run_n(&taskflow, 1),
+        executor.run_n(&taskflow, 10),
+        executor.run_n(&taskflow, 100),
+    ];
+    executor.wait_for_all();
+    for handle in handles {
+        handle
+            .wait()
+            .unwrap_or_else(|error| panic!("{context}: {error}"));
+    }
+
+    assert_eq!(
+        taskflow.num_tasks(),
+        4,
+        "{context}: after a hundred and more"
+    );
+    for j in 0..I {
+        assert_eq!(
+            data[j].load(Ordering::Relaxed),
+            triangular(j),
+            "{context}: entry {j} of the later runs"
+        );
+    }
+}
+
+#[test]
+fn cond_subflow_1_worker() {
+    condition_subflow(1);
+}
+
+#[test]
+fn cond_subflow_2_workers() {
+    condition_subflow(2);
+}
+
+#[test]
+fn cond_subflow_3_workers() {
+    condition_subflow(3);
+}
+
+#[test]
+fn cond_subflow_4_workers() {
+    condition_subflow(4);
+}
+
+#[test]
+fn cond_subflow_5_workers() {
+    condition_subflow(5);
+}
+
+#[test]
+fn cond_subflow_6_workers() {
+    condition_subflow(6);
+}
+
+#[test]
+fn cond_subflow_7_workers() {
+    condition_subflow(7);
+}
+
+#[test]
+fn cond_subflow_8_workers() {
+    condition_subflow(8);
 }
 
 // ----------------------------------------------------------------------------
