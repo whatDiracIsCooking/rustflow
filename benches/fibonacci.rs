@@ -33,32 +33,39 @@
 //! recursion with one atomic, while a group or a runtime task submits a job
 //! per level whatever the pool is doing.
 //!
-//! # `N` is smaller than upstream's, and issue #119 is why
+//! # `N` is smaller than upstream's, and `rustflow-group` is why (#119)
 //!
 //! Upstream sweeps `f = 1..=40` and its own unit test asserts `fib(25)`. The
 //! sizes below are smaller, and the limit is not the time a round takes but a
 //! **stack overflow**: a corun keeps its worker in the work-stealing loop, so
-//! every job that worker picks up while waiting nests one frame deeper, and
-//! this port's children go into the shared FIFO buffers rather than onto the
-//! submitting worker's LIFO queue -- the `if(auto w = this_worker(); w)`
-//! branch of upstream's `_schedule_async_task`. A corun therefore gets the
-//! oldest outstanding job in the pool, which is somebody else's unfinished
-//! subtree, and the nesting grows one frame per outstanding *child* rather
-//! than one per level of recursion. `tests/runtimes.rs` and
-//! `tests/task_group.rs` carry the same reduction with the same citation.
+//! every job that worker picks up while waiting nests one frame deeper, and a
+//! corun that is handed somebody else's unfinished subtree instead of the
+//! child it is waiting for nests one frame per outstanding *child* rather
+//! than one per level of recursion.
 //!
-//! The figure in those files is a debug one -- `fib(14)` passes and `fib(15)`
-//! aborts -- and a release build is not it, so the cliff was measured again
-//! for this profile rather than assumed. It sits in a different place and,
-//! more usefully, it sits in a *different place per worker count*: at 24
-//! workers `fib(23)` passes and `fib(24)` aborts, while at **one** worker
-//! `fib(17)` passes and `fib(18)` aborts every time. One worker is the
-//! binding end for the reason the paragraph above gives -- the one worker
-//! that coruns is the only worker there is to pick the outstanding children
-//! up, so it nests a frame for every one of them -- and since both worker
-//! counts measure the same `n`, that end is what sets it.
-//! `BENCHMARKS.md`'s `fibonacci` section has the measurement. **Neither size
-//! is chosen for speed**, and if the cliff moves, these move with it.
+//! #119 took that cost off the **runtime** variant: a
+//! [`Runtime`](rustflow::Runtime) hands its own worker to the submission,
+//! which is upstream's `if(auto w = this_worker(); w)` branch of
+//! `_schedule_async_task`, so the child goes onto that worker's LIFO queue
+//! and the corun pops it straight back. `rustflow-runtime` reaches `fib(40)`
+//! at one worker and at twenty-four in a release build -- the top of
+//! upstream's own sweep -- and `tests/runtimes.rs` now asserts upstream's
+//! `fib(25)`.
+//!
+//! `rustflow-group` keeps the old ceiling, and since both ids measure the
+//! same `n` it is now the one that sets it. A
+//! [`TaskGroup`](rustflow::TaskGroup) holds a worker *id* rather than the
+//! worker, and its `corun` waits on the stealing end of the queue in any
+//! case, so its children stay in the shared FIFO buffers;
+//! `src/task_group.rs`'s module docs have that argument in full. Measured in
+//! this profile rather than assumed, because the debug figure is not it: at
+//! one worker `fib(17)` passes and `fib(18)` aborts, and at 24 workers
+//! `fib(23)` passes and `fib(24)` aborts. One worker is the binding end --
+//! the one worker that coruns is the only worker there is to pick the
+//! outstanding children up -- so `fib(15)`, three levels inside it, is what
+//! the group id can carry. `BENCHMARKS.md`'s `fibonacci` section and its
+//! "#119 measurement" have both. **Neither size is chosen for speed**, and
+//! if the cliff moves, these move with it.
 
 use std::hint::black_box;
 use std::num::NonZeroUsize;
@@ -71,9 +78,11 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rustflow::{Executor, Runtime};
 
 /// The two `n` this shape is measured at, both inside the stack-depth cliff
-/// the module header describes -- which at **one** worker, the binding end,
-/// sits between `fib(17)` and `fib(18)`. Upstream's sweep is `1..=40` and its
-/// own unit test asserts `fib(25)`.
+/// the module header describes -- which since #119 is `rustflow-group`'s
+/// alone, and at **one** worker, the binding end, sits between `fib(17)` and
+/// `fib(18)`. `rustflow-runtime` would carry upstream's `fib(25)`, and its
+/// whole sweep to `fib(40)`, but the two ids share these sizes so that a row
+/// of the table compares them.
 const SIZES: [u64; 2] = [12, 15];
 
 /// Samples per measurement, and the time criterion may spend reaching them.

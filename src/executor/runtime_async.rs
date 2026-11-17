@@ -57,43 +57,49 @@
 //! instant the counter reaches zero another worker may already be running
 //! the resumed node and clearing it.
 //!
-//! # Where a child is queued, and the stack-depth cliff it costs (#119)
+//! # Where a child is queued, and the stack depth that buys (#119)
 //!
-//! In the shared buffers, like every other free node, and that is a place
-//! this port and upstream differ with a consequence worth measuring.
-//! Upstream's `_schedule_async_task` pushes onto the *submitting worker's*
-//! queue when the submitter is a worker -- its `if(auto w = this_worker(); w)`
-//! branch -- and this port collapses both branches onto the buffers because
-//! the owning end of a worker's queue belongs to the `WorkerThread` frame
-//! that called the body, which the body cannot name. `executor::async`'s
-//! module docs have that argument in full.
+//! On the queue of the worker running the body, which is upstream's
+//! `if(auto w = this_worker(); w)` branch of `_schedule_async_task` and the
+//! one branch of it only a runtime handle can take. The owning end of a
+//! worker's queue belongs to the `WorkerThread` frame that called the body
+//! and cannot be looked up from the code that frame called -- so the
+//! submission takes the worker as an argument, and a [`Runtime`] is the
+//! submitter that *has* one to pass: the handle holds `&mut WorkerThread`,
+//! because a corun needs it. `executor::async`'s module docs have both
+//! branches and `src/task_group.rs` has the submitter that comes nearest to
+//! having one and still cannot.
 //!
-//! A runtime body is the **one** submitter in the crate for which that
-//! argument does not hold: the handle it is given holds `&mut WorkerThread`,
-//! because a corun needs it, so these four forms could take upstream's other
-//! branch. They do not, and that is issue #119 rather than a decision made
-//! here -- the destination belongs to the submission, which is one function
-//! for every free node, and a second one differing only in where it pushes
-//! would be a second copy of #91's dependency protocol and #115's counting
-//! rule. #119 is blocked on this issue because this is where its route
-//! lives.
+//! What it buys is **stack depth**, and the mechanism is worth stating
+//! because it is not obvious. A worker's own queue is LIFO and
+//! [`Runtime::corun`] pops that same owning end, so the job a waiting body
+//! gets back is the child it has just spawned -- the one it is waiting for --
+//! and the nesting grows one frame per level of *recursion*. The shared
+//! buffers hand back the oldest outstanding job in the pool instead, which is
+//! somebody else's unfinished subtree: a corun that picks that up coruns
+//! *inside* a corun whose predicate is still unsatisfied, so the nesting
+//! grows one frame per outstanding *child*, which for a recursive case is
+//! most of the task tree. That was this port until #119, and it overflowed a
+//! worker's 2 MiB stack at `fib(15)` in a debug build.
 //!
-//! What it costs is **stack depth**, and the mechanism is worth stating
-//! because it is not obvious: a worker's own queue is LIFO, so upstream's
-//! corun pops the child it has just spawned -- the one it is waiting for --
-//! while the buffers hand back the oldest outstanding job in the pool, which
-//! is somebody else's unfinished subtree. A corun that picks that up coruns
-//! *inside* a corun whose predicate is still unsatisfied, so recursive
-//! spawning nests one frame per outstanding child rather than one per level
-//! of recursion. In a debug build that overflows a worker's 2 MiB stack at
-//! `fib(15)`, where the same recursion through a subflow -- a *graph*,
-//! scheduled by the worker-aware path -- reaches `fib(20)`.
-//! `tests/runtimes.rs` has the measurement and runs its recursive cases
-//! inside it.
+//! Measured after the change, in a debug build and at one worker: a chain of
+//! nested coruns reaches **500 levels** and overflows by 600, so what bounds
+//! a recursion now is its own depth and not the size of its task tree.
+//! `tests/runtimes.rs` therefore runs upstream's own inputs -- `fib(25)` at
+//! one to four workers, both sorts to ten thousand elements -- and its header
+//! carries the rest of the measurement.
 //!
-//! None of that is a correctness claim: the work all runs, in any order, at
-//! any worker count. What is bounded by the cliff is how deep a recursion
-//! may go before the stack rather than the scheduler gives out.
+//! One case keeps the buffers, and it is the same rule rather than an
+//! exception: a runtime body invoked by a *corun loop* is running on a
+//! `WorkerThread::corun_view`, which has no owning end to lend, so
+//! `WorkerThread::schedule` sends its children to the buffers. A body nested
+//! inside an [`Executor::corun`](crate::Executor::corun) or a
+//! [`TaskGroup::corun`](crate::TaskGroup::corun) is therefore back to the
+//! lower ceiling, for exactly the reason the frame below it has no queue.
+//!
+//! None of this is a correctness claim either way: the work all runs, in any
+//! order, at any worker count. What the destination decides is how deep a
+//! recursion may go before the stack rather than the scheduler gives out.
 //!
 //! # What a failure under a child reaches
 //!
@@ -571,14 +577,20 @@ impl Runtime<'_> {
     /// `Executor` at all -- `src/runtime.rs` says why there is none to hold
     /// -- so the submission hangs off what a worker has.
     ///
-    /// Where that submission *queues* the child is the buffers rather than
-    /// this worker's own queue, which the module docs' last section measures:
-    /// it is upstream's other branch, it is reachable from here and from
-    /// nowhere else in the crate, and it is #119's to take.
+    /// The worker handed to that submission is this body's own, which is
+    /// upstream's `if(auto w = this_worker(); w)` branch and the whole of
+    /// #119: the child goes onto the queue of the worker running this body
+    /// rather than into the shared buffers, so the [`Runtime::corun`] below
+    /// this frame pops the child it has just spawned. The module docs'
+    /// "Where a child is queued" section has why a runtime handle is the one
+    /// submitter in the crate that can name a worker at all.
     fn spawn_child(&self, work: AsyncWork, estate: u32) {
-        self.thread
-            .shared
-            .schedule_async_task(work, &self.child_parent(), estate);
+        self.thread.shared.schedule_async_task(
+            work,
+            &self.child_parent(),
+            estate,
+            Some(&*self.thread),
+        );
     }
 
     /// [`Runtime::spawn_child`] for a node with dependencies: upstream's
@@ -594,6 +606,7 @@ impl Runtime<'_> {
             &self.child_parent(),
             estate,
             dependencies,
+            Some(&*self.thread),
         )
     }
 
@@ -800,19 +813,26 @@ mod tests {
         job
     }
 
-    /// Takes one child's job back out of the shared buffers, for a case that
-    /// runs it by hand.
+    /// Takes one child's job back off the submitting worker's own queue, for
+    /// a case that runs it by hand.
+    ///
+    /// **Where it looks is half the assertion.** A child submitted from a
+    /// runtime body goes onto the queue of the worker running that body
+    /// (#119), which is upstream's `if(auto w = this_worker(); w)` branch, so
+    /// a submission that went to the shared buffers instead fails every case
+    /// that calls this -- and the queue is the one `test_worker` built, which
+    /// nothing else in the process holds an end of.
     ///
     /// # Why the pool cannot race this
     ///
-    /// A worker skips the steal loop entirely while `num_topologies` is zero
-    /// -- `WorkerThread::explore_task`'s fast path -- and a hand-driven run
-    /// leaves it at zero, because nothing here goes through
-    /// `Executor::run`. A parented child does not raise it either, which is
-    /// #115's rule. So every job these cases queue stays queued until the
-    /// test thread takes it, and the orderings they are about are fixed
-    /// rather than raced for. `executor::async`'s own helper says the same
-    /// thing from the other side.
+    /// It never could: the queue above is not a real worker's, so no thief
+    /// can reach it. The buffers these cases used to go through needed an
+    /// argument for the same claim, and it still holds for whatever a case
+    /// leaves there -- a worker skips the steal loop entirely while
+    /// `num_topologies` is zero (`WorkerThread::explore_task`'s fast path),
+    /// a hand-driven run leaves it at zero because nothing here goes through
+    /// `Executor::run`, and a parented child does not raise it either, which
+    /// is #115's rule.
     ///
     /// **The flip side, for whoever adds a case here:** that same fast path
     /// is why a hand-driven case must not call [`Runtime::corun`] with a
@@ -820,17 +840,10 @@ mod tests {
     /// and go round again for ever -- a hang rather than a failure. Drive the
     /// children with this instead, and leave the corun cases to
     /// `tests/runtimes.rs`, where a real run holds the count above zero.
-    fn take_child_job(executor: &Executor) -> Job {
-        let buffer = executor
-            .shared
-            .buffers
-            .first_nonempty()
-            .expect("the submission pushed a job");
-        executor
-            .shared
-            .buffers
-            .steal_from(buffer)
-            .expect("the job the submission pushed")
+    fn take_child_job(worker: &WorkerThread) -> Job {
+        worker
+            .pop()
+            .expect("the submission pushed a job onto this worker's queue")
     }
 
     /// A child raises its parent's join counter, and the **last** child to
@@ -913,10 +926,18 @@ mod tests {
             "a preempted node releases nothing: its successor waits for the \
              children"
         );
-        assert!(worker.pop().is_none(), "and queued nothing of its own");
+        // The two children, taken off this worker's own queue -- which is
+        // where #119 puts them -- before either runs, so that every `pop`
+        // below is about a resumption and nothing else.
+        let first_child = take_child_job(&worker);
+        let second_child = take_child_job(&worker);
+        assert!(
+            worker.pop().is_none(),
+            "its two children and nothing else: a preempted node releases no              successor of its own"
+        );
 
         // The first child: counted off, nothing resumed.
-        worker.invoke(take_child_job(&executor));
+        worker.invoke(first_child);
         assert_eq!(children.load(Ordering::Relaxed), 1, "one child has run");
         assert_eq!(
             node.join_counter().load(Ordering::Relaxed),
@@ -929,7 +950,7 @@ mod tests {
         );
 
         // The last child: the one that re-queues the node.
-        worker.invoke(take_child_job(&executor));
+        worker.invoke(second_child);
         assert_eq!(children.load(Ordering::Relaxed), 2, "both children ran");
         assert_eq!(
             node.join_counter().load(Ordering::Relaxed),
@@ -1016,7 +1037,7 @@ mod tests {
         worker.invoke(source_job(&taskflow, &topology));
 
         let node = taskflow.graph().node(rt);
-        let child = take_child_job(&executor);
+        let child = take_child_job(&worker);
         assert!(is_entered(node), "the node is waiting for its child");
 
         // Cancelled with the child queued and not yet dequeued, which is the
@@ -1174,8 +1195,8 @@ mod tests {
         );
 
         // The second link is not queued -- it owes its dependency -- so the
-        // one job in the buffers is the first.
-        let first = take_child_job(&executor);
+        // one job on this worker's queue is the first.
+        let first = take_child_job(&worker);
         assert!(topology.cancel(), "the run had not finished");
 
         worker.invoke(first);

@@ -158,6 +158,53 @@
 //! `IntoIterator<Item = &AsyncTask>`, both for the reasons the two async
 //! modules give.
 //!
+//! # Where a group's children are queued, and the ceiling that sets (#119)
+//!
+//! In the executor's shared buffers, where upstream pushes onto the
+//! submitting worker's own queue -- the `if(auto w = this_worker(); w)`
+//! branch of `_schedule_async_task`. #119 gave that branch to the submitters
+//! that can name the worker running them, and a group is not one of them.
+//! Two reasons, and the second is the one that would still hold if the first
+//! were fixed:
+//!
+//! - **A group has no `WorkerThread` to hand the submission.** It holds
+//!   `worker: usize`, an id, because [`Executor::task_group`] is a call on
+//!   the *executor* made from inside a task body: the owning end of that
+//!   worker's queue is in the `WorkerThread` frame that called the body, and
+//!   a frame cannot be named by the code it called. `executor::async`'s
+//!   module docs have that argument in full; the id comes from
+//!   `this_worker_id`, which is what a thread local can carry and the owning
+//!   end is not.
+//! - **A group waits on the other end of the queue anyway.**
+//!   [`TaskGroup::corun`] takes `&self` and runs on a
+//!   `WorkerThread::corun_view`, which by construction has no owning end, so
+//!   its local pops are *steals from this worker's own queue* -- the
+//!   first-in end. Pushing children LIFO onto a queue whose waiter pops FIFO
+//!   would buy nothing: the corun would still get the oldest outstanding
+//!   subtree rather than the child it just spawned, which is the whole of the
+//!   mechanism. A [`Runtime`] differs in exactly this: its `corun` holds the
+//!   `&mut WorkerThread` and pops the owning end, so push and pop are the
+//!   same LIFO end.
+//!
+//! So a group keeps the lower ceiling, and it is a **stack-depth** ceiling
+//! rather than a correctness one -- every child runs, at any worker count.
+//! Measured against a worker's default 2 MiB stack, in the debug build
+//! `cargo test` uses: the recursive Fibonacci of `tests/task_group.rs`
+//! passes at `fib(15)` and overflows at `fib(16)`, and its two sorts pass at
+//! 2000 elements and overflow at 3000. In a release build the same recursion
+//! passes `fib(17)` at one worker and `fib(23)` at twenty-four, which is
+//! `BENCHMARKS.md`'s `fibonacci` table. Upstream's `fib(25)` is therefore out
+//! of reach through a group, and `tests/task_group.rs` ships inputs a factor
+//! of two inside the cliff with the figures in its header.
+//!
+//! Lifting it would mean one of two things, both outside this port's rules as
+//! they stand: a thread local holding a pointer into another frame's
+//! `WorkerThread`, which is the `!Sync` argument `executor::queue` rests on
+//! given away for an `unsafe` block; or a second constructor on
+//! [`Runtime`] handing out a group that borrows the worker mutably, which is
+//! public API upstream does not have -- its `TaskGroup` comes from the
+//! executor and nowhere else.
+//!
 //! # Why a group cannot leave its worker
 //!
 //! Upstream deletes `TaskGroup`'s copy *and* move constructors, so a group

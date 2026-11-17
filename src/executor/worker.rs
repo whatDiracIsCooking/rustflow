@@ -460,6 +460,13 @@ impl WorkerThread {
     /// here; see that module for the trade. A corun view has no queue of its
     /// own and goes to the buffers for a different reason, which is
     /// [`LocalQueue`]'s.
+    ///
+    /// Two kinds of caller, which is upstream's two callers of the same
+    /// overload: this worker releasing the successors of a job it has just
+    /// finished, and a *free async task* submitted from inside a runtime body
+    /// running on this worker (#119) -- upstream's
+    /// `_schedule(*w, animate(...))`, which `executor::async` reaches through
+    /// the `worker` argument of its submission.
     pub(crate) fn schedule(&self, job: Job) {
         match &self.queue {
             LocalQueue::Owned(queue) => queue.push(job),

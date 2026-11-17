@@ -22,8 +22,13 @@
 //! queue is a `BoundedWSQ` (256 items by default) whose `try_push` can fail, so
 //! a *worker* that overflows its own queue spills into the shared buffers. A
 //! crossbeam deque is unbounded, so [`WorkerQueue::push`] cannot fail and that
-//! spill path disappears -- [`Buffers`] exists here only for callers that have
-//! no queue of their own, i.e. threads outside the executor.
+//! spill path disappears -- [`Buffers`] exists here only for callers with no
+//! owning end of a queue to reach. Three have none: a thread outside the
+//! executor, a corun loop (`executor::worker`'s `LocalQueue`, which holds the
+//! argument for why it runs without one), and a task body that cannot name
+//! the `WorkerThread` frame below it -- `executor::async`'s "Where a free
+//! async job is queued" is that last one, and the `!Sync` of the owning end
+//! below is what makes all three the same fact rather than three decisions.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};

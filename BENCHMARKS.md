@@ -12,7 +12,9 @@ The two shapes #96 added are the two with **no graph in them at all** --
 `silent_async` submissions and a recursive spawn -- so the construction
 asymmetry the first four have to warn about is absent from their tables, and
 they were measured in a separate run with a load of their own. Their section
-records both.
+records both. The last section of this file is a third run, #119's: it is the
+A/B of one change on the scheduling path across all six shapes, and it
+supersedes the `rustflow-runtime` column of the `fibonacci` table.
 
 ```sh
 devtools/devcontainer.sh bench                        # the whole suite
@@ -743,15 +745,20 @@ Three variants, because the submitting *thread* is the whole question here:
   one measurement of it -- the figures below are to be read against it rather
   than to re-derive it.
 - **`rustflow-group`** submits the same `N` tasks from *inside* one `spawn`ed
-  body, into a `TaskGroup`, so they go onto that worker's own LIFO queue. It
-  is upstream's `async_task_tbb` -- `tbb::task_group`, `tg.run` `N` times,
-  `tg.wait` -- translated literally, and what it costs against the first id is
-  what the buffers cost.
+  body, into a `TaskGroup`, so the submitting thread is a worker of the pool.
+  It is upstream's `async_task_tbb` -- `tbb::task_group`, `tg.run` `N` times,
+  `tg.wait` -- translated literally. Its jobs go into the shared buffers too:
+  a task group has no worker to hand the submission, which the "#119
+  measurement" section below argues and which that section re-measured as
+  unchanged, so the gap between this id and the first is **not** a gap between
+  two destinations. (The bullet below said it was; that was wrong, and the
+  correction is in that section rather than in these figures, which stand as
+  measured.)
 - **`rayon`** is `rayon::scope` plus `N` `spawn`s, which is the rayon form that
   matches upstream's TBB variant. `ThreadPool::install` makes the submitting
   thread a worker of the pool, so rayon has no external-submission variant to
-  offer: its spawns always go onto a worker's own deque, which is the
-  `rustflow-group` row's path rather than the `rustflow` row's.
+  offer: its spawns always go onto a worker's own deque, which is a
+  destination neither `rustflow` id here has.
 
 | size | workers | rustflow | rustflow-group | rayon | upstream C++ |
 |---|---|---|---|---|---|
@@ -781,9 +788,16 @@ tightest:
   a mutex to meet a waiter), and `bulk_schedule` is called with **one** job,
   so the notifier is poked once per task where a run of 65536 sources pokes it
   once for the batch.
-- **Submitting from a worker saves 30%** -- 305 ns against 440 -- and that is
-  the buffers against a worker's own queue, measured with everything else held
-  the same. It is the same route #119 is about on the recursive shape below.
+- **Submitting from a worker saves 30%** -- 305 ns against 440 -- and the
+  mechanism is *not* the one this bullet first gave: both ids push into the
+  shared buffers, so the saving is not a worker's own queue against them. What
+  differs is the submitting thread, the per-task accounting a **parentless**
+  submission takes that a group's child does not (`increment_async`'s two
+  counters, and the last decrement of each meeting a waiter under a mutex),
+  and the wait -- `wait_for_all` against a `corun` that also runs the tasks.
+  This run separated none of those, so the figure stands and the cause is
+  open; #119's section below confirms the figure does not move when a
+  *runtime* body's destination changes.
 - **rayon's scope costs ~32 ns a task** at one worker, 14x less. A scope's
   spawn is a push onto the deque of the thread that is already running the
   scope, with no allocation beyond the closure and nothing to notify while the
@@ -810,37 +824,48 @@ line for line; `rustflow-runtime` is the same recursion through a runtime task
 rather than its benchmark; `rayon` is `rayon::join`.
 
 **`n` is 12 and 15 where upstream's unit test asserts `fib(25)` and its
-benchmark sweeps to `fib(40)`, and issue #119 is why.** A corun keeps its
+benchmark sweeps to `fib(40)`, and `rustflow-group` is why.** A corun keeps its
 worker in the work-stealing loop, so every job that worker picks up while
-waiting nests one frame deeper, and a child submitted from a task body goes
-into the shared FIFO buffers rather than onto the submitting worker's LIFO
-queue. A coruning worker therefore gets the oldest outstanding job in the pool
--- somebody else's unfinished subtree -- rather than its own newest child, and
-the nesting grows one frame per outstanding *child* instead of one per level of
-recursion, until a worker's 2 MiB stack runs out. The figure
-`tests/runtimes.rs` records is a debug one, so this profile's cliff was
-measured rather than assumed, with a release build of both recursions driven
+waiting nests one frame deeper, and a corun handed the oldest outstanding job
+in the pool -- somebody else's unfinished subtree -- rather than its own newest
+child nests one frame per outstanding *child* instead of one per level of
+recursion, until a worker's 2 MiB stack runs out. That was both variants when
+#96 measured them; #119 gave the **runtime** variant upstream's
+`if(auto w = this_worker(); w)` branch, so its children go onto the submitting
+worker's LIFO queue and its corun pops them straight back. The cliff was then
+re-measured in this profile, with a release build of both recursions driven
 straight (no criterion):
 
 | variant | workers | largest `n` that passes | smallest `n` that aborts |
 |---|---|---|---|
-| `rustflow-group` | 1 | 17, over 100 rounds | 18, all 3 attempts |
-| `rustflow-runtime` | 1 | 17, over 100 rounds | 18, all 3 attempts |
-| `rustflow-group` | 24 | 23, over 20 rounds | 24 |
-| `rustflow-runtime` | 24 | 23, over 20 rounds | 24 |
+| `rustflow-group` | 1 | 17 | 18 |
+| `rustflow-group` | 24 | 23 | 24 |
+| `rustflow-runtime` | 1 | 40, the top of upstream's sweep | not reached |
+| `rustflow-runtime` | 24 | 40, the top of upstream's sweep | not reached |
 
-**One worker is the binding end, and that is #119's mechanism showing itself**:
-the one worker that coruns is the only worker there is to pick the outstanding
-children up, so it nests a frame for every one of them, while 24 workers spread
-the same tree over 24 stacks and reach six levels further. Since both worker
-counts measure the same `n`, the one-worker cliff is what sets the sizes:
-`fib(15)` is 986 spawned children and sits three levels, a factor of four in
-task count, inside it, which is the margin `tests/runtimes.rs` and
-`tests/task_group.rs` chose for the same reason. **Upstream's `fib(25)` is not
-reachable today at any worker count** -- it is 121392 spawned children, two
-orders of magnitude past the one-worker cliff -- and #119's comment thread has a prototype that reaches it
-by giving a task body's submission the submitting worker's queue. This
-benchmark measures what ships.
+The two group rows are #96's figures unchanged, which is the control: the fix
+must not move the variant it does not touch, and it does not. The two runtime
+rows are the fix -- `fib(40)` is 102334155 spawned children and took 36 s at
+one worker, so what stops that variant now is the clock and not the stack. A
+recursion through a runtime task nests one frame per level, and a chain of
+nested coruns in this profile reaches 2400 levels before a worker's stack
+gives out (2800 overflows); the figure for the debug profile the test suite
+runs under is 500 levels, which `src/executor/runtime_async.rs` records.
+
+**One worker is the binding end for the group variant, and that is the
+mechanism showing itself**: the one worker that coruns is the only worker there
+is to pick the outstanding children up, so it nests a frame for every one of
+them, while 24 workers spread the same tree over 24 stacks and reach six levels
+further. Since both variants measure the same `n`, the group's one-worker cliff
+is what sets the sizes: `fib(15)` is 986 spawned children and sits three
+levels, a factor of four in task count, inside it. `tests/runtimes.rs` -- all
+runtime tasks -- now asserts upstream's own `fib(25)` and sorts to ten
+thousand elements, while `tests/task_group.rs` keeps the reduced inputs for the
+reason `src/task_group.rs`'s module docs give: a group holds a worker *id*, not
+the worker, and waits on the stealing end of its queue in any case. Measuring
+the runtime id at upstream's `fib(25)` is now possible and is deliberately not
+done here, because a row of the table above compares the two variants at one
+`n`.
 
 | `n` | workers | rustflow-group | rustflow-runtime | rayon | upstream C++ |
 |---|---|---|---|---|---|
@@ -857,25 +882,30 @@ two numbers.
 
 What the table says:
 
-- **The two `rustflow` variants are the same scheduler and measure the same**:
-  a group per level and a runtime task per level cost the same thing, because
-  what they both do per level is submit one child through
-  `schedule_async_task` and corun. At one worker they are indistinguishable
-  (332-454 µs against 336-338 at `n = 15`, the group's own two rounds
-  disagreeing by more than the two variants do). At 24 workers the runtime
-  variant reads lower in both rounds -- 2.31-2.40 ms against 2.88-3.66 -- which
-  is the group allocation per level it does not make, but the group row's own
-  spread is as wide as the difference, so this run does not separate them.
+- **The two `rustflow` variants were the same scheduler and measured the
+  same**: a group per level and a runtime task per level cost the same thing,
+  because what they both did per level was submit one child through
+  `schedule_async_task` -- to the same destination -- and corun. At one worker
+  they were indistinguishable (332-454 µs against 336-338 at `n = 15`, the
+  group's own two rounds disagreeing by more than the two variants did). At 24
+  workers the runtime variant read lower in both rounds -- 2.31-2.40 ms against
+  2.88-3.66 -- which is the group allocation per level it does not make, but
+  the group row's own spread was as wide as the difference, so this run did not
+  separate them. **#119 separated them**, and by a lot more than that: the
+  `rustflow-runtime` column of this table is pre-#119 and the "#119
+  measurement" section below supersedes it.
 - **~340 ns per spawned child at one worker** (335 µs over 986 children), which
   is the `async_task` table's worker-submitted figure (305 ns) to within 12% --
   the same path measured from a recursion rather than a loop, and a useful
   cross-check that this shape has no cost of its own at one worker.
 - **24 workers make it 7x slower**, 335 µs to 2.3 ms for the same 986 children,
-  or ~2.4 µs each. This is the worst 1-to-24 scaling in the file and it is the
-  same cause as the stack cliff above: every child crosses into the shared
-  buffers and has to be stolen back out, and a parent that coruns is competing
+  or ~2.4 µs each. This was the worst 1-to-24 scaling in the file and it is the
+  same cause as the stack cliff above: every child crossed into the shared
+  buffers and had to be stolen back out, and a parent that coruns was competing
   for its own children with 23 other workers. Upstream's LIFO branch is what
-  this shape is built to exploit and the port does not have it yet (#119).
+  this shape is built to exploit, and #119 gave it to the runtime variant --
+  which is where a third of the one-worker time and a quarter to a third of the
+  24-worker time went; see below. The group variant still pays this.
 - **`rayon::join` costs ~13 ns a level at one worker**, 26x less, and that is
   the comparison being made rather than a scheduler being beaten: a `join`
   nobody steals from *is* direct recursion -- two closure calls and one atomic
@@ -884,3 +914,111 @@ What the table says:
   of its levels still run inline. The 100-150x ratio in the 24-worker rows is
   therefore a statement about work granularity: `fib(15)` has no work in it for
   a scheduler to amortise against, and ours schedules every level of it.
+
+## The #119 measurement: a task body's own queue, on a quiet box
+
+#119 gave a free async task submitted from inside a **runtime** body the queue
+of the worker running that body -- upstream's `if(auto w = this_worker(); w)`
+branch of `_schedule_async_task`, with the thread-local lookup replaced by an
+argument the submission is handed. A change on the scheduling path touches
+every shape, so all six were measured, not only the recursive one.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id |
+| Date | 2026-11-17 |
+| **Load average** | **2.9 to 14.3, and all of it this run's own** |
+
+That last row is the first time in this file it can be said: no other agent was
+building or testing on the box, and the load figure recorded at the start of
+each of the 24 criterion processes is the decay of the previous process's own
+24-worker ids. So the between-process noise here is this machine's rather than
+somebody else's -- which is visible in the tables below as ids whose two rounds
+still disagree by 14 to 66%, on both sides of the A/B, in the same places #96
+found them.
+
+**The method is #60's**, unchanged: A is `origin/main` (`1f81ff5`), B is this
+branch, each a separate criterion process over the same ids, round 1 A then B
+and round 2 **B then A**. Every cell is a point estimate of the mean, round 1
+then round 2, per side. The benches were filtered to the `rustflow` ids: the
+`rayon` baselines are a property of rayon and this change cannot move them.
+
+### fibonacci, the shape that moved
+
+| `n` | workers | main r1 / r2 | branch r1 / r2 | |
+|---|---|---|---|---|
+| 12 | 1 | 80.34 / 80.04 µs | **51.38 / 50.77 µs** | `rustflow-runtime`, −36% |
+| 15 | 1 | 337.96 / 335.59 µs | **201.18 / 197.89 µs** | `rustflow-runtime`, −41% |
+| 12 | 24 | 1.198 / 1.382 ms | **924.1 / 928.8 µs** | `rustflow-runtime`, −28% |
+| 15 | 24 | 2.187 / 2.322 ms | **1.378 / 1.367 ms** | `rustflow-runtime`, −39% |
+| 12 | 1 | 82.47 / 88.05 µs | 83.41 / 83.70 µs | `rustflow-group`, −2% |
+| 15 | 1 | 336.36 / 333.70 µs | 336.36 / 342.87 µs | `rustflow-group`, +1% |
+| 12 | 24 | 1.189 / 1.369 ms | 1.178 / 1.250 ms | `rustflow-group`, −5% |
+| 15 | 24 | 2.365 / 2.936 ms | 2.568 / 2.421 ms | `rustflow-group`, −6% |
+
+The runtime variant is **28% to 41% faster**, and the four percentages are
+larger than any round-to-round spread in the rows they are in -- the branch's
+own two rounds agree to within 1.6% on all four. At `n = 15` and one worker
+that is 986 spawned children going from 340 ns each to 201, which is the cost
+of a buffer push plus a steal back out, replaced by a push and a pop on the
+same end of one deque. At 24 workers it is the same thing plus the contention
+#96's bullet named: a parent that coruns is no longer competing with 23 other
+workers for its own children.
+
+The group variant is the control and does not move: its four cells sit inside
+their own rounds' spread, which at 24 workers is 14 to 21% on both sides. It
+cannot move, because a task group has no worker to hand the submission -- the
+reason is in `src/task_group.rs`, and the cliff rows above are the other half
+of the same statement.
+
+### The other five shapes did not move
+
+| shape | ids | largest change | largest spread within one side |
+|---|---|---|---|
+| `linear_chain` | 4 | +10.8% (`24w/1024`) | 16.9% |
+| `binary_tree` | 4 | −14.1% (`1w/65536`) | 28.1% |
+| `graph_traversal` | 4 | −15.7% (`1w/56759`) | 32.4% |
+| `embarrassing_parallelism` | 6 | +4.6% (`build/65536`) | 6.9% |
+| `async_task` | 8 | −25.1% (`rustflow/1w/65536`) | 65.9% |
+
+Every one of those changes is **smaller than the disagreement between the two
+rounds of one side** on the same id, which is the test #60's method is for:
+the three double-digit figures are all ids whose own rounds disagree by more,
+and they are the same ids #18 and #96 flagged as unresolvable on this box.
+Four of these five shapes have no async submission in them at all -- a graph's
+jobs were always queued by the worker-aware path -- so there is nothing in them
+for this change to have moved, and the table says so rather than assuming it.
+
+One id is worth naming because it is *not* inside the noise:
+`async_task/rustflow-group/1w/65536` read 19.21 / 19.01 ms on main and 18.35 /
+18.39 ms on the branch, a consistent **−4%** where neither side's rounds
+disagree by more than 1%. A task group's submission path differs by exactly one
+`match` on a `None` after this change and nothing else, so that is a
+code-layout effect and not a scheduling one. It is recorded rather than
+explained away.
+
+### Where the stack cliff sits now
+
+Re-measured rather than assumed, in both profiles, because they differ:
+
+| profile | route | shape | passes | aborts |
+|---|---|---|---|---|
+| debug | runtime | `fib` at 1-4 workers | 30 (832040 children, 77 s) | not reached |
+| debug | runtime | nested coruns, 1 worker | 500 | 600 |
+| debug | group | `fib` at 1-4 workers | 15 | 16 |
+| debug | group | both sorts, 1-8 workers | 2000 elements | 3000 |
+| release | runtime | `fib` at 1 and 24 workers | 40 (36 s at one worker) | not reached |
+| release | runtime | nested coruns, 1 worker | 2400 | 2800 |
+| release | group | `fib` at 1 worker | 17 | 18 |
+| release | group | `fib` at 24 workers | 23 | 24 |
+
+The "nested coruns" rows are the useful ones for the runtime route, because
+`fib` stops being stack-bound there: a body that spawns one child and coruns,
+to a given depth, is the shape that measures frames per level directly -- about
+4 KiB in debug and 870 bytes in release. A `fib` recursion nests one such
+level per level of recursion now, so its own bound is thousands of levels deep
+and its task count (1.6^n) runs out of clock first. The group rows are what
+`tests/task_group.rs` and this benchmark's sizes are chosen inside.
