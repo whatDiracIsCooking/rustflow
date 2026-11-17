@@ -29,12 +29,17 @@
 //!
 //! # What is not here yet
 //!
-//! Upstream's module-task stack, its diamond-shaped condition nodes, its
-//! dashed condition edges and its nested subflow clusters all key off handle
-//! variants that do not exist before M3/M4. The branches that would emit them
-//! are marked below at the point where they belong, but nothing stands in for
+//! Upstream's module-task stack and its nested subflow clusters key off handle
+//! variants that do not exist before M4. The branches that would emit them are
+//! marked below at the point where they belong, but nothing stands in for
 //! them: an exhaustive `match` on [`Handle`] is a better reminder than a stub,
 //! because adding the variant stops compiling until the branch is written.
+//!
+//! That is exactly what happened to the conditioner branches. The diamond node
+//! shape and the dashed, position-labelled condition edge are issue #30's, and
+//! the two handles they key off landed first, in #28 -- so each arm below is a
+//! `todo!()` naming #30 rather than a guess at the format. Dumping a graph
+//! that holds a conditioner therefore panics until that issue lands.
 
 use core::fmt;
 
@@ -211,11 +216,13 @@ fn dump_node(node: &Node, task: Task, out: &mut impl fmt::Write, level: usize) -
 ///
 /// Upstream's `switch` writes `shape=diamond color=black fillcolor=aquamarine
 /// style=filled` for a condition or multi-condition task and nothing for
-/// anything else. No handle is a conditioner yet, so every node today is a
-/// plain ellipse and the string is empty.
+/// anything else. Everything else is a plain ellipse, so the string is empty.
 fn node_shape(handle: &Handle) -> &'static str {
     match handle {
         Handle::Placeholder | Handle::Static(_) => "",
+        Handle::Condition(_) | Handle::MultiCondition(_) => {
+            todo!("the conditioner node shape is issue #30's half of the DOT dump")
+        }
     }
 }
 
@@ -224,13 +231,15 @@ fn node_shape(handle: &Handle) -> &'static str {
 /// An edge leaving a conditioner is weak -- which successor runs is decided at
 /// runtime -- so upstream draws it dashed and labels it with its position in
 /// the successor list: ` [style=dashed label="<position>"]`. Every other edge
-/// is a plain dependency and carries no attributes. The position is therefore
-/// unused until the condition handle exists, but it is the half of that format
-/// that cannot be recovered from the node alone, so it is threaded through now
-/// rather than retrofitted onto the call site later.
-fn edge_attributes(handle: &Handle, _position: usize) -> String {
+/// is a plain dependency and carries no attributes. The position is the half of
+/// that format that cannot be recovered from the node alone, which is why it is
+/// threaded through from the call site.
+fn edge_attributes(handle: &Handle, position: usize) -> String {
     match handle {
         Handle::Placeholder | Handle::Static(_) => String::new(),
+        Handle::Condition(_) | Handle::MultiCondition(_) => {
+            todo!("issue #30 labels the dashed edge leaving a conditioner: {position}")
+        }
     }
 }
 
