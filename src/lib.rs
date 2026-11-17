@@ -146,6 +146,7 @@ pub mod runtime;
 pub mod semaphore;
 pub mod subflow;
 pub mod task;
+pub mod task_group;
 pub mod taskflow;
 
 pub use crate::async_task::AsyncTask;
@@ -165,6 +166,7 @@ pub use crate::runtime::Runtime;
 pub use crate::semaphore::Semaphore;
 pub use crate::subflow::Subflow;
 pub use crate::task::{TaskMut, TaskRef, TaskType};
+pub use crate::task_group::TaskGroup;
 pub use crate::taskflow::Taskflow;
 
 /// The names you need in scope to build a graph.
