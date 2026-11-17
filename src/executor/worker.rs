@@ -280,13 +280,15 @@ impl WorkerThread {
     /// Runs one job: the task's work, then the bookkeeping that decides what
     /// becomes runnable next.
     ///
-    /// Upstream's `_invoke`, restricted to the two node kinds that exist --
+    /// Upstream's `_invoke`, restricted to the two node kinds it can run --
     /// static and placeholder. Upstream's eight other kinds, its semaphores,
     /// its observers and its cancellation check are each a later milestone,
-    /// and none of them is silently absent: the `match` below names the two it
-    /// handles and [`Handle`] is `#[non_exhaustive]`, so a new kind arrives as
-    /// a compile error here rather than as a task that mysteriously does
-    /// nothing.
+    /// and none of them is silently absent: the `match` below is exhaustive
+    /// over [`Handle`], so a new kind arrives as a compile error here rather
+    /// than as a task that mysteriously does nothing. The two conditioner
+    /// handles are what that caught first -- they are graph citizens as of
+    /// #28, with nothing to branch on them until #31 -- and their arm refuses
+    /// the run instead of guessing at the scheduling.
     ///
     /// Upstream's `_update_cache`/`TF_INVOKE_CONTINUATION` is not ported
     /// either: it keeps one ready successor out of the queue and jumps
@@ -321,6 +323,24 @@ impl WorkerThread {
             // Upstream's `std::monostate` case: a placeholder has no work, and
             // it still has successors to release.
             Handle::Placeholder => {}
+            // Upstream's `_invoke_condition_task`/`_invoke_multi_condition_task`
+            // invoke the work and then schedule only the successors its return
+            // value names. That is issue #31's, and it cannot be half-done
+            // here: a conditioner's edge is deliberately *not* counted into
+            // the join counter by `Topology::set_up`, so the unconditional
+            // release below is wrong for precisely these two handles. So the
+            // run is refused rather than approximated -- the work is not
+            // invoked at all -- and refused through the channel the static arm
+            // above already uses. A bare `panic!` would be the worse failure:
+            // it would kill the worker with this job unfinished, and
+            // `RunHandle::drop` would then block for ever instead of saying
+            // anything.
+            Handle::Condition(_) | Handle::MultiCondition(_) => {
+                topology.record_panic(Box::new(
+                    "running a condition task is not supported yet: \
+                     conditional scheduling is issue #31",
+                ));
+            }
         }
 
         // Upstream's comment, which is the whole reason this is a `fetch_add`
