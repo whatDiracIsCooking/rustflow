@@ -44,23 +44,49 @@ devtools/devcontainer.sh claude         # Claude Code, TTY attached
 devtools/devcontainer.sh shell -c 'gh pr checks 12'
 ```
 
-**The first run needs two one-time answers**, both of which then persist in the
-`rustflow-claude-config` volume (`CLAUDE_CONFIG_DIR=/claude-config`) and
-survive `down` and `rebuild`:
+### Credentials
 
-1. `/login`, unless the host exports `ANTHROPIC_API_KEY` or
-   `CLAUDE_CODE_OAUTH_TOKEN` — `docker/compose.yaml` forwards either when set.
-2. the workspace trust prompt. Until it is accepted, Claude Code ignores the
-   `permissions.allow` list in `.claude/settings.json` and says so. It is left
-   as a prompt on purpose: pre-accepting a trust decision in a committed file
-   would answer a safety question on behalf of whoever builds the image next.
+Nothing is baked into the image. Both tools authenticate from the environment,
+which `docker/compose.yaml` forwards from the host **only when the host has it
+set** (see its `environment:` comment for why that distinction is load-bearing).
 
-`devtools/devcontainer.sh nuke` drops that volume along with the build caches,
-so it is also "log in again".
+| | |
+|---|---|
+| **Claude Code** | `CLAUDE_CODE_OAUTH_TOKEN` — `claude setup-token` on the host, once, then export it |
+| **`gh`, and git push** | `GH_TOKEN` |
 
-`gh` authenticates from a forwarded `GH_TOKEN` and nothing else — no keyring,
-no `gh auth login` state in the image. If the host has no `GH_TOKEN` exported,
-in-container `gh` is simply unauthenticated; `gh auth status` is the check.
+With no `CLAUDE_CODE_OAUTH_TOKEN` (or `ANTHROPIC_API_KEY`), Claude Code falls
+back to an interactive `/login`, which persists in the
+`rustflow-claude-config` volume and survives `down` and `rebuild` — only `nuke`
+clears it. Either way works; the token is just the one that needs no prompt.
+
+**Export it before `up`.** A container's environment is fixed when it is
+*created*, so exporting a variable into a shell whose container is already
+running changes nothing in there. `devtools/devcontainer.sh down` then any
+command recreates it.
+
+`git push` needs `GH_TOKEN` and would not work without it at all: the image has
+no ssh client and the container has no keys, so this repo's `git@github.com:`
+remote is unreachable from inside. `devtools/container-bootstrap.sh` wires
+`gh`'s credential helper and an `insteadOf` rewrite into the *container's*
+global git config at create time, which sends that same remote over HTTPS with
+the token instead. Your host git config is untouched.
+
+### Two things the bootstrap does for you
+
+`devtools/container-bootstrap.sh` runs once per created container — from
+`devtools/devcontainer.sh` after `up`, and as the IDE front end's
+`postCreateCommand`, so the two cannot drift. Besides the git credentials
+above, it seeds Claude Code's `~/.claude.json` from the host's copy if the
+volume has none, because that file sits *beside* the config directory and so is
+not carried by the volume — without it a fresh container looks like a fresh
+install. It is a copy, never a shared mount: that file is one monolithic JSON
+rewritten whole on each change, so sharing it read-write would be
+last-writer-wins. Two fixups come with the copy, both explained at the point
+they happen in that script, plus a minimal `projects["/workspace"]` trust entry
+— the host's own entry is keyed by the checkout's *host* path, so trust cannot
+carry over on its own, and without it Claude Code ignores the whole
+`permissions.allow` list in `.claude/settings.json`.
 
 **Two things the container cannot do.** `docker` is not installed in it, so
 `devtools/devcontainer.sh` and `docker/compose.yaml` are host-only — from
