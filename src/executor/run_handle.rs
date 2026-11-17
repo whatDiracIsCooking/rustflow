@@ -949,10 +949,38 @@ impl WorkerThread {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::*;
     use crate::prelude::*;
+
+    /// How long a handshake waits for the other side before it gives up.
+    ///
+    /// Far longer than any rendezvous in this module needs, pinned to one
+    /// core included: nothing here passes because of this number, and the
+    /// only thing that reaches it is a side that is never going to arrive.
+    const GIVE_UP_AFTER: Duration = Duration::from_secs(120);
+
+    /// Spins until `flag` is set, failing rather than hanging if it never is.
+    ///
+    /// The same handshake `tests/basics.rs` uses for issue #40's cases, and a
+    /// spin rather than a condvar for the reason it gives: one end of every
+    /// use of it is a task body, and a worker that parked would be a worker
+    /// not running the rest of the run. `yield_now` rather than a busy
+    /// `spin_loop` because the other end is often the *main* thread, which on
+    /// a single core has to be let in.
+    ///
+    /// `what` finishes the sentence "gave up waiting for ...", because that
+    /// message is the whole diagnostic if a scheduling defect trips it.
+    fn spin_until(what: &str, flag: &AtomicBool) {
+        let deadline = Instant::now() + GIVE_UP_AFTER;
+        while !flag.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "gave up waiting for {what}");
+            thread::yield_now();
+        }
+    }
 
     #[test]
     fn an_empty_taskflow_runs_to_completion_without_a_topology() {
@@ -1212,15 +1240,38 @@ mod tests {
     /// from the moment they are handed out, and the second does not start until
     /// the first is over. The sink's own assertion is what checks the second
     /// part -- it would see a count from the other run if they overlapped.
+    ///
+    /// The count is read while the first run is *held open*, which is issue
+    /// #76: the graph is two atomic operations, so the version of this case
+    /// that read the count straight after handing out the two handles was
+    /// asserting a state the pool was free to have left already -- and `0` is
+    /// then the right answer, since the tear-down decrements before it
+    /// releases a waiter. CI's two cores found that; this box's twenty-four
+    /// hid it. So the source task of the first run signals that it is in and
+    /// waits, which makes "both runs outstanding" a fact about the program
+    /// rather than about the machine: the first cannot finish while its own
+    /// task is waiting, and the second cannot start until the first has
+    /// finished.
+    ///
+    /// Holding the first run open sharpens the queueing half rather than
+    /// distorting it, which is why the count assertion is kept where #67
+    /// dropped `empty_future`'s: the window in which an overlapping second
+    /// run would trip the `fetch_add` assertion below is now as wide as the
+    /// main thread's own progress, instead of being whatever two atomics
+    /// take.
     #[test]
     fn a_second_run_of_one_taskflow_queues_behind_the_first() {
         let executor = Executor::new(4);
         let inside = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
 
         let mut taskflow = Taskflow::new();
         let (enter, leave) = {
             let entering = Arc::clone(&inside);
             let leaving = Arc::clone(&inside);
+            let entered = Arc::clone(&entered);
+            let released = Arc::clone(&released);
             taskflow.emplace_n((
                 move || {
                     assert_eq!(
@@ -1228,6 +1279,11 @@ mod tests {
                         0,
                         "another run was still going"
                     );
+                    // The first run to get here holds its run open until the
+                    // main thread has read the count; the second finds the
+                    // flag already set and does not wait at all.
+                    entered.store(true, Ordering::Release);
+                    spin_until("the main thread to read the topology count", &released);
                 },
                 move || {
                     assert_eq!(leaving.fetch_sub(1, Ordering::SeqCst), 1);
@@ -1238,8 +1294,15 @@ mod tests {
 
         let first = executor.run(&taskflow);
         let second = executor.run(&taskflow);
+
+        // With the first run's source task waiting, the first run is in
+        // flight and the second is still behind it in the taskflow's queue --
+        // and a queued run is counted from the moment it is handed out, which
+        // is the property under test.
+        spin_until("the first run to start", &entered);
         assert_eq!(executor.num_topologies(), 2, "both runs are counted");
 
+        released.store(true, Ordering::Release);
         first.wait().expect("the first run panicked");
         second.wait().expect("the second run panicked");
         assert_eq!(inside.load(Ordering::SeqCst), 0);

@@ -12,7 +12,8 @@
 //! - [`rng`] the one random number the steal loop needs;
 //! - [`worker`] a worker and the scheduling loop it runs;
 //! - `topology` one run of one taskflow, the job a queue carries, the parent
-//!   that job's graph was scheduled under, and the run's cancellation bits --
+//!   that job's graph was scheduled under, the walk that decides which anchor
+//!   a failure is delivered to, and the run's cancellation bits --
 //!   the one module here that is crate-private, since a caller has no
 //!   business with a run's internals. It is also where the ownership
 //!   argument lives: a job owns a share of its run, of the taskflow's
@@ -74,6 +75,50 @@
 //! [`RunError::Panicked`](crate::RunError::Panicked) where a cancelled run
 //! gets `Ok(())`. Only the first panicking task of a run is reported;
 //! `ESTATE::CAUGHT`, set by the same atomic, is what drops the rest.
+//!
+//! # Anchors: who a failure is reported to
+//!
+//! "A panic cancels the rest of its own run" is the claim above that a
+//! nested graph makes more precise, because a failure inside one is not the
+//! whole run's business: somebody may be waiting for exactly that graph, and
+//! if so the failure is *theirs*. The thing that is waiting is an **anchor**,
+//! and `Job::record_panic` in `topology` is upstream's `_process_exception`:
+//! a walk from the failing node up the parent chain, marking `EXCEPTION` on
+//! every base it passes so that each nested graph the failure is inside of
+//! stops starting work, and stopping at the first anchor it finds. There are
+//! three kinds, and they are tried in this order:
+//!
+//! 1. an **explicit** anchor -- upstream's `ESTATE::EXPLICITLY_ANCHORED` --
+//!    is a frame that is blocked on this graph right now: an
+//!    [`Executor::corun`] today, and a subflow's `join` or a runtime task's
+//!    own `corun` when #50 and #51 land. It is a bit held by a guard for
+//!    exactly as long as that frame waits, so a walk that reaches it hands
+//!    the payload to a thread that is about to look. Whoever takes it decides
+//!    what to do: `corun` re-raises it on its own worker,
+//!    [`Executor::try_corun`] returns it;
+//! 2. an **implicit** anchor -- upstream's `NSTATE::IMPLICITLY_ANCHORED` --
+//!    is a node that preempted itself and means to look at its payload slot
+//!    when it is resumed. The *innermost* one the walk saw gets the payload,
+//!    because that is the one closest to the failure. No node kind this port
+//!    runs sets the bit yet; #51's runtime tasks are the first;
+//! 3. the **run**, which is every chain's root and is anchored by definition
+//!    -- upstream constructs its topology `EXPLICITLY_ANCHORED` to say so.
+//!    Its payload slot is the completion slot, so this is the case where a
+//!    `wait` reports the failure, and it is the only case a static graph has.
+//!
+//! A node whose nested graph merely *preempted* it is no anchor at all, which
+//! is upstream's arrangement rather than something left out: the children of
+//! a subflow or of a module task -- #49's and #50's, when they land -- report
+//! straight past it to the run, so a failure in one of those will surface
+//! from `wait` like any other failure of that run. What the walk does for
+//! such a node is mark it, so the siblings of the failing job are skipped.
+//!
+//! Whichever anchor is found, one `fetch_or` of `EXCEPTION | CAUGHT` on it
+//! decides whether this payload is the first and therefore the one kept --
+//! the same rule a run has always applied, now applied wherever the failure
+//! is delivered. A payload that loses is dropped, at a `NodeBase` anchor as
+//! much as at a run; `Job::record_panic` is where that parts company with
+//! upstream, and says why.
 //!
 //! # Parents, and what a nested graph counts down
 //!
@@ -151,9 +196,12 @@
 //!
 //! Upstream reads only the immediate parent, because its `_process_exception`
 //! walks the chain *upwards* and marks every ancestor as it records the
-//! failure. That walk, and the anchor bits that tell it where to stop, are
-//! issue #48; until they land the check is the half that walks, which answers
-//! the same question at the cost of one relaxed load per level of nesting.
+//! failure -- which the walk above now does too, so one level would be enough
+//! here as well. Reading every level is kept because it costs one relaxed
+//! load per level of nesting and answers strictly more: a job whose own
+//! parent is unmarked can still have a marked *grandparent*, when the failure
+//! was in a sibling subtree under the same anchor, and every job under a
+//! failed anchor is one whose result nobody will collect.
 
 pub mod corun;
 pub(crate) mod module;

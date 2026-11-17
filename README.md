@@ -258,6 +258,44 @@ the same split:
   in flight — an obligation a safe Rust API cannot state, so the module owns a
   share of its target instead. `adopt(Graph)` is the owned form of the same
   thing, for a graph with no other owner.
+- **A failure inside a nested graph is delivered to whoever is waiting for
+  that graph** (issue #48), not to the run. Upstream calls the thing that is
+  waiting an *anchor* and finds it by walking the failing node's parent chain;
+  the walk is ported as it stands, including the priority — an explicit anchor
+  (a frame blocked in a `corun` today, a subflow's `join` once #50 lands) beats
+  an implicit one (a node that preempted itself and looks when it is resumed,
+  which is #51's runtime tasks and nothing yet) beats the run, which is every
+  chain's root and is anchored by definition. Two decisions came out of it that
+  upstream does not have to make.
+
+  The payload slot is **on the node**, as upstream's `_exception_ptr` is, even
+  though a chain of parents in this port is a chain of `Nested` allocations
+  rather than of nodes and a slot per nested run would be cheaper. It cannot
+  live there: the last job of a nested graph re-queues its parent and then
+  drops the `Nested`, so a payload stored on it would be gone exactly when the
+  resumed parent needs to read it. The anchor a `corun` waits on gets a slot
+  for free, being a `NodeBase` itself; the run is the one anchor without one,
+  and uses the completion slot a `wait` already reads.
+
+  The **loser of the one-payload race is dropped** where upstream parks it on
+  the failing node. Upstream can read it back through
+  `tf::Task::exception_ptr()`, an accessor this port does not have, so parking
+  it would hold a caller's payload — destructor and all — until the next run of
+  that graph set the node up again. What the port keeps instead is the promise
+  its thread-safety case pins: of a thousand tasks failing at once, exactly one
+  payload reaches the caller and the rest are dropped by the run.
+- **Waiting on a nested graph comes in two shapes, `corun` and `try_corun`**
+  (issue #48). Upstream has one `corun`, which rethrows: a failure of the inner
+  graph is raised on the calling worker, where the task body that called it can
+  catch it — or not, in which case it becomes that task's own failure and the
+  outer run reports it. That composition is worth keeping, so `corun` is it:
+  the payload goes to `std::panic::resume_unwind`, which keeps its identity, so
+  a handler two levels up still downcasts it to what the inner task panicked
+  with. `try_corun` is the same call with the failure as an
+  `Err(CorunError::Run(RunError::Panicked(..)))` instead, for a caller that
+  means to inspect it — upstream's `try`/`catch` around the call. Both still
+  report a `corun` from a non-worker thread as `CorunError::NotAWorker`, which
+  is the one failure a caller can act on rather than propagate.
 - **A subflow's subgraph lives in a `Mutex<Graph>` inside the node's handle,**
   because the body builds it through a node the run only *borrows*: a worker
   reaches its node as `&Node`, so the graph it writes needs interior

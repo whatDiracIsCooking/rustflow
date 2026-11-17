@@ -10,13 +10,17 @@
 //! The rest of that file is deferred rather than half-ported, because every
 //! one of its remaining cases needs a node kind this port does not run yet:
 //! the subflow family (`SubflowTask`, `JoinedSubflow1..3`, `NestedSubflow`,
-//! `NestedSubflow2`, `DetachedSubflow`), the `Runtime`, `Corun` and `Module`
-//! cases, the async family (`AsyncTask`, `DependentAsyncTask`,
-//! `SilentAsyncTask`, `RuntimeAsyncTask`), `Semaphore`, and the algorithm
-//! cases (`ForEach`, `Reduce`, `Transform`, `Sort`, `Scan`, `Pipeline`...).
-//! They arrive with M4 and later, together with the subflow and runtime
-//! anchors that upstream's `_process_exception` walks to and this port does
-//! not have.
+//! `NestedSubflow2`), the `Runtime`, `RuntimeCorun1..2` and `ModuleTask`
+//! cases, the async family (`Async`, `DependentAsync`, `RuntimeAsync`),
+//! `Semaphore`, `TaskGroup`, the `Probe1..4` cases and the algorithm ones
+//! (`Algorithm`, `NestedAlgorithm`). They arrive with M4 and later, together
+//! with the subflow and runtime anchors those cases wait on.
+//!
+//! Two more are here as of the anchor walk (#48): `Exception.ExecutorCorun1`
+//! -- its static half, the subflow half being #55's -- and
+//! `Exception.ExecutorCorun2`, which are the cases about a failure inside a
+//! *nested* graph being delivered to whoever is waiting for that graph rather
+//! than to the run. They are at the end of the file, after the four above.
 //!
 //! Three adaptations, and the first is the only one that changes what is
 //! asserted:
@@ -52,7 +56,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rustflow::prelude::*;
-use rustflow::{Executor, RunError};
+use rustflow::{CorunError, Executor, RunError};
 
 /// How many times a task body has run, shared with that body.
 type Counter = Arc<AtomicUsize>;
@@ -105,6 +109,18 @@ fn chain(taskflow: &mut Taskflow, kind: Kind, counter: &Counter) -> [Task; 6] {
     }
     taskflow.linearize(tasks.iter().copied());
     tasks.try_into().expect("six tasks were emplaced")
+}
+
+/// The run failure inside a corun failure, which is the one variant of
+/// [`CorunError`] these cases can see: a task of the corun graph panicked.
+///
+/// `NotAWorker` is the other, and reaching it here would be a bug in the test
+/// rather than in the port -- every corun below is made from a task body.
+fn corun_failure(error: &CorunError) -> &RunError {
+    match error {
+        CorunError::Run(error) => error,
+        other => panic!("unexpected corun error: {other:?}"),
+    }
 }
 
 /// Asserts that `error` is the panic the failing body raised.
@@ -290,6 +306,133 @@ fn a_thousand_tasks_failing_at_once_report_exactly_one_panic() {
             dropped.load(Ordering::Relaxed),
             started,
             "{workers} worker(s): the reported payload was not the surviving one"
+        );
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: ExecutorCorun1 (static half)
+// ----------------------------------------------------------------------------
+
+/// Upstream's `executor_corun_1(W)`, first half: a task of `taskflow2`
+/// coruns `taskflow1`, whose one task fails with `"x"`, and the corun call is
+/// where that failure arrives.
+///
+/// Upstream writes it as `REQUIRE_THROWS_WITH_AS(executor.corun(taskflow1),
+/// "x", std::runtime_error)` in the body, which is a `try`/`catch` around
+/// the corun: [`try_corun`](rustflow::Executor::try_corun) is that shape
+/// without the unwind, so the task that calls it survives and the outer run
+/// completes `Ok`, exactly as upstream's `executor.run(taskflow2).get()`
+/// does not throw.
+///
+/// The second half of upstream's case puts a hundred subflows in `taskflow1`
+/// and is #55's: a subflow task is a node kind this port does not run yet.
+#[test]
+fn a_corun_of_a_failing_taskflow_reports_to_the_calling_task() {
+    for workers in 1..=4 {
+        let executor = Arc::new(Executor::new(workers));
+        let inner = Arc::new({
+            let mut inner = Taskflow::new();
+            inner.emplace(|| panic!("x"));
+            inner
+        });
+
+        let corun = counter();
+        let mut outer = Taskflow::new();
+        outer.emplace({
+            let executor = Arc::clone(&executor);
+            let inner = Arc::clone(&inner);
+            let corun = Arc::clone(&corun);
+            move || {
+                let error = executor
+                    .try_corun(&inner)
+                    .expect_err("the corun task panicked");
+                assert_failed_with_x(corun_failure(&error), &format!("{workers} worker(s)"));
+                corun.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        executor
+            .run(&outer)
+            .wait()
+            .expect("the corunning task caught the failure");
+        assert_eq!(
+            corun.load(Ordering::Relaxed),
+            1,
+            "{workers} worker(s): the corunning task ran once"
+        );
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: ExecutorCorun2
+// ----------------------------------------------------------------------------
+
+/// Upstream's `executor_corun_2(W)`: the `A..F` chain whose `C` fails, corun
+/// from a task of another taskflow, twice -- once letting the failure
+/// propagate and once catching it.
+///
+/// Both halves are upstream's and both are about where the payload goes:
+///
+/// - `corun` re-raises it on the corunning worker, so the task body that did
+///   not catch it fails with it, the executor records *that* as the outer
+///   run's failure, and `wait` reports `"x"` -- upstream's
+///   `REQUIRE_THROWS_WITH_AS(executor.run(taskflow2).get(), "x", ..)`;
+/// - `try_corun` hands it back instead, so the calling task survives and the
+///   outer run completes.
+///
+/// `counter == 2` after the first half and `== 4` after the second is
+/// upstream's arithmetic, and it is the cancellation claim: the chain is
+/// serial, so `A` and `B` ran and `D`, `E` and `F` were never scheduled --
+/// the anchor that caught the failure is marked, which is what stops the rest
+/// of a nested graph.
+#[test]
+fn an_uncaught_corun_failure_becomes_the_outer_runs_failure() {
+    for workers in 1..=4 {
+        let executor = Arc::new(Executor::new(workers));
+        let counter = counter();
+        let mut inner = Taskflow::new();
+        let [_, _, c, ..] = chain(&mut inner, Kind::Static, &counter);
+        inner.task(c).work(|| panic!("x"));
+        let inner = Arc::new(inner);
+
+        // Upstream's "uncaught corun exception propagates to the topology".
+        let mut uncaught = Taskflow::new();
+        uncaught.emplace({
+            let executor = Arc::clone(&executor);
+            let inner = Arc::clone(&inner);
+            move || executor.corun(&inner).expect("a worker may corun")
+        });
+        let error = executor
+            .run(&uncaught)
+            .wait()
+            .expect_err("the corunning task did not catch `x`");
+        assert_failed_with_x(&error, &format!("{workers} worker(s), uncaught"));
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            2,
+            "{workers} worker(s), uncaught: only the tasks before the failing one run"
+        );
+
+        // Upstream's "catch corun exception directly", which runs the same
+        // chain again: the counter is not reset, so it reaches four.
+        let mut caught = Taskflow::new();
+        caught.emplace({
+            let executor = Arc::clone(&executor);
+            let inner = Arc::clone(&inner);
+            move || {
+                let error = executor.try_corun(&inner).expect_err("`C` panicked");
+                assert_failed_with_x(corun_failure(&error), "caught");
+            }
+        });
+        executor
+            .run(&caught)
+            .wait()
+            .expect("the corunning task caught `x`");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            4,
+            "{workers} worker(s), caught: the second corun ran the same two tasks"
         );
     }
 }
