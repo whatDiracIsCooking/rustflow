@@ -13,11 +13,15 @@
 //! them is slow enough to be worth an `#[ignore]`: the whole file is a
 //! quarter of a second in a debug build.
 //!
-//! Two cases of this port's own close the file. Both are about the lease: the
+//! Four cases of this port's own close the file. Two are about the lease: the
 //! subgraph a body retained is still in the node after the run, which is what
 //! a DOT dump of a subflow is for, and it is still in the *right* node when
 //! the subflow task is one graph down, inside a composed taskflow or an
-//! adopted graph.
+//! adopted graph. The other two are issue #82's, and they are about what a
+//! body may *not* build: composing the taskflow the body belongs to -- its
+//! own, or one that a cycle of compositions leads back to -- is refused
+//! through `wait` rather than hanging the run. Neither can hang this file
+//! either, because both wait on a deadline instead of on the run.
 //!
 //! Four adaptations, none of which changes what is asserted, and the
 //! `MultipleSubflowRuns` cases name two more of their own:
@@ -46,8 +50,10 @@
 //!   apiece and reads them after the join instead. The join is what makes
 //!   that safe, and it is the point of the case.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use rustflow::prelude::*;
 use rustflow::{Executor, Node, RunHandle, SubflowWork, TaskMut};
@@ -875,5 +881,154 @@ fn a_subflow_runs_and_retains_one_graph_down() {
             dot.contains("label=\"child\""),
             "{context}: adopted: and the child it built is in it"
         );
+    }
+}
+
+// ----------------------------------------------------------------------------
+// A body that composes the taskflow it belongs to, which is issue #82's
+// ----------------------------------------------------------------------------
+
+/// How long a refused run is given to report before the case gives up.
+const GIVE_UP_AFTER: Duration = Duration::from_secs(120);
+
+/// Runs `taskflow` on a thread of its own and hands back what its `wait`
+/// reported, failing the case rather than hanging if it reports nothing.
+///
+/// Every other case in this file waits on `wait` where it stands, which is
+/// right for a run that is meant to finish. A case about a *refusal* cannot:
+/// what it pins is a run that used to never end, so a wait on this thread
+/// would hang the suite instead of failing it. The deadline-asserting spin is
+/// `executor::run_handle`'s own shape, which `tests/cancellation.rs` carries a
+/// copy of too, and the run's thread is left detached on purpose -- if the
+/// refusal ever regresses, the case fails at the deadline and the parked
+/// workers go with the process.
+fn refusal_of(taskflow: &Arc<Taskflow>, workers: usize) -> String {
+    let reported: Arc<Mutex<Option<String>>> = Arc::default();
+    let done = Arc::new(AtomicBool::new(false));
+
+    {
+        let taskflow = Arc::clone(taskflow);
+        let reported = Arc::clone(&reported);
+        let done = Arc::clone(&done);
+        thread::spawn(move || {
+            let executor = Executor::new(workers);
+            let error = executor.run(&taskflow).wait().err();
+            *reported.lock().expect("uncontended") = Some(error.map_or_else(
+                || String::from("the run reported no failure at all"),
+                |error| error.to_string(),
+            ));
+            done.store(true, Ordering::Release);
+        });
+    }
+
+    let deadline = Instant::now() + GIVE_UP_AFTER;
+    while !done.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "gave up waiting for the refused run to report"
+        );
+        thread::yield_now();
+    }
+
+    reported
+        .lock()
+        .expect("the run is over")
+        .take()
+        .expect("filled before the flag was set")
+}
+
+/// A subflow body that composes the taskflow it belongs to is refused, and
+/// the run says so through `wait` instead of never finishing.
+///
+/// #56's shape exactly, which is where this was found: the taskflow reached
+/// through a `Weak` filled in after it was built, and a body that retains its
+/// subgraph and composes its own taskflow into it. Upstream forbids this too
+/// -- composing a taskflow with itself is user error there -- so what issue
+/// #82 was about is the failure mode rather than the refusal. Scheduling the
+/// composed graph armed it a second time, which cleared the `PREEMPTED` bit
+/// of the very subflow node waiting for it, so nothing resumed that node and
+/// `wait` blocked for ever with every worker parked. `executor::module` has
+/// the mechanism in full.
+#[test]
+fn a_subflow_that_composes_its_own_taskflow_is_refused() {
+    for workers in 1..=4 {
+        let context = format!("{workers} worker(s)");
+        let entries = counter();
+        let slot: Arc<OnceLock<Weak<Taskflow>>> = Arc::default();
+
+        let mut taskflow = Taskflow::new();
+        taskflow.emplace_subflow({
+            let entries = Arc::clone(&entries);
+            let slot = Arc::clone(&slot);
+            move |subflow: &mut Subflow<'_>| {
+                bump(&entries);
+                let own = slot
+                    .get()
+                    .expect("filled before the run")
+                    .upgrade()
+                    .expect("alive for the whole run");
+                subflow.set_retain(true);
+                subflow.composed_of(own);
+            }
+        });
+        let taskflow = Arc::new(taskflow);
+        slot.set(Arc::downgrade(&taskflow))
+            .expect("the slot is filled once");
+
+        let reported = refusal_of(&taskflow, workers);
+        assert!(
+            reported.contains("may not run a graph it is already inside of"),
+            "{context}: {reported}"
+        );
+        // The observable of the defect, and the reason this is more than a
+        // message check: the second entry to the subflow node was the node
+        // being re-armed under the run that had preempted it.
+        assert_eq!(count(&entries), 1, "{context}: the body ran once");
+    }
+}
+
+/// The same refusal one link longer: two taskflows composing each other.
+///
+/// Worth its own case because it is the shape a one-level check would pass.
+/// A composed taskflow's graph is owned by that taskflow's own storage and
+/// names nothing above it, so no graph owner records this cycle; what finds
+/// it is the walk up the chain of *parents*, where the outer taskflow's graph
+/// is two links above the module node that would run it again.
+#[test]
+fn two_taskflows_that_compose_each_other_are_refused() {
+    for workers in 1..=4 {
+        let context = format!("{workers} worker(s)");
+        let entries = counter();
+        let slot: Arc<OnceLock<Weak<Taskflow>>> = Arc::default();
+
+        // The inner taskflow's one task is a subflow task whose body
+        // composes the taskflow that composed *it*.
+        let mut inner = Taskflow::with_name("inner");
+        inner.emplace_subflow({
+            let entries = Arc::clone(&entries);
+            let slot = Arc::clone(&slot);
+            move |subflow: &mut Subflow<'_>| {
+                bump(&entries);
+                let outer = slot
+                    .get()
+                    .expect("filled before the run")
+                    .upgrade()
+                    .expect("alive for the whole run");
+                subflow.composed_of(outer);
+            }
+        });
+
+        let mut outer = Taskflow::with_name("outer");
+        outer.composed_of(Arc::new(inner));
+        let outer = Arc::new(outer);
+        slot.set(Arc::downgrade(&outer))
+            .expect("the slot is filled once");
+
+        let reported = refusal_of(&outer, workers);
+        assert!(
+            reported.contains("may not run a graph it is already inside of"),
+            "{context}: {reported}"
+        );
+        assert_eq!(count(&entries), 1, "{context}: the body ran once");
     }
 }

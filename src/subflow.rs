@@ -20,9 +20,23 @@
 //! hands around. A worker here reaches its node as `&Node`, so the subgraph
 //! carries its own `Mutex` (see [`crate::Handle::Subflow`]) and the handle
 //! holds the guard for as long as the body runs. That cannot deadlock a body:
-//! the only graph a body locks is its *own* node's, so a subflow nested
-//! inside a subflow takes a different lock, and no body ever takes one
-//! twice.
+//! the only graph a body locks is its *own* node's, and a subflow nested
+//! inside a subflow is a different node, so no body holds two of these locks
+//! and none waits for one.
+//!
+//! What this lock is *not* is the thing that keeps one node to one entry.
+//! `Subflow::new` takes it with [`Mutex::try_lock`] and panics on a
+//! contended one, which catches two workers running one node while a body is
+//! building -- [`crate::Work::invoke`]'s rule, with the same report -- and
+//! that is all it catches. The lease below is why: a graph out on lease
+//! leaves the node's slot **empty and unlocked**, so a second entry to a
+//! node whose subgraph is still running finds the lock free, takes it, and
+//! runs the body again over an empty graph. Issue #82 is where that was
+//! reached -- through a taskflow composing itself, which re-armed a node this
+//! run had preempted -- and it is refused by `executor::module` rather than
+//! by this `Mutex`, because the scheduler is what knows that the node is
+//! mid-entry. The invariant that holds here is the narrow one stated above,
+//! and the "one entry per node" rule is the preemption protocol's.
 //!
 //! The guard is an [`Option`] because the body is not the only thing that
 //! wants the subgraph. Running it -- the implicit join the dispatch arm

@@ -487,9 +487,12 @@ impl NodeBase {
     /// `NSTATE::IMPLICITLY_ANCHORED`, which marks a node that preempted
     /// itself and will look at its slot when it is resumed.
     ///
-    /// No node kind this port runs sets the bit yet -- #51's runtime tasks
-    /// are the first -- so the implicit case of the walk is ported and
-    /// covered by its unit test rather than reached by a running graph.
+    /// Runtime tasks are the one node kind that sets it: `executor::runtime`
+    /// takes `PREEMPTED | IMPLICITLY_ANCHORED` together on a first entry, so
+    /// the implicit case of the walk is reached by a running graph and not
+    /// only by the unit test written for it. A node that a subflow or a
+    /// module merely preempted is no anchor, which is upstream's arrangement
+    /// too.
     pub(crate) fn is_implicitly_anchored(&self) -> bool {
         self.nstate.load(Ordering::Relaxed) & Node::IMPLICITLY_ANCHORED != 0
     }

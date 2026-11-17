@@ -850,6 +850,52 @@ impl Job {
         self.topology.cancelled() || self.parent.ancestor_cancelled()
     }
 
+    /// Whether `graph` is a graph this job is already running inside of: the
+    /// one its own node lives in, or the one any node above it on the parent
+    /// chain lives in.
+    ///
+    /// Upstream has nothing to compare: `_schedule_graph` takes a `Graph&`
+    /// and `_set_up_graph` re-arms whatever it is handed. This is issue #82's
+    /// question, and `executor::module` is the one caller -- a graph armed a
+    /// second time while a run of it is in flight loses the state that run is
+    /// keeping in its nodes, and that module's docs have what it costs.
+    ///
+    /// The **parent** chain rather than the owner chain, which is the one
+    /// subtlety. A composed `Arc<Taskflow>`'s graph is owned by a [`Flow`]
+    /// and names nothing above it, so two taskflows composing each other are
+    /// a cycle no [`GraphOwner`] link records; what does record it is the
+    /// chain of parents, each link of which is the job of the node whose
+    /// graph is running -- exactly the graphs of this run that are still in
+    /// flight above this job.
+    ///
+    /// One pointer comparison per level of nesting, no allocation, and
+    /// nothing that touches a lock: a module task of a top-level graph pays
+    /// exactly one comparison, because its chain ends at [`Parent::Run`]. A
+    /// corun's anchor ends a chain without naming the job that started it
+    /// ([`Nested::resume`] is `None` for one), so a graph enclosing a corun
+    /// is not seen -- which is the limit of what this answers, and
+    /// `Executor::corun` of a taskflow one of whose own tasks is running is
+    /// already reported by [`crate::Work::invoke`]'s `try_lock` instead.
+    pub(crate) fn runs_inside(&self, graph: &Graph) -> bool {
+        let mut job = self;
+        loop {
+            if std::ptr::eq(job.graph(), graph) {
+                return true;
+            }
+
+            // Upstream's `parent == node->_topology` as the end of the walk:
+            // the run's own graph is the graph of the job the chain ends at,
+            // so it has been compared by the time this returns.
+            let Parent::Nested(nested) = job.parent() else {
+                return false;
+            };
+            match nested.resume() {
+                Some(parent) => job = parent,
+                None => return false,
+            }
+        }
+    }
+
     /// The job that runs `task` as part of the same run of the same graph,
     /// under the same parent.
     ///
@@ -1592,6 +1638,16 @@ impl Topology {
 /// explicit-anchor bit as well, and arming a graph clears the word, so what
 /// keeps a waiting frame's anchor from being wiped by the very call that
 /// schedules the graph it waits for is that the anchor is not in it.
+///
+/// One shape did reach it, and it is issue #82's: a module task composed of a
+/// taskflow the run is *already inside of* -- which a subflow body can build,
+/// since the taskflow it belongs to can be alive behind an `Arc` -- would arm
+/// that taskflow's graph a second time, clearing the `PREEMPTED` bit and the
+/// join counter of the very node waiting for the graph being armed. Nothing
+/// would then re-queue that node and the run would never finish.
+/// `executor::module` refuses such a target before it is scheduled, through
+/// [`Job::runs_inside`], and that refusal is what keeps the paragraph above
+/// true rather than nearly true.
 ///
 /// Emptying the payload slot is upstream's `node->_exception_ptr = nullptr`,
 /// in the same loop and for the same reason: the slot is where an anchor's
@@ -2540,6 +2596,34 @@ mod tests {
         // anything.
         assert!(chain.jobs[0].node().base().take_panic().is_none());
         assert!(chain.jobs[1].node().base().take_panic().is_none());
+    }
+
+    /// What `executor::module` asks before it schedules a target: a job
+    /// recognises its own graph and every graph above it on the parent
+    /// chain, and nothing else.
+    ///
+    /// The chain is the one the anchor cases use, which is exactly the shape
+    /// the question is about -- jobs of a nested graph two links below the
+    /// graph their parents live in -- and the case that matters is the
+    /// *second* link, since a walk that compared one level only would pass
+    /// the first assertion and let issue #82's cycle of two taskflows
+    /// through.
+    #[test]
+    fn a_job_knows_the_graphs_it_is_running_inside_of() {
+        let chain = Chain::new(1, &Parent::Run);
+        let job = &chain.jobs[0];
+
+        assert!(job.runs_inside(job.graph()), "its own graph");
+        assert!(
+            job.runs_inside(chain.flow.graph()),
+            "the graph both its parents live in, two links up"
+        );
+
+        let elsewhere = Taskflow::new();
+        assert!(
+            !job.runs_inside(elsewhere.flow().graph()),
+            "a graph this run has never been in"
+        );
     }
 
     /// A waiter that arrives before the run finishes has to be released by

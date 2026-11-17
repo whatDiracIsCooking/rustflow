@@ -137,6 +137,49 @@
 //! port can refuse without a lock on every run of every graph, and the most
 //! it can do with an obligation no type here expresses is to make breaking it
 //! report itself -- which the `try_lock` above does.
+//!
+//! # A target this run is already inside of
+//!
+//! One shape of that error is one this run **can** see coming, so it is
+//! refused here rather than left to the caller: a target that is a graph the
+//! module node is already inside of. A taskflow cannot be composed of itself
+//! when it is built -- `composed_of` takes an `Arc<Taskflow>` and the
+//! taskflow it builds into needs `&mut` -- but a subflow body can do it while
+//! the taskflow runs, since #50 made [`Subflow`](crate::Subflow) a
+//! [`FlowBuilder`](crate::FlowBuilder) and the taskflow a body belongs to can
+//! be alive behind an `Arc` the caller holds. Issue #82 is what that did, and
+//! the mechanism is worth writing down because none of it is about locking:
+//!
+//! - the body composes its own taskflow, so the module node in its subgraph
+//!   is handed the graph the run is *in*;
+//! - scheduling that graph calls `set_up_graph` on it, which re-arms every
+//!   node -- `nstate` to the node's dependency count, join counter with it --
+//!   and the subflow node the module node hangs under is one of those nodes.
+//!   It is carrying `PREEMPTED` and a join counter of one, and both are gone;
+//! - the subgraph then finishes, and `Shared::finish_job` reads a parent that
+//!   is no longer preempted. Nothing re-queues the subflow node, the run's
+//!   own counter never reaches zero, and `wait` never returns -- with every
+//!   worker parked, because the run is not slow, it is over and unreported.
+//!
+//! So the first entry asks [`Job::runs_inside`] whether the target is a graph
+//! this job is already inside of -- its own, or that of any node on its
+//! parent chain -- and refuses it through `Job::record_panic` if it is, which
+//! is the path a panicking task body takes: the payload becomes the run's,
+//! the rest of the run is cancelled, and `wait` answers `Err` instead of
+//! never returning. Two taskflows composing each other are the same cycle one
+//! link longer, and the walk finds them for the same reason.
+//!
+//! The walk costs one pointer comparison per level of nesting on a module
+//! node's first entry, and a module task of a top-level graph pays exactly
+//! one: its parent chain ends at the run. What it cannot see is a graph that
+//! encloses a [`corun`](crate::Executor::corun), whose anchor ends a chain
+//! without naming the job that started it -- and that route needs no second
+//! answer, because a corun of the taskflow whose task is coruning re-enters a
+//! node whose body is still running and is reported by
+//! [`Work::invoke`](crate::Work::invoke)'s `try_lock`, the failure #49
+//! established. A preempted node's body is *not* running, which is the whole
+//! of why the self-composing case slipped past that `try_lock` and needed a
+//! refusal of its own.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -145,6 +188,15 @@ use crate::executor::topology::{GraphOwner, Job, Nested};
 use crate::executor::worker::{Release, WorkerThread};
 use crate::graph::{Graph, Node};
 use crate::taskflow::Taskflow;
+
+/// What a module task composed of a graph its own run is inside of reports,
+/// instead of hanging that run: see the module docs.
+///
+/// A `&'static str` payload, which is what `panic!` with a literal message
+/// produces and what [`RunError`](crate::RunError) renders first.
+const CYCLE: &str = "a module task may not run a graph it is already \
+     inside of: a taskflow composed of itself, directly or through a cycle \
+     of compositions, has no execution order";
 
 /// Runs the module task `job` is for, against the taskflow it is composed of:
 /// upstream's `_invoke_module_task`.
@@ -211,6 +263,17 @@ fn invoke_impl(worker: &WorkerThread, job: &Job, target: &GraphOwner) -> Option<
     // entry, which starts the target graph and leaves the node owing its
     // successors until that graph is done.
     if node.nstate().load(Ordering::Relaxed) & Node::PREEMPTED == 0 {
+        // This port's own refusal, which upstream has no equivalent of:
+        // arming a graph that is already in flight above this node would
+        // clear the state the nodes of it are keeping, and the module docs
+        // have what that costs. Reported rather than run, through the path a
+        // panicking body takes, so that the node finishes here and the run's
+        // `wait` answers rather than never returning.
+        if job.runs_inside(target.graph()) {
+            job.record_panic(Box::new(CYCLE));
+            return Some(Release::Strong);
+        }
+
         // Before the graph is scheduled, because a child may finish before
         // this call returns and the bit is what tells the last one to re-queue
         // this node.
