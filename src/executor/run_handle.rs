@@ -88,7 +88,9 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError, Weak};
 use std::task::{Context, Poll};
 
-use crate::executor::topology::{Cancellable, Finished, Job, Parent, Topology, set_up_graph};
+use crate::executor::topology::{
+    Cancellable, Finished, GraphOwner, Job, Parent, Topology, set_up_graph,
+};
 use crate::executor::worker::WorkerThread;
 use crate::executor::{Executor, Shared};
 use crate::graph::Node;
@@ -726,7 +728,7 @@ fn repeat(times: usize) -> impl FnMut() -> bool + Send + 'static {
 }
 
 impl Shared {
-    /// Arms every node of `flow`'s graph for `topology`, counts its source
+    /// Arms every node of `owner`'s graph for `topology`, counts its source
     /// tasks against `parent` and queues them.
     ///
     /// Upstream's `_schedule_graph(Worker&, Graph&, Topology*, NodeBase*)`,
@@ -738,10 +740,12 @@ impl Shared {
     /// can run and finish, and decrement that counter, before this call has
     /// returned.
     ///
-    /// Upstream takes a `Graph&`, where this takes the share that owns it: a
+    /// Upstream takes a `Graph&`, where this takes whatever owns the graph: a
     /// job owns what it names, so the jobs this queues each need a handle on
     /// the graph rather than a reference into it. That is #40's shape, and
-    /// `executor::topology` has the argument.
+    /// `executor::topology` has the argument -- including why that handle is
+    /// a choice of four kinds (#74) rather than the one `Arc<Flow>` it was
+    /// when a nested graph could only be a composed taskflow's.
     ///
     /// The `worker` is upstream's: a thread that is one of this executor's
     /// workers pushes the sources onto its own queue, and any other thread
@@ -755,11 +759,11 @@ impl Shared {
     pub(crate) fn schedule_graph(
         &self,
         worker: Option<&WorkerThread>,
-        flow: &Arc<Flow>,
+        owner: &GraphOwner,
         topology: &Arc<Topology>,
         parent: &Parent,
     ) {
-        let num_sources = set_up_graph(flow.graph());
+        let num_sources = set_up_graph(owner.graph());
         parent.count_queued(topology, num_sources);
 
         match worker {
@@ -767,11 +771,11 @@ impl Shared {
             // `WorkerThread::schedule` per job here: the deque behind a
             // worker's queue grows, so there is no bulk push to make.
             Some(worker) => {
-                for job in Job::sources(flow, topology, parent) {
+                for job in Job::sources(owner, topology, parent) {
                     worker.schedule(job);
                 }
             }
-            None => self.bulk_schedule(Job::sources(flow, topology, parent)),
+            None => self.bulk_schedule(Job::sources(owner, topology, parent)),
         }
     }
 
@@ -794,7 +798,7 @@ impl Shared {
             flow.has_source_task(),
             "a run is only ever created for a graph with a source task"
         );
-        self.schedule_graph(worker, flow, topology, &Parent::Run);
+        self.schedule_graph(worker, &GraphOwner::flow(flow), topology, &Parent::Run);
     }
 
     /// Ends a run whose last job has just finished, or sends its graph round

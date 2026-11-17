@@ -83,8 +83,8 @@
 //! The inner run's own payload slot is still read, as a backstop, because one
 //! kind of failure has no node to walk up from and lands there instead: this
 //! run's policy callbacks, which a corun gives nothing to do, and a node kind
-//! the executor refuses rather than runs, which is the adopted module handle
-//! until #74 and the subflow and runtime handles until #50 and #51.
+//! the executor refuses rather than runs, which is the subflow and runtime
+//! handles until #50 and #51.
 //!
 //! Which leaves the question of what to *do* with it, and both answers are
 //! wanted often enough that this module offers each by name:
@@ -116,7 +116,7 @@ use std::sync::Arc;
 
 use crate::executor::Executor;
 use crate::executor::run_handle::RunError;
-use crate::executor::topology::{Nested, Topology};
+use crate::executor::topology::{GraphOwner, Nested, Topology};
 use crate::executor::worker::WorkerThread;
 use crate::taskflow::{Flow, Taskflow};
 
@@ -143,10 +143,12 @@ use crate::taskflow::{Flow, Taskflow};
 ///    [`Executor::corun`] and [`Executor::try_corun`] one implementation.
 ///
 /// The graph arrives as the share that owns it rather than as a `&Graph`,
-/// which is what [`Shared::schedule_graph`](crate::executor::Shared) takes
-/// and therefore what survives the widening that a subflow's subgraph and an
-/// adopted module's graph will need: a job of this graph has to own the
-/// storage its node indices resolve in, and a reference cannot be owned.
+/// because a job of this graph has to own the storage its node indices
+/// resolve in and a reference cannot be owned. That share is one of the four
+/// kinds of graph owner `Shared::schedule_graph` takes since #74, and the one
+/// every caller of this has in hand: a corun of a whole taskflow. A corun of
+/// a graph some node owns -- `Subflow::join`, #50 -- widens this parameter
+/// the same way, in the issue that needs it.
 ///
 /// `worker` is upstream's `Worker&`: the real one when the caller is a
 /// dispatch arm inside `WorkerThread::invoke`, and a
@@ -170,9 +172,12 @@ pub(crate) fn corun_graph(
 
     {
         let _anchor = parent.base().anchor_explicitly();
-        worker
-            .shared
-            .schedule_graph(Some(worker), flow, topology, &parent.as_parent());
+        worker.shared.schedule_graph(
+            Some(worker),
+            &GraphOwner::flow(flow),
+            topology,
+            &parent.as_parent(),
+        );
         worker.corun_until(|| parent.outstanding() == 0);
     }
 

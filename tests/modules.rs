@@ -24,9 +24,12 @@
 //!   their compositions through `executor.async`, which is milestone 5.
 //!
 //! Nothing here composes an *adopted* graph either, and nothing upstream does
-//! in this file: `adopt` is the owned form of the same node kind, and running
-//! one waits on issue #74 -- `executor::module` says why the two forms part
-//! company in this port where they do not upstream.
+//! in this file: `adopt` is the owned form of the same node kind, so these
+//! cases would say nothing new about it. What is particular to that form is
+//! which arena its tasks resolve in, which is a claim about the scheduler
+//! rather than about composition, and it is pinned beside the code in
+//! `executor::module`'s own cases (#74). `executor::module` says why the two
+//! forms part company in this port where they do not upstream.
 //!
 //! Three adaptations:
 //!

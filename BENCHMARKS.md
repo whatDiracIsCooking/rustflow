@@ -257,6 +257,67 @@ Two things would get most of it back, and neither is this PR:
   would fail. Half the atomics for a racy panic is the wrong trade; the
   continuation optimisation is the one to do first.
 
+## The #74 decision: a job names which of four graphs it walks, at one word
+
+Issue #74 widened the field #40 had just introduced. A queued `Job` held an
+`Arc<Flow>` -- a share of the taskflow's storage -- which names two of the four
+graphs the scheduler can run: the run's own graph, and the target of a module
+task composed of an `Arc<Taskflow>`. The other two are owned *inside* the
+handle of the node they hang off, an adopted module's `Graph` and a subflow's
+`Mutex<Graph>`, and nothing names one but the owner of the outer graph plus
+that node's index as a path. So the field became a two-variant enum -- a share
+or a path -- and `size_of::<Job>()` went from **32 bytes to 40**: two pointer
+variants need a tag, and there is no niche to put it in. The
+`a_job_is_five_words` case in `executor::topology` pins both numbers.
+
+One job is built per task on the hot path and travels through a work-stealing
+deque by value, so the fifth word is a cost worth having a number for.
+Measured the way #40's was, and for the same reason -- cross-run criterion
+comparison on this box measures whatever else the box is doing: interleaved
+rounds, both variants of a round within a minute of each other, `-- rustflow`
+so the rayon ids are not built. Six rounds for `linear_chain` and four for the
+two `embarrassing_parallelism` ids that resolve at all; load average 4.2 to 6.6
+throughout, with no other agent on the box. Point estimates of the mean, in
+the order the rounds ran:
+
+| id | before (one `Arc<Flow>`) | after (tag + pointer) | delta | per task |
+|---|---|---|---|---|
+| `linear_chain/1w/1024` | 158.6, 161.7, 159.6, 160.0, 161.2, 147.0 µs | 169.6, 164.3, 147.8, 150.1, 166.4, 165.5 µs | +1.6% | +2.5 ns |
+| `linear_chain/1w/16384` | 2.101, 2.250, 2.242, 2.260, 2.230, 2.249 ms | 2.326, 2.351, 2.348, 2.341, 2.018, 2.362 ms | +3.1% | +4.2 ns |
+| `linear_chain/24w/1024` | 297.7, 297.6, 307.0, 299.6, 300.0, 310.2 µs | 315.4, 317.4, 315.0, 314.4, 302.6, 312.1 µs | +3.6% | +10.6 ns |
+| `linear_chain/24w/16384` | 4.282, 4.225, 4.262, 4.279, 4.350, 4.176 ms | 4.335, 4.394, 4.410, 4.337, 4.356, 4.343 ms | +2.3% | +6.1 ns |
+| `embarrassing/24w/4096` | 955.6, 974.9, 977.0, 973.1 µs | 976.7, 982.3, 972.0, 981.3 µs | +0.8% | +1.9 ns |
+| `embarrassing/24w/65536` | 13.70, 13.35, 13.64, 13.72 ms | 13.71, 13.73, 13.48, 14.23 ms | +1.3% | +2.8 ns |
+
+So **2 to 4% on the shapes built to measure nothing but the scheduler, and
+about 1% on the shape with a task body in it** -- an order of magnitude less
+than #40's own 19%, and in the same place: a chain at 24 workers, where every
+job is handed to whichever worker wakes first and the deque slot it travels in
+is cold when it arrives. A 32-byte job fits a cache line twice over and a
+40-byte one does not, which is what the +10.6 ns on `24w/1024` looks like. Two
+caveats on reading the table: the two single-worker `linear_chain` ids swing
+by ±9% round to round, so their deltas are the mean of six rounds and not a
+resolved effect; and the first two-way set measured `embarrassing/24w/4096` at
++9%, which four interleaved rounds did not reproduce -- the "before" column of
+that earlier set was itself 8% faster than this one. Interleaving within a
+round is the only thing this box protects, and these two ids are at the edge
+of what it can resolve.
+
+**An alternative that keeps a job at 32 bytes was measured and rejected.**
+Boxing the owner -- `GraphOwner(Arc<Owned>)`, one pointer, with the enum
+behind it -- costs one extra dependent load per resolution and one allocation
+per graph scheduled, and buys the word back. Measured in the same rounds as
+the flat enum, it did not win: `linear_chain/24w/1024` came out at +6.2%
+against the flat enum's +2.1% over that round-set's own baseline, and
+`embarrassing/24w/4096` at +2.1% against +0.8%. The owner allocation is shared
+by every job of a graph and is therefore hot, but a job's owner is read once
+per invocation and twice more on the queueing path, so the indirection costs
+about what the word costs -- and the flat enum is the one with no allocation
+and no second load in it. So the extra word is accepted, and what it buys is
+not a nanosecond trade at all: before it, a job of an adopted module's graph
+resolved its indices against the composing taskflow's arena, and the arm that
+ran one refused the run rather than do that silently.
+
 ## The `Work` decision: `Mutex::try_lock` stays
 
 `Work` holds its callable in a `Mutex` and `invoke` takes it with `try_lock`,

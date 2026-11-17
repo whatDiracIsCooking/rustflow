@@ -252,11 +252,11 @@ pub trait FlowBuilder {
     /// keep alive and no share to count. It is the form to reach for when the
     /// composed graph has no other owner.
     ///
-    /// Running one is issue #74, where a composed target already runs: the two
-    /// forms differ only in who owns the target graph, and a graph owned
-    /// inline by the handle is the one of the two that a job cannot yet name.
-    /// A run reaching one until then reports a panic rather than running it,
-    /// as `executor::module` says.
+    /// Running one runs the whole of `graph` before this task's successors,
+    /// exactly as a composed target runs: the two forms differ only in who
+    /// owns the target graph, which is a question the scheduler answers for
+    /// all four kinds of nested graph in one place (#74) and
+    /// `executor::module` says how for these two.
     ///
     /// ```
     /// use rustflow::prelude::*;

@@ -21,7 +21,7 @@
 //!   from being a queue of raw pointers;
 //! - `module`, `subflow` and `runtime` one dynamic-tasking node kind each,
 //!   reached by one line from the worker's handle match. `module` runs a
-//!   composed taskflow as of #49 and refuses an adopted graph until #74;
+//!   composed taskflow as of #49 and an adopted graph as of #74;
 //!   `subflow` and `runtime` refuse the run and say which issue lands them
 //!   (#50, #51). They are separate files so that the three can land without
 //!   meeting in the worker;
