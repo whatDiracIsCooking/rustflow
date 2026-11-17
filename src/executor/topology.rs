@@ -998,6 +998,31 @@ impl Job {
         self.graph().node(self.task)
     }
 
+    /// The free-standing node this job runs, or `None` for a job of a graph
+    /// somebody built.
+    ///
+    /// Upstream's `std::get_if<Node::DependentAsync>(&node->_handle)`, which
+    /// is how both of its async tear-downs reach the state that is a *free*
+    /// node's rather than a node's: the `FINISHED` bit and the successor
+    /// list. Here that state is on [`AsyncNode`] -- `executor::async_node`
+    /// says why a free node is a one-node arena -- and this is the only way
+    /// to it from a job, since [`Job::node`] resolves past the arena to the
+    /// [`Node`] inside it.
+    ///
+    /// The one caller is the dependent-async tear-down in
+    /// `executor::dependent_async`, which marks the task finished and drains
+    /// what was waiting for it. The share rather than a borrow because a
+    /// caller that needs to *keep* the node -- to name it as a dependency of
+    /// something else -- needs the count, and handing back `&AsyncNode`
+    /// would make that a second accessor for no gain: a borrow of the share
+    /// is still a borrow of the node.
+    pub(crate) fn async_node(&self) -> Option<&Arc<AsyncNode>> {
+        match &self.owner {
+            GraphOwner::Async(node) => Some(node),
+            GraphOwner::Run(_) | GraphOwner::Flow(_) | GraphOwner::Inside(_) => None,
+        }
+    }
+
     /// What this job's graph was scheduled under.
     pub(crate) fn parent(&self) -> &Parent {
         &self.parent
