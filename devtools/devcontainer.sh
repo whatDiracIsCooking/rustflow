@@ -19,7 +19,9 @@
 #   devtools/devcontainer.sh status        what is running
 #
 # VS Code / IDE users can instead open .devcontainer/devcontainer.json; it
-# builds the same root Dockerfile.
+# builds the same root Dockerfile and runs the same
+# devtools/container-bootstrap.sh (git push credentials + the Claude Code
+# config seed) as its postCreateCommand.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,11 +32,35 @@ export HOST_GID="${HOST_GID:-$(id -g)}"
 
 dc() { docker compose -f "$COMPOSE_FILE" "$@"; }
 
+# Hand the host's ~/.claude.json to the container, then run the in-container
+# bootstrap (git push credentials + the Claude Code config seed; see that
+# script's header). Streamed in over `exec` rather than bind-mounted, which the
+# IDE front end does instead: compose would have to name the host path in
+# compose.yaml, and docker refuses to start a container whose bind source does
+# not exist -- so a host that has never run claude could not bring the
+# container up at all. Here the file simply may or may not be there.
+#
+# `exec -T`: no pty, or the redirect below is not a pipe. Both halves are
+# allowed to fail; a container you cannot push from still builds.
+bootstrap() {
+    if [ -r "$HOME/.claude.json" ]; then
+        dc exec -T dev bash -c 'cat > /tmp/claude-seed.json' \
+            < "$HOME/.claude.json" || true
+    fi
+    dc exec -T dev bash /workspace/devtools/container-bootstrap.sh || true
+}
+
 # Bring `dev` up only if it isn't already; `up -d` on a running container is a
 # no-op but still prints noise on every single command.
+#
+# The bootstrap runs only on the branch that created the container, because
+# what it writes (/home/<user>/.gitconfig and the seeded config) lives in the
+# container's own filesystem and so is exactly what a recreate loses. It is
+# idempotent anyway.
 ensure_up() {
     if [ -z "$(dc ps -q dev 2>/dev/null)" ]; then
         dc up -d dev
+        bootstrap
     fi
 }
 
@@ -46,7 +72,7 @@ cmd="${1:-shell}"
 shift || true
 
 case "$cmd" in
-    up)      dc up -d dev ;;
+    up)      dc up -d dev; bootstrap ;;
     shell)
         ensure_up
         if [ "${1:-}" = "-c" ]; then
@@ -78,7 +104,7 @@ case "$cmd" in
         ;;
     test)    in_dev "cargo test --all-features $*" ;;
     fmt)     in_dev 'cargo fmt --all' ;;
-    rebuild) dc build --no-cache dev && dc up -d --force-recreate dev ;;
+    rebuild) dc build --no-cache dev && dc up -d --force-recreate dev && bootstrap ;;
     down)    dc down ;;
     nuke)    dc down -v ;;
     status)  dc ps ;;

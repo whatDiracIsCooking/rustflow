@@ -15,13 +15,24 @@ Drive the current changes all the way to `main` in one pass. Each step has a
 gotcha; follow them in order.
 
 **Where to run it.** From the host, every step works. From inside the
-devcontainer, `gh` is installed and `docker/compose.yaml` forwards GH_TOKEN
-when the host has it exported -- so the whole skill runs in there too, with two
-exceptions: step 3's `devtools/devcontainer.sh check` is host-only (no `docker`
-in the container; run the three `cargo` commands directly instead), and git
-does not work at all in a `.claude/worktrees/` checkout mounted into the
-container, because its `.git` file points at an absolute host path the
-container cannot see. Worktree work therefore commits and pushes from the host.
+devcontainer it works too, but only on the **main checkout** and only with
+GH_TOKEN exported on the host -- check both before starting, because each
+failure lands mid-skill:
+
+- `gh auth status` must show a token. The image ships `gh` but no credentials;
+  `docker/compose.yaml` forwards GH_TOKEN only when the host has it set, and
+  only into a container **created** after it was exported (`down`, then up).
+- push needs that same token. The image has no ssh client at all, so this
+  repo's `git@github.com:` remote is unreachable until
+  `devtools/container-bootstrap.sh` rewrites it to HTTPS at container-create
+  time -- which it does only when GH_TOKEN is present. Without it, `git push`
+  fails with `ssh: not found`.
+- step 3's `devtools/devcontainer.sh check` is host-only (no `docker` in the
+  container). Run the three `cargo` commands directly instead.
+- git does not work **at all** in a `.claude/worktrees/` checkout mounted into
+  the container: its `.git` is a file naming an absolute host path, so every
+  git command dies with `fatal: not a git repository`. Worktree work commits
+  and pushes from the host.
 
 ## 1. Commit the relevant changes
 

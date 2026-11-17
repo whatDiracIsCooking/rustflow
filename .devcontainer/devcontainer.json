@@ -11,11 +11,12 @@
   },
   "workspaceFolder": "/workspace",
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
-  "//mounts": "Mounted by the same names docker/compose.yaml declares, so both front ends warm one cargo registry, one /target and one Claude Code login rather than a cold copy each. rustflow-claude-config is CLAUDE_CONFIG_DIR in the Dockerfile; it is what makes an in-container `claude /login` outlast a container recreate.",
+  "//mounts": "The three volumes are mounted by the same names docker/compose.yaml declares, so both front ends warm one cargo registry, one /target and one Claude Code login rather than a cold copy each. rustflow-claude-config is CLAUDE_CONFIG_DIR in the Dockerfile; it is what makes a login outlast a container recreate. The fourth entry hands the host's ~/.claude.json to postCreateCommand below, READ-ONLY and under a different name: that file is one monolithic JSON rewritten whole on every change, so the container takes its own copy rather than sharing it. NOTE: unlike devtools/devcontainer.sh, which can test for the file first, docker refuses to start a container whose bind source is missing -- so on a host that has never run Claude Code, drop this line.",
   "mounts": [
     "source=rustflow-cargo-registry,target=/usr/local/cargo/registry,type=volume",
     "source=rustflow-target,target=/target,type=volume",
-    "source=rustflow-claude-config,target=/claude-config,type=volume"
+    "source=rustflow-claude-config,target=/claude-config,type=volume",
+    "source=${localEnv:HOME}/.claude.json,target=/tmp/claude-seed.json,type=bind,readonly"
   ],
   "//containerEnv": "All three are optional and forwarded from the host, matching the `environment:` list in docker/compose.yaml. ${localEnv:VAR} expands to the empty string when the host has no such variable; an empty value is not a configured credential, so a machine that sets neither of Claude Code's two still gets the interactive /login path.",
   "containerEnv": {
@@ -23,6 +24,9 @@
     "CLAUDE_CODE_OAUTH_TOKEN": "${localEnv:CLAUDE_CODE_OAUTH_TOKEN}",
     "GH_TOKEN": "${localEnv:GH_TOKEN}"
   },
+  "//postCreateCommand": "The same script devtools/devcontainer.sh runs after its own `up`, so the two front ends cannot drift: it sets up git push credentials from GH_TOKEN and seeds Claude Code's config from the mount above. Per-created-container, which is right -- both of those land in the container's own filesystem.",
+  "postCreateCommand": "bash /workspace/devtools/container-bootstrap.sh",
+
   "remoteUser": "dev",
   "customizations": {
     "vscode": {
