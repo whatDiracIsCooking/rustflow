@@ -43,3 +43,43 @@ undocumented_unsafe_blocks = "warn"
 # the same reason the runtime dependencies are.
 [target.'cfg(loom)'.dependencies]
 loom = "=0.7.3"
+
+# Dev-only, and that distinction is the dependency policy's: a dev dependency
+# "need only be useful", while a runtime one has to replace something upstream
+# hand-wrote. Neither of these is in the library -- `cargo bench --no-run` is
+# the only thing that builds them -- so the shipped crate is still the two
+# crossbeam crates and nothing else. Pinned exactly, like every other
+# dependency here.
+#
+# `criterion` with no default features: the default set is
+# `rayon + plotters + cargo_bench_support`, and `plotters` only draws the SVGs
+# the `html_reports` feature emits -- which is *not* in the default set, so
+# plotting is a few hundred crates of tree that nothing here would ever call.
+# `cargo_bench_support` is what lets a criterion harness run under plain
+# `cargo bench` at all, and `rayon` is criterion's own analysis parallelism,
+# free here because the benchmarks depend on rayon anyway.
+[dev-dependencies]
+criterion = { version = "=0.8.2", default-features = false, features = [
+    "cargo_bench_support",
+    "rayon",
+] }
+rayon = "=1.12.0"
+
+# `harness = false` on each: criterion brings its own `main`, and libtest's
+# would otherwise take the command line and report zero benchmarks. One target
+# per upstream benchmark directory, named after it.
+[[bench]]
+name = "linear_chain"
+harness = false
+
+[[bench]]
+name = "binary_tree"
+harness = false
+
+[[bench]]
+name = "graph_traversal"
+harness = false
+
+[[bench]]
+name = "embarrassing_parallelism"
+harness = false
