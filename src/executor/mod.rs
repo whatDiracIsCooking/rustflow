@@ -20,10 +20,11 @@
 //!   storage and of its parent chain, which is what keeps a queue of jobs
 //!   from being a queue of raw pointers;
 //! - `module`, `subflow` and `runtime` one dynamic-tasking node kind each,
-//!   reached by one line from the worker's handle match. All three refuse the
-//!   run for now and say which issue lands them (#49, #50, #51); they are
-//!   separate files so that those three can land without meeting in the
-//!   worker;
+//!   reached by one line from the worker's handle match. `module` runs a
+//!   composed taskflow as of #49 and refuses an adopted graph until #74;
+//!   `subflow` and `runtime` refuse the run and say which issue lands them
+//!   (#50, #51). They are separate files so that the three can land without
+//!   meeting in the worker;
 //! - [`run_handle`] the `run` family itself -- `run`, `run_n`, `run_until` and
 //!   the owning half of each -- the tear-down that decides whether a finished
 //!   run goes round again, the handle whose borrow is this port's answer to
@@ -108,9 +109,9 @@
 //!
 //! A node whose nested graph merely *preempted* it is no anchor at all, which
 //! is upstream's arrangement rather than something left out: the children of
-//! a subflow or of a module task -- #49's and #50's, when they land -- report
-//! straight past it to the run, so a failure in one of those will surface
-//! from `wait` like any other failure of that run. What the walk does for
+//! a module task -- #49's, and of a subflow once #50 lands -- report straight
+//! past it to the run, so a failure in one of those surfaces from `wait` like
+//! any other failure of that run. What the walk does for
 //! such a node is mark it, so the siblings of the failing job are skipped.
 //!
 //! Whichever anchor is found, one `fetch_or` of `EXCEPTION | CAUGHT` on it

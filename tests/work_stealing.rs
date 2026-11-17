@@ -38,16 +38,17 @@
 //! async tasks are milestone 5. The first and third phases need nothing that
 //! is missing and are upstream's own.
 //!
-//! One case is here with an adaptation rather than a cut, and it is the one
-//! worth arguing about: `EmbarrasingStarvation` wraps its 65536-task fan-out
-//! in `parent.composed_of(taskflow)` and runs the *parent*. Module tasks are
-//! milestone 4 (#49), so what runs here is the fan-out itself. The assertion
-//! it carries is untouched and still has teeth -- `set.size() == W` fails if a
-//! single worker is left asleep -- but the shapes are not identical and the
-//! difference favours upstream: a module expands into the queue of the one
-//! worker that ran the module node, so upstream's fan-out has to be *stolen*,
-//! where this one is handed to the shared buffers by the submitting thread.
-//! #49 should re-point this case at `composed_of`.
+//! One case was here with an adaptation rather than a cut, and it is no
+//! longer: `EmbarrasingStarvation` wraps its 65536-task fan-out in
+//! `parent.composed_of(taskflow)` and runs the *parent*, which this file
+//! could not do until module tasks landed (#49) and now does. The shape
+//! matters rather than being a formality, which is why the flattened version
+//! was never left in place: a module task expands into the queue of the one
+//! worker that ran the module node, so the fan-out has to be *stolen* out of
+//! that queue, where a fan-out submitted from this thread is handed to the
+//! shared overflow buffers and found by every worker at once. The stealing
+//! one is the harder scheduling case and the one the assertion -- `set.size()
+//! == W`, which fails if a single worker is left asleep -- exists for.
 //!
 //! Two standing adaptations across the file:
 //!
@@ -526,12 +527,14 @@ fn starvation_loop_8_workers() {
 // Testcase: EmbarrasingStarvation
 // ----------------------------------------------------------------------------
 
-/// Upstream's `embarrasing_starvation(W)`, less its module task -- the file
-/// header says what that costs and why it is not faked.
+/// Upstream's `embarrasing_starvation(W)`, module task and all.
 ///
 /// 65536 independent tasks, each recording its worker and then waiting for all
 /// `W` of them to have arrived. There is no dependency anywhere, so the only
-/// thing between a worker and the work is whether it was woken.
+/// thing between a worker and the work is whether it was woken -- and the
+/// fan-out is reachable only through a module task, so the work starts out in
+/// one worker's own queue and every other worker has to steal it. The file
+/// header says why that is the shape worth running.
 fn embarrasing_starvation(workers: usize) {
     const B: usize = 65536;
 
@@ -557,7 +560,11 @@ fn embarrasing_starvation(workers: usize) {
         });
     }
 
-    run(&executor, &taskflow);
+    // Upstream's `parent.composed_of(taskflow)`: the fan-out is run as a
+    // module of a parent taskflow rather than directly.
+    let mut parent = Taskflow::new();
+    parent.composed_of(Arc::new(taskflow));
+    run(&executor, &parent);
 
     assert_eq!(
         involved.count(),

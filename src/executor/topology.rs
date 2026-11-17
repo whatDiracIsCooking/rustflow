@@ -148,14 +148,17 @@ pub(crate) struct Job {
     /// *takeable* -- see [`Topology::release_flow`] -- and therefore lives
     /// behind a mutex, which is no place for a hot path to go.
     ///
-    /// This is the one field a nested graph will widen. Upstream's node knows
+    /// This is the one field a nested graph widens. Upstream's node knows
     /// which of the four graphs it lives in through the pointer the arena
-    /// hands out; here the job owns the graph it walks, so a job of a module's
-    /// target graph will own that `Arc<Taskflow>` and a job of a subflow's
-    /// subgraph will reach it through the parent's job. Everything the
-    /// executor can run today lives in the root graph, so there is one owner
-    /// to name and [`Job::graph`] is the single place that resolves it; #49,
-    /// #50 and #51 are what turn it into a choice of four.
+    /// hands out; here the job owns the graph it walks, and two of the four
+    /// kinds are already an `Arc<Flow>`: the run's own graph, and the target
+    /// of a module task composed `Arc<Taskflow>`, whose storage is this field
+    /// for every job of it (#49). The other two -- a subflow's subgraph and an
+    /// adopted module's graph -- live *inside* the handle of the node they
+    /// hang off, so naming one takes the outer share plus that node's index
+    /// as a path, which is the widening issue #74 makes once rather than three
+    /// times. [`Job::graph`] is the single place that resolves whichever it
+    /// is.
     flow: Arc<Flow>,
     /// The run `task` is part of.
     topology: Arc<Topology>,
@@ -786,7 +789,7 @@ impl Cancellable {
     }
 }
 
-/// One run of one [`Taskflow`]: upstream's `tf::Topology`.
+/// One run of one [`Taskflow`](crate::Taskflow): upstream's `tf::Topology`.
 ///
 /// One upstream member is not here: `_promise` is a [`Completion`] behind a
 /// `Mutex`, because the payload a panicking task hands back is not a value

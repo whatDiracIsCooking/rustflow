@@ -216,8 +216,12 @@ pub trait FlowBuilder {
     /// What the share does *not* buy is permission to run one target twice at
     /// once: a graph's per-node counters belong to one run at a time, which is
     /// upstream's rule too (`composed_of` is "thread-safe as long as the target
-    /// is not concurrently ran by two or more threads"). Running one is issue
-    /// #49.
+    /// is not concurrently ran by two or more threads"). Two module tasks over
+    /// one target are therefore fine when nothing can run them at the same
+    /// time -- an edge between them is enough -- and a caller's error when
+    /// they can. Runs of one taskflow serialise, so queueing several runs of a
+    /// composition is not that error; `executor::module` sets out both sides,
+    /// and the failure a worker reports if the rule is broken.
     ///
     /// ```
     /// use std::sync::Arc;
@@ -248,8 +252,11 @@ pub trait FlowBuilder {
     /// keep alive and no share to count. It is the form to reach for when the
     /// composed graph has no other owner.
     ///
-    /// Running one is issue #49; the two forms differ there only in where the
-    /// arm finds the graph.
+    /// Running one is issue #74, where a composed target already runs: the two
+    /// forms differ only in who owns the target graph, and a graph owned
+    /// inline by the handle is the one of the two that a job cannot yet name.
+    /// A run reaching one until then reports a panic rather than running it,
+    /// as `executor::module` says.
     ///
     /// ```
     /// use rustflow::prelude::*;

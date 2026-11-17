@@ -83,8 +83,8 @@
 //! The inner run's own payload slot is still read, as a backstop, because one
 //! kind of failure has no node to walk up from and lands there instead: this
 //! run's policy callbacks, which a corun gives nothing to do, and a node kind
-//! the executor refuses rather than runs, which reports against a topology
-//! directly until #49, #50 and #51 land.
+//! the executor refuses rather than runs, which is the adopted module handle
+//! until #74 and the subflow and runtime handles until #50 and #51.
 //!
 //! Which leaves the question of what to *do* with it, and both answers are
 //! wanted often enough that this module offers each by name:
