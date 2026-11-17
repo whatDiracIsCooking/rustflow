@@ -219,7 +219,8 @@ the same split:
   work-stealing queue layer, and the only other crate in the tree is
   `crossbeam-epoch`, which `crossbeam-deque` pulls in itself. Anything optional
   goes behind a Cargo feature so the default build stays at those two.
-- **Dev** dependencies need only be useful: `loom` for the lock-free parts,
+- **Dev** dependencies need only be useful: `loom` for the lock-free parts
+  and the wake-ordering protocol (`tests/loom_*.rs`),
   `criterion` for the ported benchmarks, `rayon` as the baseline those
   benchmarks compare against, in the role TBB plays upstream.
 

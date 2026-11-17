@@ -847,11 +847,12 @@ mod tests {
                 executor.corun(&inner).expect("a worker may corun");
 
                 // A `corun` that has returned is accounted for, not merely
-                // finished -- the same promise `wait` makes, and for the same
-                // reason: the tear-down decrements the count before it
-                // releases this frame. With one worker nothing else can be
-                // running, so the only topology left is the outer run that
-                // this task belongs to.
+                // finished -- the same promise `wait` makes. The frame
+                // decrements the count itself, after its hold on the storage
+                // has become unique and before it returns, where a `wait`er's
+                // decrement is the last share's (#138). With one worker
+                // nothing else can be running, so the only topology left is
+                // the outer run that this task belongs to.
                 assert_eq!(executor.num_topologies(), 1);
             }
         });

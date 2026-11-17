@@ -72,6 +72,7 @@
 //! taskflow's run queue, so a hundred `run`s of a composition are a hundred
 //! runs of each target in a row rather than at once.
 
+use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
@@ -588,6 +589,91 @@ fn a_composition_is_editable_the_instant_its_run_reports_done() {
         assert!(
             editor.join().is_ok(),
             "a run reported done while a share of its taskflow was still held"
+        );
+    }
+}
+
+/// The same promise through `Executor::wait_for_all` instead of `wait`, which
+/// is issue #138: the other thread a finished run releases.
+///
+/// `wait` is woken by the last share of the run's hold on the storage (#109).
+/// `wait_for_all` is woken by something else -- the run count falling to zero
+/// -- and until #138 the tear-down decremented that count *before* it dropped
+/// its own share of the hold. So the window the case above closes for `wait`
+/// was open for `wait_for_all`: it could return with the tear-down's share, or
+/// a straggling copy of the preempted module node's job, still holding the
+/// storage, and the caller's next edit would panic. The fix is that the last
+/// share's `Drop` performs the decrement too, so the two waiters are woken by
+/// one event in one order.
+///
+/// Only a leaked handle can reach this in safe code -- a live `RunHandle`
+/// borrows the taskflow, so there is no editing it until the handle is gone,
+/// and dropping the handle *is* a `wait` -- which is why `mem::forget` is here
+/// and why the round has nothing else in it. The composition and the thread
+/// count are the case above's, for the same reasons.
+///
+/// Against the unfixed tear-down this failed in the first few rounds of
+/// every run it was given -- 50 of 50, pinned to two cores, to one, and
+/// unpinned on a 24-core box alike -- which is a far wider window than
+/// #109's, because a condvar wake puts the waiter on a core at once while the
+/// tear-down still has two lines to go. Read that as diagnosis, not as the
+/// acceptance: the fix is an ordering, the model in `tests/loom_storage.rs`
+/// is what says the ordering is right, and this case is what says the
+/// executor implements it.
+#[test]
+fn a_composition_is_editable_the_instant_wait_for_all_returns() {
+    /// Rounds per thread, each a leaked `run_n` of three, a `wait_for_all`
+    /// and one edit -- and the edit is the assertion.
+    const ROUNDS: usize = 400;
+    /// Threads, each with a two-worker executor of its own, so that the
+    /// thread the tear-down runs on can be descheduled between its decrement
+    /// and its drop.
+    const THREADS: usize = 12;
+
+    let editors: Vec<thread::JoinHandle<()>> = (0..THREADS)
+        .map(|_| {
+            thread::spawn(|| {
+                let counter = counter();
+                let executor = Executor::new(2);
+                let target = chain(2, &counter);
+
+                for round in 0..ROUNDS {
+                    let mut taskflow = Taskflow::new();
+                    let own = {
+                        let counter = Arc::clone(&counter);
+                        taskflow.emplace(move || {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        })
+                    };
+                    let module = taskflow.composed_of(Arc::clone(&target));
+                    taskflow.task(own).precede([module]);
+
+                    counter.store(0, Ordering::Relaxed);
+                    // Leaked on purpose: the handle is the only other thing
+                    // that could wait for this run, and this case is about
+                    // the wait that is not it.
+                    mem::forget(executor.run_n(&taskflow, 3));
+                    executor.wait_for_all();
+                    assert_eq!(
+                        counter.load(Ordering::Relaxed),
+                        9,
+                        "round {round}: three runs of a composition counting three each"
+                    );
+
+                    // The edit, with nothing in between. `Taskflow::graph_mut`
+                    // panics here if any share of this taskflow's storage is
+                    // still outstanding.
+                    taskflow.clear();
+                    assert!(taskflow.is_empty(), "round {round}: the edit took");
+                }
+            })
+        })
+        .collect();
+
+    for editor in editors {
+        assert!(
+            editor.join().is_ok(),
+            "`wait_for_all` returned while a share of a finished run's taskflow was still held"
         );
     }
 }
