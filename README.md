@@ -46,47 +46,63 @@ devtools/devcontainer.sh shell -c 'gh pr checks 12'
 
 ### Credentials
 
-Nothing is baked into the image. Both tools authenticate from the environment,
-which `docker/compose.yaml` forwards from the host **only when the host has it
-set** (see its `environment:` comment for why that distinction is load-bearing).
+**Claude Code needs no setup.** The `dev` service bind-mounts your `~/.claude`
+as the container's config directory, so the container is logged in because you
+are — no token to mint, no `/login` to answer, and `nuke` cannot clear it
+(it drops volumes, and this is a bind).
 
-| | |
-|---|---|
-| **Claude Code** | `CLAUDE_CODE_OAUTH_TOKEN` — `claude setup-token` on the host, once, then export it |
-| **`gh`, and git push** | `GH_TOKEN` |
+Two details make that safe rather than merely convenient, and both are worth
+knowing before changing the mount:
 
-With no `CLAUDE_CODE_OAUTH_TOKEN` (or `ANTHROPIC_API_KEY`), Claude Code falls
-back to an interactive `/login`, which persists in the
-`rustflow-claude-config` volume and survives `down` and `rebuild` — only `nuke`
-clears it. Either way works; the token is just the one that needs no prompt.
+- **A directory, not just `.credentials.json`.** A single-file bind mount can
+  be written through but never *replaced*: an atomic write-temp-then-rename —
+  how a careful writer updates a credential — fails on one with
+  `OSError: [Errno 16] Device or resource busy`. Mounting the directory keeps
+  the rename inside the mount. Measured, not assumed: a container session
+  refreshes the token and the host's file is updated in place.
+- **Shared live, not copied.** That file holds a `refreshToken` rewritten when
+  the access token refreshes, so two copies would drift and a container refresh
+  could invalidate your host login. One copy cannot.
 
-**Export it before `up`.** A container's environment is fixed when it is
-*created*, so exporting a variable into a shell whose container is already
-running changes nothing in there. `devtools/devcontainer.sh down` then any
-command recreates it.
+`~/.claude.json` is deliberately **not** shared. Claude Code keeps it *beside*
+the config directory, and that separation is the whole trick: it is one
+monolithic JSON holding every project's state, rewritten whole on each change,
+so sharing it would be last-writer-wins between host and container. The
+container gets its own copy (see the bootstrap, below). For the same reason the
+image does **not** set `CLAUDE_CONFIG_DIR` — that would collapse the two back
+into one shared directory.
 
-`git push` needs `GH_TOKEN` and would not work without it at all: the image has
-no ssh client and the container has no keys, so this repo's `git@github.com:`
-remote is unreachable from inside. `devtools/container-bootstrap.sh` wires
-`gh`'s credential helper and an `insteadOf` rewrite into the *container's*
-global git config at create time, which sends that same remote over HTTPS with
-the token instead. Your host git config is untouched.
+`plugins/` and `backups/` are shadowed back out of the bind with empty volumes,
+so a container cannot rewrite plugin state every other session on the host
+shares.
 
-### Two things the bootstrap does for you
+**`gh` and `git push` are the ones that need a variable**: `GH_TOKEN`, which
+`docker/compose.yaml` forwards from the host only when the host has it set (see
+its `environment:` comment for why that distinction is load-bearing). Without
+it, push does not work *at all* — the image has no ssh client and the container
+has no keys, so this repo's `git@github.com:` remote is unreachable.
+`devtools/container-bootstrap.sh` wires `gh`'s credential helper and an
+`insteadOf` rewrite into the *container's* global git config, sending that same
+remote over HTTPS with the token instead. Your host git config is untouched.
+
+`ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` are forwarded too, for a host
+that has no `~/.claude` to mount (a CI runner): `claude setup-token` produces
+the latter. **Export any of them before `up`** — a container's environment is
+fixed when it is *created*, so exporting into a shell whose container is already
+running changes nothing in there. `down`, then any command, recreates it.
+
+### What the bootstrap does
 
 `devtools/container-bootstrap.sh` runs once per created container — from
 `devtools/devcontainer.sh` after `up`, and as the IDE front end's
 `postCreateCommand`, so the two cannot drift. Besides the git credentials
-above, it seeds Claude Code's `~/.claude.json` from the host's copy if the
-volume has none, because that file sits *beside* the config directory and so is
-not carried by the volume — without it a fresh container looks like a fresh
-install. It is a copy, never a shared mount: that file is one monolithic JSON
-rewritten whole on each change, so sharing it read-write would be
-last-writer-wins. Two fixups come with the copy, both explained at the point
-they happen in that script, plus a minimal `projects["/workspace"]` trust entry
-— the host's own entry is keyed by the checkout's *host* path, so trust cannot
-carry over on its own, and without it Claude Code ignores the whole
-`permissions.allow` list in `.claude/settings.json`.
+above, it seeds `~/.claude.json` from the host's copy. Since credentials come
+from the mount, that is not about logging in; it carries onboarding state and
+supplies the one thing nothing else can — a minimal `projects["/workspace"]`
+trust entry. The host's own entry is keyed by the checkout's *host* path, so
+trust cannot carry over on its own, and until it is accepted Claude Code
+ignores the whole `permissions.allow` list in `.claude/settings.json`. Two
+fixups come with the copy, both explained where they happen in that script.
 
 **Two things the container cannot do.** `docker` is not installed in it, so
 `devtools/devcontainer.sh` and `docker/compose.yaml` are host-only — from

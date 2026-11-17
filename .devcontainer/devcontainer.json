@@ -11,14 +11,16 @@
   },
   "workspaceFolder": "/workspace",
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
-  "//mounts": "The three volumes are mounted by the same names docker/compose.yaml declares, so both front ends warm one cargo registry, one /target and one Claude Code login rather than a cold copy each. rustflow-claude-config is CLAUDE_CONFIG_DIR in the Dockerfile; it is what makes a login outlast a container recreate. The fourth entry hands the host's ~/.claude.json to postCreateCommand below, READ-ONLY and under a different name: that file is one monolithic JSON rewritten whole on every change, so the container takes its own copy rather than sharing it. NOTE: unlike devtools/devcontainer.sh, which can test for the file first, docker refuses to start a container whose bind source is missing -- so on a host that has never run Claude Code, drop this line.",
+  "//mounts": "Every entry matches docker/compose.yaml's `dev` service, so the two front ends share one cargo registry and one /target instead of a cold copy each, and agree on where Claude Code's config comes from. (1,2) the build caches. (3) the host's ~/.claude, bound READ-WRITE at $HOME/.claude (HOME is pinned in the Dockerfile so this path can be named here): the container is logged in because you are. A directory and not just the credentials file inside it, because a single-file bind mount cannot be replaced by rename -- see the long comment in compose.yaml. (4,5) shadow two subtrees back out of that bind so the container cannot write host plugin state. (6) ~/.claude.json, READ-ONLY and under a different name, for postCreateCommand to copy: it sits beside the config dir rather than in it, and is one monolithic JSON rewritten whole on each change, so it is copied rather than shared. NOTE: unlike devtools/devcontainer.sh, which creates or tests for a source first, this file cannot -- so on a host that has never run Claude Code, drop entries 3 and 6.",
   "mounts": [
     "source=rustflow-cargo-registry,target=/usr/local/cargo/registry,type=volume",
     "source=rustflow-target,target=/target,type=volume",
-    "source=rustflow-claude-config,target=/claude-config,type=volume",
+    "source=${localEnv:HOME}/.claude,target=/home/dev/.claude,type=bind,consistency=cached",
+    "source=rustflow-claude-plugins,target=/home/dev/.claude/plugins,type=volume",
+    "source=rustflow-claude-backups,target=/home/dev/.claude/backups,type=volume",
     "source=${localEnv:HOME}/.claude.json,target=/tmp/claude-seed.json,type=bind,readonly"
   ],
-  "//containerEnv": "All three are optional and forwarded from the host, matching the `environment:` list in docker/compose.yaml. ${localEnv:VAR} expands to the empty string when the host has no such variable; an empty value is not a configured credential, so a machine that sets neither of Claude Code's two still gets the interactive /login path.",
+  "//containerEnv": "All three are optional and forwarded from the host, matching the `environment:` list in docker/compose.yaml. ${localEnv:VAR} expands to the empty string when the host has no such variable, and an empty value is not a configured credential. Claude Code's two are usually not wanted at all here -- the ~/.claude mount above already logs the container in -- and exist for a host that has no ~/.claude to mount. GH_TOKEN is not optional in the same way: it is the only thing that authenticates gh, and the only way git push works.",
   "containerEnv": {
     "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
     "CLAUDE_CODE_OAUTH_TOKEN": "${localEnv:CLAUDE_CODE_OAUTH_TOKEN}",
