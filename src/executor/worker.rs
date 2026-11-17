@@ -357,22 +357,37 @@ impl WorkerThread {
     /// `_tear_down_topology`.
     ///
     /// Only the final-run half of upstream's is here, because only a topology
-    /// that runs once can exist yet. The rest of it hooks in above
-    /// [`Topology::finish`], and in this order: evaluate the run predicate and,
-    /// if it says run again, re-arm the graph with
+    /// that runs once can exist yet. The rest of it hooks in at the top of
+    /// this method, before either line below, and in this order: evaluate the
+    /// run predicate and, if it says run again, re-arm the graph with
     /// [`Topology::set_up`](crate::executor::topology::Topology::set_up) and
     /// queue its sources through [`WorkerThread::schedule`] -- a re-run is the
-    /// same topology, so it must not be counted again -- and otherwise call the
-    /// per-run callback and start the next topology of the taskflow's queue.
-    /// `taskflow` is a parameter for exactly that: re-arming the graph needs
-    /// it, and the topology deliberately holds no reference to it.
+    /// same topology, so it must neither be counted again nor finish -- and
+    /// otherwise call the per-run callback and start the next topology of the
+    /// taskflow's queue. `taskflow` is a parameter for exactly that: re-arming
+    /// the graph needs it, and the topology deliberately holds no reference to
+    /// it.
     pub(crate) fn tear_down_topology(&mut self, _taskflow: &Taskflow, topology: &Topology) {
-        // Last touch of `topology` -- and of the taskflow, whose borrow the
-        // released handle gives up at the same moment. `decrement_topology`
-        // reads only the executor's shared state, which every worker holds a
-        // share of and which therefore outlives all of them.
-        topology.finish();
+        // The accounting first and the completion slot last. This is
+        // deliberately *not* upstream's order -- its `_tear_down_topology`
+        // calls `_carry_out_promise()` and only then `_decrement_topology()`,
+        // so a caller whose `tf::Future` has just come back can still see
+        // `num_topologies()` counting the run it has already been handed the
+        // result of. The window is small, real and free to close, and worth
+        // closing because that count is what `wait_for_all` blocks on and what
+        // the worker loop's fast path reads: here, once a `wait` returns, the
+        // run is fully accounted for. The release in `decrement_topology`'s
+        // `fetch_sub` and the lock `finish` takes are what carry that to the
+        // waiting thread, whose own read of the count is relaxed.
+        //
+        // The order is also the only one the port's lifetimes allow, which is
+        // what makes it free: `finish` releases the thread that owns the
+        // topology *and* the taskflow's borrow, so it has to be this worker's
+        // last touch of either, while `decrement_topology` reads only the
+        // executor's shared state -- which every worker holds a share of, and
+        // which therefore outlives all of them.
         self.shared.decrement_topology();
+        topology.finish();
     }
 
     /// Steals until something turns up, the worker is told to stop, or the

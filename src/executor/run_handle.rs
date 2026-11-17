@@ -129,6 +129,13 @@ impl<'a> RunHandle<'a> {
     /// somebody else's stack for them. See [`RunError::Panicked`] for how to
     /// get upstream's behaviour back.
     ///
+    /// When this returns, the run is not merely finished but fully accounted
+    /// for: [`Executor::num_topologies`] no longer counts it, so a
+    /// [`Executor::wait_for_all`] that follows cannot block on it. Dropping
+    /// the handle without waiting gives the same guarantee, for the same
+    /// reason. Upstream's `tf::Future` does not -- see
+    /// `WorkerThread::tear_down_topology` for the ordering that buys it.
+    ///
     /// Waiting from inside a task body works, but it blocks the worker running
     /// that task, so the run being waited for needs another worker to make
     /// progress on. `corun`, which lends the blocked worker to the inner run
@@ -287,6 +294,41 @@ mod tests {
 
         let from_other = RunError::Panicked(Box::new(7_u8));
         assert_eq!(from_other.to_string(), "a task panicked");
+    }
+
+    /// `num_topologies` is what [`Executor::wait_for_all`] blocks on and what
+    /// the worker loop's fast path reads, so a run that has already handed its
+    /// result back must not still be counted. The check is inside the loop
+    /// rather than after it because the defect it guards is a window of a few
+    /// instructions between a worker releasing the waiter and finishing its
+    /// bookkeeping: one iteration almost never lands in it, and the window is
+    /// wider the fewer cores there are to go round. The first version of this
+    /// scheduler had that window -- it is upstream's order -- and a two-core
+    /// run of `a_thousand_runs_of_a_diamond_chain` is what caught it.
+    #[test]
+    fn a_finished_run_is_no_longer_counted_once_its_result_is_handed_back() {
+        const RUNS: usize = 1000;
+
+        let executor = Executor::new(2);
+        let mut taskflow = Taskflow::new();
+        let (a, b) = taskflow.emplace_n((|| {}, || {}));
+        taskflow.task(a).precede([b]);
+
+        for _ in 0..RUNS {
+            executor.run(&taskflow).wait().expect("no task panicked");
+            assert_eq!(executor.num_topologies(), 0, "`wait` returned too early");
+        }
+
+        // The same promise on the path that never waits explicitly: the
+        // handle's `Drop` blocks, so it owes exactly what `wait` owes.
+        for _ in 0..RUNS {
+            drop(executor.run(&taskflow));
+            assert_eq!(executor.num_topologies(), 0, "`drop` returned too early");
+        }
+
+        // And `wait_for_all` has nothing left to wait for.
+        executor.wait_for_all();
+        assert_eq!(executor.num_topologies(), 0);
     }
 
     /// The borrow is the whole design, so it is worth a compile-time check
