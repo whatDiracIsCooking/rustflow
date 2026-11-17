@@ -103,7 +103,8 @@ file/section it is translated from>
   `RunAndWait.Simple`), a property that must hold (a panicking task leaves the
   executor usable), or a `cargo bench` comparison — plus `Gate green`, meaning
   `cargo fmt --all --check`, `cargo clippy --all-targets --all-features --
-  -D warnings`, `cargo test --all-features`, `cargo deny check`, all four.
+  -D warnings`, `cargo test --all-features`, `cargo deny check` and
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features`, all five.
 - **Never a repeat count.** Not "N consecutive passes", not "replay N×", not a
   spread measured over repeats — a flaky concurrency test is not made sound by
   running it more often. A loop inside one test (`for _ in 0..1000` over a
@@ -370,7 +371,7 @@ Then warm the shared build once from the main checkout, so three cold agents
 do not each compile the world from nothing:
 
 ```bash
-cargo fmt --all --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --all-features && cargo deny check
+cargo fmt --all --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --all-features && cargo deny check && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ```
 
 A red gate on `main` is a stop: every agent would inherit the failure and
@@ -378,13 +379,13 @@ report STUCK. Fix or report that first.
 
 Two environment facts that decide whether `run` can work at all:
 
-- **`ci` must be active.** It runs the gate's first three commands in the same
-  image on every PR, and its fourth, `cargo deny check`, as a separate `deny`
-  job in the same workflow — unlike repos where CI skips the real build, here a
-  green `ci` is real evidence, and both of those jobs have to be green. If `ci`
-  is disabled (`gh workflow list --all`), `gh pr checks` reports nothing and
-  the only evidence is each agent's own gate run; say so in the final report
-  and merge on that.
+- **`ci` must be active.** It runs four of the gate's five commands in the same
+  image on every PR, and the remaining one, `cargo deny check`, as a separate
+  `deny` job in the same workflow — unlike repos where CI skips the real build,
+  here a green `ci` is real evidence, and both of those jobs have to be green.
+  If `ci` is disabled (`gh workflow list --all`), `gh pr checks` reports
+  nothing and the only evidence is each agent's own gate run; say so in the
+  final report and merge on that.
 - **Worktree git must work.** A worktree created *in the container* records a
   container gitdir (`.claude/worktrees/<wt>/.git` reads `gitdir:
   /workspace/.git/worktrees/<wt>`) and git works there, including push. One
@@ -474,7 +475,7 @@ gh pr checks <M> --watch
 Check that:
 
 - `mergeable` is `MERGEABLE` and `ci` is green (it is the real gate here);
-- the body has `Closes #<n>` and, under *What was run*, the four gate commands
+- the body has `Closes #<n>` and, under *What was run*, the five gate commands
   with their results, plus the acceptance check named in the issue;
 - the diff did not buy green with an `#[allow]` that silences one of
   `Cargo.toml`'s crate-wide lints (`missing_docs`,
@@ -598,11 +599,12 @@ Rules:
   worktree. Your job ends at an open PR with your own gate run reported in it.
   Then reply exactly: "PR #<M> ready" + one line with the gate result and the
   test counts.
-- The gate is the definition of done, and all four parts of it:
+- The gate is the definition of done, and all five parts of it:
     CARGO_TARGET_DIR=/target/<wt> CARGO_BUILD_JOBS=<J> cargo fmt --all --check
     CARGO_TARGET_DIR=/target/<wt> CARGO_BUILD_JOBS=<J> cargo clippy --all-targets --all-features -- -D warnings
     CARGO_TARGET_DIR=/target/<wt> CARGO_BUILD_JOBS=<J> cargo test --all-features
     cargo deny check
+    RUSTDOCFLAGS="-D warnings" CARGO_TARGET_DIR=/target/<wt> CARGO_BUILD_JOBS=<J> cargo doc --no-deps --all-features
   Use that CARGO_TARGET_DIR on every cargo command that builds: siblings are
   building in parallel and cargo locks a target directory for the whole build,
   so the shared default /target would serialise you behind them. An empty
@@ -631,10 +633,10 @@ Rules:
   Co-Authored-By line from your system reminder. Commit Cargo.lock in the same
   commit as any Cargo.toml dependency change.
 - Open the PR with `gh pr create --body-file <file in your scratchpad>`, with
-  `Closes #<n>`, and under "What was run" the four gate commands with their
-  results plus the acceptance check from the issue. On the PR, `ci` runs the
-  first three and a separate `deny` job runs the fourth; do not claim a check
-  you did not see.
+  `Closes #<n>`, and under "What was run" the five gate commands with their
+  results plus the acceptance check from the issue. On the PR, `ci` runs four
+  of them and a separate `deny` job runs `cargo deny check`; do not claim a
+  check you did not see.
 - You own these files and ONLY these: <the agent's partition>. Siblings are
   working in parallel — if you need to change a file outside your partition,
   reply "STUCK: <what>" instead. In `src/lib.rs` and `Cargo.toml`, touch only

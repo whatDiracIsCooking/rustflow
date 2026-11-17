@@ -39,7 +39,7 @@
 //!   `ESTATE::CANCELLED`, which lives in `topology` in an allocation a
 //!   lifetime-free token can hold a `Weak` to;
 //! - a job of a cancelled run is skipped at the top of
-//!   [`WorkerThread::invoke`](worker::WorkerThread), which is upstream's
+//!   `WorkerThread::invoke` in [`worker`], which is upstream's
 //!   `_is_parent_cancelled` early-out, and torn down without being run so that
 //!   the run's join counters still reach zero;
 //! - a cancelled run does not go round again, which is the cancellation half

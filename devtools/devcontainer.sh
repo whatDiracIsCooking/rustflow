@@ -10,7 +10,7 @@
 #   devtools/devcontainer.sh shell         interactive bash inside it
 #   devtools/devcontainer.sh shell -c CMD  run one command inside it
 #   devtools/devcontainer.sh claude [ARGS] Claude Code inside it
-#   devtools/devcontainer.sh check         fmt + clippy + test + deny (the CI gate)
+#   devtools/devcontainer.sh check         the gate: fmt + clippy + test + deny + doc
 #   devtools/devcontainer.sh test [ARGS]   cargo test
 #   devtools/devcontainer.sh bench [ARGS]  cargo bench (the criterion suite)
 #   devtools/devcontainer.sh rebuild       rebuild the image after a Dockerfile edit
@@ -109,13 +109,16 @@ case "$cmd" in
     # The fourth command needs cargo-deny, which the image installs pinned by
     # ARG CARGO_DENY_VERSION. CI runs it as a separate job on a plain runner
     # (see .github/workflows/ci.yml) because the image CI uses is the stock
-    # rust one; the command itself is the same.
+    # rust one; the command itself is the same. The fifth needs nothing but
+    # rustdoc, and denies its warnings through RUSTDOCFLAGS so that a plain
+    # `cargo doc` stays usable while a doc link is being written.
     check)
         in_dev 'set -e
                 cargo fmt --all --check
                 cargo clippy --all-targets --all-features -- -D warnings
                 cargo test --all-features
-                cargo deny check'
+                cargo deny check
+                RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features'
         ;;
     test)    in_dev "cargo test --all-features $*" ;;
     # Not part of `check`, deliberately: a benchmark answers "how fast", which

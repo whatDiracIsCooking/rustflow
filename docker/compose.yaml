@@ -78,6 +78,7 @@ services:
         cargo clippy --all-targets --all-features -- -D warnings
         cargo test --all-features ${CARGO_TEST_ARGS:-}
         cargo deny check
+        RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
   # The long-lived interactive container devtools/devcontainer.sh execs into,
   # and the one an in-container `claude` runs in. It holds no state of its own

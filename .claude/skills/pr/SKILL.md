@@ -74,7 +74,7 @@ git push -u origin <branch>
   nothing about correctness. Run the gate yourself first and read its output:
 
   ```bash
-  devtools/devcontainer.sh check   # fmt --check, clippy -D warnings, test, deny
+  devtools/devcontainer.sh check   # fmt, clippy -D warnings, test, deny, doc
   ```
 
   Pushing on a red gate is how a branch reaches review broken; if `check`
@@ -128,12 +128,13 @@ branch ever does survive a merge.
 
 - **Wait for CI — unless it's disabled.** `.github/workflows/ci.yml` runs
   `cargo fmt --all --check`, `cargo clippy --all-targets --all-features --
-  -D warnings`, then `cargo test --all-features` on every PR — the first three
-  commands of `devtools/devcontainer.sh check`, in the same container image, so
-  a local green should mean a remote green. The gate's fourth command,
-  `cargo deny check`, is a separate `deny` job in that same workflow rather
-  than a fourth step, for the reason given beside it; the workflow is green
-  only when both jobs are, which is also what `automerge` waits on.
+  -D warnings`, `cargo test --all-features` and
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features` on every
+  PR — four of the five commands of `devtools/devcontainer.sh check`, in the
+  same container image, so a local green should mean a remote green. The
+  remaining one, `cargo deny check`, is a separate `deny` job in that same
+  workflow rather than a step, for the reason given beside it; the workflow
+  is green only when both jobs are, which is also what `automerge` waits on.
   Check with `gh pr checks <number> --watch` before merging, and do not merge
   red. If `ci.yml` is manually disabled (`gh workflow list --all`), there is no
   check to wait for — `gh pr checks` will show nothing — so merge on the

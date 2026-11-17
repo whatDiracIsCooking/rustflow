@@ -23,9 +23,10 @@ cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 cargo deny check
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ```
 
-Run all four and read the output before reporting back. Partial greens are
+Run all five and read the output before reporting back. Partial greens are
 not green, and `-D warnings` means a *warning* is a failure.
 
 - **Inside the devcontainer** (the usual case) run those commands directly.
@@ -38,11 +39,18 @@ not green, and `-D warnings` means a *warning* is a failure.
   image, pinned by `ARG CARGO_DENY_VERSION` in the root `Dockerfile` the same
   way the toolchain is. So `command not found` here means the container was
   built before that arg existed: rebuild the image rather than installing
-  cargo-deny yourself or concluding the gate is three steps.
-- CI (`.github/workflows/ci.yml`) runs the first three commands in the same
-  image, so a local green should mean a remote green. The fourth is a separate
-  `deny` job on a plain runner rather than a fourth step there -- its comment
-  says why -- which means the workflow is green only when *both* jobs are.
+  cargo-deny yourself or concluding the gate is four steps.
+- **`cargo doc`** is in the gate because `missing_docs` is a crate-wide lint,
+  so docs are part of the build here. It catches what `cargo test` does not:
+  a doc link is only *built* by the doc-tests, so a link into a private item
+  is a rustdoc warning and nothing else. Fix such a link by widening the
+  target's visibility if it belongs in the public docs, or by naming the item
+  in backticks instead -- never by an `#[allow]`.
+- CI (`.github/workflows/ci.yml`) runs four of the commands in the same
+  image, so a local green should mean a remote green. `cargo deny check` is a
+  separate `deny` job on a plain runner rather than a step there -- its
+  comment says why -- which means the workflow is green only when *both* jobs
+  are.
 
 **Never wait in a loop.** Run a gate command in the foreground and read its
 output. No `until`/`while` + `sleep` poll -- not on `pgrep`, not on a log

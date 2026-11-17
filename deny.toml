@@ -3,7 +3,7 @@
 # upstream hand-wrote and be better tested than our own port of it -- and this
 # file is the half of it a machine can check: licenses, advisories, duplicate
 # versions, and where a crate came from. `cargo deny check` is the fourth step
-# of the gate, beside fmt, clippy and test.
+# of the gate, beside fmt, clippy, test and doc.
 #
 # cargo-deny's own version is pinned in two places that must stay equal:
 # `ARG CARGO_DENY_VERSION` in the root Dockerfile, and the pinned
