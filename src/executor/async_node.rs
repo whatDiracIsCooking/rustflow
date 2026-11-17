@@ -125,18 +125,6 @@ impl AsyncNode {
     /// handles. A free node with, say, a subflow handle would be a node whose
     /// dispatch arm preempts it with no parent above it to resume it, so the
     /// assertion is about the scheduler and not about tidiness.
-    // Nothing in the library creates a free node yet: #86 is the types, and
-    // the submitting calls that mint one are #88's `silent_async`/`async` and
-    // #91's `silent_dependent_async`. `expect` rather than `allow`, and
-    // `not(test)` rather than unconditional, so that the attribute cannot
-    // outlive the gap -- the build fails the moment the item is used, in the
-    // test build today and in #88's library code tomorrow. The other ones,
-    // on the two items below and on `Job::free` and `AsyncTask::new`, are the
-    // same statement about the same gap.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the calls that create one are #88 and #91")
-    )]
     pub(crate) fn new(name: impl Into<String>, handle: Handle) -> Arc<Self> {
         debug_assert!(
             handle.is_async() || handle.is_dependent_async(),
@@ -205,6 +193,14 @@ impl AsyncNode {
     /// tests `ESTATE::FINISHED` and either pushes onto `_edges` or counts the
     /// dependency as already met. The two branches have to be one atomic
     /// step, and the module docs say what a lost race would cost.
+    // Nothing in the library names a dependency yet: #91's
+    // `silent_dependent_async` is the call that will. `expect` rather than
+    // `allow`, and `not(test)` rather than unconditional, so that the
+    // attribute cannot outlive the gap -- the build fails the moment the item
+    // is used, in the test build today and in #91's library code tomorrow.
+    // The one on `finish` below and the one on `AsyncTask::new` are the same
+    // statement about the same gap, which #88 retired for the two items it
+    // supplied a caller for.
     #[cfg_attr(not(test), expect(dead_code, reason = "naming a dependency is #91"))]
     pub(crate) fn push_successor(&self, job: Job) -> bool {
         let mut successors = self.lock_successors();
@@ -230,7 +226,14 @@ impl AsyncNode {
     /// -- and with release ordering, which is what makes the acquire load in
     /// [`AsyncNode::is_finished`] a real happens-before for a handle holder
     /// reading the body's results.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the async tear-down is #88"))]
+    // #91's rather than #88's, which is worth saying because the plain async
+    // tear-down landed without calling this: upstream sets `ESTATE::FINISHED`
+    // in `_tear_down_dependent_async` only, since a `Handle::Async` node has
+    // no handle through which anybody could ask whether it is done.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the dependent-async tear-down is #91")
+    )]
     pub(crate) fn finish(&self) -> Vec<Job> {
         let mut successors = self.lock_successors();
         self.finished.store(true, Ordering::Release);

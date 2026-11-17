@@ -726,12 +726,6 @@ impl Job {
     /// which is upstream's reference count on the same node for the same
     /// reason: a caller who drops the last handle on a task that has not run
     /// yet must not free the node under the worker that is about to run it.
-    // Nothing queues a free node yet; `executor::async_node` says what the
-    // attribute is and why it is `expect` under `not(test)`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the path that queues one is #88")
-    )]
     pub(crate) fn free(node: &Arc<AsyncNode>, parent: &Parent) -> Self {
         Self {
             task: AsyncNode::TASK,

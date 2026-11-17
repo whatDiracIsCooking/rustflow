@@ -377,6 +377,27 @@ pub(crate) struct Shared {
     /// upstream pads it separately, with a comment that says the false
     /// sharing between the two "can cause serious performance drop".
     pub(crate) num_topologies: CachePadded<AtomicUsize>,
+    /// How many *free async tasks* are queued or running: the half of
+    /// `num_topologies` that [`Drop`] waits for.
+    ///
+    /// Upstream has no second counter and needs none: its destructor calls
+    /// `wait_for_all`, which waits for every kind of work at once, and a
+    /// detached `tf::Future` is as much its problem as a submitted
+    /// `silent_async`. This port can tell the two apart and must: a run in
+    /// flight is a run whose [`RunHandle`](crate::RunHandle) borrows the
+    /// executor, so the only way to reach `Drop` with one outstanding is to
+    /// have *leaked* that handle -- and the documented answer to a leaked
+    /// handle is that the pool still comes down. An async task has no handle
+    /// that borrows anything, so nothing but this can keep the pool alive
+    /// long enough to run it. `executor::async`, which owns the counting,
+    /// has the decision in full.
+    ///
+    /// Padded for `num_topologies`' reason rather than because this one is
+    /// read on the hot path -- it is not: it is *written* by every async
+    /// submission and tear-down, and sharing a line with the count a worker
+    /// checks before every sweep is exactly the false sharing upstream's own
+    /// comment warns about.
+    pub(crate) num_asyncs: CachePadded<AtomicUsize>,
     /// The lock [`Executor::wait_for_all`] reads `num_topologies` under.
     ///
     /// Upstream waits on the atomic itself, which C++20 can do and Rust
@@ -387,6 +408,13 @@ pub(crate) struct Shared {
     pub(crate) topologies: Mutex<()>,
     /// Signalled when `num_topologies` falls to zero.
     pub(crate) no_topologies: Condvar,
+    /// The lock [`Drop`] reads `num_asyncs` under, and the condvar it is
+    /// signalled on. A pair of its own rather than the one above, so that a
+    /// run finishing does not wake a shutdown that is waiting for async
+    /// tasks and vice versa; `executor::async` holds both ends of it.
+    pub(crate) asyncs: Mutex<()>,
+    /// Signalled when `num_asyncs` falls to zero.
+    pub(crate) no_asyncs: Condvar,
     /// Which worker a thread is, by thread id.
     ///
     /// Upstream keeps the same map for the reason its comment gives: a
@@ -529,7 +557,7 @@ impl Executor {
     /// no workers has nowhere to put work and nothing to run it.
     #[must_use]
     pub fn new(num_workers: usize) -> Self {
-        Self::spawn(num_workers, None)
+        Self::spawn_pool(num_workers, None)
     }
 
     /// Creates an executor with `num_workers` worker threads, calling
@@ -540,7 +568,7 @@ impl Executor {
     /// Panics if `num_workers` is zero, as [`Executor::new`] does.
     #[must_use]
     pub fn with_worker_interface(num_workers: usize, interface: Arc<dyn WorkerInterface>) -> Self {
-        Self::spawn(num_workers, Some(interface))
+        Self::spawn_pool(num_workers, Some(interface))
     }
 
     /// The number of worker threads. Upstream's `num_workers`.
@@ -607,7 +635,11 @@ impl Executor {
 
     /// Builds the shared state and spawns the pool. Upstream's constructor plus
     /// the half of `_spawn` that is bookkeeping rather than scheduling.
-    fn spawn(num_workers: usize, interface: Option<Arc<dyn WorkerInterface>>) -> Self {
+    ///
+    /// `spawn_pool` rather than `spawn`, which is what it was called until
+    /// #88: [`Executor::spawn`] is now the public submission of an async
+    /// task, upstream's `async` under the name Rust leaves available for it.
+    fn spawn_pool(num_workers: usize, interface: Option<Arc<dyn WorkerInterface>>) -> Self {
         assert!(num_workers > 0, "an executor needs at least one worker");
 
         // The queues are built out here because their two ends go to different
@@ -629,8 +661,11 @@ impl Executor {
                 buffers: Buffers::new(num_workers),
                 notifier: CachePadded::new(DefaultNotifier::new(num_workers)),
                 num_topologies: CachePadded::new(AtomicUsize::new(0)),
+                num_asyncs: CachePadded::new(AtomicUsize::new(0)),
                 topologies: Mutex::new(()),
                 no_topologies: Condvar::new(),
+                asyncs: Mutex::new(()),
+                no_asyncs: Condvar::new(),
                 thread_ids: OnceLock::new(),
                 start: StartGate::new(),
             }),
@@ -679,23 +714,44 @@ impl Default for Executor {
 }
 
 impl Drop for Executor {
-    /// Upstream's `_shutdown`: tell every worker to stop, wake the ones that
-    /// are asleep, and join them all.
+    /// Upstream's `_shutdown`: wait for the work that has nobody else to wait
+    /// for it, tell every worker to stop, wake the ones that are asleep, and
+    /// join them all.
     ///
-    /// Upstream first calls `wait_for_all`, so that a topology still running
-    /// finishes before the pool goes away. There is deliberately no such call
-    /// here: a [`RunHandle`](crate::RunHandle) borrows the executor and blocks
-    /// when it is dropped, so a run in flight is a run whose handle is keeping
-    /// the executor alive. The one way past that is a handle the caller
-    /// *leaked*, and then this runs with a topology outstanding: the workers
-    /// stop where they are, the jobs still queued are dropped, and the run
-    /// never finishes -- which nothing is waiting for, the thing that would
-    /// have waited being the handle that was leaked. See [`run_handle`] for
-    /// the rest of what a leaked handle does.
+    /// Upstream's first line is `wait_for_all`, so that nothing still running
+    /// is left without a pool. This waits for **free async tasks only** --
+    /// `num_asyncs` rather than `num_topologies` -- and the split is the one
+    /// `executor::async` argues for:
     ///
-    /// Not waiting here is also what keeps a worker that died of a bug from
-    /// turning shutdown into a hang -- the pool still comes down.
+    /// - an async task submitted with [`Executor::spawn`] or
+    ///   [`Executor::silent_async`] is waited for, because nothing else can
+    ///   be. Its handle is `'static` and dropping one detaches, and a
+    ///   `silent_async` has no handle at all, so without this line a queued
+    ///   body would simply be dropped unrun -- which is the one thing the
+    ///   submitting call promises not to do;
+    /// - a **run** is not waited for, and that keeps the documented behaviour
+    ///   of a leaked [`RunHandle`](crate::RunHandle) true. A handle that was
+    ///   dropped has already blocked until its run was over, so a run in
+    ///   flight here is one whose handle was leaked: the workers stop where
+    ///   they are, the jobs still queued are dropped, and the run never
+    ///   finishes -- which nothing is waiting for, the thing that would have
+    ///   waited being the handle that was leaked. See [`run_handle`] for the
+    ///   rest of what a leaked handle does. It is also what keeps a worker
+    ///   that died of a bug from turning shutdown into a hang.
+    ///
+    /// One foot-gun comes with the wait, and it is upstream's too: dropping
+    /// the last share of an executor *from inside one of its own async
+    /// tasks* deadlocks, because the task doing the dropping is one the wait
+    /// is waiting for. Upstream's destructor has the same property for the
+    /// same reason.
     fn drop(&mut self) {
+        // Upstream's `wait_for_all()`, narrowed to the count above for the
+        // reason the doc comment gives. Before the `done` flags, not after: a
+        // worker told to stop leaves its loop with whatever is still queued
+        // unrun, so the flags cannot be set while an async task is waiting
+        // for a worker to pick it up.
+        self.shared.wait_for_asyncs();
+
         for worker in &self.shared.workers {
             // Relaxed, as upstream's `test_and_set` is: `notify_all` below
             // carries the sequentially consistent fence that orders this write

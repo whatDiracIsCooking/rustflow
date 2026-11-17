@@ -88,7 +88,7 @@ use crate::Runtime;
 use crate::executor::run_handle::RunError;
 use crate::executor::topology::Job;
 use crate::executor::worker::{Release, Worker, WorkerThread};
-use crate::graph::{Node, RuntimeWork, Task};
+use crate::graph::{AsyncWork, Node, RuntimeWork, Task};
 
 /// The two bits a runtime task holds while its own work is outstanding:
 /// upstream's `NSTATE::PREEMPTED | NSTATE::IMPLICITLY_ANCHORED`, which it
@@ -177,6 +177,51 @@ fn run_body(worker: &mut WorkerThread, job: &Job, node: &Node, work: &RuntimeWor
     if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| work.invoke(&mut runtime))) {
         job.record_panic(payload);
     }
+}
+
+/// Refuses to run a runtime-shaped async body, which is issue #90.
+///
+/// The two shapes are upstream's `void(Runtime&)` and `void(Runtime&, bool)`
+/// alternatives -- cases 1 and 2 of its `_invoke_async_task`, which both go
+/// to the `_invoke_runtime_task_impl` [`invoke`] above is the other overload
+/// of. They land here rather than in `executor::async` so that #90 is a
+/// change to this module, which owns everything that hands a body a
+/// [`Runtime`], and not to the module that owns submission.
+///
+/// Nothing can reach this today. An async node is created only by
+/// `AsyncNode::new`, which is crate-private, and the submitting calls that
+/// use it -- `Executor::spawn` and `Executor::silent_async` -- build a plain
+/// body whatever their own body returns; a runtime-shaped handle in a
+/// taskflow's *graph* is refused one step earlier, by `executor::async`
+/// itself. So this is the seam and the issue marker rather than a path with
+/// behaviour, and what little behaviour it has is chosen to keep the
+/// scheduler's books straight:
+///
+/// - the refusal is parked on the node's own payload slot, which is the one
+///   anchor a free node always has -- `Job::record_panic`'s last case. The
+///   walk that function performs is deliberately not used, for the reason
+///   `executor::async` sets out: the chain above a parentless free node roots
+///   at the sentinel run every async task in the process shares, and marking
+///   that would cancel every async task submitted afterwards;
+/// - the answer is `Some(Release::Strong)` rather than `None`, because `None`
+///   means the node was preempted and something will resume it, which nothing
+///   here does -- and because the arm that called this only runs the
+///   tear-down for an answer that is `Some`, so a `None` here would leak the
+///   counters a submission raised.
+pub(crate) fn invoke_async(
+    _worker: &mut WorkerThread,
+    job: &Job,
+    _work: &AsyncWork,
+) -> Option<Release> {
+    let base = job.node().base();
+    if base.claim_panic() {
+        base.keep_panic(Box::new(
+            "a runtime-shaped async body cannot be run yet: `spawn_runtime` and \
+             `silent_async_runtime` are issue #90",
+        ));
+    }
+
+    Some(Release::Strong)
 }
 
 impl Runtime<'_> {
