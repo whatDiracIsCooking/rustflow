@@ -878,27 +878,19 @@ mod tests {
         job
     }
 
-    /// Takes one child's job back out of the shared buffers, for a case that
-    /// runs it by hand.
+    /// Takes one child's job back off the submitting worker's own queue, for
+    /// a case that runs it by hand.
     ///
-    /// `Runtime::silent_async` queues a child through the buffers like every
-    /// other free node (`executor::runtime_async` has why), and a case about
-    /// a *graph's* runtime node can take it straight back: nothing in such a
-    /// case counts a topology, and a worker skips the steal loop entirely
-    /// while `num_topologies` is zero. The cases over a free node here are
-    /// the ones that cannot -- `free_async` counts one, as a real submission
-    /// does -- which is why those still stand a child in by hand.
-    fn child_job(executor: &Executor) -> Job {
-        let buffer = executor
-            .shared
-            .buffers
-            .first_nonempty()
-            .expect("the submission pushed a job");
-        executor
-            .shared
-            .buffers
-            .steal_from(buffer)
-            .expect("the job the submission pushed")
+    /// `Runtime::silent_async` queues a child on the queue of the worker
+    /// running the body -- upstream's `if(auto w = this_worker(); w)` branch,
+    /// which #119 is about and `executor::runtime_async` argues -- so where
+    /// this looks is itself part of what the case asserts. The queue is the
+    /// one `test_worker` built and nothing else holds an end of it, so a job
+    /// left there cannot be stolen while the case walks over it.
+    fn child_job(worker: &WorkerThread) -> Job {
+        worker
+            .pop()
+            .expect("the submission pushed a job onto this worker's queue")
     }
 
     /// The state bits of `task`, masked to the two this arm sets.
@@ -1017,6 +1009,9 @@ mod tests {
             1,
             "one piece of spawned work is still outstanding"
         );
+        // The child, taken off this worker's own queue -- which is where
+        // #119 puts it -- before the assertion that nothing *else* is there.
+        let child = child_job(&worker);
         assert!(
             worker.pop().is_none(),
             "a preempted node releases nothing: its successors wait for the \
@@ -1028,11 +1023,10 @@ mod tests {
             "and it released nothing to run here either"
         );
 
-        // The child, taken back out of the buffers and run here: its
-        // tear-down is `WorkerThread::finish_job`, which reads the parent's
-        // state word before the decrement and, finding `PREEMPTED`, re-queues
-        // the job the node was dequeued as.
-        worker.invoke(child_job(&executor));
+        // Run here: its tear-down is `WorkerThread::finish_job`, which reads
+        // the parent's state word before the decrement and, finding
+        // `PREEMPTED`, re-queues the job the node was dequeued as.
+        worker.invoke(child);
         assert_eq!(children.load(Ordering::Relaxed), 1, "the child ran");
         assert_eq!(
             node.join_counter().load(Ordering::Relaxed),

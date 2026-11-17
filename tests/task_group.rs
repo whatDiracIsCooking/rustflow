@@ -57,27 +57,37 @@
 //!
 //!   The reason is stack depth, and it is not the recursion's own. A corun
 //!   keeps its worker in the work-stealing loop, so every job it picks up
-//!   while waiting nests one frame deeper -- and the jobs it picks up are the
-//!   *oldest* outstanding ones, because a task body's submission goes to the
-//!   executor's shared buffers (crossbeam `Injector`s, which hand work back
-//!   FIFO) rather than onto the submitting worker's own LIFO queue. Upstream
-//!   pushes onto that queue -- the `if(auto w = this_worker(); w)` branch of
-//!   `_schedule_async_task` -- so its corun takes its own newest child first
-//!   and nests one frame per level of *recursion*. Here it takes the largest
-//!   outstanding subtree first and nests one frame per outstanding *child*,
-//!   which for a recursive case is most of the task tree.
+//!   while waiting nests one frame deeper -- and the jobs a *group's* corun
+//!   picks up are the oldest outstanding ones, because a group's children go
+//!   to the executor's shared buffers (crossbeam `Injector`s, which hand work
+//!   back FIFO) and because a group waits on the stealing end of its worker's
+//!   queue, which is FIFO too. Upstream pushes onto the submitting worker's
+//!   own LIFO queue and pops that same end -- the
+//!   `if(auto w = this_worker(); w)` branch of `_schedule_async_task` -- so
+//!   its corun takes its own newest child first and nests one frame per level
+//!   of *recursion*. Here it takes the largest outstanding subtree first and
+//!   nests one frame per outstanding *child*, which for a recursive case is
+//!   most of the task tree.
 //!
-//!   A task body cannot reach that queue in this port, which
-//!   `Executor::schedule_async_task` records as a deliberate collapse of
-//!   upstream's two branches, so the depth is a property of the scheduler and
-//!   not of this file -- and a subflow recursion shows the other side of it:
-//!   `tests/subflows.rs` computes `fib(20)` at one worker, because a
-//!   subflow's children are a *graph*, scheduled through the worker-aware
-//!   path that does push onto that worker's queue. Measured in a debug build
-//!   against a worker's default 2 MiB stack: `fib(14)` passes and `fib(16)`
-//!   aborts, a thousand elements pass and four thousand abort. The sizes
-//!   below therefore sit a factor of three or so inside the cliff, and
-//!   restoring upstream's own is a scheduling change rather than a test one.
+//!   #119 gave that branch to the submitters that can name the worker running
+//!   them, and a [`TaskGroup`] is not one of them: it holds a worker *id*,
+//!   because [`Executor::task_group`](rustflow::Executor::task_group) is
+//!   called from inside a task body, and its `corun` has no owning end of the
+//!   queue to pop even if it did. `src/task_group.rs`'s module docs have that
+//!   argument in full, with what lifting it would cost. So the depth is a
+//!   property of the scheduler and not of this file -- while
+//!   `tests/runtimes.rs`, whose recursion goes through a
+//!   [`Runtime`](rustflow::Runtime) and *can* name its worker, now runs
+//!   upstream's own `fib(25)` and ten thousand elements, and
+//!   `tests/subflows.rs` computes `fib(20)` at one worker because a subflow's
+//!   children are a *graph*, scheduled through the worker-aware path all
+//!   along.
+//!
+//!   Re-measured after #119, in a debug build against a worker's default
+//!   2 MiB stack: `fib(15)` passes and `fib(16)` aborts, 2000 elements pass
+//!   and 3000 abort. The inputs below therefore sit a factor of two or so
+//!   inside a cliff the fix does not move, and raising them is a scheduling
+//!   change rather than a test one.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -101,9 +111,10 @@ const TASKS: usize = 1000;
 
 /// What the two recursive Fibonacci cases compute.
 ///
-/// Upstream's is 25. The module docs have why this port asserts a smaller
-/// one, which is the stack a corun nests rather than anything about the
-/// recursion.
+/// Upstream's is 25, and the module docs have why a group asserts a smaller
+/// one: the stack a group's corun nests, which #119 left where it was.
+/// `fib(15)` is the largest that passes and `fib(16)` aborts, so this is a
+/// factor of two inside the cliff rather than at it.
 const FIBONACCI_N: usize = 12;
 
 /// `fibonacci(12)`, which is what both recursive cases must come back with.
@@ -729,8 +740,9 @@ fn partition(data: &mut [u32]) -> usize {
 }
 
 /// `end` values from upstream's two sort cases, by factors of ten as
-/// upstream's loops go -- stopping three steps short of its ten thousand,
-/// for the reason the module docs give.
+/// upstream's loops go -- stopping one step short of its ten thousand, for
+/// the reason the module docs give: 2000 elements are the most that pass
+/// through a group, and these sizes stay inside that.
 const MERGE_SORT_SIZES: [usize; 3] = [10, 100, 1000];
 const QUICK_SORT_SIZES: [usize; 4] = [1, 10, 100, 1000];
 

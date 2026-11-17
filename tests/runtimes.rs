@@ -20,32 +20,43 @@
 //! is not the runtime task's to schedule, and on where a child's panic is
 //! reported.
 //!
-//! # The recursive cases run smaller inputs than upstream's
+//! # The recursive cases run upstream's own inputs, since #119
 //!
-//! `Fibonacci`, `FibonacciSwapped`, `MergeSort` and `QuickSort` are ported at
-//! **fib(12)** and **at most 1000 elements** where upstream runs fib(25) and
-//! 10000 elements. The reduction is issue #119 and is a property of this
-//! port's scheduling path rather than of these cases.
+//! `Fibonacci`, `FibonacciSwapped`, `MergeSort` and `QuickSort` assert
+//! **fib(25)** and sort **up to ten thousand elements**, which are upstream's
+//! figures. They did not until #119, and what the reduction was about is
+//! worth keeping, because the ceiling it describes still binds
+//! `tests/task_group.rs`.
 //!
 //! A corun keeps its worker in the work-stealing loop, so every job that
-//! worker picks up while waiting nests one frame deeper. A child spawned from
-//! a task body goes into the shared buffers, which hand work back **FIFO**,
-//! where upstream pushes onto the submitting worker's own **LIFO** queue --
-//! the `if(auto w = this_worker(); w)` branch of `_schedule_async_task`. So
-//! upstream's corun gets its *newest* child back, which is usually the one it
-//! is waiting for, and this port's gets the oldest outstanding job in the
-//! pool, which is somebody else's unfinished subtree. The nesting then grows
-//! one frame per outstanding child rather than one per level of recursion,
-//! and a worker's 2 MiB stack runs out.
+//! worker picks up while waiting nests one frame deeper. Until #119 a child
+//! spawned from a task body went into the shared buffers, which hand work
+//! back **FIFO**, where upstream pushes onto the submitting worker's own
+//! **LIFO** queue -- the `if(auto w = this_worker(); w)` branch of
+//! `_schedule_async_task`. A corun therefore got the oldest outstanding job
+//! in the pool, which is somebody else's unfinished subtree, rather than the
+//! child it had just spawned, and the nesting grew one frame per outstanding
+//! child instead of one per level of recursion: fib(14) passed and fib(15)
+//! aborted, 2000 elements passed and 4000 aborted, so this file ran fib(12)
+//! and stopped at a thousand.
 //!
-//! Measured in a debug build, which is where `cargo test` runs: fib(14)
-//! passes and fib(15) aborts; 2000 elements pass and 4000 abort. The figures
-//! above are a factor of two or three inside both, and `tests/task_group.rs`
-//! -- where #93 found the same cliff -- runs fib(12) and a thousand elements
-//! for the same reason. `tests/subflows.rs` computes fib(20) at one worker
-//! because a subflow's children are a *graph*, scheduled through the
-//! worker-aware path, which is the comparison that says the cliff is the
-//! route and not the depth.
+//! A [`Runtime`](rustflow::Runtime) now hands its own worker to the
+//! submission, so these cases take upstream's branch and nest one frame per
+//! level of recursion. Re-measured in a debug build, which is where
+//! `cargo test` runs: the whole file passes at upstream's inputs, fib(28) and
+//! fib(30) pass too -- the latter in 77 s, which is what now decides the size
+//! -- and a chain of nested coruns reaches 500 levels at one worker before a
+//! worker's 2 MiB stack gives out. So the bound on these shapes is their task
+//! count rather than their depth.
+//!
+//! `tests/task_group.rs` keeps the reduced inputs, and that is the other half
+//! of the same measurement: a [`TaskGroup`](rustflow::TaskGroup) has no
+//! `WorkerThread` to hand the submission and waits on the stealing end of the
+//! queue in any case, so it stays on the buffers -- `src/task_group.rs`'s
+//! module docs have the argument and the figures. `tests/subflows.rs`
+//! computes fib(20) at one worker through a *graph*, which was always
+//! scheduled by the worker-aware path, and is the comparison that said the
+//! cliff was the route and not the depth.
 //!
 //! Four adaptations, all of them the port's shapes rather than changes to
 //! what is being asserted:
@@ -483,10 +494,11 @@ fn fibonacci_on(workers: usize, n: u64, recurse: fn(u64, &mut Runtime<'_>) -> u6
 /// recursion goes. One worker is the interesting end -- a corun that could
 /// not run its own children would have nowhere else to get them from.
 ///
-/// `fib(12)` where upstream runs `fib(25)`, which is the module header's
-/// reduction and issue #119's: the recursion is as deep as the port's
-/// scheduling path can take it with a factor of two to spare, and the header
-/// has the measurement.
+/// `fib(25)`, which is upstream's own figure: #119 gave a runtime body's
+/// submission the queue of the worker running it, so the corun below pops
+/// the child it just spawned and the recursion nests one frame per level
+/// rather than one per outstanding child. The header has the measurement
+/// this file ran at before that, and how far past 25 the shape now goes.
 ///
 /// **How a regression surfaces**: a wrong *answer* for a lost store, and a
 /// **hang** for a lost resumption or a counter that never reaches one. That
@@ -498,9 +510,9 @@ fn fibonacci_on(workers: usize, n: u64, recurse: fn(u64, &mut Runtime<'_>) -> u6
 fn a_runtime_task_computes_fibonacci_recursively() {
     for workers in 1..=4 {
         assert_eq!(
-            fibonacci_on(workers, 12, fibonacci),
-            144,
-            "{workers} worker(s): fib(12)"
+            fibonacci_on(workers, 25, fibonacci),
+            75025,
+            "{workers} worker(s): fib(25)"
         );
     }
 }
@@ -508,15 +520,14 @@ fn a_runtime_task_computes_fibonacci_recursively() {
 /// Upstream's `Runtime.FibonacciSwapped.1thread` through `.4threads`.
 ///
 /// [`fibonacci_swapped`] has what the swap is for; everything the case above
-/// says about the reduced `n` and about how a regression surfaces holds here
-/// too.
+/// says about `n` and about how a regression surfaces holds here too.
 #[test]
 fn a_runtime_task_computes_fibonacci_with_the_spawn_last() {
     for workers in 1..=4 {
         assert_eq!(
-            fibonacci_on(workers, 12, fibonacci_swapped),
-            144,
-            "{workers} worker(s): fib(12)"
+            fibonacci_on(workers, 25, fibonacci_swapped),
+            75025,
+            "{workers} worker(s): fib(25)"
         );
     }
 }
@@ -678,14 +689,16 @@ fn a_runtime_task_joins_its_children_and_their_children() {
     }
 }
 
-/// The input sizes the two sort cases run at, which are **not** upstream's:
-/// its are 10, 100, 1000 and 10000 (plus 1 for the quick sort).
+/// The input sizes the two sort cases run at, which are upstream's: its merge
+/// sort sweeps 10, 100, 1000 and 10000, and its quick sort the same plus 1.
+/// One constant covers both, so the merge sort also runs the single element,
+/// which costs nothing and asserts the base case twice.
 ///
-/// `tests/task_group.rs` has the same reduction for the same reason, and the
-/// module header above has the measurement: 10000 elements overflow a
-/// worker's stack in this port, 1000 are well inside the cliff, and the cause
-/// is issue #119 rather than anything either sort does.
-const SIZES: [usize; 4] = [1, 10, 100, 1000];
+/// Ten thousand elements overflowed a worker's stack before #119, which is
+/// why this list stopped at a thousand; the module header has both
+/// measurements, and `tests/task_group.rs` is where the reduced sizes still
+/// live, for the reason that file's header gives.
+const SIZES: [usize; 5] = [1, 10, 100, 1000, 10000];
 
 /// The buffer upstream's two sort cases share between a parent and its
 /// children: `std::vector<int>` there, `Arc<[AtomicI32]>` here.
@@ -819,9 +832,8 @@ fn merge_sort_spawn(runtime: &mut Runtime<'_>, data: &Shared, beg: usize, end: u
 ///
 /// **How a regression surfaces**: as an unsorted buffer for a corun that
 /// returned too early, and as a hang for a corun that never returns. The
-/// sizes are [`SIZES`] rather than upstream's, which the module header and
-/// that constant explain -- the recursion is still deep enough to nest
-/// coruns many levels at one worker, which is what makes the second a real
+/// sizes are upstream's, which [`SIZES`] sets out; the recursion nests coruns
+/// many levels deep at one worker, which is what makes the second a real
 /// risk.
 #[test]
 fn a_runtime_task_merge_sorts_recursively() {
@@ -898,7 +910,7 @@ fn quick_sort_spawn(runtime: &mut Runtime<'_>, data: &Shared, beg: usize, end: u
 /// Upstream reuses one taskflow across its five sizes and resizes the vector
 /// its body captured by reference; the body here owns a share of the buffer
 /// instead, so the taskflow is rebuilt per size. Same graph, one task, one
-/// run per size -- [`SIZES`] of them, for the module header's reason.
+/// run per size -- [`SIZES`] of them, which are upstream's five.
 ///
 /// **How a regression surfaces**: as an unsorted buffer if a child's writes
 /// are not waited for, and as a hang if a resumption is lost -- which with no

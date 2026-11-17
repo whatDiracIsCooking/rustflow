@@ -76,23 +76,28 @@
 //! loop's newly ready jobs do: `Executor::spawn` called from inside a body
 //! cannot name the frame that called it. A [`Runtime`](crate::Runtime) body
 //! can, because a runtime task is *given* the scheduler -- the handle holds
-//! that frame -- so the four `Runtime` forms in `executor::runtime_async`
-//! (#92) pass `Some`, and their children go onto the queue of the worker
-//! running the body.
+//! that frame -- so the eight `Runtime` forms in `executor::runtime_async`
+//! (#92) pass `Some` through their two funnels, and their children go onto
+//! the queue of the worker running the body. A [`TaskGroup`](crate::TaskGroup)
+//! is the submitter that comes nearest to passing one and still cannot:
+//! `src/task_group.rs` has that argument and the ceiling it leaves, which is
+//! the lower of the two this module has.
 //!
-//! That difference is not a micro-optimisation, and #92 is where it stopped
+//! That difference is not a micro-optimisation, and #119 is where it stopped
 //! being one: a worker's own queue is LIFO, so a body that spawns a child and
 //! then coruns gets *that child* back first, where the buffers would have
 //! handed it the oldest job in the pool. Recursive spawning is the shape that
 //! cares -- each nested corun that picks up somebody else's work instead of
 //! its own adds a frame without retiring one -- and `Runtime.Fibonacci` in
 //! `tests/runtimes.rs` overflowed a worker's stack in under a second when
-//! every child went to the buffers. What the buffers cost a *parentless*
-//! submission is only locality, which is why that branch is unchanged: the
-//! job is taken out by whichever worker sweeps it up rather than by the
-//! submitting worker's next pop, nothing is waiting on it in a frame below,
-//! and progress is unaffected -- every worker steals from the buffers, and
-//! the submitting worker's own sweep reaches them before it sleeps.
+//! every child went to the buffers, where with this branch it computes
+//! upstream's own `fib(25)` at one to four workers. What the buffers cost a
+//! *parentless* submission is only locality, which is why that branch is
+//! unchanged: the job is taken out by whichever worker sweeps it up rather
+//! than by the submitting worker's next pop, nothing is waiting on it in a
+//! frame below, and progress is unaffected -- every worker steals from the
+//! buffers, and the submitting worker's own sweep reaches them before it
+//! sleeps.
 //!
 //! # What the executor counts, and what its `Drop` waits for
 //!
@@ -293,8 +298,14 @@ impl Executor {
     /// why there is no `executor()` to reach back through -- so the eight
     /// `Runtime` forms in `executor::runtime_async` (#92) submit their
     /// children through the method below.
+    ///
+    /// No `worker` argument, where the method below has one: a call on an
+    /// `Executor` is a call that cannot name the frame running it, which is
+    /// the whole of why that argument is an argument. The module docs' "Where
+    /// a free async job is queued" has it in full, and `src/task_group.rs`
+    /// has the same answer for the submitter that is nearest to having one.
     pub(crate) fn schedule_async_task(&self, work: AsyncWork, parent: &Parent, estate: u32) {
-        self.shared.schedule_async_task(work, parent, estate);
+        self.shared.schedule_async_task(work, parent, estate, None);
     }
 }
 
@@ -649,7 +660,27 @@ impl Shared {
     /// omission but by design, which `src/runtime.rs`'s "Why there is no
     /// `executor()`" sets out. [`Executor::schedule_async_task`] stays as the
     /// one-line call the two public forms make, so nothing about them moved.
-    pub(crate) fn schedule_async_task(&self, work: AsyncWork, parent: &Parent, estate: u32) {
+    ///
+    /// # `worker`, which is upstream's `this_worker()`
+    ///
+    /// `Some` is upstream's `if(auto w = this_worker(); w)` branch and queues
+    /// the job on that worker's own queue; `None` is its freelance branch and
+    /// goes to the shared buffers. The difference from upstream is only how
+    /// the branch is *decided*: there the submitting worker is looked up in a
+    /// thread local, here it is an argument, because the owning end of a
+    /// worker's queue lives in the [`WorkerThread`] frame below the task body
+    /// and a lookup could not hand it out. So the callers that were handed
+    /// that frame pass it on -- the eight `Runtime` forms in
+    /// `executor::runtime_async`, through two private funnels -- and every
+    /// other caller passes `None`. The module docs have what each branch
+    /// costs and which submitters can take which.
+    pub(crate) fn schedule_async_task(
+        &self,
+        work: AsyncWork,
+        parent: &Parent,
+        estate: u32,
+        worker: Option<&WorkerThread>,
+    ) {
         // Only a parentless submission, which is upstream's split exactly:
         // `_increment_topology` is a line of the public `async` and
         // `silent_async` -- the two that pass a null parent -- and not of the
@@ -671,14 +702,14 @@ impl Shared {
         let job = Job::free(&node, parent);
         parent.count_queued(Topology::free_standing(), 1);
 
-        // Upstream's two branches, collapsed for the reason the module docs
-        // give: the owning end of the submitting worker's queue belongs to
-        // the frame below this call, so there is one destination and it is
-        // the one every thread outside the pool uses. Issue #119 is what
-        // that costs a recursive body, and the module docs name the one
-        // caller -- a runtime body (#92) -- that could take upstream's other
-        // branch if it were given the choice.
-        self.bulk_schedule([job]);
+        // Upstream's two branches of `_schedule_async_task`, over the
+        // argument rather than over a thread-local lookup: #119 is what the
+        // second one buys a recursive body, and the module docs have both the
+        // mechanism and which submitters can name a worker at all.
+        match worker {
+            Some(worker) => worker.schedule(job),
+            None => self.bulk_schedule([job]),
+        }
     }
 
     /// Counts one more free async task, before it is queued.

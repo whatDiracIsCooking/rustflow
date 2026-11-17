@@ -356,6 +356,10 @@ impl Executor {
     /// too: a [`Runtime`](crate::Runtime) body naming the dependencies of a
     /// child of its own (#92) has the worker's share of [`Shared`] and no
     /// `Executor` at all.
+    ///
+    /// No `worker` argument, where the method below has one, for
+    /// [`Executor::schedule_async_task`]'s reason: a call on an `Executor`
+    /// cannot name the frame running it.
     pub(crate) fn schedule_dependent_async_task<'a>(
         &self,
         work: AsyncWork,
@@ -364,7 +368,7 @@ impl Executor {
         dependencies: impl IntoIterator<Item = &'a AsyncTask>,
     ) -> AsyncTask {
         self.shared
-            .schedule_dependent_async_task(work, parent, estate, dependencies)
+            .schedule_dependent_async_task(work, parent, estate, dependencies, None)
     }
 }
 
@@ -396,12 +400,23 @@ impl Shared {
     /// reason, which is the same one here: `Shared` is what a worker holds,
     /// and a [`Runtime`](crate::Runtime) body submitting a dependent child
     /// (#92) has no `Executor` to call.
+    ///
+    /// `worker` is that method's own argument and means exactly what it means
+    /// there -- upstream's `this_worker()`, as a parameter rather than a
+    /// lookup -- with one thing particular to this node kind: it decides
+    /// where only the push *this* call may make goes, which is the one for a
+    /// task whose dependencies were all met already. A task released later by
+    /// a predecessor's tear-down is queued by whichever worker ran that
+    /// predecessor, through `WorkerThread::schedule`, and was never this
+    /// submission's to place. Upstream's branch sits inside its
+    /// `if(num_predecessors == 0)` for the same reason.
     pub(crate) fn schedule_dependent_async_task<'a>(
         &self,
         work: AsyncWork,
         parent: &Parent,
         estate: u32,
         dependencies: impl IntoIterator<Item = &'a AsyncTask>,
+        worker: Option<&WorkerThread>,
     ) -> AsyncTask {
         // Parentless only, which is the condition the tear-down below
         // decrements under and upstream's split between its public
@@ -486,7 +501,14 @@ impl Shared {
         // the release half publishes the pushes above to the tear-down that
         // is released by the predecessor's own decrement instead.
         if outstanding.fetch_sub(met + SUBMITTING, Ordering::AcqRel) == met + SUBMITTING {
-            self.bulk_schedule([Job::free(&node, parent)]);
+            // Upstream's two branches of that `_schedule`, over the argument
+            // rather than over a thread-local lookup, as the plain
+            // submission's are.
+            let job = Job::free(&node, parent);
+            match worker {
+                Some(worker) => worker.schedule(job),
+                None => self.bulk_schedule([job]),
+            }
         }
 
         // Upstream's `AsyncTask task(animate(...))` is taken at the *top* of
