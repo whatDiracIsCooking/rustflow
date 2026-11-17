@@ -7,33 +7,50 @@
 //! and `Exception.ThreadSafety`, a thousand tasks that all fail at once. All
 //! four run at 1..=4 workers, which is upstream's own sweep.
 //!
-//! The rest of that file is deferred rather than half-ported, because every
-//! one of its remaining cases needs a node kind this port does not run yet:
-//! the `Runtime` and `RuntimeCorun1..2` cases, the async family (`Async`,
-//! `DependentAsync`, `RuntimeAsync`), `Semaphore`, `TaskGroup`, the
-//! `Probe1..4` cases and the algorithm ones (`Algorithm`,
-//! `NestedAlgorithm`). They arrive with M4 and later, together with the
-//! runtime anchors those cases wait on.
+//! The rest of that file is deferred rather than half-ported, in three
+//! groups and for three different reasons:
 //!
-//! Two of the subflow family are here as of subflow tasking (#50), at the end
-//! of the file: `Exception.SubflowTask` and `Exception.JoinedSubflow1`, which
-//! are the cases about where a failure *inside* a subgraph is delivered.
-//! `JoinedSubflow2` and `3`, `NestedSubflow` and `NestedSubflow2` are #55's,
-//! with the rest of that issue's exception work.
+//! - the async family -- `Async`, `Async.Runtime`, `Runtime.Async`,
+//!   `RuntimeAsync`, `DependentAsync.Runtime`, `TaskGroup.Async` and
+//!   `TaskGroup.Basics` -- needs the `async` node kinds, which are M5 and M6,
+//!   and with them the one shape of the anchor walk no graph can reach yet:
+//!   an *implicit* anchor that nothing explicit sits above.
+//! - `Semaphore` and the algorithm cases, `Algorithm` and `NestedAlgorithm`,
+//!   need node kinds and parallel algorithms later milestones bring.
+//! - `Probe1..4` read a failed task's payload back off the node it failed on,
+//!   through `tf::Task::exception_ptr()`. That accessor is deliberately not
+//!   part of this port: `Job::record_panic` *drops* a payload that loses the
+//!   race for an anchor rather than parking it on the node, which
+//!   `a_thousand_tasks_failing_at_once_report_exactly_one_panic` below pins
+//!   from the other side. So those four wait on that decision being
+//!   revisited rather than on a milestone.
 //!
-//! Two more are here as of the anchor walk (#48): `Exception.ExecutorCorun1`
-//! -- its static half, the subflow half being #55's -- and
-//! `Exception.ExecutorCorun2`, which are the cases about a failure inside a
-//! *nested* graph being delivered to whoever is waiting for that graph rather
-//! than to the run. They are at the end of the file, after the four above.
+//! The subflow family is here in full, and the file is ordered by the issue a
+//! case arrived with rather than by upstream's layout.
+//! `Exception.SubflowTask` and `Exception.JoinedSubflow1` arrived with
+//! subflow tasking (#50) and are the cases about where a failure *inside* a
+//! subgraph is delivered; `JoinedSubflow2`, `JoinedSubflow3`,
+//! `NestedSubflow` and `NestedSubflow2` arrived with #55 and are the cases
+//! about the **anchor priority** -- which of several things waiting on a
+//! chain of nested graphs gets the payload, and what the others see instead.
 //!
-//! And `Exception.ModuleTask` is here as of module tasks (#49), at the very
-//! end: a failure inside a composed taskflow, which that walk delivers to the
-//! composing run because a module node is no anchor. Its commented-out second
-//! half, the same composition with a subflow inside it, waits on #55 with the
-//! rest of the subflow family.
+//! `Exception.ExecutorCorun1` and `Exception.ExecutorCorun2` are here as of
+//! the anchor walk (#48), the subflow half of `ExecutorCorun1` as of #55:
+//! they are the cases about a failure inside a *nested* graph being delivered
+//! to whoever is waiting for that graph rather than to the run.
+//! `Exception.RuntimeCorun1` and `RuntimeCorun2` are the same two from inside
+//! a runtime task, and are #55's -- which makes them the one pair here where
+//! an explicit anchor and an implicit one are both on the chain, since a
+//! runtime node is implicitly anchored for as long as its body runs.
 //!
-//! Three adaptations, and the first is the only one that changes what is
+//! And `Exception.ModuleTask` is here as of module tasks (#49): a failure
+//! inside a composed taskflow, which that walk delivers to the composing run
+//! because a module node is no anchor. Its second half -- the same
+//! composition with a subflow inside it, which upstream leaves commented out
+//! -- is ported with it as of #55, because this port can now run it and
+//! it is the deepest chain of unanchored nodes the suite has.
+//!
+//! Five adaptations, and the first is the only one that changes what is
 //! asserted:
 //!
 //! - **A panic where upstream throws.** Upstream's failing body throws
@@ -55,6 +72,22 @@
 //!   `exception_ptr`. The payload here is a type that counts its own drops, so
 //!   the case can assert the sharper thing directly: of the tasks that failed,
 //!   exactly one payload reached the caller and every other was dropped.
+//! - **A corun from a task where upstream coruns from an async task.**
+//!   `NestedSubflow` and `NestedSubflow2` each corun the nested taskflow four
+//!   more times after the run -- from `async`, from `silent_async`, and from
+//!   each of those with a runtime handle -- which is one question asked of
+//!   four node kinds M5 brings. The one node kind this milestone has that can
+//!   corun is an ordinary task, so each of those cases coruns the taskflow
+//!   once from a task of a second taskflow in place of the four, and says so
+//!   where it does it.
+//! - **A `post_join` flag is asserted only where upstream can.**
+//!   `JoinedSubflow1` says in a comment that its own flag cannot be checked,
+//!   because the failure cancels the children and a join with nothing left to
+//!   run succeeds; that comment is honoured below and the flag is left out
+//!   with it. `JoinedSubflow2` is the case where the same flag *can* be
+//!   asserted and upstream does assert it -- its sixteen children are all
+//!   sources of the subgraph, so at least one of them runs and fails however
+//!   the pool is sized -- and it is asserted here too.
 //!
 //! The default panic hook prints each panic on its way past. The harness
 //! captures that, so it shows up only when a test fails, which is when it is
@@ -64,10 +97,10 @@
 
 use std::panic;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rustflow::prelude::*;
-use rustflow::{CorunError, Executor, RunError};
+use rustflow::{CorunError, Executor, JoinError, RunError};
 
 /// How many times a task body has run, shared with that body.
 type Counter = Arc<AtomicUsize>;
@@ -344,7 +377,8 @@ fn a_thousand_tasks_failing_at_once_report_exactly_one_panic() {
 /// does not throw.
 ///
 /// The second half of upstream's case puts a hundred subflows in `taskflow1`
-/// and is #55's: a subflow task is a node kind this port does not run yet.
+/// instead, and is
+/// [`a_corun_of_failing_subflows_reports_to_the_calling_task`] below.
 #[test]
 fn a_corun_of_a_failing_taskflow_reports_to_the_calling_task() {
     for workers in 1..=4 {
@@ -470,11 +504,16 @@ fn an_uncaught_corun_failure_becomes_the_outer_runs_failure() {
 /// top-level task's does, and `executor::module` needed no code of its own
 /// for it.
 ///
-/// The commented-out half of upstream's case -- the same composition with a
-/// subflow inside it -- waits on #55, as the subflow family above does.
+/// Upstream's commented-out half -- the same composition with a subflow
+/// inside it, failing with `"y"` -- is here as of #55, because the port can
+/// run it and it is the longest chain of *unanchored* nodes the suite has: a
+/// child of a subflow of a module of a run. Nothing on it is waiting for
+/// anything, so the walk marks three bases on its way past and the run is
+/// still what reports the payload.
 #[test]
 fn a_panic_inside_a_module_fails_the_composing_run() {
     for workers in 1..=4 {
+        let context = format!("{workers} worker(s)");
         let executor = Executor::new(workers);
 
         let mut target = Taskflow::new();
@@ -487,7 +526,23 @@ fn a_panic_inside_a_module_fails_the_composing_run() {
             .run(&taskflow)
             .wait()
             .expect_err("the task of the composed taskflow panicked");
-        assert_failed_with_x(&error, &format!("{workers} worker(s)"));
+        assert_failed_with_x(&error, &context);
+
+        // Upstream's commented-out half: the composed taskflow's one task is
+        // a subflow task whose child fails.
+        let mut target = Taskflow::new();
+        target.emplace_subflow(|subflow: &mut Subflow<'_>| {
+            subflow.emplace(|| panic!("y"));
+        });
+
+        let mut taskflow = Taskflow::new();
+        taskflow.composed_of(Arc::new(target));
+
+        let error = executor
+            .run(&taskflow)
+            .wait()
+            .expect_err("the child of the composed subflow panicked");
+        assert_failed_with(&error, "y", &context);
     }
 }
 
@@ -592,5 +647,668 @@ fn a_panic_under_a_hundred_joined_subflows_reaches_the_run() {
             .wait()
             .expect_err("the children of every joined subflow panicked");
         assert_failed_with(&error, "x", &context);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Exception.JoinedSubflow2
+// ----------------------------------------------------------------------------
+
+/// Upstream's `joined_subflow_2(W)`: one subflow task emplacing sixteen
+/// children that all panic, joining them explicitly, and catching what the
+/// join hands back.
+///
+/// `post_join == false` is upstream's assertion and the anchor priority is
+/// what makes it hold: the `try_join` anchors the node for the length of the
+/// nested run, so the payload stops there instead of travelling to the run,
+/// and a body that was handed a failure cannot have fallen through to the
+/// line after the join. It is also the case where that flag *can* be
+/// asserted, unlike `JoinedSubflow1`'s -- the sixteen children are all
+/// sources of the subgraph, so at least one of them runs and fails whatever
+/// the pool does.
+///
+/// The failing run at the end is the port being stricter than upstream rather
+/// than different from it. Upstream calls `wait()` and never looks at what the
+/// run reports, and there *is* something to report: a `try_join` that failed
+/// leaves the subflow joinable, so the implicit join runs the same sixteen
+/// children a second time and nothing is catching that one.
+/// [`Subflow::try_join`](rustflow::Subflow::try_join) sets out the obligation
+/// a body takes on by catching; this is what declining it looks like from
+/// outside.
+#[test]
+fn a_body_that_catches_its_joins_failure_stops_where_it_caught_it() {
+    /// Upstream's sixteen children.
+    const CHILDREN: usize = 16;
+
+    for workers in 1..=4 {
+        let context = format!("{workers} worker(s)");
+        let post_join = Arc::new(AtomicBool::new(false));
+
+        let mut taskflow = Taskflow::new();
+        taskflow.emplace_subflow({
+            let post_join = Arc::clone(&post_join);
+            move |subflow: &mut Subflow<'_>| {
+                for _ in 0..CHILDREN {
+                    subflow.emplace(|| panic!("x"));
+                }
+
+                // Upstream's `try { sf0.join(); post_join = true; }
+                // catch(const std::runtime_error& re) { .. }`: `try_join` is
+                // that `try`/`catch` without the unwind, so the store is
+                // reached only on the path where the join succeeded.
+                match subflow.try_join() {
+                    Ok(()) => post_join.store(true, Ordering::Relaxed),
+                    Err(error) => assert_failed_with(join_failure(&error), "x", "the join"),
+                }
+            }
+        });
+
+        let error = Executor::new(workers)
+            .run(&taskflow)
+            .wait()
+            .expect_err("the implicit join raised what the explicit one caught");
+        assert_failed_with(&error, "x", &context);
+
+        assert!(
+            !post_join.load(Ordering::Relaxed),
+            "{context}: the body went on past a join that failed"
+        );
+    }
+}
+
+/// The run failure inside a join failure, which is the one variant of
+/// [`JoinError`] these cases can see: a task of the subgraph panicked.
+///
+/// [`corun_failure`]'s counterpart, and a `match` for the same reason --
+/// `JoinError` is `#[non_exhaustive]` outside the crate. Reaching
+/// `AlreadyJoined` here would be a bug in the test: every join below is the
+/// first one its body makes.
+fn join_failure(error: &JoinError) -> &RunError {
+    match error {
+        JoinError::Run(error) => error,
+        other => panic!("unexpected join error: {other:?}"),
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Exception.JoinedSubflow3
+// ----------------------------------------------------------------------------
+
+/// Upstream's `joined_subflow_3(N)`: four children chained `W -> X -> Y -> Z`
+/// inside one subflow task whose `X` fails, once left to the implicit join and
+/// once joined explicitly.
+///
+/// `num_tasks == 2` is upstream's assertion for both halves and is the
+/// `counter == 2` of the `A..F` cases one level down: the children are
+/// serial, so `W` ran, `X` failed, and `Y` and `Z` were never scheduled. What
+/// differs between the halves is only where the payload was raised -- the
+/// run's own slot for the implicit join, and the body that called `join` for
+/// the explicit one, which re-raises it and so fails the subflow task itself
+/// -- and `wait` reports the same payload either way. That is the pair's
+/// point: the two joins are different mechanisms with one observable answer.
+#[test]
+fn only_the_children_before_a_failing_one_run_under_either_join() {
+    for workers in 1..=4 {
+        let executor = Executor::new(workers);
+
+        // Upstream's implicit-join half, failing with `"x"`.
+        let num_tasks = counter();
+        let mut taskflow = Taskflow::new();
+        taskflow.emplace_subflow(chained_children(&num_tasks, "x", Join::Implicit));
+
+        let context = format!("{workers} worker(s), implicit");
+        let error = executor
+            .run(&taskflow)
+            .wait()
+            .expect_err("the second child panicked");
+        assert_failed_with(&error, "x", &context);
+        assert_eq!(
+            num_tasks.load(Ordering::Relaxed),
+            2,
+            "{context}: only the children up to the failing one ran"
+        );
+
+        // Upstream's explicit-join half, failing with `"y"`. Upstream clears
+        // and refills one taskflow; a second one says the same thing without
+        // the clear, and the fresh counter is upstream's `num_tasks = 0`.
+        let num_tasks = counter();
+        let mut taskflow = Taskflow::new();
+        taskflow.emplace_subflow(chained_children(&num_tasks, "y", Join::Explicit));
+
+        let context = format!("{workers} worker(s), explicit");
+        let error = executor
+            .run(&taskflow)
+            .wait()
+            .expect_err("the join re-raised what the second child panicked with");
+        assert_failed_with(&error, "y", &context);
+        assert_eq!(
+            num_tasks.load(Ordering::Relaxed),
+            2,
+            "{context}: only the children up to the failing one ran"
+        );
+    }
+}
+
+/// Which join a subflow case uses, which is the only difference between the
+/// two halves of `joined_subflow_3` and between upstream's `NestedSubflow`
+/// and `NestedSubflow2`.
+#[derive(Clone, Copy, Debug)]
+enum Join {
+    /// The body returns and the dispatch arm runs the subgraph for it. That
+    /// join anchors nothing: the node is preempted and has undertaken to look
+    /// at no payload, so a failure inside walks straight past it.
+    Implicit,
+    /// The body calls `join`, which anchors its own node for the length of the
+    /// nested run and re-raises whatever the subgraph failed with.
+    Explicit,
+}
+
+/// Upstream's four children of `joined_subflow_3`: `W -> X -> Y -> Z`, each
+/// counting itself, with `X` panicking with `payload`.
+fn chained_children(
+    counter: &Counter,
+    payload: &'static str,
+    join: Join,
+) -> impl for<'a> FnMut(&mut Subflow<'a>) + Send + 'static {
+    let counter = Arc::clone(counter);
+    move |subflow: &mut Subflow<'_>| {
+        let w = subflow.emplace(bump(&counter));
+        let x = {
+            let counter = Arc::clone(&counter);
+            subflow.emplace(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                // `panic_any` rather than `panic!`, so that the payload is
+                // the `&'static str` the assertions downcast to rather than
+                // the `String` a formatted message would be.
+                panic::panic_any(payload);
+            })
+        };
+        let y = subflow.emplace(bump(&counter));
+        let z = subflow.emplace(bump(&counter));
+        subflow.linearize([w, x, y, z]);
+
+        if matches!(join, Join::Explicit) {
+            subflow.join().expect("a fresh subflow is joinable");
+        }
+    }
+}
+
+/// A body that counts itself: upstream's `[&num_tasks](){ ++num_tasks; }`.
+fn bump(counter: &Counter) -> impl FnMut() + Send + 'static {
+    let counter = Arc::clone(counter);
+    move || {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Exception.NestedSubflow and Exception.NestedSubflow2
+// ----------------------------------------------------------------------------
+
+/// Upstream's `nested_subflow(N)`: four levels of subflow, the innermost of
+/// which fails, with every level left to the implicit join.
+#[test]
+fn a_panic_four_subflows_down_reaches_the_run_through_implicit_joins() {
+    for workers in 1..=4 {
+        nested_subflow(workers, Join::Implicit);
+    }
+}
+
+/// Upstream's `nested_subflow_2(N)`: the same four levels with every one of
+/// them joined explicitly.
+#[test]
+fn a_panic_four_subflows_down_reaches_the_run_through_explicit_joins() {
+    for workers in 1..=4 {
+        nested_subflow(workers, Join::Explicit);
+    }
+}
+
+/// How many levels of subflow upstream's two nested cases build.
+const LEVELS: usize = 4;
+
+/// Upstream's `nested_subflow` and `nested_subflow_2`, which differ only in
+/// whether each level joins explicitly.
+///
+/// `num_tasks == 12` is upstream's assertion for both, and it is the same
+/// serial-chain arithmetic as the `A..F` cases three levels further in: two
+/// children ran at each of the four levels, each of the three inner bodies
+/// counted itself, and the failing child counted itself -- `2 * 4 + 3 + 1` --
+/// while the `Y` and `Z` of every level never started and neither did the
+/// nine remaining rounds of the `run_n`.
+///
+/// What the pair is about is the anchor priority, and the two halves take
+/// opposite routes to the same payload:
+///
+/// - with every level left to the implicit join, no base on the chain is an
+///   anchor at all. The walk marks four of them on the way past -- which is
+///   what cancels the rest of each level -- and the payload lands on the run,
+///   exactly as the module case's does;
+/// - with every level joined explicitly, the walk stops at the first one it
+///   meets, the innermost `join`. That re-raises the payload, failing the body
+///   that joined, whose failure then walks up to the join above it, and so on:
+///   four hand-offs rather than one walk. The payload keeps its identity
+///   through all four, which is what
+///   [`resume_unwind`](std::panic::resume_unwind) is for and what makes the
+///   two halves indistinguishable from the run's point of view.
+fn nested_subflow(workers: usize, join: Join) {
+    /// Upstream's `run_n(taskflow, 10)`.
+    const ROUNDS: usize = 10;
+    /// Upstream's `REQUIRE(num_tasks == 12)`.
+    const COUNTED: usize = 2 * LEVELS + (LEVELS - 1) + 1;
+
+    let context = format!("{workers} worker(s), {join:?}");
+    let executor = Arc::new(Executor::new(workers));
+    let num_tasks = counter();
+
+    let taskflow = Arc::new({
+        let mut taskflow = Taskflow::new();
+        taskflow.emplace_subflow(nested_body(&num_tasks, 1, join));
+        taskflow
+    });
+
+    // The first round fails, which cancels the run, so the other nine never
+    // start -- a claim the count below makes as much as it makes one about the
+    // levels.
+    let error = executor
+        .run_n(&taskflow, ROUNDS)
+        .wait()
+        .expect_err("the innermost child panicked");
+    assert_failed_with(&error, "x", &context);
+    assert_eq!(
+        num_tasks.load(Ordering::Relaxed),
+        COUNTED,
+        "{context}: two children of each level, three bodies and the failing child"
+    );
+
+    // Upstream coruns the same taskflow four more times here -- from an
+    // `async` task, from a `silent_async` task and from each of those with a
+    // runtime handle -- and the module docs say why one corun from an ordinary
+    // task stands in for the four. The question is the same one with a level
+    // added: the chain now roots at the corun's own anchor rather than at a
+    // run, so the payload comes out of `try_corun` and the outer run completes
+    // normally.
+    num_tasks.store(0, Ordering::Relaxed);
+    let mut outer = Taskflow::new();
+    outer.emplace({
+        let executor = Arc::clone(&executor);
+        let taskflow = Arc::clone(&taskflow);
+        let context = context.clone();
+        move || {
+            let error = executor
+                .try_corun(&taskflow)
+                .expect_err("the innermost child panicked");
+            assert_failed_with(corun_failure(&error), "x", &context);
+        }
+    });
+
+    executor
+        .run(&outer)
+        .wait()
+        .expect("the corunning task caught the failure");
+    assert_eq!(
+        num_tasks.load(Ordering::Relaxed),
+        COUNTED,
+        "{context}, corun: the nested graph ran exactly as far as it did under the run"
+    );
+}
+
+/// What a subflow body is, spelled out because [`nested_body`] returns one of
+/// itself: the bound [`FlowBuilder::emplace_subflow`] takes, boxed so that the
+/// recursion has a type.
+type NestedBody = dyn for<'a> FnMut(&mut Subflow<'a>) + Send + 'static;
+
+/// Upstream's four nested bodies, built by recursion over `level` rather than
+/// as four copies of one lambda.
+///
+/// `level` counts from one, as upstream's names do (`sf1` outwards). Every
+/// level but the first counts its own body -- upstream's `++num_tasks` at the
+/// top of the three inner lambdas -- and every level emplaces
+/// `V -> W -> X -> Y -> Z` where `X` is the next level down, or at [`LEVELS`]
+/// the child that fails.
+///
+/// The recursion happens while the graph is being *built*, which is to say
+/// while the body above it is running, so each round of a `run_n` rebuilds the
+/// levels below it exactly as upstream's nested lambdas do.
+fn nested_body(counter: &Counter, level: usize, join: Join) -> Box<NestedBody> {
+    let counter = Arc::clone(counter);
+    Box::new(move |subflow: &mut Subflow<'_>| {
+        // Upstream's `++num_tasks` at the top of `sf2`, `sf3` and `sf4`'s
+        // bodies, which the outermost body does not have: it is the task of
+        // the taskflow itself rather than a child of anything.
+        if level > 1 {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let v = subflow.emplace(bump(&counter));
+        let w = subflow.emplace(bump(&counter));
+        let x = if level < LEVELS {
+            subflow.emplace_subflow(nested_body(&counter, level + 1, join))
+        } else {
+            let counter = Arc::clone(&counter);
+            subflow.emplace(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                panic!("x")
+            })
+        };
+        let y = subflow.emplace(bump(&counter));
+        let z = subflow.emplace(bump(&counter));
+        subflow.linearize([v, w, x, y, z]);
+
+        if matches!(join, Join::Explicit) {
+            subflow.join().expect("a fresh subflow is joinable");
+        }
+    })
+}
+
+// ----------------------------------------------------------------------------
+// This port's own: two anchors on one chain
+// ----------------------------------------------------------------------------
+
+/// Not an upstream case: two explicit anchors on one chain with the inner one
+/// catching, so that nothing reaches the outer one or the run.
+///
+/// Every upstream case lets the payload travel all the way to the top, which
+/// cannot tell "the innermost anchor was chosen" apart from "every anchor on
+/// the chain was handed a copy" -- `JoinedSubflow1` and the explicit half of
+/// `nested_subflow` would pass either way. This is the difference, and it is
+/// the half of `Job::record_panic`'s walk that the suite would otherwise take
+/// on trust.
+///
+/// It needs the inner body to do two things: catch the failure *and* erase the
+/// child. A join that failed leaves the subflow joinable, so the implicit join
+/// would otherwise run the child again and raise the same panic where nothing
+/// is catching it -- which is exactly what the case above asserts happens.
+/// [`Subflow::try_join`](rustflow::Subflow::try_join) names that obligation;
+/// this is a body meeting it.
+#[test]
+fn the_innermost_explicit_anchor_catches_and_nothing_travels_past_it() {
+    for workers in 1..=4 {
+        let context = format!("{workers} worker(s)");
+        let caught = counter();
+
+        let mut taskflow = Taskflow::new();
+        taskflow.emplace_subflow({
+            let caught = Arc::clone(&caught);
+            move |outer: &mut Subflow<'_>| {
+                let caught = Arc::clone(&caught);
+                outer.emplace_subflow(move |inner: &mut Subflow<'_>| {
+                    let child = inner.emplace(|| panic!("x"));
+
+                    let error = inner.try_join().expect_err("the child panicked");
+                    assert_failed_with(join_failure(&error), "x", "the inner join");
+                    caught.fetch_add(1, Ordering::Relaxed);
+
+                    // The failure ends here, and this is what saying so looks
+                    // like: with the child erased the implicit join has
+                    // nothing to run and raises nothing.
+                    inner.erase(child);
+                });
+
+                // Nothing failed under *this* join, because the body above
+                // kept its subgraph's failure to itself.
+                outer.join().expect("a fresh subflow is joinable");
+            }
+        });
+
+        Executor::new(workers)
+            .run(&taskflow)
+            .wait()
+            .expect("the inner join caught the only failure there was");
+        assert_eq!(
+            caught.load(Ordering::Relaxed),
+            1,
+            "{context}: the inner body caught its child's panic exactly once"
+        );
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: ExecutorCorun1 (subflow half)
+// ----------------------------------------------------------------------------
+
+/// Upstream's `executor_corun_1(W)`, second half: `taskflow1` is a hundred
+/// subflow tasks, each emplacing a hundred children that all panic with
+/// `"y"`, and a task of `taskflow2` coruns it.
+///
+/// The static half says where a failure of a corun graph goes; this one says
+/// that it still goes there from a graph *inside* that graph. A child of a
+/// subflow of a corun sits two unanchored bases below the anchor -- the child
+/// is waiting for nothing and neither is the subflow node, which was left to
+/// the implicit join -- so the walk marks both and hands the payload to the
+/// one frame that is blocked, which is the `try_corun` call and not the outer
+/// run.
+///
+/// Ten thousand panicking children is upstream's count, and almost none of
+/// them run: the first failure marks the anchor, and a job under a marked
+/// anchor is skipped by `Job::is_parent_cancelled`. That is what makes a case
+/// of this shape cost milliseconds, and it is the thing being tested as much
+/// as the delivery is.
+#[test]
+fn a_corun_of_failing_subflows_reports_to_the_calling_task() {
+    for workers in 1..=4 {
+        let context = format!("{workers} worker(s)");
+        let executor = Arc::new(Executor::new(workers));
+        let inner = Arc::new(failing_subflows("y"));
+
+        let corun = counter();
+        let mut outer = Taskflow::new();
+        outer.emplace({
+            let executor = Arc::clone(&executor);
+            let inner = Arc::clone(&inner);
+            let corun = Arc::clone(&corun);
+            let context = context.clone();
+            move || {
+                let error = executor
+                    .try_corun(&inner)
+                    .expect_err("a child of every subflow panicked");
+                assert_failed_with(corun_failure(&error), "y", &context);
+                corun.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        executor
+            .run(&outer)
+            .wait()
+            .expect("the corunning task caught the failure");
+        assert_eq!(
+            corun.load(Ordering::Relaxed),
+            1,
+            "{context}: the corunning task ran once"
+        );
+    }
+}
+
+/// Upstream's `taskflow1` for the second halves of `executor_corun_1` and
+/// `runtime_corun_1`: a hundred subflow tasks, each emplacing a hundred
+/// children that all panic with `payload`.
+fn failing_subflows(payload: &'static str) -> Taskflow {
+    /// Upstream's hundred subflow tasks.
+    const SUBFLOWS: usize = 100;
+    /// Upstream's hundred children of each.
+    const CHILDREN: usize = 100;
+
+    let mut taskflow = Taskflow::new();
+    for _ in 0..SUBFLOWS {
+        taskflow.emplace_subflow(move |subflow: &mut Subflow<'_>| {
+            for _ in 0..CHILDREN {
+                subflow.emplace(move || panic::panic_any(payload));
+            }
+        });
+    }
+    taskflow
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: RuntimeCorun1
+// ----------------------------------------------------------------------------
+
+/// Upstream's `runtime_corun_1(W)`: `ExecutorCorun1`'s corun made from a
+/// *runtime* task's body, in upstream's three phases -- a one-task graph
+/// caught, a graph of a hundred failing subflows caught, and that second graph
+/// again with the catch taken off so the failure propagates.
+///
+/// A runtime task is where the anchor priority has two candidates for the
+/// first time. The node is `IMPLICITLY_ANCHORED` for as long as its body runs
+/// -- it has undertaken to look at its own slot once whatever it spawned is
+/// done -- and the corun inside that body anchors itself *explicitly*.
+/// Upstream's `_process_exception` prefers the explicit one and says so in a
+/// comment, "Implicit anchor has the lowest priority", and the catching body
+/// below reads that preference from both ends: the payload comes out of
+/// [`Executor::try_corun`](rustflow::Executor::try_corun), and
+/// [`Runtime::try_corun`](rustflow::Runtime::try_corun) -- which is what reads
+/// the node's own slot -- finds nothing at all.
+///
+/// Upstream's third phase changes the body to `executor.corun(..)` and nothing
+/// else, so the payload is raised on the worker, fails the runtime task, and
+/// the walk carries it to the run: the node is implicitly anchored at that
+/// moment too, and the run above it is an anchor by definition and outranks
+/// it.
+///
+/// One adaptation, and not to what is asserted: upstream clears `taskflow1`
+/// and refills it between the first two phases, where a task body here owns an
+/// [`Arc`] of what it coruns, so the second graph is a second taskflow. The
+/// *body* is replaced in place, through
+/// [`TaskMut::runtime_work`](rustflow::TaskMut::runtime_work), which is
+/// upstream's `task.work(..)`.
+#[test]
+fn a_runtime_body_catches_a_corun_failure_until_it_is_asked_not_to() {
+    for workers in 1..=4 {
+        let context = format!("{workers} worker(s)");
+        let executor = Arc::new(Executor::new(workers));
+
+        // Upstream's first `taskflow1`: one task, which fails.
+        let one_task = Arc::new({
+            let mut flow = Taskflow::new();
+            flow.emplace(|| panic!("x"));
+            flow
+        });
+        // Upstream's refilled `taskflow1`.
+        let subflows = Arc::new(failing_subflows("x"));
+
+        let mut taskflow = Taskflow::new();
+        let task = taskflow.emplace_runtime(catching(&executor, &one_task, &context));
+        executor
+            .run(&taskflow)
+            .wait()
+            .expect("the runtime body caught `x`");
+
+        taskflow
+            .task(task)
+            .runtime_work(catching(&executor, &subflows, &context));
+        executor
+            .run(&taskflow)
+            .wait()
+            .expect("the runtime body caught the `x` of a nested subflow");
+
+        // Upstream's "change it to parent propagation".
+        taskflow.task(task).runtime_work({
+            let executor = Arc::clone(&executor);
+            let subflows = Arc::clone(&subflows);
+            move |_runtime: &mut Runtime<'_>| {
+                executor
+                    .corun(&subflows)
+                    .expect("a runtime body runs on a worker of this executor");
+            }
+        });
+        let error = executor
+            .run(&taskflow)
+            .wait()
+            .expect_err("the runtime body let `x` through");
+        assert_failed_with(&error, "x", &context);
+    }
+}
+
+/// Upstream's catching runtime body: corun `flow`, expect its failure with
+/// `"x"`, and then check that the node's own slot stayed empty.
+///
+/// That second check is the anchor priority stated as the negative, and it is
+/// why the handle is used at all here -- upstream's body takes a
+/// `tf::Runtime&` and never touches it.
+fn catching(
+    executor: &Arc<Executor>,
+    flow: &Arc<Taskflow>,
+    context: &str,
+) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static {
+    let executor = Arc::clone(executor);
+    let flow = Arc::clone(flow);
+    let context = context.to_owned();
+    move |runtime: &mut Runtime<'_>| {
+        let error = executor
+            .try_corun(&flow)
+            .expect_err("a task of the corun graph panicked");
+        assert_failed_with(corun_failure(&error), "x", &context);
+
+        runtime.try_corun().unwrap_or_else(|error| {
+            panic!("{context}: the runtime node's own slot took a payload: {error:?}")
+        });
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: RuntimeCorun2
+// ----------------------------------------------------------------------------
+
+/// Upstream's `runtime_corun_2(W)`: `ExecutorCorun2` with a runtime task doing
+/// the corunning -- the `A..F` chain whose `C` fails, corun once uncaught and
+/// once caught, with `counter == 2` and then `== 4`.
+///
+/// Everything the pair asserts is `ExecutorCorun2`'s, and upstream repeats it
+/// from a runtime body because the node the corun hangs under is a different
+/// one: an implicitly anchored node rather than a plain static task. Both
+/// halves say that it makes no difference, which is the preference
+/// `a_runtime_body_catches_a_corun_failure_until_it_is_asked_not_to` states
+/// directly.
+#[test]
+fn an_uncaught_corun_failure_in_a_runtime_body_becomes_the_outer_runs_failure() {
+    for workers in 1..=4 {
+        let executor = Arc::new(Executor::new(workers));
+        let counter = counter();
+        let mut inner = Taskflow::new();
+        let [_, _, c, ..] = chain(&mut inner, Kind::Static, &counter);
+        inner.task(c).work(|| panic!("x"));
+        let inner = Arc::new(inner);
+
+        // Upstream's "uncaught corun exception propagates to the topology".
+        let mut uncaught = Taskflow::new();
+        uncaught.emplace_runtime({
+            let executor = Arc::clone(&executor);
+            let inner = Arc::clone(&inner);
+            move |_runtime: &mut Runtime<'_>| {
+                executor
+                    .corun(&inner)
+                    .expect("a runtime body runs on a worker of this executor");
+            }
+        });
+        let error = executor
+            .run(&uncaught)
+            .wait()
+            .expect_err("the corunning runtime task did not catch `x`");
+        assert_failed_with_x(&error, &format!("{workers} worker(s), uncaught"));
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            2,
+            "{workers} worker(s), uncaught: only the tasks before the failing one run"
+        );
+
+        // Upstream's "catch corun exception directly", which runs the same
+        // chain again: the counter is not reset, so it reaches four.
+        let mut caught = Taskflow::new();
+        caught.emplace_runtime({
+            let executor = Arc::clone(&executor);
+            let inner = Arc::clone(&inner);
+            move |_runtime: &mut Runtime<'_>| {
+                let error = executor.try_corun(&inner).expect_err("`C` panicked");
+                assert_failed_with_x(corun_failure(&error), "caught");
+            }
+        });
+        executor
+            .run(&caught)
+            .wait()
+            .expect("the corunning runtime task caught `x`");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            4,
+            "{workers} worker(s), caught: the second corun ran the same two tasks"
+        );
     }
 }
