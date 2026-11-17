@@ -98,6 +98,22 @@
 //! still unwinding a preemption in the case above. Nothing on either path
 //! touches the run after that drop.
 //!
+//! Not every waiter can be released, though, and the one that cannot is why
+//! the rule above is about the hold rather than about the `Drop`. A
+//! [`corun`](crate::Executor::corun) frame does not park in a completion
+//! slot: it spins in the work-stealing loop until the anchor its graph was
+//! scheduled under reaches zero, so there is no thread for a straggling share
+//! to release and the zero it watches for arrives while the copies are still
+//! on their way out -- issue #112, which is #109's mechanism at #109's own
+//! blind spot. What such a frame can do is the thing no *holder* of a share
+//! can: ask whether it holds the last one. So a corun takes its run's hold
+//! out of the topology ([`Topology::take_storage`]), schedules its graph
+//! through it as [`Shared::set_up_topology`] does, and keeps it until
+//! `Arc::get_mut` says it is unique -- at which point the flow share the
+//! caller is about to edit through is the one *inside* that hold, and no
+//! ordering between two shares is left to get wrong. `executor::corun` has
+//! the rest, including why no job it is waiting for can be waiting for it.
+//!
 //! One share is deliberately held *across* a tear-down, and it is worth
 //! saying why that does not contradict the job rule either. Since #62 a worker
 //! keeps one ready successor out of its queue to run next -- upstream's
@@ -312,6 +328,8 @@
 //! that harmless is that the waiter is released by the last share of
 //! [`Storage`], and every link of a parent chain holds one: the chain is
 //! therefore not a hole in the guarantee but one of the holders of it.
+//!
+//! [`Shared::set_up_topology`]: crate::executor::Shared::set_up_topology
 
 use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
@@ -394,11 +412,19 @@ pub(crate) enum GraphOwner {
     /// The graph of the run itself, held through the run's [`Storage`] hold
     /// on the taskflow's storage rather than through a bare share of it --
     /// which is what makes the last of these shares to go the thing that
-    /// releases the thread waiting on the run (#109).
+    /// releases the thread waiting on the run (#109), and what makes the
+    /// hold's becoming unique the thing a [`corun`](crate::Executor::corun)
+    /// frame waits for (#112). Both waiters are the same hold read from the
+    /// two sides it has.
     Run(Arc<Storage>),
     /// A taskflow's storage reached without such a hold, which is the target
-    /// of a module task composed of an `Arc<Taskflow>` and the graph of a
-    /// [`corun`](crate::Executor::corun).
+    /// of a module task composed of an `Arc<Taskflow>`.
+    ///
+    /// A corun's graph was this until #112: a share nobody could count, so a
+    /// straggling copy of a preempted node's job held one past the moment the
+    /// corun frame returned and the caller's next edit of the taskflow
+    /// panicked. It is a [`Run`](GraphOwner::Run) now, over the hold its own
+    /// run already had.
     Flow(Arc<Flow>),
     /// A graph that one node of another graph owns, which is the next two:
     /// an adopted module's graph, and a subflow's subgraph.
@@ -425,6 +451,14 @@ pub(crate) enum GraphOwner {
 /// than off the tear-down: a job copied out of a node that *preempted* cannot
 /// be made to give its share up before the decrement that ends the run, so
 /// the run is made to end after the share instead (#109).
+///
+/// A thread parked in the completion slot is not the only thing that waits
+/// for a graph, and the other one takes the same hold the other way round: a
+/// [`corun`](crate::Executor::corun) frame owns the hold its graph is
+/// scheduled through and waits for it to become unique, rather than being
+/// released by whoever drops the last share. [`Storage::ungated`] has why the
+/// two shapes are the one mechanism, and #112 is where the corun frame had
+/// neither.
 ///
 /// One allocation per run, handed out by [`Topology::storage`] and cloned by
 /// every job that run's graph is scheduled as -- so a job's hold on the graph
@@ -787,11 +821,24 @@ impl Storage {
     /// [`Topology::new`] gets.
     ///
     /// Two kinds of run reach that constructor, and neither is waited for
-    /// through the completion slot this would release. A
+    /// through the completion slot a gating hold releases. The topologies this
+    /// crate's own tests build by hand are driven step by step rather than
+    /// run, so nothing waits on them at all. And a
     /// [`corun`](crate::Executor::corun) is waited for by the frame that
-    /// started it, watching the anchor its graph is scheduled under; and the
-    /// topologies this crate's own tests build by hand are driven step by step
-    /// rather than run. Both end through [`Topology::release_flow`], which
+    /// started it, which cannot be released by anything: it is not parked, it
+    /// is spinning in the work-stealing loop, so what it needs is not a
+    /// release but a *question it can ask*. This hold is that question. The
+    /// frame takes the share out of its run -- [`Topology::take_storage`] --
+    /// schedules the graph through it, and waits for it to become unique
+    /// before it returns, which is exactly as strong as the ordering
+    /// [`Drop for Storage`](Storage) gives a `wait`: every job of the graph
+    /// owns a share of this hold, and the flow share the caller is about to
+    /// edit through is *inside* it.
+    ///
+    /// Issue #112 is where that was missing and this comment was a forward
+    /// reference instead; `executor::corun` has the argument in full,
+    /// including why a frame may ask a question the last share cannot answer
+    /// for it. Both kinds end through [`Topology::release_flow`], which
     /// releases the waiter itself for a hold that cannot.
     fn ungated(flow: Arc<Flow>) -> Arc<Self> {
         Arc::new(Self {
@@ -1832,6 +1879,29 @@ impl Topology {
     /// [`Shared::set_up_topology`]: crate::executor::Shared::set_up_topology
     pub(crate) fn storage(&self) -> Option<Arc<Storage>> {
         self.lock_storage().clone()
+    }
+
+    /// Hands this run's share of its hold on the taskflow's storage *out*,
+    /// leaving the run with none.
+    ///
+    /// [`Topology::release_flow`] without the release, for the one caller that
+    /// has something to do with the share before the run is over: a
+    /// [`corun`](crate::Executor::corun) frame, which schedules its graph
+    /// through this hold and then keeps it until no job of that graph holds a
+    /// copy. `executor::corun` has why that is a frame's answer to the
+    /// question `Drop for Storage` answers for a thread in the completion
+    /// slot, and why it is the frame rather than the last share that has to
+    /// ask it (#112).
+    ///
+    /// Nothing is dropped here, so nothing of this run's can be touched by
+    /// the one lock this takes -- which is what lets this be a plain take
+    /// where `release_flow` has to drop its share outside the guard.
+    ///
+    /// The run is left in the state the tear-down leaves it in, so
+    /// `release_flow` afterwards finds no share and releases the waiter
+    /// itself -- which for a corun's run is what finishes it.
+    pub(crate) fn take_storage(&self) -> Option<Arc<Storage>> {
+        self.lock_storage().take()
     }
 
     /// Releases this run's share of its hold on the taskflow's storage, and

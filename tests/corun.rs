@@ -205,3 +205,133 @@ fn corun_until_runs_the_work_a_parked_worker_would_have_slept_through() {
     assert_eq!(counter.load(Ordering::Relaxed), BUMPS);
     executor.wait_for_all();
 }
+
+// --------------------------------------------------------
+// Testcase: the taskflow a corun returned from
+// --------------------------------------------------------
+
+/// A chain of `tasks` tasks, each bumping `counter`: the graph a round of the
+/// case below composes.
+fn chain(tasks: usize, counter: &Arc<AtomicUsize>) -> Taskflow {
+    let mut taskflow = Taskflow::new();
+    let mut previous = None;
+    for _ in 0..tasks {
+        let task = taskflow.emplace(bump(counter));
+        if let Some(previous) = previous {
+            taskflow.task(previous).precede([task]);
+        }
+        previous = Some(task);
+    }
+    taskflow
+}
+
+/// A `corun` that has returned leaves its taskflow editable, which is the same
+/// promise `RunHandle::wait` makes and is issue #112.
+///
+/// `tests/modules.rs::a_composition_is_editable_the_instant_its_run_reports_done`
+/// is this case one entry point over: #109 found that a node which *preempts*
+/// is dequeued as a job and that job is then copied -- onto the frame still
+/// inside the dispatch arm, into the parent its nested graph is scheduled
+/// under, and once more as the job the last child re-queues to resume it --
+/// and that only the last of those three is ever spent by finishing it. The
+/// other two hold a share of the taskflow's storage for a few instructions
+/// after the resumed node has finished, so the thread that was waiting can be
+/// released while a share is still outstanding and its next `emplace` panics.
+///
+/// #109 fixed that for a thread waiting on a run's completion slot, by making
+/// the last share of the run's hold on the storage what releases it. A corun
+/// frame is not released by that slot at all: it waits on an *anchor*, in the
+/// work-stealing loop, until the anchor's join counter reaches zero -- so the
+/// ordering `Drop for Storage` establishes does not reach it, and the same
+/// straggling copies can outlive the zero this frame is watching for.
+///
+/// Four things have to coincide, which is the whole shape of this case:
+///
+/// - **a corun**, so that the wait is on an anchor rather than on a run;
+/// - **a preempting node under it**, which is the composition: a module task
+///   of the coruned graph is the node whose job gets copied;
+/// - **an edit with nothing in between** -- not a sleep, not a retry -- on a
+///   taskflow the corunning body *owns*, which is what makes `Arc::get_mut`
+///   in `Taskflow::graph_mut` the assertion;
+/// - **contention**, because the window is a handful of instructions wide and
+///   the thread that has to lose the race is another worker. Several threads
+///   each running their own executor is what supplies it, as it is in #109's
+///   two cases.
+///
+/// The one number that is not arbitrary is the four workers. One runs the body
+/// that coruns, one runs the coruned graph, and the other two are **parked** --
+/// which is what widens the window from "a few instructions" to "a syscall":
+/// the worker that re-queues the job resuming the preempted node notifies the
+/// pool while still holding the copy, and waking a parked thread is far slower
+/// than the corunning frame needs to steal that job, finish it and return. At
+/// two workers, with nobody to wake, this case never reproduced the race at
+/// all -- 72000 coruns of it pinned to two cores, with the share count
+/// instrumented, saw no straggler. At four it fails against the unfixed
+/// scheduler 8 runs out of 8 unpinned and 6 out of 8 pinned to two cores.
+///
+/// A round is one corun of a three-task graph and one edit, so the whole case
+/// is under a tenth of a second.
+#[test]
+fn a_coruned_taskflow_is_editable_the_instant_corun_returns() {
+    /// Rounds per thread. Each is one corun and one edit, and the edit is the
+    /// assertion.
+    const ROUNDS: usize = 400;
+    /// Threads, each with a four-worker executor of its own.
+    const THREADS: usize = 12;
+
+    let editors: Vec<std::thread::JoinHandle<()>> = (0..THREADS)
+        .map(|_| {
+            std::thread::spawn(|| {
+                // Four, for the reason the docs above give: one worker for
+                // the body, one for the graph it coruns, and two parked.
+                let executor = Arc::new(Executor::new(4));
+                let counter = Arc::new(AtomicUsize::new(0));
+                let target = Arc::new(chain(2, &counter));
+
+                // One task, which does every round from inside a worker:
+                // `corun` is a worker's call, so the taskflow being edited has
+                // to be one a task body owns.
+                let mut driver = Taskflow::new();
+                driver.emplace({
+                    let executor = Arc::clone(&executor);
+                    let counter = Arc::clone(&counter);
+                    let target = Arc::clone(&target);
+                    move || {
+                        for round in 0..ROUNDS {
+                            let mut coruned = Taskflow::new();
+                            let own = coruned.emplace(bump(&counter));
+                            let module = coruned.composed_of(Arc::clone(&target));
+                            coruned.task(own).precede([module]);
+
+                            counter.store(0, Ordering::Relaxed);
+                            executor.corun(&coruned).expect("a worker may corun");
+                            assert_eq!(
+                                counter.load(Ordering::Relaxed),
+                                3,
+                                "round {round}: one task and a two-task composition"
+                            );
+
+                            // The edit. `Taskflow::graph_mut` panics here if
+                            // any share of this taskflow's storage is still
+                            // outstanding.
+                            coruned.clear();
+                            assert!(coruned.is_empty(), "round {round}: the edit took");
+                        }
+                    }
+                });
+
+                executor
+                    .run(&driver)
+                    .wait()
+                    .expect("the body that coruns and edits");
+            })
+        })
+        .collect();
+
+    for editor in editors {
+        assert!(
+            editor.join().is_ok(),
+            "a corun returned while a share of the taskflow it ran was still held"
+        );
+    }
+}
