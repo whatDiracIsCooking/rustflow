@@ -12,7 +12,7 @@
 //! subflows and module tasks (M4), and `CancelFromAsync` needs async tasks
 //! (M5). Upstream's commented-out `CancelLinearChain` is left commented out.
 //!
-//! Four adaptations, and the first is the only one that changes what is
+//! Four adaptations, and the first two are the ones that change what is
 //! being asserted:
 //!
 //! - **`EmptyFuture` becomes a token whose run has completed.** Upstream
@@ -23,10 +23,16 @@
 //!   there is nothing to cancel report `false`? -- is asked of a
 //!   [`Canceller`](rustflow::Canceller) whose run has finished, which is the
 //!   state upstream's failed `weak_ptr::lock()` describes.
-//! - **`fu.wait_for(0ms) == std::future_status::ready` becomes one poll of the
-//!   handle.** A `RunHandle` is a [`Future`], so asking whether a run is
-//!   complete *without* waiting for it is a single `poll`; see
-//!   [`poll_once`].
+//! - **`fu.wait_for(0ms) == std::future_status::ready` becomes a wait.** A
+//!   `RunHandle` is a [`Future`], so asking whether a run is complete
+//!   *without* waiting for it is a single `poll` -- see [`poll_once`] -- and
+//!   `cancel_from_another` asks exactly that, where `Pending` is the answer
+//!   by construction. Upstream's four *ready* polls in
+//!   `MultipleCancellations` are a different statement: they read "the
+//!   executor being idle means every run is complete", which is true upstream
+//!   and deliberately false here, because `Shared::tear_down_topology`
+//!   decrements the topology count before it releases the run's waiter.
+//!   `multiple_cancellations` says what is waited for in their place.
 //! - **The shared counter is an `AtomicUsize`** where upstream's is an
 //!   `std::atomic<int>&` captured by reference. Task bodies here are
 //!   `Send + 'static`, so the sharing is spelled as an [`Arc`].
@@ -131,9 +137,23 @@ fn empty_future() {
 
     let run = executor.run(&taskflow);
     let canceller = run.canceller();
-    assert!(run.cancel(), "the run had not finished");
+    // What this cancel *reports* is deliberately not asserted, and is not to
+    // be "tightened" back into an `assert!` (#67): a hundred `fetch_add`s
+    // across four workers finish in microseconds, so this run may well be
+    // over by the time the call lands -- and `cancel` then reports `false`,
+    // which is its contract, not a fault. Nothing is lost by dropping that
+    // assertion, because upstream's `EmptyFuture` makes no such claim either:
+    // it cancels a default-constructed `tf::Future` and checks only the
+    // `false`. The call itself stays, so that what the two assertions below
+    // describe is a run which was asked to cancel and completed anyway,
+    // whichever side of the race it fell on.
+    run.cancel();
     run.wait().expect("a cancelled run completes normally");
 
+    // Race-free, unlike the call above, and for a reason in the library
+    // rather than in the timings: `Topology::finish` marks the run finished
+    // *before* it releases a waiter under the completion lock, so a `cancel`
+    // ordered after a returned `wait` can only report `false`.
     assert!(
         !canceller.cancel(),
         "a run that has completed has nothing to cancel"
@@ -183,17 +203,22 @@ fn basic_cancellation() {
 /// Upstream's `MultipleCancellations`: four graphs of 10000 sleeping tasks on
 /// one executor, all four cancelled, then `wait_for_all`.
 ///
-/// The four polls at the end are upstream's four `wait_for(0ms) == ready`
-/// checks, and they are a slightly different statement here than there.
-/// Upstream fulfils a run's promise and *then* decrements its topology count;
-/// this port decrements first and releases the waiter last, deliberately --
-/// `Shared::tear_down_topology` says why -- so what `wait_for_all` returning
-/// guarantees here is the count, and a poll could in principle be beaten by
-/// the handful of instructions between the last run's decrement and its
-/// `Topology::finish`. The assertion is kept as upstream wrote it rather than
-/// softened into a wait, because what it is really for -- a cancelled run
-/// left with work still scheduled -- is a failure of seconds, not of
-/// instructions.
+/// The four waits at the end are upstream's four `wait_for(0ms) == ready`
+/// checks, and they have to be waits here. Upstream fulfils a run's promise
+/// and *then* decrements its topology count, so its polls assert a real
+/// implication: the executor being idle means every run is complete. This
+/// port decrements first and releases the waiter last, deliberately --
+/// `Shared::tear_down_topology` says why -- so that implication is one it
+/// does not offer, and a poll here could be beaten by the handful of
+/// instructions between a run's decrement and its `Topology::finish`. Four
+/// polls are four chances to lose that race, which is #67's reasoning applied
+/// to this case: an assertion that cannot hold is not made sounder by the
+/// window being narrow.
+///
+/// So what is asserted is that each run does complete, and the teeth are
+/// where they already were -- `counter < TASKS`, read once the executor is
+/// idle, which a cancelled run left with work still scheduled fails by a
+/// factor of four.
 #[test]
 fn multiple_cancellations() {
     let executor = Executor::new(4);
@@ -206,7 +231,7 @@ fn multiple_cancellations() {
     ];
 
     counter.store(0, Ordering::Relaxed);
-    let mut runs: Vec<RunHandle<'_>> = taskflows.iter().map(|tf| executor.run(tf)).collect();
+    let runs: Vec<RunHandle<'_>> = taskflows.iter().map(|tf| executor.run(tf)).collect();
     assert_eq!(executor.num_topologies(), 4, "four runs are in flight");
 
     for (run, which) in runs.iter().zip(1..) {
@@ -219,11 +244,9 @@ fn multiple_cancellations() {
         "four whole graphs ran, so nothing was cancelled"
     );
 
-    for (run, which) in runs.iter_mut().zip(1..) {
-        assert!(
-            matches!(poll_once(run), Poll::Ready(Ok(()))),
-            "run {which} was not complete once the executor was idle"
-        );
+    for (run, which) in runs.into_iter().zip(1..) {
+        run.wait()
+            .unwrap_or_else(|error| panic!("run {which} failed: {error}"));
     }
     assert_eq!(executor.num_topologies(), 0);
 }
