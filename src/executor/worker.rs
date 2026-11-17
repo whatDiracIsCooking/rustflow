@@ -69,7 +69,9 @@
 //!   outright. An index that is negative or past the last successor names
 //!   nothing, which is how a branch ends, and so does a conditioner whose body
 //!   panics: the panic is recorded on the topology and the selection stays
-//!   empty.
+//!   empty. A panic also cancels the rest of the run, so for a conditioner the
+//!   empty selection is belt and braces -- there is nothing left to select
+//!   into.
 //!
 //! A selected successor has its join counter *stored to zero* rather than
 //! decremented. That is upstream's "zeroing the join counter for invariant",
@@ -502,12 +504,18 @@ impl WorkerThread {
 
         let release = match node.handle() {
             // Upstream's `_invoke_static_task`, whose
-            // `TF_EXECUTOR_EXCEPTION_HANDLER` is this `catch_unwind`: the
-            // failure is stored on the topology and reported from `wait`,
-            // never raised on a worker thread. `AssertUnwindSafe` is the
-            // honest annotation -- the state a panicking body can leave
-            // half-written is the user's own, reachable only through what the
-            // closure captured.
+            // `TF_EXECUTOR_EXCEPTION_HANDLER` is this `catch_unwind` and whose
+            // `_process_exception` is `Topology::record_panic`: the failure is
+            // stored on the topology, cancels whatever the run had not
+            // started, and is reported from `wait`, never raised on a worker
+            // thread. `AssertUnwindSafe` is the honest annotation -- the state
+            // a panicking body can leave half-written is the user's own,
+            // reachable only through what the closure captured.
+            //
+            // The successors below are still released, as upstream's are: its
+            // exception handler is the body of the first switch and does not
+            // skip the second. What stops them is the early-out above, when
+            // the worker that dequeues one finds the run cancelled.
             Handle::Static(work) => {
                 if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| work.invoke())) {
                     topology.record_panic(payload);
@@ -520,10 +528,9 @@ impl WorkerThread {
             // Upstream's `_invoke_condition_task`, which is the static invoker
             // plus a return value: the same exception handler, and `conds = {
             // work() }` where the static one discards what it called. A panic
-            // is therefore recorded exactly as a static task's is, and the
-            // selection it leaves behind is empty -- which selects no
-            // successor and ends the branch. Cancelling the rest of the run
-            // instead is #32's, not this arm's.
+            // is therefore recorded exactly as a static task's is -- rest of
+            // the run cancelled and all -- and the selection it leaves behind
+            // is empty, which selects no successor and ends the branch.
             Handle::Condition(work) => Release::Selected(
                 panic::catch_unwind(AssertUnwindSafe(|| work.invoke()))
                     .map_err(|payload| topology.record_panic(payload))

@@ -1354,25 +1354,35 @@ fn runs_of_one_taskflow_do_not_overlap() {
 // Testcase: a panicking task, and a graph deep enough to steal from
 //
 // Neither is upstream's. Upstream's exception cases live in
-// `unittests/test_exception.cpp` and test cancellation along with the throw,
-// which is a later milestone; these two are the issue's own bar for the first
-// end-to-end run.
+// `unittests/test_exceptions.cpp`, whose four runnable cases are translated
+// in `tests/exceptions.rs`; this one is the issue's own bar for the first
+// end-to-end run, and asserts what a panic does to the tasks beside it rather
+// than what it is reported as.
 // --------------------------------------------------------
 
 /// How many tasks run beside the panicking one.
 const SIBLINGS: usize = 16;
 
+/// A panic is reported through the handle, and it cancels the rest of its own
+/// run on the terms cancellation always has: a task already running is left to
+/// finish, and a task not yet scheduled does not run.
+///
+/// So the sibling count has no single right answer -- how many of the sixteen
+/// were in flight when the panic landed is the race between the panic and the
+/// pool -- while the sink has: it cannot be scheduled until every one of the
+/// seventeen has released it, the panicking one included, so by the time a
+/// worker could dequeue it the run is already cancelled and the early-out
+/// skips it. That asymmetry is the whole of the behaviour, which is why this
+/// case is a fan-in rather than a chain; `tests/exceptions.rs` has upstream's
+/// chain, where the counts are exact.
 #[test]
-fn a_panicking_task_is_reported_and_the_rest_of_the_run_still_completes() {
+fn a_panicking_task_is_reported_and_cancels_what_had_not_started() {
     let executor = Executor::new(4);
     let siblings = Arc::new(AtomicUsize::new(0));
     let sinks = Arc::new(AtomicUsize::new(0));
 
     // One task that panics, sixteen beside it that do not, and a sink that
-    // succeeds all seventeen. The sink is the part that matters: a panicking
-    // task must not cancel the run, because cancellation is a later milestone
-    // and silently skipping the rest of the graph would be the wrong half of
-    // it to have.
+    // succeeds all seventeen.
     let mut taskflow = Taskflow::new();
     let mut sources = vec![emplace(&mut taskflow, || panic!("boom"))];
     for _ in 0..SIBLINGS {
@@ -1404,19 +1414,32 @@ fn a_panicking_task_is_reported_and_the_rest_of_the_run_still_completes() {
         panic!("unexpected error: {error:?}");
     }
 
-    assert_eq!(siblings.load(Ordering::Relaxed), SIBLINGS);
-    assert_eq!(sinks.load(Ordering::Relaxed), 1, "the sink did not run");
+    assert!(
+        siblings.load(Ordering::Relaxed) <= SIBLINGS,
+        "a sibling ran more than once"
+    );
+    assert_eq!(
+        sinks.load(Ordering::Relaxed),
+        0,
+        "the sink cannot be scheduled before the panic that cancels the run"
+    );
 
     // The same taskflow again. The panicking task poisoned its own work on the
     // way out, so this is also the check that a poisoned task is still
-    // runnable and still reports the panic rather than a lock error.
+    // runnable and still reports the panic rather than a lock error -- and
+    // that a run after a failed one starts clean, since the cancellation is
+    // the topology's and each run has its own.
+    let before = siblings.load(Ordering::Relaxed);
     let error = executor
         .run(&taskflow)
         .wait()
         .expect_err("the second run reported no panic");
     assert!(matches!(error, RunError::Panicked(_)));
-    assert_eq!(siblings.load(Ordering::Relaxed), SIBLINGS * 2);
-    assert_eq!(sinks.load(Ordering::Relaxed), 2);
+    assert!(
+        (before..=before + SIBLINGS).contains(&siblings.load(Ordering::Relaxed)),
+        "the second run ran a sibling more than once"
+    );
+    assert_eq!(sinks.load(Ordering::Relaxed), 0, "the sink ran after all");
 
     // And the executor itself is no worse for it.
     let mut after = Taskflow::new();
