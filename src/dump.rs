@@ -49,10 +49,17 @@
 //! closed. `Dumper::visited`, keyed by the address of the graph, is what makes
 //! a target composed twice dump once -- two module tasks, one cluster, and the
 //! second task reporting the first task's `m<id>`. It is also upstream's guard
-//! against a taskflow that composes itself dumping for ever, which this port
-//! keeps even though its own API cannot build that cycle yet: composing needs
-//! an `Arc<Taskflow>` of the target and mutating needs `&mut`, and
-//! `Arc::get_mut` refuses once a clone exists.
+//! against a taskflow that composes itself dumping for ever, and that guard is
+//! reachable here rather than kept for upstream's sake alone. The top-level
+//! builder cannot close the cycle: composing needs an `Arc<Taskflow>` of the
+//! target and mutating needs `&mut`, and `Arc::get_mut` refuses once a clone
+//! exists. A subflow body can, because a [`Subflow`](crate::Subflow) is a
+//! [`FlowBuilder`](crate::FlowBuilder) over a subgraph and runs at a moment
+//! when the taskflow it belongs to may already be alive behind an `Arc` of the
+//! caller's own. The dump of one such graph terminates and names the cycle
+//! rather than following it: the module task in the subgraph reports the
+//! top-level graph's `m<id>`, exactly as the second of two module tasks on one
+//! target does.
 //!
 //! A subflow's or an adopted module's graph is dumped *inside* the owning
 //! node's cluster instead, by recursion, and cannot recurse for ever at all:

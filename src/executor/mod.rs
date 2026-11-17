@@ -37,6 +37,19 @@
 //! workers, hand them the shared state, join them on drop. See each submodule
 //! for what it does and does not owe to upstream.
 //!
+//! The scheduler itself contains no `unsafe` at all, and that is a property
+//! to keep rather than a coincidence to notice: its one `unsafe` boundary
+//! was a job holding raw pointers at the run and at the taskflow's storage,
+//! and it went when a job started owning what it names instead -- the
+//! README's "A run owns the graph it walks", and `topology`'s own argument.
+//! What is left is [`notifier`]'s lock-free waiter stack, where a worker
+//! about to park publishes its [`Thread`](std::thread::Thread) handle into a
+//! slot that only the notifier which has popped it may read. That is the
+//! whole of the crate's `unsafe`, and `tests/loom_notifier.rs` is what
+//! models the invariant it rests on. A node kind added here that would need
+//! a raw pointer to reach something is a design to reconsider, not a
+//! `// SAFETY:` comment to write.
+//!
 //! # Cancelling a run
 //!
 //! [`RunHandle::cancel`](crate::RunHandle::cancel) and
@@ -179,8 +192,8 @@
 //!    tear-down against its own parent.
 //!
 //! The protocol costs one requeue per nested graph where upstream, whose
-//! `_update_cache` is not ported, resumes the parent on the worker that
-//! finished the last child.
+//! `_update_cache` is not ported (issue #62), resumes the parent on the
+//! worker that finished the last child.
 //!
 //! All three arms that can preempt a node now do: a module task (#49, #74),
 //! a runtime task that spawned work (#51) and a subflow left to its implicit
