@@ -7,16 +7,33 @@
 //! and `Exception.ThreadSafety`, a thousand tasks that all fail at once. All
 //! four run at 1..=4 workers, which is upstream's own sweep.
 //!
-//! The rest of that file is deferred rather than half-ported, in three
-//! groups and for three different reasons:
+//! The async family is at the end of the file, in upstream's own order:
+//! `Async`, `Async.Runtime`, `DependentAsync.Runtime`, `RuntimeAsync`,
+//! `TaskGroup.Basics`, `TaskGroup.Async` and `Runtime.Async`, with
+//! `Semaphore` -- which upstream puts ahead of the task-group cases -- after
+//! them. All eight arrived with #94, once there were free node kinds to hang
+//! them on, a task group to open and semaphores the executor honours; between
+//! them they are the only cases in this suite that reach the shape no graph
+//! can make -- an *implicit* anchor with nothing explicit above it, which is
+//! what a group's anchor and an entered runtime node both are.
 //!
-//! - the async family -- `Async`, `Async.Runtime`, `Runtime.Async`,
-//!   `RuntimeAsync`, `DependentAsync.Runtime`, `TaskGroup.Async` and
-//!   `TaskGroup.Basics` -- needs the `async` node kinds, which are M5 and M6,
-//!   and with them the one shape of the anchor walk no graph can reach yet:
-//!   an *implicit* anchor that nothing explicit sits above.
-//! - `Semaphore` and the algorithm cases, `Algorithm` and `NestedAlgorithm`,
-//!   need node kinds and parallel algorithms later milestones bring.
+//! Three of those eight run a shorter worker sweep than upstream's eight:
+//! `TaskGroup.Async` stops at five, `Runtime.Async` at four and `Semaphore`
+//! at three, and each says where it stops why. The sweep is there to cover
+//! "one worker does all of it" and "several workers steal it", and the
+//! reduced ends reach both; CI runs on about two cores, so the upper half of
+//! upstream's sweep would cost oversubscribed runs of the heaviest cases here
+//! for no shape the lower half does not already make. `Semaphore` has a
+//! second reason of its own, which its case states: its graph is a serial
+//! chain in which at most one task is ever runnable. Nothing else about any
+//! of the eight is reduced -- the hundred rounds of a hundred children are
+//! upstream's own, and so are the 1024 failures of the two `.Runtime` cases.
+//!
+//! Two groups of that file are still not here, and neither is waiting on a
+//! node kind:
+//!
+//! - the algorithm cases, `Algorithm` and `NestedAlgorithm`, need the
+//!   parallel algorithms a later milestone brings.
 //! - `Probe1..4` read a failed task's payload back off the node it failed on,
 //!   through `tf::Task::exception_ptr()`. That accessor is deliberately not
 //!   part of this port: `Job::record_panic` *drops* a payload that loses the
@@ -72,14 +89,15 @@
 //!   `exception_ptr`. The payload here is a type that counts its own drops, so
 //!   the case can assert the sharper thing directly: of the tasks that failed,
 //!   exactly one payload reached the caller and every other was dropped.
-//! - **A corun from a task where upstream coruns from an async task.**
-//!   `NestedSubflow` and `NestedSubflow2` each corun the nested taskflow four
-//!   more times after the run -- from `async`, from `silent_async`, and from
-//!   each of those with a runtime handle -- which is one question asked of
-//!   four node kinds M5 brings. The one node kind this milestone has that can
-//!   corun is an ordinary task, so each of those cases coruns the taskflow
-//!   once from a task of a second taskflow in place of the four, and says so
-//!   where it does it.
+//! - **A silent task's assertion is recorded rather than raised.** Upstream
+//!   writes `REQUIRE`s inside `silent_async` bodies in three places here --
+//!   the two `silent_async` coruns of `NestedSubflow` and `NestedSubflow2`,
+//!   and the silent half of `Runtime.Async` -- where a failure would be
+//!   caught by the task wrapper and then dropped, there being no handle to
+//!   report it to. `Executor::silent_async` says so in as many words. So each
+//!   such body hands its outcome to a shared cell instead and the assertion
+//!   is made on this thread once the task is known to have run, which is the
+//!   same claim without a case that can pass in silence.
 //! - **A `post_join` flag is asserted only where upstream can.**
 //!   `JoinedSubflow1` says in a comment that its own flag cannot be checked,
 //!   because the failure cancels the children and a join with nothing left to
@@ -100,7 +118,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rustflow::prelude::*;
-use rustflow::{CorunError, Executor, JoinError, RunError};
+use rustflow::{AsyncHandle, CorunError, Executor, JoinError, RunError, Semaphore};
 
 /// How many times a task body has run, shared with that body.
 type Counter = Arc<AtomicUsize>;
@@ -920,16 +938,20 @@ fn nested_subflow(workers: usize, join: Join) {
         "{context}: two children of each level, three bodies and the failing child"
     );
 
-    // Upstream coruns the same taskflow four more times here -- from an
-    // `async` task, from a `silent_async` task and from each of those with a
-    // runtime handle -- and the module docs say why one corun from an ordinary
-    // task stands in for the four. The question is the same one with a level
-    // added: the chain now roots at the corun's own anchor rather than at a
-    // run, so the payload comes out of `try_corun` and the outer run completes
-    // normally.
-    num_tasks.store(0, Ordering::Relaxed);
-    let mut outer = Taskflow::new();
-    outer.emplace({
+    // Upstream coruns the same taskflow four more times here, from each of
+    // the four free node kinds that can corun: an `async` task, a
+    // `silent_async` one, and each of those handed a runtime. The question is
+    // the run's with a level added -- the chain now roots at the corun's own
+    // anchor rather than at a run, so the payload comes out of `try_corun`
+    // and nothing is left for the task itself to report -- and asking it of
+    // four node kinds is asking whether the anchor the corun pushes depends
+    // on what is under it. It does not, which is why all four read the same.
+    //
+    // Upstream's commented-out `rt.corun(taskflow)` lines are left out with
+    // them: a `Runtime` here has no corun-a-taskflow form, and upstream's own
+    // two runtime bodies call `executor.corun(taskflow)` exactly as the plain
+    // two do.
+    let corun = {
         let executor = Arc::clone(&executor);
         let taskflow = Arc::clone(&taskflow);
         let context = context.clone();
@@ -939,16 +961,86 @@ fn nested_subflow(workers: usize, join: Join) {
                 .expect_err("the innermost child panicked");
             assert_failed_with(corun_failure(&error), "x", &context);
         }
-    });
+    };
 
+    // Upstream's `executor.async([&](){ .. }).get()`.
+    num_tasks.store(0, Ordering::Relaxed);
     executor
-        .run(&outer)
+        .spawn(corun.clone())
         .wait()
-        .expect("the corunning task caught the failure");
+        .expect("the corunning async task caught the failure");
     assert_eq!(
         num_tasks.load(Ordering::Relaxed),
         COUNTED,
-        "{context}, corun: the nested graph ran exactly as far as it did under the run"
+        "{context}, corun from an async task: the nested graph ran exactly as \
+         far as it did under the run"
+    );
+
+    // Upstream's `executor.silent_async([&](){ .. }); executor.wait_for_all();`.
+    // The assertion inside `corun` would be dropped here rather than
+    // reported -- the module docs' silent-task adaptation -- so the body says
+    // that it got all the way through it and the check is this thread's.
+    num_tasks.store(0, Ordering::Relaxed);
+    let silent_finished = Arc::new(AtomicBool::new(false));
+    executor.silent_async({
+        let corun = corun.clone();
+        let finished = Arc::clone(&silent_finished);
+        move || {
+            corun();
+            finished.store(true, Ordering::Release);
+        }
+    });
+    executor.wait_for_all();
+    assert!(
+        silent_finished.load(Ordering::Acquire),
+        "{context}, corun from a silent async task: the body did not reach its end"
+    );
+    assert_eq!(
+        num_tasks.load(Ordering::Relaxed),
+        COUNTED,
+        "{context}, corun from a silent async task: the nested graph ran \
+         exactly as far as it did under the run"
+    );
+
+    // Upstream's `executor.async([&](tf::Runtime&){ .. }).get()`.
+    num_tasks.store(0, Ordering::Relaxed);
+    executor
+        .spawn_runtime({
+            let corun = corun.clone();
+            move |_runtime: &mut Runtime<'_>| corun()
+        })
+        .wait()
+        .expect("the corunning runtime-shaped async task caught the failure");
+    assert_eq!(
+        num_tasks.load(Ordering::Relaxed),
+        COUNTED,
+        "{context}, corun from an async task's runtime: the nested graph ran \
+         exactly as far as it did under the run"
+    );
+
+    // Upstream's `executor.silent_async([&](tf::Runtime&){ .. });
+    // executor.wait_for_all();`, with the same shared cell as the plain
+    // silent one above.
+    num_tasks.store(0, Ordering::Relaxed);
+    let silent_runtime_finished = Arc::new(AtomicBool::new(false));
+    executor.silent_async_runtime({
+        let finished = Arc::clone(&silent_runtime_finished);
+        move |_runtime: &mut Runtime<'_>| {
+            corun();
+            finished.store(true, Ordering::Release);
+        }
+    });
+    executor.wait_for_all();
+    assert!(
+        silent_runtime_finished.load(Ordering::Acquire),
+        "{context}, corun from a silent async task's runtime: the body did \
+         not reach its end"
+    );
+    assert_eq!(
+        num_tasks.load(Ordering::Relaxed),
+        COUNTED,
+        "{context}, corun from a silent async task's runtime: the nested \
+         graph ran exactly as far as it did under the run"
     );
 }
 
@@ -1311,4 +1403,698 @@ fn an_uncaught_corun_failure_in_a_runtime_body_becomes_the_outer_runs_failure() 
             "{workers} worker(s), caught: the second corun ran the same two tasks"
         );
     }
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: Async
+// ----------------------------------------------------------------------------
+
+/// Upstream's `async_task(W)`: the three things a free-standing task can do
+/// with a failure, asked of the two forms that have one.
+///
+/// A handle-bearing task delivers its panic to the handle and a silent one
+/// drops it, which is the whole case -- and the clean `spawn` first is what
+/// makes the other two mean anything, since an executor that failed to run a
+/// body at all would pass a case that only looked for failures.
+fn async_task(workers: usize) {
+    let context = format!("{workers} worker(s)");
+    let executor = Executor::new(workers);
+
+    let one = executor.spawn(|| 1);
+    assert_eq!(
+        one.wait().expect("the body did not panic"),
+        1,
+        "{context}: an async task's result reaches its handle"
+    );
+
+    // The return type is written out because Rust has nothing to infer it
+    // from: a body that only panics never produces an `R`. Upstream's lambda
+    // is deduced `void` for the same reason and `1` above is its `int`.
+    let failed = executor.spawn(|| -> i32 { panic!("x") });
+    let error = failed.wait().expect_err("the body panicked");
+    assert_failed_with_x(&error, &context);
+
+    // Upstream's "exception is caught without any action": nothing is waiting
+    // for this one, so the payload is dropped where the wrapper caught it and
+    // the executor carries on. The `wait_for_all` is what says it ran at all.
+    executor.silent_async(|| panic!("y"));
+    executor.wait_for_all();
+}
+
+#[test]
+fn an_async_tasks_panic_reaches_its_handle_and_nothing_else_1_thread() {
+    async_task(1);
+}
+
+#[test]
+fn an_async_tasks_panic_reaches_its_handle_and_nothing_else_2_threads() {
+    async_task(2);
+}
+
+#[test]
+fn an_async_tasks_panic_reaches_its_handle_and_nothing_else_3_threads() {
+    async_task(3);
+}
+
+#[test]
+fn an_async_tasks_panic_reaches_its_handle_and_nothing_else_4_threads() {
+    async_task(4);
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: Async.Runtime
+// ----------------------------------------------------------------------------
+
+/// How many failures upstream's two runtime-shaped async cases submit at
+/// once: its `for(size_t i=0; i<1024; i++)`.
+const FAILING_FREE_TASKS: usize = 1024;
+
+/// Upstream's `async_with_runtime(W)`: 1024 runtime-shaped async tasks whose
+/// bodies all panic, and every one of the 1024 handles reports it.
+///
+/// The volume is what the case is for. One such task says that an explicitly
+/// anchored free node routes its own body's panic to its handle; a thousand
+/// at once say that the slot each payload lands in is the slot that node's
+/// handle reads, which is the claim a shared slot or a lost payload would
+/// break -- and they say it while the walk in `Job::record_panic` is being
+/// run from every worker at the same time.
+fn async_with_runtime(workers: usize) {
+    let context = format!("{workers} worker(s)");
+    let executor = Executor::new(workers);
+
+    let handles: Vec<_> = (0..FAILING_FREE_TASKS)
+        .map(|_| executor.spawn_runtime(|_runtime: &mut Runtime<'_>| panic!("x")))
+        .collect();
+
+    for (task, handle) in handles.into_iter().enumerate() {
+        let error = handle.wait().expect_err("the body panicked");
+        assert_failed_with_x(&error, &format!("{context}, task {task}"));
+    }
+
+    // Upstream's "silently caught by the task".
+    executor.silent_async_runtime(|_runtime: &mut Runtime<'_>| panic!("x"));
+    executor.wait_for_all();
+}
+
+#[test]
+fn a_thousand_runtime_shaped_async_tasks_each_report_their_own_panic_1_thread() {
+    async_with_runtime(1);
+}
+
+#[test]
+fn a_thousand_runtime_shaped_async_tasks_each_report_their_own_panic_2_threads() {
+    async_with_runtime(2);
+}
+
+#[test]
+fn a_thousand_runtime_shaped_async_tasks_each_report_their_own_panic_3_threads() {
+    async_with_runtime(3);
+}
+
+#[test]
+fn a_thousand_runtime_shaped_async_tasks_each_report_their_own_panic_4_threads() {
+    async_with_runtime(4);
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: DependentAsync.Runtime
+// ----------------------------------------------------------------------------
+
+/// Upstream's `dependent_async_with_runtime(W)`: the case above over the
+/// dependent-async pair instead, which is the same node with a dependency
+/// count in front of it.
+///
+/// Upstream's own loop asserts nothing: it declares `futures` and then writes
+/// `auto [t, f] = executor.dependent_async(..)` inside the loop, so every
+/// handle is dropped where it is made and the `for(auto& fu : futures)` below
+/// iterates an empty vector. What the case *means* to check is what is
+/// checked here -- each of the 1024 handles reports the panic of its own body
+/// -- which is upstream's `Async.Runtime` assertion over the dependent form,
+/// and the one the comment above its loop describes.
+fn dependent_async_with_runtime(workers: usize) {
+    let context = format!("{workers} worker(s)");
+    let executor = Executor::new(workers);
+
+    let handles: Vec<_> = (0..FAILING_FREE_TASKS)
+        .map(|_| {
+            let (_task, handle) =
+                executor.dependent_async_runtime(|_runtime: &mut Runtime<'_>| panic!("x"), []);
+            handle
+        })
+        .collect();
+
+    for (task, handle) in handles.into_iter().enumerate() {
+        let error = handle.wait().expect_err("the body panicked");
+        assert_failed_with_x(&error, &format!("{context}, task {task}"));
+    }
+
+    // Upstream's "silently caught by the task".
+    executor.silent_dependent_async_runtime(|_runtime: &mut Runtime<'_>| panic!("x"), []);
+    executor.wait_for_all();
+}
+
+#[test]
+fn a_thousand_runtime_shaped_dependent_async_tasks_each_report_their_own_panic_1_thread() {
+    dependent_async_with_runtime(1);
+}
+
+#[test]
+fn a_thousand_runtime_shaped_dependent_async_tasks_each_report_their_own_panic_2_threads() {
+    dependent_async_with_runtime(2);
+}
+
+#[test]
+fn a_thousand_runtime_shaped_dependent_async_tasks_each_report_their_own_panic_3_threads() {
+    dependent_async_with_runtime(3);
+}
+
+#[test]
+fn a_thousand_runtime_shaped_dependent_async_tasks_each_report_their_own_panic_4_threads() {
+    dependent_async_with_runtime(4);
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: RuntimeAsync
+// ----------------------------------------------------------------------------
+
+/// Upstream's `runtime_async_task(W)` from the commented-out `RuntimeAsync`
+/// block: the three things a *graph's* runtime task sees when the work it
+/// spawned fails, which are three different answers to "who is waiting".
+///
+/// Upstream leaves the whole case commented out and does not say why; this
+/// port can run it, as it runs the commented-out half of `ModuleTask`, so it
+/// is here rather than named and skipped. The three phases are upstream's own
+/// and each changes exactly one thing:
+///
+/// - a child spawned with a **handle** delivers its panic to that handle, and
+///   nothing reaches the task that spawned it. So the run succeeds and the
+///   second task still runs;
+/// - a **silent** child's panic goes up to the first anchor, which is the
+///   runtime node itself while its body is entered, and
+///   [`Runtime::try_corun`] is what takes it. A body that takes it has
+///   handled it, so again the run succeeds;
+/// - the same silent child with the corun left **bare**: `corun` re-raises,
+///   the body unwinds, and the payload is the run's -- so the successor never
+///   runs and the flag stays at zero.
+///
+/// Two adaptations, and the second is the one that changes a line rather than
+/// its spelling:
+///
+/// - the first phase's body **waits** on its child's handle, which blocks the
+///   worker, so the case needs a worker to spare and upstream runs it at two
+///   threads and up. That sweep is kept, and it is the reason this is the one
+///   case in the file that does not start at one;
+/// - upstream's third phase sleeps a second before its bare `corun` so that
+///   the silent child has certainly failed by the time the corun looks. No
+///   sleep is needed here and none is used: the child's payload is recorded
+///   by `Job::record_panic` *before* its job releases the parent count the
+///   corun is waiting on, so a corun that has observed the counter has
+///   already observed the payload. The sleep would only make the case a
+///   second slower per worker count.
+fn runtime_async_task(workers: usize) {
+    let context = format!("{workers} worker(s)");
+    let executor = Executor::new(workers);
+    let flag = counter();
+    let mut taskflow = Taskflow::new();
+
+    // Upstream's first phase: `rt.async` twice, once cleanly and once into a
+    // panic, with the second task of the graph reporting that the run went on.
+    taskflow.emplace_runtime({
+        let context = context.clone();
+        move |runtime: &mut Runtime<'_>| {
+            let one = runtime.spawn(|| 1);
+            assert_eq!(
+                one.wait().expect("the child did not panic"),
+                1,
+                "{context}: a runtime child's result reaches its handle"
+            );
+
+            let failed = runtime.spawn(|| -> i32 { panic!("z") });
+            let error = failed.wait().expect_err("the child panicked");
+            assert_failed_with(&error, "z", &context);
+        }
+    });
+    taskflow.emplace({
+        let flag = Arc::clone(&flag);
+        move || {
+            flag.store(1, Ordering::Relaxed);
+        }
+    });
+
+    executor
+        .run(&taskflow)
+        .wait()
+        .expect("a child's panic went to its own handle, not to the run");
+    assert_eq!(
+        flag.load(Ordering::Relaxed),
+        1,
+        "{context}: the rest of the graph ran"
+    );
+
+    // Upstream's second phase: a silent child, and a corun that takes what it
+    // left behind. The body has handled the failure, so the run has none.
+    flag.store(0, Ordering::Relaxed);
+    taskflow.clear();
+    let caught = taskflow.emplace_runtime({
+        let context = context.clone();
+        let flag = Arc::clone(&flag);
+        move |runtime: &mut Runtime<'_>| {
+            runtime.silent_async(|| panic!("a"));
+            let error = runtime
+                .try_corun()
+                .expect_err("the silent child's panic landed on this node");
+            assert_failed_with(&error, "a", &context);
+            flag.store(1, Ordering::Relaxed);
+        }
+    });
+    let after_caught = taskflow.emplace({
+        let flag = Arc::clone(&flag);
+        move || {
+            flag.store(2, Ordering::Relaxed);
+        }
+    });
+    taskflow.task(caught).precede([after_caught]);
+
+    executor
+        .run(&taskflow)
+        .wait()
+        .expect("the runtime body caught its silent child's panic");
+    assert_eq!(
+        flag.load(Ordering::Relaxed),
+        2,
+        "{context}: the successor of a body that caught its child ran"
+    );
+
+    // Upstream's third phase: the same silent child with the corun bare, so
+    // the payload is re-raised and becomes the run's.
+    flag.store(0, Ordering::Relaxed);
+    taskflow.clear();
+    let uncaught = taskflow.emplace_runtime({
+        let flag = Arc::clone(&flag);
+        move |runtime: &mut Runtime<'_>| {
+            runtime.silent_async(|| panic!("a"));
+            runtime.corun();
+            // Upstream's comment says this line cannot be asserted on; here
+            // it is simply not reached, because `corun` unwinds.
+            flag.store(1, Ordering::Relaxed);
+        }
+    });
+    let after_uncaught = taskflow.emplace({
+        let flag = Arc::clone(&flag);
+        move || {
+            flag.store(2, Ordering::Relaxed);
+        }
+    });
+    taskflow.task(uncaught).precede([after_uncaught]);
+
+    let error = executor
+        .run(&taskflow)
+        .wait()
+        .expect_err("the bare corun re-raised the child's panic");
+    assert_failed_with(&error, "a", &context);
+    assert_eq!(
+        flag.load(Ordering::Relaxed),
+        0,
+        "{context}: neither the rest of the failing body nor its successor ran"
+    );
+}
+
+#[test]
+fn a_runtime_bodys_children_report_to_their_handle_their_node_or_the_run_2_threads() {
+    runtime_async_task(2);
+}
+
+#[test]
+fn a_runtime_bodys_children_report_to_their_handle_their_node_or_the_run_3_threads() {
+    runtime_async_task(3);
+}
+
+#[test]
+fn a_runtime_bodys_children_report_to_their_handle_their_node_or_the_run_4_threads() {
+    runtime_async_task(4);
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: TaskGroup.Basics
+// ----------------------------------------------------------------------------
+
+/// Upstream's `Exception.TaskGroup.Basics`: a thread that is not a worker of
+/// the executor cannot open a task group.
+///
+/// Upstream's constructor throws and the case catches anything at all;
+/// [`Executor::task_group`] returns a [`CorunError`] instead, so the
+/// assertion is which error it is. The refusal is the same refusal
+/// [`Executor::corun`] makes, and for the same reason: waiting on a group
+/// means coruning, which only a worker can do.
+#[test]
+fn only_a_worker_may_open_a_task_group() {
+    let executor = Executor::new(4);
+    let error = executor
+        .task_group()
+        .expect_err("the test thread is no worker of this executor");
+    assert!(
+        matches!(error, CorunError::NotAWorker),
+        "unexpected error: {error:?}"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: TaskGroup.Async
+// ----------------------------------------------------------------------------
+
+/// Upstream's rounds in `task_group_async_task` and `runtime_async_task`:
+/// `for(size_t r=0; r<100; r++)` and `for(size_t r=1; r<100; r++)`.
+const CORUN_ROUNDS: usize = 100;
+
+/// How many failing children each round of those two cases spawns, twice
+/// over: upstream's `for(size_t i=0; i<100; i=i+1)`.
+const FAILING_CHILDREN: usize = 100;
+
+/// Upstream's `task_group_async_task(W)`: a hundred rounds of a hundred
+/// failing children spawned into one group, each round once with handles and
+/// once silently.
+///
+/// The two halves are the group's half of the same split `RuntimeAsync` makes
+/// of a runtime node, and the rounds are what make it a statement about
+/// *reuse*:
+///
+/// - with handles, every payload is delivered to its own handle, so the group
+///   sees nothing, the corun is quiet, and all hundred children run --
+///   nothing was cancelled, which `counter == 100` is what says;
+/// - silently, the first payload to land marks the group's anchor, which is
+///   the bit the scheduler reads as cancellation, so the children that had
+///   not started are skipped. At most one child per worker can have got past
+///   its own early-out by then, which is upstream's `counter <= W`.
+///
+/// Then the group is used again, a hundred times over: taking the payload is
+/// what clears the mark, so a group that reported a failure and a fresh one
+/// have to behave identically. A port that left the mark set would fail the
+/// very next round's `counter == 100`.
+///
+/// `is_cancelled` stays false throughout, as upstream asserts, and that is
+/// not the same question: it reads the parents *above* the group's anchor,
+/// where the payload lands on the anchor itself.
+///
+/// Upstream sweeps one through eight workers and this stops at five, which
+/// the module docs argue; the `counter <= W` bound is what the sweep is for
+/// and it is asked at each of the five.
+///
+/// The whole body runs inside an [`Executor::spawn`] because only a worker
+/// may open a group at all -- upstream's own reason for writing it that way,
+/// and the case above is the other side of it.
+fn task_group_async_task(workers: usize) {
+    let context = format!("{workers} worker(s)");
+    let executor = Arc::new(Executor::new(workers));
+
+    executor
+        .spawn({
+            let executor = Arc::clone(&executor);
+            move || {
+                let group = executor
+                    .task_group()
+                    .expect("an async task runs on a worker, which may open a group");
+                let counter = counter();
+
+                for round in 0..CORUN_ROUNDS {
+                    let context = format!("{context}, round {round}");
+
+                    // Upstream's "async will propagate exceptions to future".
+                    counter.store(0, Ordering::Relaxed);
+                    let handles: Vec<AsyncHandle<()>> = (0..FAILING_CHILDREN)
+                        .map(|_| {
+                            let counter = Arc::clone(&counter);
+                            group.spawn(move || {
+                                counter.fetch_add(1, Ordering::Relaxed);
+                                panic!("x")
+                            })
+                        })
+                        .collect();
+
+                    group.try_corun().unwrap_or_else(|error| {
+                        panic!("{context}: a handled child's panic reached the group: {error:?}")
+                    });
+                    assert!(
+                        !group.is_cancelled(),
+                        "{context}: nothing above the group failed"
+                    );
+                    assert_eq!(
+                        counter.load(Ordering::Relaxed),
+                        FAILING_CHILDREN,
+                        "{context}: no child was skipped, since the group was never marked"
+                    );
+
+                    // Upstream drops the futures its `tg.async` hands back,
+                    // which is where the payloads went: each one is read
+                    // here instead, which costs nothing after the corun and
+                    // is the other half of "propagate exceptions to future".
+                    for handle in handles {
+                        let error = handle.wait().expect_err("the child panicked");
+                        assert_failed_with_x(&error, &context);
+                    }
+
+                    // Upstream's "silent async will propagate exceptions to
+                    // caller".
+                    counter.store(0, Ordering::Relaxed);
+                    for _ in 0..FAILING_CHILDREN {
+                        let counter = Arc::clone(&counter);
+                        group.silent_async(move || {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                            panic!("x")
+                        });
+                    }
+
+                    let error = group
+                        .try_corun()
+                        .expect_err("a silent child's panic landed on the group");
+                    assert_failed_with_x(&error, &context);
+                    let ran = counter.load(Ordering::Relaxed);
+                    assert!(
+                        ran <= workers,
+                        "{context}: {ran} children ran past the mark, which is more than \
+                         the {workers} that can have been in flight when it was set"
+                    );
+                    assert!(
+                        !group.is_cancelled(),
+                        "{context}: taking the payload cleared the mark"
+                    );
+                }
+            }
+        })
+        .wait()
+        .expect("no assertion inside the group's owner failed");
+}
+
+#[test]
+fn a_groups_failing_children_report_to_their_handles_or_to_the_group_1_thread() {
+    task_group_async_task(1);
+}
+
+#[test]
+fn a_groups_failing_children_report_to_their_handles_or_to_the_group_2_threads() {
+    task_group_async_task(2);
+}
+
+#[test]
+fn a_groups_failing_children_report_to_their_handles_or_to_the_group_3_threads() {
+    task_group_async_task(3);
+}
+
+#[test]
+fn a_groups_failing_children_report_to_their_handles_or_to_the_group_4_threads() {
+    task_group_async_task(4);
+}
+
+#[test]
+fn a_groups_failing_children_report_to_their_handles_or_to_the_group_5_threads() {
+    task_group_async_task(5);
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: Runtime.Async
+// ----------------------------------------------------------------------------
+
+/// Upstream's second `runtime_async_task(W)`, the one behind
+/// `Exception.Runtime.Async`: the case above with a runtime node's anchor in
+/// place of a group's.
+///
+/// Upstream writes the two cases as one body with `tg.` swapped for `rt.`,
+/// and that is the point of having both: a group's anchor is a `NodeBase` on
+/// the opening task's frame and a runtime node's is the node the body is
+/// running on, so the two reach the same walk by different routes and have to
+/// answer the same. Everything
+/// `a_groups_failing_children_report_to_their_handles_or_to_the_group` says
+/// about the two halves, the rounds and `is_cancelled` holds here unchanged.
+///
+/// Upstream's own sweep is one through eight workers; this file's is one
+/// through four, which is the sweep every other case here runs and reaches
+/// both shapes the case is about -- one worker coruning its own children, and
+/// several stealing them.
+fn runtime_async_from_a_free_node(workers: usize) {
+    let context = format!("{workers} worker(s)");
+    let executor = Executor::new(workers);
+
+    executor
+        .spawn_runtime(move |runtime: &mut Runtime<'_>| {
+            let counter = counter();
+
+            for round in 0..CORUN_ROUNDS {
+                let context = format!("{context}, round {round}");
+
+                // Upstream's "async will propagate exceptions to future".
+                counter.store(0, Ordering::Relaxed);
+                let handles: Vec<AsyncHandle<()>> = (0..FAILING_CHILDREN)
+                    .map(|_| {
+                        let counter = Arc::clone(&counter);
+                        runtime.spawn(move || {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                            panic!("x")
+                        })
+                    })
+                    .collect();
+
+                runtime.try_corun().unwrap_or_else(|error| {
+                    panic!("{context}: a handled child's panic reached this node: {error:?}")
+                });
+                assert!(
+                    !runtime.is_cancelled(),
+                    "{context}: nothing above this node failed"
+                );
+                assert_eq!(
+                    counter.load(Ordering::Relaxed),
+                    FAILING_CHILDREN,
+                    "{context}: no child was skipped, since the node was never marked"
+                );
+
+                for handle in handles {
+                    let error = handle.wait().expect_err("the child panicked");
+                    assert_failed_with_x(&error, &context);
+                }
+
+                // Upstream's "silent async will propagate exceptions to
+                // caller".
+                counter.store(0, Ordering::Relaxed);
+                for _ in 0..FAILING_CHILDREN {
+                    let counter = Arc::clone(&counter);
+                    runtime.silent_async(move || {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        panic!("x")
+                    });
+                }
+
+                let error = runtime
+                    .try_corun()
+                    .expect_err("a silent child's panic landed on this node");
+                assert_failed_with_x(&error, &context);
+                let ran = counter.load(Ordering::Relaxed);
+                assert!(
+                    ran <= workers,
+                    "{context}: {ran} children ran past the mark, which is more than the \
+                     {workers} that can have been in flight when it was set"
+                );
+                assert!(
+                    !runtime.is_cancelled(),
+                    "{context}: taking the payload cleared the mark"
+                );
+            }
+        })
+        .wait()
+        .expect("no assertion inside the runtime body failed");
+}
+
+#[test]
+fn a_runtime_nodes_failing_children_report_to_their_handles_or_to_the_node_1_thread() {
+    runtime_async_from_a_free_node(1);
+}
+
+#[test]
+fn a_runtime_nodes_failing_children_report_to_their_handles_or_to_the_node_2_threads() {
+    runtime_async_from_a_free_node(2);
+}
+
+#[test]
+fn a_runtime_nodes_failing_children_report_to_their_handles_or_to_the_node_3_threads() {
+    runtime_async_from_a_free_node(3);
+}
+
+#[test]
+fn a_runtime_nodes_failing_children_report_to_their_handles_or_to_the_node_4_threads() {
+    runtime_async_from_a_free_node(4);
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: Semaphore
+// ----------------------------------------------------------------------------
+
+/// Upstream's `semaphore1(W)`: a failing task between an `acquire` and the
+/// `release` that was going to answer it, twice over.
+///
+/// The arithmetic is the whole case and it is about what a *cancelled* run
+/// does to a count it took. `A` acquires, `B` fails, so `C` and `D` are
+/// skipped -- and `D` was the task that releases, so the count stays taken: a
+/// semaphore of one is left at zero by a run that failed, and nothing gives
+/// it back. [`Semaphore::reset`] is what does, which is why upstream resets
+/// before running the graph a second time, and why the second run reports the
+/// same failure rather than hanging on a count nobody holds.
+///
+/// Upstream sweeps one through four workers; three is where this port stops,
+/// since the chain is serial and the fourth worker changes nothing about a
+/// graph in which at most one task is ever runnable.
+fn semaphore1(workers: usize) {
+    let context = format!("{workers} worker(s)");
+    let executor = Executor::new(workers);
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut taskflow = Taskflow::new();
+
+    let a = taskflow.emplace(|| {});
+    let b = taskflow.emplace(|| panic!("exception"));
+    let c = taskflow.emplace(|| {});
+    let d = taskflow.emplace(|| {});
+    taskflow.linearize([a, b, c, d]);
+    taskflow.task(a).acquire(&semaphore);
+    taskflow.task(d).release(&semaphore);
+
+    assert_eq!(semaphore.value(), 1, "{context}: nothing has acquired yet");
+
+    // Upstream's comment: when `B` fails, `D` will not run, and so the
+    // semaphore is not released.
+    let error = executor
+        .run(&taskflow)
+        .wait()
+        .expect_err("`B` panicked, so the run failed");
+    assert_failed_with(&error, "exception", &context);
+    assert_eq!(
+        semaphore.value(),
+        0,
+        "{context}: the count `A` took was never given back"
+    );
+
+    // Upstream's "reset the semaphore to a clean state before running the
+    // taskflow again".
+    semaphore.reset();
+    assert_eq!(
+        semaphore.value(),
+        1,
+        "{context}: the reset gave the count back"
+    );
+
+    let error = executor
+        .run(&taskflow)
+        .wait()
+        .expect_err("`B` panicked again, so the second run failed too");
+    assert_failed_with(&error, "exception", &context);
+}
+
+#[test]
+fn a_failing_task_between_an_acquire_and_its_release_leaves_the_count_taken_1_thread() {
+    semaphore1(1);
+}
+
+#[test]
+fn a_failing_task_between_an_acquire_and_its_release_leaves_the_count_taken_2_threads() {
+    semaphore1(2);
+}
+
+#[test]
+fn a_failing_task_between_an_acquire_and_its_release_leaves_the_count_taken_3_threads() {
+    semaphore1(3);
 }

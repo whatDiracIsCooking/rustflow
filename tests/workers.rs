@@ -1,16 +1,21 @@
 //! Translated from `unittests/test_workers.cpp` (Taskflow v4.1.0).
 //!
 //! Upstream's two cases are `WorkerInterface.Basics`, run at one through eight
-//! workers, and `Worker.Identifier`. The first translates directly. The second
-//! does not: it runs its checks inside `executor.async(...)`, and there is no
-//! `async` -- nor any other way to put work on a worker -- until the topology
-//! lands, so the only closure this port can get onto a worker thread is the
-//! worker interface's own prologue. [`Identifier`] below is the handshake that
-//! makes that work, and it is the only part of this file that is not a
-//! translation.
+//! workers, and `Worker.Identifier`, and both translate directly -- the second
+//! as of #94, which brought the `async` forms it asks its question from.
 //!
-//! The third case is this repo's, from the issue rather than from upstream: an
-//! executor that is created and dropped in a loop must not leak a thread.
+//! Two cases are this file's own, and neither replaces anything:
+//!
+//! - [`Identifier`] asks `Worker.Identifier`'s question of a worker's
+//!   *prologue* rather than of a task body. It was written when there was no
+//!   way to put a closure on a worker at all, and it is kept because the
+//!   prologue is the one place upstream never asks: a worker that did not yet
+//!   know who it was while running its own prologue would pass the upstream
+//!   case and fail this one. The handshake is what makes it possible to ask,
+//!   since a prologue runs while the executor is still being built and so
+//!   cannot be handed it as an argument.
+//! - the last case is from the issue rather than from upstream: an executor
+//!   that is created and dropped in a loop must not leak a thread.
 
 use std::any::Any;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -244,10 +249,15 @@ impl WorkerInterface for Identifier {
     fn scheduler_epilogue(&self, _worker: &Worker, _panicked: Option<Box<dyn Any + Send>>) {}
 }
 
-/// Upstream's `Worker.Identifier`: a worker finds itself in its own executor
-/// and nowhere else, and a thread that is nobody's worker finds itself nowhere.
+/// `Worker.Identifier`'s question asked of a worker's prologue: a worker
+/// finds itself in its own executor and nowhere else, and a thread that is
+/// nobody's worker finds itself nowhere.
+///
+/// This port's own, and the module docs say why it is kept now that
+/// `a_worker_finds_itself_in_its_own_executor_and_no_other` below asks
+/// upstream's own version from a task body.
 #[test]
-fn a_worker_finds_itself_in_its_own_executor_and_no_other() {
+fn a_workers_prologue_finds_itself_in_its_own_executor_and_no_other() {
     for workers in 1..=4 {
         let other = Arc::new(Executor::new(2));
         let identifier = Arc::new(Identifier::new(Arc::clone(&other)));
@@ -297,6 +307,109 @@ fn a_worker_finds_itself_in_its_own_executor_and_no_other() {
         // The reports are all in, so nothing is holding the handle any more.
         drop(state);
         drop(executor);
+    }
+}
+
+/// How many rounds upstream's `Worker.Identifier` submits of each of its four
+/// forms: its `for(size_t i=0; i<1000; ++i)`.
+const IDENTIFIER_ROUNDS: usize = 1000;
+
+/// Upstream's four executors, each with this many workers.
+///
+/// Upstream default-constructs them, which is one pool per hardware thread
+/// four times over. Two apiece is enough for the question -- a worker of one
+/// pool is asked about all four -- and keeps the eight threads this case
+/// starts from crowding out the rest of the binary.
+const IDENTIFIER_WORKERS: usize = 2;
+
+/// Upstream's body, once per executor: the thread running it is a worker of
+/// `mine` and of none of the others.
+///
+/// Upstream writes the four checks out four times with the `!= nullptr` moved
+/// along one line each; this is that table read from `mine` instead. The
+/// counter is what reports a body whose assertions were *dropped* rather than
+/// raised -- `executor.silent_async` has nowhere to report a panic to, so the
+/// silent form of this case would otherwise pass in silence. A count short of
+/// [`IDENTIFIER_ROUNDS`] is that body having panicked, and the panic itself
+/// is on stderr.
+fn finds_itself(
+    executors: &[Arc<Executor>],
+    mine: usize,
+    ran: &Arc<AtomicUsize>,
+) -> impl Fn() + Clone + Send + 'static {
+    let executors: Vec<Arc<Executor>> = executors.to_vec();
+    let ran = Arc::clone(ran);
+    move || {
+        for (index, executor) in executors.iter().enumerate() {
+            let id = executor.this_worker_id();
+            let worker = executor.this_worker().map(Worker::id);
+            if index == mine {
+                assert!(
+                    id.is_some(),
+                    "executor {index} did not recognise its own worker"
+                );
+                assert_eq!(
+                    worker, id,
+                    "executor {index} named one worker by id and another by handle"
+                );
+            } else {
+                assert_eq!(
+                    id, None,
+                    "executor {index} recognised a worker of executor {mine}"
+                );
+                assert!(worker.is_none());
+            }
+        }
+        ran.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Upstream's `Worker.Identifier`: a worker finds itself in its own executor
+/// and nowhere else, and a thread that is nobody's worker finds itself
+/// nowhere.
+///
+/// Upstream's four forms are kept as four, one per executor -- `async`,
+/// `silent_async` and `dependent_async` twice -- because what the case is
+/// about is the executor-to-worker map rather than the submission: every one
+/// of them puts a body on a worker of its own pool, and all four have to
+/// agree about which pool that is. A thread-local "current worker" would pass
+/// the first form and fail the other three.
+///
+/// The handles are dropped as upstream drops its futures, so the two counts
+/// `wait_for_all` reads are what wait for the four thousand bodies.
+#[test]
+fn a_worker_finds_itself_in_its_own_executor_and_no_other() {
+    let executors: Vec<Arc<Executor>> = (0..4)
+        .map(|_| Arc::new(Executor::new(IDENTIFIER_WORKERS)))
+        .collect();
+    let ran: Vec<Arc<AtomicUsize>> = (0..executors.len())
+        .map(|_| Arc::new(AtomicUsize::new(0)))
+        .collect();
+
+    // The thread running this test is a worker of none of them, which is
+    // upstream's `this_worker_id() == -1` from the main thread.
+    for (index, executor) in executors.iter().enumerate() {
+        assert_eq!(executor.this_worker_id(), None, "executor {index}");
+        assert!(executor.this_worker().is_none(), "executor {index}");
+    }
+
+    for _ in 0..IDENTIFIER_ROUNDS {
+        executors[0].spawn(finds_itself(&executors, 0, &ran[0]));
+        executors[1].silent_async(finds_itself(&executors, 1, &ran[1]));
+        executors[2].dependent_async(finds_itself(&executors, 2, &ran[2]), []);
+        executors[3].dependent_async(finds_itself(&executors, 3, &ran[3]), []);
+    }
+
+    for executor in &executors {
+        executor.wait_for_all();
+    }
+
+    for (index, ran) in ran.iter().enumerate() {
+        assert_eq!(
+            ran.load(Ordering::Relaxed),
+            IDENTIFIER_ROUNDS,
+            "executor {index}: a body did not reach its end"
+        );
     }
 }
 
