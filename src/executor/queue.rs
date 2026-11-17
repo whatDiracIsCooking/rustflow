@@ -158,6 +158,32 @@ impl<T> Clone for Thief<T> {
 /// A *batch* -- [`push_bulk`](Self::push_bulk) -- is dealt round-robin instead,
 /// and hashes nothing. See that method: the hash is what #60 measured as the
 /// one reducible cost on this path.
+///
+/// # Why the count is not larger, which is #102 and is settled
+///
+/// More buffers measurably help the one path this type exists for -- 48 of them
+/// at 24 workers are worth 4 to 6% to a submission that keeps thousands of jobs
+/// in the buffers at once -- and the count is **still**
+/// `bit_width(num_workers)`, because it is not a property of that path alone.
+/// `Shared::num_queues` is workers plus buffers, and that one number is every
+/// worker's victim space
+/// (`WorkerThread::explore_task` draws over it), the spin budget before a
+/// worker gives up and parks (`max_steals`), and the length of the
+/// [`first_nonempty`](Self::first_nonempty) sweep on the sleep path. At 48
+/// buffers a 1024-task chain at 24 workers costs **26% more** and a
+/// `TaskGroup` recursion 18% more, both measured larger than their own noise.
+/// Nor is there a compromise count: at 12 buffers the chain still costs 21%,
+/// and the bulk submission gets back only a third of its win.
+///
+/// The regime that decides the sign is how deep the buffers are when a thief
+/// arrives: 65536 sources dealt round-robin leave every buffer non-empty, so
+/// extra buffers only spread the cache lines, while one source task leaves all
+/// but one empty and every extra buffer is somewhere else to look. The shapes
+/// in `BENCHMARKS.md` want opposite ends of that trade, which is why upstream's
+/// "log2(N) performs best" is kept rather than tuned: see that file's "#102
+/// decision" section for the six shapes' figures, and for what sizing the
+/// buffers *independently* of the victim space would have to look like if the
+/// win is ever wanted. The measurement says it would not be enough on its own.
 #[derive(Debug)]
 pub struct Buffers<T> {
     // Upstream gives each queue `alignas(TF_CACHELINE_SIZE)`. crossbeam already

@@ -12,9 +12,12 @@ The two shapes #96 added are the two with **no graph in them at all** --
 `silent_async` submissions and a recursive spawn -- so the construction
 asymmetry the first four have to warn about is absent from their tables, and
 they were measured in a separate run with a load of their own. Their section
-records both. The last section of this file is a third run, #119's: it is the
-A/B of one change on the scheduling path across all six shapes, and it
-supersedes the `rustflow-runtime` column of the `fibonacci` table.
+records both. The third run is #119's: it is the A/B of one change on the
+scheduling path across all six shapes, and it supersedes the
+`rustflow-runtime` column of the `fibonacci` table. The last section is a
+fourth run, #102's, on the same quiet box: an A/B of the *spill-buffer count*
+across all six shapes, which changed no shipped code and is the reason the
+count is still `bit_width(num_workers)`.
 
 ```sh
 devtools/devcontainer.sh bench                        # the whole suite
@@ -568,6 +571,11 @@ empty victims instead. Buying 10% on one shape with a slower steal loop
 everywhere needs its own issue and its own measurement of the other three
 shapes, not a line in this one.
 
+**That issue was #102, and the last section of this file is its measurement**:
+all six shapes, the shipped 5 against 12 and 48, on a quiet box. It declines
+the change as well -- though not for the reason given here, which it also
+measured and found wrong.
+
 ### 5. What it actually costs: ~100 ns a task, and more workers do not help
 
 The decisive measurement is the shape with **no task body at all** -- 65536
@@ -1022,3 +1030,270 @@ to a given depth, is the shape that measures frames per level directly -- about
 level per level of recursion now, so its own bound is thousands of levels deep
 and its task count (1.6^n) runs out of clock first. The group rows are what
 `tests/task_group.rs` and this benchmark's sizes are chosen inside.
+
+## The #102 decision: 5 spill buffers stay, and here is what 48 costs
+
+`Buffers::new` makes `bit_width(num_workers)` spill buffers -- 5 at 24 workers
+-- which is upstream's sizing and its own "log2(N) performs best". The "#60
+finding" above measured that 48 buffers are worth about 10% to
+`embarrassing_parallelism` and declined to take them, because the count is also
+every worker's victim space; #102 is where that decision was measured rather
+than argued. **The count stays at `bit_width(num_workers)`**, and this section
+is the evidence: on this box 48 buffers buy 4 to 6% on the two shapes that
+keep thousands of jobs in the buffers at once and cost 8 to 26% on two of the
+four that keep a handful there, and 12 buffers buy a third of the win for most
+of the cost.
+
+Nothing in the crate changed to measure it. The two sizings are the same
+binary under an environment override read once per `Buffers::new`, and the
+counter figures below come from a temporary instrumented build; none of that
+instrumentation is in the shipped code.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id |
+| Date | 2026-11-17 |
+| **Load average** | **1.9 to 17.8, and all of it this run's own** |
+
+**The box was quiet**, as it was for #119 and for no section before that: no
+other agent was building or testing on it, and the load figure recorded at the
+start of each of the 156 criterion processes is the decay of the previous
+process's own 24-worker ids -- it reads 1.9 to 2.3 through the two shapes whose
+ids are cheapest and climbs to 17.8 through `async_task` and `fibonacci`, which
+is this run's own 24 threads and nobody else's.
+
+### How many of a worker's victims are buffers, and can the two be sized apart
+
+Read against the code, which is what the issue asked for first:
+
+- `Shared::num_queues()` is `workers.len() + buffers.num_buffers()`, and
+  `WorkerThread::explore_task` passes exactly that to `victim_excluding`, which
+  draws `draw % (num_queues - 1)` and then skips the drawing worker's own
+  index. So at 24 workers and 29 queues a worker draws over **28 candidates, of
+  which 5 are buffers -- 17.9%**. At 12 buffers it is 12 of 35 (34.3%), and at
+  48 it is **48 of 71 (67.6%)**: two draws in three would land on a queue only
+  a non-worker submitter ever fills.
+- **The loop can tell the two apart where it steals, and cannot where it
+  draws.** `WorkerThread::steal_from` branches on `victim < num_workers` and
+  calls a different method for each kind; the draw above is one remainder over
+  the union, which is the whole reason upstream numbers its victims
+  `0..num_workers + num_buffers` in the first place, as `steal_from`'s own doc
+  records.
+- **So the two spaces could be sized apart**, and the shape it would take is
+  clear enough to write down: draw over `num_workers + 1` slots with the last
+  one meaning "the buffers", and resolve that slot through
+  `Buffers::first_nonempty`. The buffer count would then leave the draw
+  entirely.
+
+That is not taken here, and the measurement is why rather than taste. The count
+leaks out of the submission path in **three** places, not one: the draw's
+range, the spin budget `max_steals = (num_queues + 1) * 2` that decides when a
+worker stops stealing and parks, and the `first_nonempty` sweep itself, which
+is O(buffers). Separating the draw fixes one of the three. And the draw is not
+where the time goes anyway: the dilution arithmetic above predicts 2.5x more
+wasted steal attempts at 48 buffers than at 5 (71 candidates against 28 for one
+item), where the counters below measure **116x**. A fix aimed at the draw is
+therefore aimed at the wrong number, and a worker that resolved "the buffers"
+by sweeping 48 of them would pay the sweep instead. Sizing the two spaces apart
+is the better change *if the win is ever wanted*; on these figures the win is
+not worth wanting, so it stays unbuilt and this paragraph is the record of what
+it would be.
+
+### Method
+
+#60's, unchanged, which this file has twice recorded as not optional: a fixed
+order read **+61%** on an id that order-swapping read **−25%** on. A is the
+shipped `bit_width(num_workers)`, B is `2 * num_workers` buffers -- **48 at 24
+workers**, which is #60's best row, and 2 at one worker. Each id ran in its own
+criterion process, filtered to the `rustflow` ids because the `rayon`
+baselines cannot move, and the four processes of an id ran back to back in the
+order **A B B A**, so each side holds positions 1 and 4 or 2 and 3 and neither
+is systematically warmer. Every cell is a point estimate of the mean, round 1
+then round 2, and the column that decides whether a change is real is the
+**spread between the two rounds of one side** on that id.
+
+### 24 workers: 5 buffers against 48
+
+| id | 5 buffers, r1 / r2 | 48 buffers, r1 / r2 | change | widest spread in one side |
+|---|---|---|---|---|
+| `linear_chain/rustflow/1024` | 145.76 / 146.37 µs | 187.15 / 181.91 µs | **+26.3%** | 2.9% |
+| `linear_chain/rustflow/16384` | 1.942 / 1.946 ms | 1.951 / 1.905 ms | −0.8% | 2.4% |
+| `binary_tree/rustflow/4096` | 1.143 / 1.141 ms | 1.131 / 1.106 ms | −2.0% | 2.2% |
+| `binary_tree/rustflow/65536` | 14.552 / 14.542 ms | 14.493 / 14.796 ms | +0.7% | 2.1% |
+| `graph_traversal/rustflow/3476` | 456.54 / 460.60 µs | 460.30 / 456.48 µs | −0.0% | 0.9% |
+| `graph_traversal/rustflow/56759` | 5.899 / 5.866 ms | 5.942 / 5.868 ms | +0.4% | 1.3% |
+| `embarrassing/rustflow/4096` | 874.96 / 885.65 µs | 855.35 / 871.80 µs | −1.9% | 1.9% |
+| `embarrassing/rustflow/65536` | 11.949 / 11.986 ms | 11.287 / 11.115 ms | **−6.4%** | 1.5% |
+| `async_task/rustflow/4096` | 4.970 / 4.879 ms | 4.709 / 4.600 ms | −5.5% | 2.4% |
+| `async_task/rustflow/65536` | 80.945 / 85.632 ms | 73.286 / 81.793 ms | −6.9% | 11.6% |
+| `async_task/rustflow-group/4096` | 5.017 / 4.970 ms | 4.771 / 4.791 ms | **−4.3%** | 1.0% |
+| `async_task/rustflow-group/65536` | 77.300 / 75.964 ms | 73.307 / 73.331 ms | **−4.3%** | 1.8% |
+| `fibonacci/rustflow-group/12` | 1.228 / 1.295 ms | 1.367 / 1.358 ms | +8.0% | 5.4% |
+| `fibonacci/rustflow-group/15` | 2.699 / 2.791 ms | 3.314 / 3.174 ms | **+18.2%** | 4.4% |
+| `fibonacci/rustflow-runtime/12` | 932.30 / 922.44 µs | 915.09 / 914.31 µs | −1.4% | 1.1% |
+| `fibonacci/rustflow-runtime/15` | 1.466 / 1.427 ms | 1.445 / 1.425 ms | −0.8% | 2.8% |
+
+Six changes are larger than either side's own spread and are therefore results
+rather than noise: **−6.4% on `embarrassing/65536`**, −4.3% on both
+`async_task-group` ids and −5.5% on `async_task/rustflow/4096`, against
+**+26.3% on `linear_chain/1024`** and **+18.2% on `fibonacci-group/15`**
+(+8.0% at `n = 12`, where one side's spread is 5.4% and the margin is thin).
+`async_task/rustflow/65536` reads −6.9% but its own rounds disagree by 11.6%,
+so it is not resolved -- it is the same id #96 and #119 both had to flag.
+
+**The two shapes #102 predicted would pay did not pay.** `binary_tree` and
+`graph_traversal` -- the shapes that push successors onto worker queues and
+never touch a buffer -- do not move at either size, in any of their eight
+cells, and the largest figure in them (−2.0%) sits inside its own side's
+spread. The prediction in the #60 section, that a 48-of-72 victim space would
+cost the shapes that steal from worker queues, is **measured and wrong**.
+
+What pays instead is the shape with **one source task and nothing to steal**,
+and it pays per *run* rather than per task: `linear_chain/1024` costs +26.3% of
+146 µs, or about 39 µs a run, while `linear_chain/16384` -- the same scheduler,
+the same single source, 16 times the tasks -- does not move, because the same
+39 µs is 2% of 1.94 ms and this box cannot see 2%. `fibonacci-group` pays the
+same way: a group's children go into the buffers, but only a handful are
+outstanding at a time, so each one is a search of a nearly empty space.
+
+So the regime that decides the sign is **how deep the buffers are when a thief
+arrives**, not which queue the shape's successors go to. 65536 sources dealt
+round-robin leave every one of 48 buffers non-empty, so the first attempt
+succeeds whatever the count and all the extra buffers do is spread the
+producer's and the consumers' writes over more cache lines -- which is the 4 to
+6% win. One source, or 986 children of a recursion, leave 47 of 48 empty, and
+then the count is pure search cost.
+
+### One worker: 1 buffer against 2
+
+The same rule at the other end of the sweep. `bit_width(1)` is 1, so A has a
+single buffer and B has two, and at one worker *every* candidate victim is a
+buffer either way -- so these rows carry no victim dilution at all, only the
+cost or benefit of a second injector.
+
+| id | 1 buffer, r1 / r2 | 2 buffers, r1 / r2 | change | widest spread in one side |
+|---|---|---|---|---|
+| `linear_chain/rustflow/1024` | 196.76 / 132.24 µs | 130.89 / 146.79 µs | not resolved | 48.8% |
+| `linear_chain/rustflow/16384` | 1.950 / 1.943 ms | 1.944 / 1.945 ms | −0.1% | 0.4% |
+| `binary_tree/rustflow/4096` | 645.13 / 590.24 µs | 674.63 / 674.28 µs | +9.2% | 9.3% |
+| `binary_tree/rustflow/65536` | 21.423 / 9.766 ms | 9.888 / 9.777 ms | not resolved | 119.4% |
+| `graph_traversal/rustflow/3476` | 796.26 / 792.94 µs | 779.71 / 793.65 µs | −1.0% | 1.8% |
+| `graph_traversal/rustflow/56759` | 12.267 / 12.870 ms | 12.893 / 13.028 ms | +3.1% | 4.9% |
+| `embarrassing/rustflow/4096` | 2.835 / 2.792 ms | 2.699 / 2.812 ms | −2.0% | 4.2% |
+| `embarrassing/rustflow/65536` | 44.558 / 44.946 ms | 44.772 / 45.181 ms | +0.5% | 0.9% |
+| `async_task/rustflow/4096` | 1.936 / 1.885 ms | 1.947 / 1.998 ms | +3.2% | 2.7% |
+| `async_task/rustflow/65536` | 30.884 / 31.258 ms | 29.379 / 29.533 ms | **−5.2%** | 1.2% |
+| `async_task/rustflow-group/4096` | 784.06 / 776.43 µs | 803.24 / 802.65 µs | **+2.9%** | 1.0% |
+| `async_task/rustflow-group/65536` | 19.132 / 19.273 ms | 20.038 / 19.777 ms | **+3.7%** | 1.3% |
+| `fibonacci/rustflow-group/12` | 82.38 / 84.21 µs | 80.83 / 79.80 µs | −3.6% | 2.2% |
+| `fibonacci/rustflow-group/15` | 335.54 / 334.63 µs | 323.90 / 325.52 µs | **−3.1%** | 0.5% |
+| `fibonacci/rustflow-runtime/12` | 48.56 / 48.54 µs | 48.34 / 48.55 µs | −0.2% | 0.4% |
+| `fibonacci/rustflow-runtime/15` | 188.64 / 188.09 µs | 189.11 / 188.86 µs | +0.3% | 0.3% |
+
+Four of those are resolved and they disagree in sign, which is the regime split
+again and nothing else: the **externally** submitted `async_task` id gains 5.2%
+from a second buffer, because its producer is a different thread from its one
+consumer and two injectors give them a line each, while the **worker**-
+submitted `async_task-group` ids *lose* 2.9 to 3.7%, because there the producer
+and the consumer are the same thread and the second buffer only has to be
+searched. Two ids are unresolvable on this box and are left that way:
+`linear_chain/1w/1024`, which the #40 table also had to drop, and
+`binary_tree/1w/65536`, whose first process of the shape read 21.4 ms against
+9.77 ms in its other three -- a 2.2x first-touch artefact, not a sizing effect.
+`binary_tree/1w/4096`'s +9.2% is inside its own 9.3% spread.
+
+### 12 buffers: a third of the win, most of the cost
+
+The obvious compromise, measured the same way on the seven 24-worker ids that
+moved at all:
+
+| id | 5 buffers, r1 / r2 | 12 buffers, r1 / r2 | change | widest spread in one side |
+|---|---|---|---|---|
+| `linear_chain/rustflow/1024` | 137.16 / 132.71 µs | 163.99 / 163.18 µs | **+21.2%** | 3.4% |
+| `embarrassing/rustflow/4096` | 886.95 / 864.62 µs | 871.48 / 875.62 µs | −0.3% | 2.6% |
+| `embarrassing/rustflow/65536` | 12.214 / 12.264 ms | 12.014 / 11.891 ms | **−2.3%** | 1.0% |
+| `async_task/rustflow/4096` | 5.330 / 4.874 ms | 4.997 / 4.880 ms | −3.2% | 9.4% |
+| `async_task/rustflow-group/65536` | 74.550 / 77.242 ms | 74.243 / 76.023 ms | −1.0% | 3.6% |
+| `fibonacci/rustflow-group/12` | 1.204 / 1.215 ms | 1.223 / 1.244 ms | +2.0% | 1.7% |
+| `fibonacci/rustflow-group/15` | 2.607 / 2.536 ms | 2.410 / 2.406 ms | **−6.4%** | 2.8% |
+
+The 5-buffer column is this round-set's own, measured minutes after the one
+above, which is why it does not match cell for cell: as everywhere in this
+file, the comparison is within a set and never across two.
+
+`linear_chain/1024` loses 21.2% at 12 buffers against 26.3% at 48, so **nearly
+the whole cost arrives by 12**, while `embarrassing/65536` gets −2.3% of the
+−6.4% that 48 is worth. There is no count between 5 and 48 that is a free win:
+the cost comes in first. (`fibonacci-group/15` reads −6.4% here against +18.2%
+at 48, which is not monotone and is the one figure in this section with no
+mechanism offered for it; both sides' rounds are tight, so it is recorded as
+measured rather than averaged away.)
+
+### The steal loop, counted
+
+The number the #60 section said would get worse -- its 1.01 to 1.02 buffer
+attempts per job -- measured directly, with temporary counters in
+`explore_task` splitting its outcomes by the kind of queue drawn. One
+instrumented run per sizing: 100 runs of a 1024-task chain and 4 runs of a
+65536-task flat graph, both at 24 workers. The counters are atomics inside the
+steal loop, so these are counts and emphatically not timings.
+
+The chain, per run:
+
+| buffers | successful steals | empty buffer draws | empty worker-queue draws |
+|---|---|---|---|
+| 5 (shipped) | 1.00 | **0.08** | 0.58 |
+| 12 | 1.00 | 13.6 | 25.1 |
+| 48 | 1.00 | **51.5** | 25.0 |
+
+The flat graph, per job:
+
+| buffers | buffer attempts, successful + empty | empty worker-queue draws |
+|---|---|---|
+| 5 (shipped) | **1.012** | 0.057 |
+| 12 | 1.405 | 0.776 |
+| 48 | **1.082** | 0.039 |
+
+- **A chain needs exactly one steal per run** at every sizing -- the source
+  task -- because #62's continuation keeps every one of the other 1023 links
+  on the worker that readied it. So the +26.3% above buys nothing whatsoever:
+  it is the cost of *finding* that one job. The wasted draws that find nothing
+  go from 0.66 a run at 5 buffers to 38.7 at 12 and 76.5 at 48, a **116x
+  rise** where the draw's dilution predicts 2.5x (71 candidates against 28 for
+  one item). Whatever the remaining factor of 46 is, it is not the victim
+  draw's probability -- which is what stops "size the two spaces apart" from
+  being the answer to this. The likeliest explanation is one this run did not
+  measure and so does not claim: at 5 buffers the pool's 24 sticky victims can
+  cover every buffer, and past 24 they cannot, so a search that used to end on
+  the first attempt starts running for dozens.
+- **The park path is not involved.** A fourth counter on the
+  `Buffers::first_nonempty` sweep in `wait_for_task` -- the one O(buffers)
+  scan on the sleep path, and the obvious suspect -- reads 0.00 sweeps per
+  chain run at 5 buffers and 0.04 at 48: between runs a worker parks through
+  `wait_for_task`'s `num_topologies() == 0` fast path, which skips the sweep
+  entirely. A negative result worth keeping, because it is where the next
+  reader would look first.
+- **The flat graph reproduces #60 exactly and then barely moves**: 1.012
+  buffer attempts per job at the shipped count, against the 1.01 to 1.02 that
+  section reported, and 1.082 at 48. That is the other half of the regime
+  split -- with 65536 items dealt over 48 buffers the first attempt still
+  succeeds, so the count costs the search nothing and the cache-line spread is
+  free money. The 12-buffer row of that table (1.405, and 0.776 worker draws
+  against 0.039 at 48) does not fit the pattern its neighbours make on either
+  side; it comes from a single 4-run instrumented pass, and it is reported as
+  measured rather than explained.
+
+### The decision
+
+**`bit_width(num_workers)` stays**, and `src/executor/queue.rs` names this
+issue so the 10% is not rediscovered as free. Upstream's "empirically, log2(N)
+performs best" turns out to hold for this port too, for a reason upstream does
+not state and this run can: the count trades a bulk submitter's cache-line
+spread against every thief's search cost in a sparse space, and the shapes in
+this file want opposite ends of that trade. What the one shape that benefits
+would need is not more buffers: it is not to materialise 65536 jobs and hand
+each one across a core boundary, which the end of the "#60 finding" section
+argues is a milestone rather than a patch.
