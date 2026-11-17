@@ -68,6 +68,69 @@
 //! [`Executor::run`] makes with a lifetime: the borrow of `taskflow` ends when
 //! this function returns, and it cannot return until the run is over.
 //!
+//! # Why the frame waits twice
+//!
+//! "The run is over" turns out to be two questions, and the anchor answers
+//! only the first. A node that **preempts** -- a module task, a subflow task,
+//! a runtime task -- is dequeued as a job and that job is then *copied*: onto
+//! the frame still inside the dispatch arm, into the parent its nested graph
+//! is scheduled under, and once more as the job the last child of that graph
+//! re-queues to resume it. Only the third copy is ever finished, so only its
+//! share of the taskflow's storage is given up before the decrement that
+//! drives the anchor's counter to zero. The other two are dropped a few
+//! instructions later by frames that have moved on. So the anchor reaching
+//! zero says *every job of the graph has finished*; it does not say every
+//! copy of one has been dropped, and the caller's next line may be an edit of
+//! the taskflow -- which panics in
+//! [`Taskflow::graph_mut`](crate::Taskflow::graph_mut) while any share of its
+//! storage is outstanding.
+//!
+//! Issue #109 met that for a thread waiting in a run's completion slot and
+//! answered it with the hold `executor::topology` calls `Storage`: every job
+//! of the run's graph owns a share, and whoever drops the *last* one releases
+//! the storage and then the waiter, so the two are one event in one order. A
+//! corun frame cannot be released that way, because it is not waiting to be
+//! released -- it is spinning in the work-stealing loop, and there is no
+//! parked thread for a straggling copy to wake. #112 is that gap.
+//!
+//! What a frame can do instead is the one thing no holder of a share can: ask
+//! whether it holds the last one. So a corun **takes its run's hold out of
+//! the topology**, schedules the graph through it exactly as a `run`'s
+//! tear-down schedules its own, and then waits a second time -- in the same
+//! loop, on `Arc::get_mut` -- until that hold is unique. The flow share the
+//! caller is about to edit through is *inside* the hold, so uniqueness is the
+//! whole of the guarantee: no second share to be ordered against, and the
+//! frame drops the hold itself as its last act. `corun_payload` is those few
+//! lines.
+//!
+//! Three properties make the second wait sound rather than hopeful:
+//!
+//! - **It terminates.** Every holder of a share other than this frame is a
+//!   job of the graph, a copy of one, or an owner derived from one -- and a
+//!   job that has not finished still counts against the anchor, so the first
+//!   wait has already ruled out anything parked, queued or running. What is
+//!   left is copies on their way out of frames that owe nothing and wait for
+//!   nobody, which is why no job this wait is waiting for can be waiting for
+//!   it.
+//! - **It is not a busy wait that costs the pool a thread.** It is
+//!   `corun_until`, so the worker runs other people's jobs while it asks, as
+//!   it does for the first wait and for the same reason.
+//! - **It covers the nested graphs too.** A job of a module's target graph
+//!   holds a share of *that* taskflow rather than of this one, and it keeps
+//!   the hold alive through its parent chain -- the copy of the preempted
+//!   node's job -- which it gives up after its own. So a unique hold means
+//!   every graph under the corun is finished with, one level or five.
+//!
+//! The other callers of `corun_graph` need none of this, which is worth
+//! saying because it is why the fix is here rather than there.
+//! `Subflow::join` and `Runtime::corun` wait on a *node*, inside a run that
+//! somebody else is waiting on, and every job under such a node holds the
+//! hold of that enclosing run -- through its owner chain for a job of the
+//! run's own graph, through its parent chain for a job nested deeper -- so
+//! #109's ordering already covers the edit those frames lead back to. The
+//! anchor case is the one where the graph belongs to a taskflow nobody else
+//! is holding still, and the frame that returns is the one that may edit it.
+//!
 //! # Why a failure comes back here rather than from `wait`
 //!
 //! A task of the inner graph that panics does not report to the inner run.
@@ -115,7 +178,7 @@ use std::sync::Arc;
 
 use crate::executor::Executor;
 use crate::executor::run_handle::RunError;
-use crate::executor::topology::{GraphOwner, Nested, Topology};
+use crate::executor::topology::{GraphOwner, Nested, Storage, Topology};
 use crate::executor::worker::WorkerThread;
 use crate::taskflow::{Flow, Taskflow};
 
@@ -146,8 +209,9 @@ use crate::taskflow::{Flow, Taskflow};
 /// reference cannot be owned. It is any of the four kinds of graph owner
 /// `Shared::schedule_graph` takes since #74, which is what lets the two
 /// callers it has today share one implementation: [`Executor::corun`] hands
-/// over a share of a taskflow's storage, and `Subflow::join` (#50) the lease
-/// of the subgraph its own node owns.
+/// over its run's hold on a taskflow's storage -- the share it then waits to
+/// become unique, which is the module docs' second wait -- and
+/// `Subflow::join` (#50) the lease of the subgraph its own node owns.
 ///
 /// `worker` is upstream's `Worker&`: the real one when the caller is a
 /// dispatch arm inside `WorkerThread::invoke`, and a
@@ -313,6 +377,27 @@ impl InnerRun {
         &self.anchor
     }
 
+    /// This run's hold on the taskflow's storage, taken out for the frame to
+    /// own: what the graph is scheduled through, and what the frame waits to
+    /// become unique before it returns.
+    ///
+    /// The run keeps no share of its own afterwards, which is the point --
+    /// uniqueness is the question, and a share left behind a lock in the
+    /// topology would answer it `false` for ever. [`InnerRun::end`] is
+    /// unaffected: it finds no share and finishes the run itself, which is
+    /// what `Topology::release_flow` does for any hold that releases nobody.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called twice, or after [`InnerRun::end`]: a run built by
+    /// [`InnerRun::new`] holds its storage exactly once, and `corun_payload`
+    /// is the one caller.
+    fn take_hold(&self) -> Arc<Storage> {
+        self.topology
+            .take_storage()
+            .expect("a corun's run holds its storage until this frame takes it")
+    }
+
     /// Ends the run: the last touch of the graph, and then the completion
     /// slot.
     ///
@@ -325,6 +410,12 @@ impl InnerRun {
     /// releasing whoever waits, in that order, for the reason
     /// `executor::topology` gives: by the time this frame returns, its
     /// caller may edit the taskflow again.
+    ///
+    /// For a run whose graph was scheduled the share is already gone --
+    /// [`InnerRun::take_hold`] took it, and the frame dropped it once no job
+    /// held a copy -- so the first line here finds nothing and the second is
+    /// what finishes the run. A run with no graph to schedule still holds it,
+    /// and the two lines are then the tear-down's own pair.
     ///
     /// Idempotent, so that [`Drop`] can call it after the frame already has.
     fn end(&self) {
@@ -383,6 +474,16 @@ impl Executor {
     /// *same* taskflow are the caller's responsibility -- they would put two
     /// workers on one node, which [`Work::invoke`](crate::Work::invoke)
     /// reports as a panic.
+    ///
+    /// "Over" is as strong here as it is for
+    /// [`RunHandle::wait`](crate::RunHandle::wait), and that is a promise
+    /// rather than an accident: a caller that owns the taskflow it coruns may
+    /// edit it on the next line, with nothing in between. No job of the run
+    /// and no copy of one holds a share of its storage by the time this
+    /// returns, so [`Taskflow::clear`](crate::Taskflow::clear) and the
+    /// task-building API cannot find `Arc::get_mut` contested. The module
+    /// docs' "Why the frame waits twice" is what that costs and why the
+    /// anchor alone was not enough (#112).
     ///
     /// A taskflow with no source task -- an empty one, or one whose every node
     /// is in a cycle -- runs nothing and returns `Ok`. Upstream returns early
@@ -538,16 +639,38 @@ impl Executor {
             // upstream hands `_corun_graph`; `WorkerThread::corun_view` says
             // why the real one cannot be reached from a task body.
             let mut worker = WorkerThread::corun_view(Arc::clone(&self.shared), id);
+
+            // The run's own hold on the storage, taken out so that this frame
+            // owns it: the graph goes under it exactly as
+            // `Shared::set_up_topology` puts a `run`'s graph under its own,
+            // which is what gives every job of the graph -- and every copy of
+            // one -- a share of this allocation rather than a share of the
+            // taskflow nobody can count.
+            let mut hold = run.take_hold();
             payload = corun_graph(
                 &mut worker,
-                &GraphOwner::flow(taskflow.flow()),
+                &GraphOwner::run(&hold),
                 run.topology(),
                 run.anchor(),
             );
 
+            // The second wait, and issue #112: the anchor reaching zero says
+            // every job of the graph has finished, not that every copy of one
+            // has been dropped. This asks the other question, on the one
+            // allocation that can answer it and in the loop that keeps the
+            // worker useful while it does.
+            worker.corun_until(|| Arc::get_mut(&mut hold).is_some());
+
+            // Which makes this the last share of the taskflow's storage any
+            // run of it holds. The caller may edit the taskflow the instant
+            // this call returns, and the line above is what that rests on.
+            drop(hold);
+
             // The decrement every run gets, which for a corun is this frame's
             // rather than a tear-down's -- see `InnerRun::end`, which is the
-            // rest of what the tear-down would have done.
+            // rest of what the tear-down would have done. After the waits, as
+            // a tear-down accounts for a run before it releases the thread
+            // waiting on it: once this call returns, the run is accounted for.
             self.shared.decrement_topology();
         }
 
@@ -869,6 +992,53 @@ mod tests {
             .wait()
             .expect("the outer task caught it");
         assert_eq!(caught.load(Ordering::Relaxed), 1);
+    }
+
+    /// The guarantee `Executor::corun` documents, asserted on the mechanism
+    /// rather than on a race: when the call returns, the only share of the
+    /// coruned taskflow's storage left is the taskflow's own.
+    ///
+    /// A composition makes it worth asserting -- a module task is a node that
+    /// *preempts*, so its job is copied into two places no `finish` reaches,
+    /// and before #112 those copies could outlive the anchor's counter
+    /// reaching zero. `tests/corun.rs` is where the same claim is put under
+    /// contention and where the numbers for before and after are; this is the
+    /// one that says what is being counted.
+    #[test]
+    fn a_corun_leaves_no_share_of_the_taskflow_it_ran() {
+        let executor = Arc::new(Executor::new(4));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let target = Arc::new(chain(2, &counter));
+        let shares = Arc::new(AtomicUsize::new(0));
+
+        let mut driver = Taskflow::new();
+        driver.emplace({
+            let executor = Arc::clone(&executor);
+            let counter = Arc::clone(&counter);
+            let target = Arc::clone(&target);
+            let shares = Arc::clone(&shares);
+            move || {
+                let mut coruned = chain(1, &counter);
+                coruned.composed_of(Arc::clone(&target));
+
+                executor.corun(&coruned).expect("a worker may corun");
+                shares.store(Arc::strong_count(coruned.flow()), Ordering::Relaxed);
+
+                // Which is the same statement from the caller's side: the
+                // edit a `wait` is allowed, with nothing in between.
+                coruned.clear();
+                assert!(coruned.is_empty(), "the edit took");
+            }
+        });
+
+        executor.run(&driver).wait().expect("no task panicked");
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            shares.load(Ordering::Relaxed),
+            1,
+            "a corun that has returned holds nothing of the taskflow it ran"
+        );
+        executor.wait_for_all();
     }
 
     #[test]
