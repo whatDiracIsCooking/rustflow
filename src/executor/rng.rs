@@ -47,8 +47,9 @@ pub struct Xorshift32 {
 }
 
 impl Xorshift32 {
-    /// Creates a generator from `seed`, folding a zero seed to
-    /// [`ZERO_SEED_32`].
+    /// Creates a generator from `seed`, folding a zero seed to a fixed
+    /// non-zero word -- zero is a fixed point of every xorshift, so a zero
+    /// seed would give a generator that returns nothing but zero.
     #[must_use]
     pub const fn new(seed: u32) -> Self {
         Self {
@@ -94,8 +95,8 @@ pub struct Xorshift64 {
 const OUTPUT_MULTIPLIER: u64 = 0x2545_F491_4F6C_DD1D;
 
 impl Xorshift64 {
-    /// Creates a generator from `seed`, folding a zero seed to
-    /// [`ZERO_SEED_64`].
+    /// Creates a generator from `seed`, folding a zero seed to a fixed
+    /// non-zero word, for the reason [`Xorshift32::new`] gives.
     #[must_use]
     pub const fn new(seed: u64) -> Self {
         Self {

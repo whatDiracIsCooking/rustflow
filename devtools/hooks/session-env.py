@@ -52,8 +52,9 @@ def main() -> None:
             "docker/compose.yaml are host-only, so do not try to run them "
             "from in here. The gate is `cargo fmt --all --check && cargo "
             "clippy --all-targets --all-features -- -D warnings && cargo test "
-            "--all-features && cargo deny check` -- all four, the last from "
-            "the image's pinned cargo-deny."
+            "--all-features && cargo deny check && RUSTDOCFLAGS=\"-D "
+            "warnings\" cargo doc --no-deps --all-features` -- all five, "
+            "with cargo deny from the image's pinned binary."
         )
     else:
         context = (

@@ -25,20 +25,20 @@
 //!   executor sets at shutdown, and the [`Thief`] every other worker steals
 //!   through. It is `Sync`, it lives in the executor's worker array, and it is
 //!   what a [`WorkerInterface`] is handed.
-//! - [`WorkerThread`] is the part only the worker's own thread touches: the
+//! - `WorkerThread` is the part only the worker's own thread touches: the
 //!   owning end of its queue, its sticky victim and its generator. It is
 //!   created inside the spawned thread and moves nowhere, so the "only the
 //!   owner pushes or pops" rule that upstream writes in a comment is here a
 //!   property of where the value lives.
 //!
-//! That split is also why a [`WorkerThread`] does not always hold the owning
-//! end of its queue. A corun loop -- [`WorkerThread::corun_until`], the loop
-//! `Executor::corun` runs -- starts from *inside* a task body, which is inside
-//! the [`WorkerThread`] frame already running that worker's loop, and a frame
-//! cannot be named from the code it called. So a corun loop gets a second
-//! [`WorkerThread`] over the same worker, built by
-//! [`WorkerThread::corun_view`], and reaches the queue the only way a value
-//! without the owning end can: see [`LocalQueue`].
+//! That split is also why a `WorkerThread` does not always hold the owning
+//! end of its queue. A corun loop -- `WorkerThread::corun_until`, the loop
+//! `Executor::corun` runs -- starts from *inside* a task body, which is
+//! inside the `WorkerThread` frame already running that worker's loop, and a
+//! frame cannot be named from the code it called. So a corun loop gets a
+//! second `WorkerThread` over the same worker, built by
+//! `WorkerThread::corun_view`, and reaches the queue the only way a value
+//! without the owning end can: see `LocalQueue` below.
 //!
 //! The one upstream field with no equivalent is `_thread`: a `JoinHandle` is
 //! owned by whoever will join it, so the executor keeps the handles and the
@@ -52,16 +52,15 @@
 //! the one node kind that picks its own successors, and that single fact is
 //! what the strong/weak dependency split exists for. Upstream's `_invoke` has
 //! two switches over the handle because of it, and so does
-//! [`WorkerThread::invoke`]: the first runs the work and keeps what a
+//! `WorkerThread::invoke`: the first runs the work and keeps what a
 //! conditioner returned, the second decides what this node's successors are
 //! owed.
 //!
 //! - An edge out of a *non*-conditioner is a **strong** dependency. It is
-//!   counted into the successor's join counter by
-//!   [`Topology::set_up`](crate::executor::topology::Topology::set_up), and
-//!   finishing the predecessor decrements that counter; the successor becomes
-//!   ready when the count reaches zero, which is when every strong
-//!   predecessor has run.
+//!   counted into the successor's join counter by `Topology::set_up` in the
+//!   crate-private `executor::topology`, and finishing the predecessor
+//!   decrements that counter; the successor becomes ready when the count
+//!   reaches zero, which is when every strong predecessor has run.
 //! - An edge out of a conditioner is a **weak** dependency. It is not counted,
 //!   so it gates nothing. The conditioner's return value instead names
 //!   successor *positions* -- one `i32` for a condition task, any number of

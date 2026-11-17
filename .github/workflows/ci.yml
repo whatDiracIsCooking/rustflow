@@ -1,11 +1,11 @@
 # The gate, named `ci` because the `pr` skill and automerge.yml both key off
-# that exact name. Its first three steps run the same three commands as
-# `devtools/devcontainer.sh check` and the `check` service in
+# that exact name. Four of the gate's five commands are steps of this job --
+# the same four as `devtools/devcontainer.sh check` and the `check` service in
 # docker/compose.yaml, in the same container image -- so a green run here and a
-# green run on your machine mean the same thing. The gate's fourth step,
-# `cargo deny check`, is the separate `deny` job below rather than a fourth
-# step here, for the reason given there; this workflow is green only when both
-# jobs are, which is also what automerge.yml waits on.
+# green run on your machine mean the same thing. The remaining one, `cargo deny
+# check`, is the separate `deny` job below rather than a step here, for the
+# reason given there; this workflow is green only when both jobs are, which is
+# also what automerge.yml waits on.
 #
 # The toolchain pin lives in ONE place: `ARG RUST_VERSION` in the root
 # Dockerfile. The image below must be kept equal to it by hand; there is no
@@ -59,13 +59,24 @@ jobs:
       - name: Test
         run: cargo test --all-features
 
+      # Needs no tool the image does not already have, which is why this one
+      # is a step here and `cargo deny check` is a job of its own. `cargo
+      # test` builds the doc-tests, so a *broken* intra-doc link already
+      # fails above; what this adds is the rest of rustdoc's lints -- a link
+      # to a private item being the one that accumulated unseen (#57).
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps --all-features
+
       # No dependency caching yet, on purpose: this crate has zero
       # dependencies, so a cache round-trip would cost more than the build it
       # saves. Add actions/cache on ~/.cargo/registry and ./target once there
       # is a dependency tree worth restoring.
 
-  # The gate's fourth step: `cargo deny check` against deny.toml -- licenses,
-  # RustSec advisories, duplicate versions, crate sources.
+  # The one gate command that is not a step of `ci` above: `cargo deny check`
+  # against deny.toml -- licenses, RustSec advisories, duplicate versions,
+  # crate sources.
   #
   # A separate job, and NOT a step in `ci` above, because the image that job
   # runs in is the stock rust one, which has no cargo-deny. (The repo's own

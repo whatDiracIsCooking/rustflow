@@ -27,8 +27,8 @@
 //! The calling worker stays in the work-stealing loop, running the inner
 //! graph's jobs and anybody else's, until the inner run's last job has
 //! finished. The pool never loses a thread to waiting, so no amount of nesting
-//! can drain it. [`WorkerThread::corun_until`] is that loop, and it says what
-//! separates it from the worker's own.
+//! can drain it. `WorkerThread::corun_until`, in `executor::worker`, is that
+//! loop, and its comment says what separates it from the worker's own.
 //!
 //! Three consequences worth stating, because they are what a caller feels:
 //!
@@ -53,7 +53,7 @@
 //! (issue #40).
 //!
 //! `corun` has no such exposure, and not because it is more careful: the
-//! topology is owned by [`InnerRun`], a value this module creates on the corun
+//! topology is owned by `InnerRun`, a value this module creates on the corun
 //! frame and never hands out. A caller cannot hold it, so a caller cannot
 //! forget it, and the `Drop` that waits for the run is the only way the frame
 //! can be left -- including an unwind through it.
