@@ -493,3 +493,98 @@ fn cancelling_a_run_skips_the_rest_of_a_module() {
         );
     }
 }
+
+// ----------------------------------------------------------------------------
+// Testcase: editing a composition the instant its run is done
+// ----------------------------------------------------------------------------
+
+/// A composition is editable the instant `wait` returns, and stays so under
+/// contention: this port's own case, and issue #109's.
+///
+/// `tests/basics.rs`'s `a_taskflow_is_editable_the_instant_its_run_reports_done`
+/// makes the same claim over a static graph and never found this, because what
+/// breaks it is a node that *preempts*. A module node is dequeued as a job and
+/// that job is then copied -- onto the frame inside the dispatch arm, into the
+/// parent the target graph is scheduled under, and once more as the job the
+/// last child of that graph re-queues to resume the node -- and only the last
+/// of those three copies is ever spent by finishing it. The other two hold a
+/// share of the taskflow's storage for a few instructions after the resumed
+/// node has ended the run, so `wait` could return, and did, with `Arc::get_mut`
+/// on that storage still contested: a panic in the caller's next `emplace`.
+///
+/// Three things have to coincide to see it, which is why this case is shaped
+/// the way it is rather than as another round of the `module1` arithmetic:
+///
+/// - **a composition**, for the preempted node;
+/// - **`run_n` and an edit with nothing in between**, so that the last run's
+///   tear-down and the edit are the two sides of the window;
+/// - **contention**, because the window is a handful of instructions wide and
+///   the thread that has to lose the race is a worker. Several threads each
+///   running their own two-worker executor is what supplies it: the panic was
+///   first seen on CI, where this suite's seventeen cases share about two
+///   cores, and `module1_2_workers` alone never reproduced it at all.
+///
+/// Against the unfixed scheduler this failed in its first few hundred rounds
+/// on every box it was tried on; the fix is that the thread waiting on a run
+/// is released by the last share of the run's hold on the storage rather than
+/// by the tear-down, so there is no ordering left for a straggling copy to
+/// lose. A round is three runs of a three-task composition, so the whole case
+/// is a few hundredths of a second -- the same order as the cases above it,
+/// which is why it is not `#[ignore]`d either.
+#[test]
+fn a_composition_is_editable_the_instant_its_run_reports_done() {
+    /// Rounds per thread. Each is a `run_n` of three and one edit, and the
+    /// edit is the assertion.
+    const ROUNDS: usize = 400;
+    /// Threads, each with a two-worker executor and a composition of its own.
+    /// More than the cores of any box this runs on, which is the point: the
+    /// worker that has to be slow to lose the race has to be descheduled to
+    /// be that slow.
+    const THREADS: usize = 12;
+
+    let editors: Vec<thread::JoinHandle<()>> = (0..THREADS)
+        .map(|_| {
+            thread::spawn(|| {
+                let counter = counter();
+                let executor = Executor::new(2);
+                let target = chain(2, &counter);
+
+                for round in 0..ROUNDS {
+                    let mut taskflow = Taskflow::new();
+                    let own = {
+                        let counter = Arc::clone(&counter);
+                        taskflow.emplace(move || {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        })
+                    };
+                    let module = taskflow.composed_of(Arc::clone(&target));
+                    taskflow.task(own).precede([module]);
+
+                    counter.store(0, Ordering::Relaxed);
+                    executor
+                        .run_n(&taskflow, 3)
+                        .wait()
+                        .expect("no task of a composition panicked");
+                    assert_eq!(
+                        counter.load(Ordering::Relaxed),
+                        9,
+                        "round {round}: three runs of a composition counting three each"
+                    );
+
+                    // The edit, with nothing in between -- not a sleep, not a
+                    // retry. `Taskflow::graph_mut` panics here if any share of
+                    // this taskflow's storage is still outstanding.
+                    taskflow.clear();
+                    assert!(taskflow.is_empty(), "round {round}: the edit took");
+                }
+            })
+        })
+        .collect();
+
+    for editor in editors {
+        assert!(
+            editor.join().is_ok(),
+            "a run reported done while a share of its taskflow was still held"
+        );
+    }
+}

@@ -44,27 +44,62 @@
 //!
 //! # The order the shares are released in
 //!
-//! One thing is load-bearing beyond mere liveness, and it is why the shares
-//! are released where they are rather than wherever they fall out of scope.
-//! `Arc::get_mut` is what `Taskflow::graph_mut` rests on, so a share
-//! outstanding one instant too long would turn an ordinary edit of a taskflow
-//! whose run has finished into a panic. Two rules stop that, and the compiler
-//! enforces both rather than a comment, because each releases its share by
-//! *consuming* the value that holds it:
+//! One thing is load-bearing beyond mere liveness. `Arc::get_mut` is what
+//! `Taskflow::graph_mut` rests on, so a share outstanding one instant too
+//! long would turn an ordinary edit of a taskflow whose run has finished into
+//! a panic -- and the thing a caller does the instant a `wait` returns is
+//! edit the taskflow.
+//!
+//! The rule that answers it is about the *last* share rather than about any
+//! particular holder: **the thread waiting on a run is released by whoever
+//! drops the last share of that run's hold on the storage.** That hold is
+//! [`Storage`], every job of the run's own graph owns a share of it, and its
+//! [`Drop`] releases the storage and then the waiter -- so "the storage is
+//! free" and "the waiter is awake" are one event in one order instead of two
+//! events a worker has to be trusted to keep in it. The tear-down's last act
+//! is accordingly to drop the run's own share, not to release the waiter
+//! itself: [`Topology::release_flow`].
+//!
+//! Two rules used to say it instead, and issue #109 is where the pair turned
+//! out not to add up to the guarantee:
 //!
 //! - a job releases its share of the storage before it decrements the join
-//!   counter that may end the run -- [`Job::finish`];
-//! - the tear-down releases the run's own share before [`Topology::finish`]
-//!   releases the waiting thread -- [`Topology::release_flow`].
+//!   counter that may end the run -- [`Job::finish`], which is still how it is
+//!   done and still enforced by *consuming* the job rather than by a comment;
+//! - the tear-down released the run's own share before releasing the waiting
+//!   thread, which it still does and which is still not enough.
 //!
-//! So by the time a `wait` returns, the taskflow's own share is the only one
-//! left and the graph can be edited again at once. That is also why
-//! `Topology::finish` is still the last thing the worker that ends a run does:
-//! what a touch after it would cost is no longer a use-after-free, but it is
-//! still a panic in somebody's `emplace`.
+//! What the first rule does not cover is a share that no finishing job holds.
+//! A node that **preempts** -- a module task, a subflow task, a runtime task
+//! -- is dequeued as a job, and that job is then *copied*: once onto the frame
+//! that is still inside the dispatch arm, once into the [`Nested`] its nested
+//! graph is scheduled under, and once more as the job the last child of that
+//! graph re-queues to resume the node. Only the third copy is ever `finish`ed.
+//! The other two are dropped a few instructions later by frames that have
+//! moved on, and nothing orders those few instructions against the resumed
+//! node finishing the run -- so a `wait` could return, and on CI did, with a
+//! copy of a preempted node's job still holding the storage and the caller's
+//! next `emplace` panicking.
+//!
+//! Eliminating the copies instead is not available, and the reason is this
+//! module's own ownership shape rather than anything about preemption. The
+//! join counter a child of a nested graph decrements lives in the parent
+//! *node*, which is in a graph the copy in `Nested` is what keeps alive, so a
+//! child cannot give that copy up before the decrement that may end the run:
+//! it would be decrementing a counter in freed memory. The copy on the
+//! preempting frame has no decrement to be ordered against at all -- it is
+//! dropped when the dispatch arm returns, and the run can end while it is
+//! still on the way out. Both shares therefore have to outlive the decrement,
+//! and what has to move is the release of the waiter.
+//!
+//! One consequence is worth naming: the thread that releases a waiter is no
+//! longer always the one that tore the run down. It is whichever thread drops
+//! the last share, which is the tear-down in the ordinary case and a worker
+//! still unwinding a preemption in the case above. Nothing on either path
+//! touches the run after that drop.
 //!
 //! One share is deliberately held *across* a tear-down, and it is worth
-//! saying why that does not contradict the first rule. Since #62 a worker
+//! saying why that does not contradict the job rule either. Since #62 a worker
 //! keeps one ready successor out of its queue to run next -- upstream's
 //! `_update_cache`, the continuation loop in `WorkerThread::invoke` -- so a
 //! job of the graph exists, holding a share of the storage, while the job
@@ -166,7 +201,7 @@
 //!   So [`Job::is_parent_cancelled`] reads `false` for a free node with no
 //!   parent, and reads the chain above it when there is one. A task group
 //!   cancels its children through exactly that chain.
-//! - **It holds no taskflow.** Its `flow` slot is `None`, so sharing it
+//! - **It holds no taskflow.** Its storage slot is `None`, so sharing it
 //!   keeps nothing alive but itself: one allocation for the whole process,
 //!   which is what keeps an async task at upstream's one allocation per task
 //!   beyond its body.
@@ -267,18 +302,21 @@
 //! `Nested` is also what lets a finished child resume a preempted parent: the
 //! job to re-queue is the one the parent was dequeued as.
 //!
-//! A job of a nested graph does keep a share of the taskflow's storage alive
-//! through its parent chain, which the rule above would seem to forbid. It
-//! does not: what that rule protects is the *last* decrement of a run, the one
-//! that releases a thread free to edit the taskflow, and that decrement is
-//! always the topology's -- a nested parent reaching zero resumes a node of a
-//! run that is still in flight. The chain is released by the tear-down of the
-//! job at the root of it, which is where the rule applies and holds.
+//! A job of a nested graph keeps a share of the taskflow's storage alive
+//! through its parent chain, and *that* is the share the ordering section is
+//! about: it is released when the child's own `Parent` is dropped, which is
+//! after the decrement that may have ended the run rather than before it.
+//! The job rule cannot reach it, for the reason that section gives -- the
+//! counter the child decrements is inside what the chain keeps alive -- so
+//! nothing about the chain is ordered against a `wait` returning. What makes
+//! that harmless is that the waiter is released by the last share of
+//! [`Storage`], and every link of a parent chain holds one: the chain is
+//! therefore not a hole in the guarantee but one of the holders of it.
 
 use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::task::{Poll, Waker};
 
 use crate::executor::async_node::AsyncNode;
@@ -337,20 +375,30 @@ pub(crate) struct Job {
 /// Which graph a [`Job`]'s [`Task`] indexes, and what keeps that graph alive:
 /// upstream's `Graph&`, as a choice of owner rather than a reference.
 ///
-/// Three variants for the five kinds of graph the scheduler can run, because
+/// Four variants for the five kinds of graph the scheduler can run, because
 /// what differs between the five is only who owns them, and on that question
-/// the first four pair up. The module docs have the argument in full,
-/// including why the subflow's is the one that cannot be read where it lies
-/// and why a free async node's arena is nobody's but its own.
+/// the two nested-in-a-node kinds pair up. The module docs have the argument
+/// in full, including why the subflow's is the one that cannot be read where
+/// it lies and why a free async node's arena is nobody's but its own.
+///
+/// The run's own graph has a variant to itself even though a module's target
+/// is a taskflow's storage too, and the ordering section of the module docs
+/// is the whole of why: the shares of *that* graph are the ones a waiting
+/// thread is released by.
 ///
 /// `Clone` because every job of a graph holds an owner of its own, so
 /// scheduling a graph of `n` sources clones this `n` times: one atomic
 /// increment each, whichever variant it is.
 #[derive(Clone)]
 pub(crate) enum GraphOwner {
-    /// A taskflow's storage, which is two of the five kinds: the graph of the
-    /// run itself, and the target of a module task composed of an
-    /// `Arc<Taskflow>`.
+    /// The graph of the run itself, held through the run's [`Storage`] hold
+    /// on the taskflow's storage rather than through a bare share of it --
+    /// which is what makes the last of these shares to go the thing that
+    /// releases the thread waiting on the run (#109).
+    Run(Arc<Storage>),
+    /// A taskflow's storage reached without such a hold, which is the target
+    /// of a module task composed of an `Arc<Taskflow>` and the graph of a
+    /// [`corun`](crate::Executor::corun).
     Flow(Arc<Flow>),
     /// A graph that one node of another graph owns, which is the next two:
     /// an adopted module's graph, and a subflow's subgraph.
@@ -364,6 +412,42 @@ pub(crate) enum GraphOwner {
     /// last [`AsyncTask`](crate::AsyncTask) handle on a task that has not run
     /// yet does not take the node out from under the worker.
     Async(Arc<AsyncNode>),
+}
+
+/// A run's hold on the storage of the taskflow it is a run of: the share
+/// every job of that run's own graph owns, and -- when the last of those
+/// shares goes -- what releases the thread waiting on the run.
+///
+/// Upstream has nothing here, for the same reason it has no [`GraphOwner`]:
+/// its `Topology` holds a `Taskflow&`, its queued nodes hold nothing at all,
+/// and so there is no last share to be the last of. Here there is, and the
+/// ordering section of the module docs is why the waiter hangs off it rather
+/// than off the tear-down: a job copied out of a node that *preempted* cannot
+/// be made to give its share up before the decrement that ends the run, so
+/// the run is made to end after the share instead (#109).
+///
+/// One allocation per run, handed out by [`Topology::storage`] and cloned by
+/// every job that run's graph is scheduled as -- so a job's hold on the graph
+/// it walks still costs the one `Arc` it cost when this was a bare
+/// `Arc<Flow>` (#40), with one pointer hop more to resolve it.
+pub(crate) struct Storage {
+    /// The storage itself: the graph and the queue of runs of it.
+    ///
+    /// An `Option` for the length of this type's [`Drop`] and no longer. The
+    /// share has to be released *before* the waiter, and drop glue -- which
+    /// runs after `Drop::drop` -- would get the two the wrong way round.
+    flow: Option<Arc<Flow>>,
+    /// The run whose waiter the last share of this hold releases, or an empty
+    /// [`Weak`] for a hold that releases nobody.
+    ///
+    /// `Weak` rather than a share because the topology holds one of *these*
+    /// until its tear-down: a share back would be a cycle, and the only thing
+    /// that would break it is a run completing -- which a run abandoned by a
+    /// leaked handle never does. Nothing is lost by it, since every job that
+    /// holds this holds an `Arc<Topology>` beside it and the thread being
+    /// released holds one too: the upgrade can only fail for a run nobody can
+    /// still be waiting on.
+    run: Weak<Topology>,
 }
 
 /// A graph owned by one node of another graph, named by that node.
@@ -557,11 +641,20 @@ impl Nested {
 }
 
 impl GraphOwner {
-    /// The graph of a taskflow's storage: a run's own graph, or a module
-    /// task's target.
+    /// The graph of the run itself, held through that run's hold on the
+    /// taskflow's storage.
     ///
-    /// A share rather than the `&Arc<Flow>` the caller has, because every
+    /// A share rather than the `&Arc<Storage>` the caller has, because every
     /// job built over it keeps one and the caller's own goes out of scope.
+    pub(crate) fn run(storage: &Arc<Storage>) -> Self {
+        Self::Run(Arc::clone(storage))
+    }
+
+    /// The graph of a taskflow's storage reached without a run's hold on it: a
+    /// module task's target, or a corun's graph.
+    ///
+    /// A share rather than the `&Arc<Flow>` the caller has, for the reason
+    /// [`GraphOwner::run`] gives.
     pub(crate) fn flow(flow: &Arc<Flow>) -> Self {
         Self::Flow(Arc::clone(flow))
     }
@@ -586,6 +679,7 @@ impl GraphOwner {
     /// whose panic is the same one for the same reason.
     pub(crate) fn graph(&self) -> &Graph {
         match self {
+            Self::Run(storage) => storage.graph(),
             Self::Flow(flow) => flow.graph(),
             Self::Inside(inside) => inside.graph(),
             Self::Async(node) => node.graph(),
@@ -618,11 +712,12 @@ impl GraphOwner {
     /// be ruled out and what it costs.
     ///
     /// Also `None` for an owner that is not a lease at all, which no caller
-    /// has reason to ask about: a taskflow's storage, an adopted module's
-    /// graph and an async task's own arena are read where they lie.
+    /// has reason to ask about: a taskflow's storage -- held with a run's hold
+    /// on it or without -- an adopted module's graph and an async task's own
+    /// arena are all read where they lie.
     pub(crate) fn take_lease(self) -> Option<Graph> {
         match self {
-            Self::Flow(_) | Self::Async(_) => None,
+            Self::Run(_) | Self::Flow(_) | Self::Async(_) => None,
             // Taking the field rather than moving it out, because `Inside`
             // implements `Drop` -- and leaving `None` behind is exactly what
             // keeps that `Drop` from returning the graph a second time.
@@ -647,9 +742,94 @@ impl GraphOwner {
     /// path walk is not what a hash is for.
     fn identity(&self) -> *const () {
         match self {
+            Self::Run(storage) => Arc::as_ptr(storage).cast(),
             Self::Flow(flow) => Arc::as_ptr(flow).cast(),
             Self::Inside(inside) => Arc::as_ptr(inside).cast(),
             Self::Async(node) => Arc::as_ptr(node).cast(),
+        }
+    }
+}
+
+impl Storage {
+    /// A hold on `flow` whose last share releases `run`'s waiter: what
+    /// [`Topology::for_run`] gives a run somebody is waiting on.
+    fn gating(flow: Arc<Flow>, run: &Weak<Topology>) -> Arc<Self> {
+        Arc::new(Self {
+            flow: Some(flow),
+            run: run.clone(),
+        })
+    }
+
+    /// A hold on `flow` that releases nobody: what a topology built by
+    /// [`Topology::new`] gets.
+    ///
+    /// Two kinds of run reach that constructor, and neither is waited for
+    /// through the completion slot this would release. A
+    /// [`corun`](crate::Executor::corun) is waited for by the frame that
+    /// started it, watching the anchor its graph is scheduled under; and the
+    /// topologies this crate's own tests build by hand are driven step by step
+    /// rather than run. Both end through [`Topology::release_flow`], which
+    /// releases the waiter itself for a hold that cannot.
+    fn ungated(flow: Arc<Flow>) -> Arc<Self> {
+        Arc::new(Self {
+            flow: Some(flow),
+            run: Weak::new(),
+        })
+    }
+
+    /// The storage this is a hold on.
+    ///
+    /// # Panics
+    ///
+    /// Panics once [`Drop`] has released it, which is a state no caller can
+    /// observe: the only `None` is the one the destructor leaves behind.
+    pub(crate) fn flow(&self) -> &Arc<Flow> {
+        self.flow
+            .as_ref()
+            .expect("a run's hold on its storage is released only as it is dropped")
+    }
+
+    /// The graph, which is what the jobs holding this resolve their task
+    /// index in.
+    fn graph(&self) -> &Graph {
+        self.flow().graph()
+    }
+
+    /// Whether dropping the last share of this hold is what releases the
+    /// thread waiting on the run.
+    ///
+    /// `false` for an [`ungated`](Storage::ungated) hold, whose `run` is an
+    /// empty [`Weak`] and whose strong count is therefore zero. Asked by
+    /// [`Topology::release_flow`], which is called on a live topology, so a
+    /// gating hold cannot answer `false` by having outlived its run.
+    fn gates_completion(&self) -> bool {
+        self.run.strong_count() != 0
+    }
+}
+
+impl Drop for Storage {
+    /// Releases the storage and then the thread waiting on the run, in that
+    /// order, which is the whole of the guarantee
+    /// [`Taskflow::graph_mut`](crate::Taskflow::graph_mut) makes.
+    ///
+    /// This runs when the last share of the hold goes, and which thread that
+    /// is depends on how the run ended: the tear-down's own
+    /// [`Topology::release_flow`] is the common case, and a worker still
+    /// dropping a copy of a preempted node's job is the case issue #109 was.
+    /// Either way the waiter is released after the last share rather than
+    /// before it, so a caller whose `wait` has returned finds `Arc::get_mut`
+    /// on its taskflow's storage uncontested. The module docs' ordering
+    /// section has why those copies cannot be ordered instead.
+    ///
+    /// `Drop for Inside` is the same shape one level in -- the last share of a
+    /// subflow's lease is what sends the subgraph home -- and rests on the
+    /// same observation: no holder of a share can prove it is the last.
+    fn drop(&mut self) {
+        drop(self.flow.take());
+
+        // `None` only for a run nobody can be waiting on: see the field.
+        if let Some(run) = self.run.upgrade() {
+            run.finish();
         }
     }
 }
@@ -1085,18 +1265,25 @@ impl Job {
     ///
     /// The job's own share of whatever owns its graph is released here, and
     /// *here* is the point: the caller's next move is to decrement the join
-    /// counter that may end the run, and a share still outstanding when the
-    /// waiting thread is released would be a share outstanding when that
-    /// thread edits its taskflow. Consuming the job is what makes the compiler
-    /// enforce it -- the node and the graph a worker was holding are borrows
-    /// of this value, so nothing can touch them afterwards. See the module
-    /// docs, which also say why the share a nested job keeps through its
-    /// parent chain is not the same question.
+    /// counter that may end the run, so this keeps the window a share is
+    /// outstanding for as narrow as it can be -- one job, from the moment it
+    /// is counted to the moment it is spent. Consuming the job is what makes
+    /// the compiler enforce it: the node and the graph a worker was holding
+    /// are borrows of this value, so nothing can touch them afterwards.
+    ///
+    /// What it is *not* is the whole of the editable-taskflow guarantee, and
+    /// the module docs' ordering section says why: a preempted node's job is
+    /// copied into places no `finish` reaches, so the waiter is released by
+    /// the last share of the run's [`Storage`] hold rather than by the
+    /// counter this decrement drives. Narrowing the window is still worth
+    /// doing -- a share is a share, and this is the hot path that holds most
+    /// of them.
     ///
     /// For a job of a nested graph the owner released here is the path or the
     /// lease rather than a share of the taskflow -- and that is the same rule
     /// one level in: the last job of a subgraph gives the lease up before the
-    /// counter that resumes the node the subgraph came out of.
+    /// counter that resumes the node the subgraph came out of. The share it
+    /// keeps through its [`Parent`] goes later, which the module docs cover.
     pub(crate) fn finish(self) -> Finished {
         let Self {
             task: _,
@@ -1367,8 +1554,8 @@ pub(crate) struct Topology {
     /// topology; the extra allocation is what lets a token outlive the run
     /// handle's borrow. See [`Cancellable`].
     estate: Arc<Cancellable>,
-    /// This run's share of the taskflow's storage, until the tear-down takes
-    /// it back out.
+    /// This run's share of its hold on the taskflow's storage, until the
+    /// tear-down takes it back out.
     ///
     /// Upstream's `Topology::_taskflow`, which is a `Taskflow&` -- a reference
     /// that the taskflow outliving its runs is what keeps valid. A share
@@ -1377,14 +1564,21 @@ pub(crate) struct Topology {
     /// particular moment rather than whenever the topology happens to be
     /// dropped: see [`Topology::release_flow`] and the module docs.
     ///
+    /// A [`Storage`] rather than the `Arc<Flow>` it was before #109, because
+    /// the share released here is the one the *waiter* hangs off: this is the
+    /// share whose drop is usually the last, and `Storage`'s own `Drop` is
+    /// what releases the thread waiting on the run when it is.
+    ///
     /// `None` means there is no graph to run, which is a run that was over
     /// before it was handed out -- [`Topology::nothing_to_run`]. Those are
     /// never set up, never queued and never torn down, so nothing ever asks
     /// them for a graph.
     ///
     /// The lock is never held while either of the other two is, and never
-    /// across anything but a clone or a drop of the share.
-    flow: Mutex<Option<Arc<Flow>>>,
+    /// across anything but a clone or a take of the share -- never across the
+    /// *drop* of one, which would run a destructor that takes the completion
+    /// lock with this one held.
+    storage: Mutex<Option<Arc<Storage>>>,
 }
 
 /// Upstream's `Topology::_predicate` and `_on_finish`, which is what makes a
@@ -1437,19 +1631,44 @@ impl Topology {
     /// run the graph again, and `on_finish` is called once the answer is no.
     ///
     /// Upstream's `Topology(Taskflow&, P&&, C&&)`, whose `Taskflow&` this
-    /// share of the taskflow's storage is: upstream can hold a reference
+    /// hold on the taskflow's storage is: upstream can hold a reference
     /// because its rule says the taskflow outlives its runs, and this port
     /// holds a share because it does not take the caller's word for that. The
     /// methods that walk the graph still take it as a parameter all the same,
     /// since every caller of them has it in hand already; what this share is
     /// for is the tear-down, which is reached from a job that has given its
     /// own share up. See the module docs.
+    ///
+    /// The hold this builds releases no waiter -- [`Storage::ungated`] has
+    /// which runs want that and why it is the safe default. A run a caller
+    /// gets a [`RunHandle`](crate::RunHandle) on goes through
+    /// [`Topology::for_run`] instead.
     pub(crate) fn new<P, C>(predicate: P, on_finish: C, flow: Arc<Flow>) -> Self
     where
         P: FnMut() -> bool + Send + 'static,
         C: FnOnce() + Send + 'static,
     {
-        Self::over(predicate, on_finish, Some(flow))
+        Self::over(predicate, on_finish, Some(Storage::ungated(flow)))
+    }
+
+    /// The same run, for a caller that will hand a
+    /// [`RunHandle`](crate::RunHandle) on it out: its hold on the storage
+    /// names the run back, so that the last share of that hold is what
+    /// releases whoever waits.
+    ///
+    /// Upstream has one constructor because it has nothing to name back --
+    /// the `shared_ptr<Topology>` its `_fetch_enqueue` makes is the run's only
+    /// owner and its `Topology` holds a `Taskflow&`. The naming back is
+    /// #109's, and `Arc::new_cyclic` is what lets the hold be built with the
+    /// run's own `Weak` in it rather than installed afterwards. The ordering
+    /// section of the module docs says what it buys; [`Storage::ungated`] says
+    /// which runs do without it and why that is not a trap.
+    pub(crate) fn for_run<P, C>(predicate: P, on_finish: C, flow: Arc<Flow>) -> Arc<Self>
+    where
+        P: FnMut() -> bool + Send + 'static,
+        C: FnOnce() + Send + 'static,
+    {
+        Arc::new_cyclic(|run| Self::over(predicate, on_finish, Some(Storage::gating(flow, run))))
     }
 
     /// The one run every free-standing async node claims to be part of: a
@@ -1524,7 +1743,7 @@ impl Topology {
     }
 
     /// The one constructor, over a run that may or may not have a graph.
-    fn over<P, C>(predicate: P, on_finish: C, flow: Option<Arc<Flow>>) -> Self
+    fn over<P, C>(predicate: P, on_finish: C, storage: Option<Arc<Storage>>) -> Self
     where
         P: FnMut() -> bool + Send + 'static,
         C: FnOnce() + Send + 'static,
@@ -1542,40 +1761,63 @@ impl Topology {
             }),
             finished: Condvar::new(),
             estate: Arc::new(Cancellable::new()),
-            flow: Mutex::new(flow),
+            storage: Mutex::new(storage),
         }
     }
 
-    /// This run's share of the taskflow's storage, or `None` once the
-    /// tear-down has released it.
+    /// This run's share of its hold on the taskflow's storage, or `None` once
+    /// the tear-down has released it.
     ///
-    /// The tear-down is the only caller, and the share it hands back is what
-    /// it reaches the graph and the run queue through -- the job that got it
-    /// there having released its own, for the reason [`Job::finish`] gives.
-    pub(crate) fn flow(&self) -> Option<Arc<Flow>> {
-        self.lock_flow().clone()
+    /// What the tear-down reaches the graph and the run queue through -- the
+    /// job that got it there having released its own share, for the reason
+    /// [`Job::finish`] gives -- and what [`Shared::set_up_topology`] schedules
+    /// the graph under, so that every job of the run holds a share of the same
+    /// hold.
+    ///
+    /// [`Shared::set_up_topology`]: crate::executor::Shared::set_up_topology
+    pub(crate) fn storage(&self) -> Option<Arc<Storage>> {
+        self.lock_storage().clone()
     }
 
-    /// Releases this run's share of the taskflow's storage.
+    /// Releases this run's share of its hold on the taskflow's storage, and
+    /// with it the thread waiting on the run.
     ///
-    /// Called by the tear-down of the *final* run of a graph, immediately
-    /// before [`Topology::finish`] and after the last thing that needed the
-    /// graph. That order is what leaves the taskflow's own share the only one
-    /// outstanding when the waiting thread wakes, so that a caller whose
-    /// `wait` has returned can edit the taskflow again at once. See the module
-    /// docs.
+    /// Called by the tear-down of the *final* run of a graph, as its last act
+    /// and after everything that needed the graph. It is one act rather than
+    /// two since #109: the share goes, and if it was the last share of the
+    /// hold then [`Drop for Storage`](Storage) releases the waiter on the spot
+    /// -- and if it was not, the worker still holding a copy of a preempted
+    /// node's job releases the waiter when it drops that copy, a few
+    /// instructions later. Either way the waiter wakes to a storage no run
+    /// holds a share of, which is what [`Taskflow::graph_mut`] needs of it.
     ///
-    /// Idempotent, because a run that went round again releases nothing and a
-    /// run that is over has nothing left to release.
+    /// [`Topology::finish`] is called here directly for a hold that names no
+    /// run to release -- [`Storage::ungated`] -- which is also what makes this
+    /// idempotent: a second call finds no share, releases the waiter again,
+    /// and a waiter already released stays released.
+    ///
+    /// [`Taskflow::graph_mut`]: crate::Taskflow::graph_mut
     pub(crate) fn release_flow(&self) {
-        drop(self.lock_flow().take());
+        // Taken out from under the lock and dropped outside it: the drop runs
+        // a destructor that takes this topology's completion lock, and the
+        // two are never held at once.
+        let released = self.lock_storage().take();
+
+        let releases_the_waiter = released
+            .as_ref()
+            .is_some_and(|storage| storage.gates_completion());
+        drop(released);
+
+        if !releases_the_waiter {
+            self.finish();
+        }
     }
 
     /// The share slot. Poisoning is taken rather than propagated, as the rest
     /// of this type's locks are: the slot holds one `Option` and nothing under
     /// the lock can panic.
-    fn lock_flow(&self) -> MutexGuard<'_, Option<Arc<Flow>>> {
-        self.flow.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock_storage(&self) -> MutexGuard<'_, Option<Arc<Storage>>> {
+        self.storage.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Whether this run has been cancelled: upstream's `Topology::cancelled`.
@@ -1739,9 +1981,13 @@ impl Topology {
     /// again the moment it wakes, so a touch of the graph after this point
     /// would be a share of the storage outstanding during that edit -- which
     /// is a panic in the caller's `emplace` rather than anything a worker
-    /// would notice. [`Topology::release_flow`], called immediately before
-    /// this, is what makes the rule keepable; the module docs have the order
-    /// in full.
+    /// would notice. What makes the rule keepable is that the ordinary way
+    /// here is through `Drop for Storage`, which releases the storage on its
+    /// way to this call: [`Topology::release_flow`] is what starts that, and
+    /// the module docs have the order in full. The two callers that reach
+    /// this directly are a run whose hold releases nobody --
+    /// [`Storage::ungated`] -- and [`Topology::nothing_to_run`], which has no
+    /// storage and no run.
     ///
     /// The notification is sent *under* the lock rather than after it: a
     /// waiter cannot return from [`Condvar::wait`](std::sync::Condvar::wait)
@@ -2415,6 +2661,72 @@ mod tests {
         // Taken, not cloned, exactly as `join` takes it.
         assert!(matches!(topology.poll_join(&waker), Poll::Ready(None)));
         assert_eq!(woken.load(Ordering::Relaxed), 1, "no second wake");
+    }
+
+    /// The ordering issue #109 was about, as the two lines that make it: a
+    /// share of a run's hold on the storage outstanding when the tear-down
+    /// has done everything else keeps the waiter blocked, and dropping that
+    /// share is what releases it.
+    ///
+    /// The straggler here stands in for a copy of a preempted node's job,
+    /// which is what holds one in the scheduler -- see the module docs' order
+    /// section -- and the assertion is the one `Taskflow::graph_mut` makes a
+    /// line later: when the waiter wakes, the taskflow's own share is the
+    /// only one left.
+    #[test]
+    fn the_waiter_is_released_by_the_last_share_of_the_hold_on_the_storage() {
+        let woken = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountingWaker(Arc::clone(&woken))));
+
+        let mut taskflow = Taskflow::new();
+        taskflow.emplace(|| {});
+        let taskflow = taskflow;
+        let topology = Topology::for_run(|| true, || {}, Arc::clone(taskflow.flow()));
+        let straggler = topology
+            .storage()
+            .expect("a run that has not been torn down holds its own share");
+
+        assert!(topology.poll_join(&waker).is_pending());
+
+        // The whole of the tear-down's last act, with the straggler still
+        // holding a share: nothing is released, because the storage is not
+        // free yet.
+        topology.release_flow();
+        assert!(
+            topology.poll_join(&waker).is_pending(),
+            "a run whose storage is still held is not over"
+        );
+        assert_eq!(woken.load(Ordering::Relaxed), 0);
+
+        drop(straggler);
+        assert!(
+            topology.poll_join(&waker).is_ready(),
+            "the last share of the hold releases the waiter"
+        );
+        assert_eq!(woken.load(Ordering::Relaxed), 1, "the waker was not woken");
+        assert_eq!(
+            Arc::strong_count(taskflow.flow()),
+            1,
+            "the taskflow's own share is the only one left, which is what \
+             `Taskflow::graph_mut` asks `Arc::get_mut`"
+        );
+    }
+
+    /// A hold that names no run releases nobody, so the tear-down of such a
+    /// run releases the waiter itself: a corun's topology, and every
+    /// topology these tests build by hand, is one of those.
+    #[test]
+    fn a_run_whose_hold_names_no_waiter_is_finished_by_releasing_the_storage() {
+        let taskflow = Taskflow::new();
+        let topology = Topology::new(|| true, || {}, Arc::clone(taskflow.flow()));
+        let straggler = topology.storage().expect("built with a hold");
+
+        topology.release_flow();
+        assert!(
+            topology.join().is_none(),
+            "an ungated hold is released by `release_flow` rather than by its own drop"
+        );
+        drop(straggler);
     }
 
     /// A waker that counts, in place of a runtime.
