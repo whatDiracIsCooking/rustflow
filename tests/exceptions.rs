@@ -10,7 +10,7 @@
 //! The rest of that file is deferred rather than half-ported, because every
 //! one of its remaining cases needs a node kind this port does not run yet:
 //! the subflow family (`SubflowTask`, `JoinedSubflow1..3`, `NestedSubflow`,
-//! `NestedSubflow2`), the `Runtime`, `RuntimeCorun1..2` and `ModuleTask`
+//! `NestedSubflow2`), the `Runtime` and `RuntimeCorun1..2`
 //! cases, the async family (`Async`, `DependentAsync`, `RuntimeAsync`),
 //! `Semaphore`, `TaskGroup`, the `Probe1..4` cases and the algorithm ones
 //! (`Algorithm`, `NestedAlgorithm`). They arrive with M4 and later, together
@@ -21,6 +21,12 @@
 //! `Exception.ExecutorCorun2`, which are the cases about a failure inside a
 //! *nested* graph being delivered to whoever is waiting for that graph rather
 //! than to the run. They are at the end of the file, after the four above.
+//!
+//! And `Exception.ModuleTask` is here as of module tasks (#49), at the very
+//! end: a failure inside a composed taskflow, which that walk delivers to the
+//! composing run because a module node is no anchor. Its commented-out second
+//! half, the same composition with a subflow inside it, waits on #55 with the
+//! rest of the subflow family.
 //!
 //! Three adaptations, and the first is the only one that changes what is
 //! asserted:
@@ -434,5 +440,41 @@ fn an_uncaught_corun_failure_becomes_the_outer_runs_failure() {
             4,
             "{workers} worker(s), caught: the second corun ran the same two tasks"
         );
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: ModuleTask
+// ----------------------------------------------------------------------------
+
+/// Upstream's `module_task(W)`: `taskflow2` composed of a `taskflow1` whose
+/// one task panics, and the failure comes out of the composing run's `wait`.
+///
+/// What this adds to the cases above is where the payload travels. A module
+/// node is not an anchor -- it preempted itself and undertook to look at
+/// nothing -- so the walk in `Job::record_panic` marks it on the way past and
+/// carries the payload to the first ancestor that *is* anchored, which for a
+/// composition is the run. So a failure one graph down surfaces exactly as a
+/// top-level task's does, and `executor::module` needed no code of its own
+/// for it.
+///
+/// The commented-out half of upstream's case -- the same composition with a
+/// subflow inside it -- waits on #55, as the subflow family above does.
+#[test]
+fn a_panic_inside_a_module_fails_the_composing_run() {
+    for workers in 1..=4 {
+        let executor = Executor::new(workers);
+
+        let mut target = Taskflow::new();
+        target.emplace(|| panic!("x"));
+
+        let mut taskflow = Taskflow::new();
+        taskflow.composed_of(Arc::new(target));
+
+        let error = executor
+            .run(&taskflow)
+            .wait()
+            .expect_err("the task of the composed taskflow panicked");
+        assert_failed_with_x(&error, &format!("{workers} worker(s)"));
     }
 }

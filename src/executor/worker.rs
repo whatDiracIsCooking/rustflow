@@ -462,9 +462,10 @@ impl WorkerThread {
     ///
     /// Upstream's `_invoke`. The four node kinds it can run itself are static,
     /// placeholder and the two conditioners; the four dynamic-tasking kinds
-    /// each get one line here into the module that owns them, and each of
-    /// those three modules refuses the run for now (see [`module`],
-    /// [`subflow`] and [`runtime`]). Upstream's three remaining kinds, its
+    /// each get one line here into the module that owns them. [`module`] runs
+    /// a composed taskflow as of #49 and refuses an adopted graph until #74;
+    /// [`subflow`] and [`runtime`] refuse the run for now. Upstream's three
+    /// remaining kinds, its
     /// semaphores and its observers are each a later milestone, and none of
     /// them is silently absent: the `match` below is exhaustive over
     /// [`Handle`], so a new kind arrives as a compile error here rather than
@@ -556,13 +557,19 @@ impl WorkerThread {
             )),
             // The four dynamic-tasking handles, each upstream's
             // `_invoke_*_task` and each one line so that the three modules
-            // below are the only ones #49, #50 and #51 have to edit. Every one
-            // of them may preempt this node rather than finish it, which is
-            // what the `None` under the match is about.
+            // below are the only ones #50 and #51 have to edit. Every one of
+            // them may preempt this node rather than finish it, which is what
+            // the `None` under the match is about.
+            //
+            // The two module arms are upstream's two forwarders, and each
+            // hands over what its handle *owns* rather than the `Graph&`
+            // upstream resolves here: a nested graph is scheduled through the
+            // share that owns it, which only one of the two has. See
+            // [`module`].
             Handle::Subflow { work, subgraph } => subflow::invoke(self, &job, work, subgraph),
             Handle::Runtime(work) => runtime::invoke(self, &job, work),
-            Handle::Module(target) => module::invoke(self, &job, target.graph()),
-            Handle::AdoptedModule(adopted) => module::invoke(self, &job, adopted),
+            Handle::Module(target) => module::invoke(self, &job, target),
+            Handle::AdoptedModule(adopted) => module::invoke_adopted(self, &job, adopted),
         };
 
         // Upstream's `return true` out of `_invoke_subflow_task`,
