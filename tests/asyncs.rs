@@ -1,15 +1,18 @@
 //! Translated from `unittests/test_asyncs.cpp` (Taskflow v4.1.0).
 //!
-//! Two of upstream's groups are here, and they are the two that need nothing
-//! but a closure handed to the executor: `Async`, a hundred thousand
+//! Three of upstream's groups are here. `Async` is a hundred thousand
 //! value-returning submissions whose handles are collected and then read, and
-//! `NestedAsync`, the same hundred thousand with a chain of three more
-//! submitted from inside each body. Both run at one, two, four, eight and
+//! `NestedAsync` is the same hundred thousand with a chain of three more
+//! submitted from inside each body; both run at one, two, four, eight and
 //! sixteen workers, one `#[test]` per worker count as upstream has one
 //! `TEST_CASE`, so a failure names the pool it happened on.
+//! `MixedAsync.<N>Executors` is the third and is about something else
+//! entirely -- N *executors*, submitting to each other -- and its own
+//! function says what it pins.
 //!
-//! Each case asserts two separate things, which is why the counter is there
-//! at all when the handles already carry a value: the counter says every body
+//! Each of those first two cases asserts two separate things, which is why
+//! the counter is there at all when the handles already carry a value: the
+//! counter says every body
 //! *ran*, and the sum over the handles says every body's result reached the
 //! caller who asked for it. Upstream asserts the same pair -- `counter == N`
 //! after `wait_for_all`, then `-c == 2*N` over the futures -- and the order
@@ -27,22 +30,24 @@
 //! Upstream's remaining groups are named rather than half-ported, each with
 //! what it waits on:
 //!
-//! - **`MixedAsync.<N>Executors`** (upstream's `mixed_executor_async`) and
-//!   **`AsyncRuntime`** / **`RecursiveAsyncRuntime`** need runtime-shaped
-//!   bodies: `spawn_runtime` and `silent_async_runtime` on the executor,
-//!   which are #90, and `Runtime::spawn` / `Runtime::silent_async`, which are
-//!   #92. The dispatch arm refuses such a body today rather than quietly
-//!   doing nothing with it.
+//! - **`AsyncRuntime`** and **`RecursiveAsyncRuntime`** need a runtime body
+//!   to be able to spawn work *under its own node*: `Runtime::spawn` and
+//!   `Runtime::silent_async`, which are #92. The bodies themselves arrived
+//!   with #90 -- `MixedAsync.<N>Executors` below submits them -- but a body
+//!   that cannot spawn a child cannot be recursive, and
+//!   `Runtime::corun` has nothing to wait for until then.
 //! - **`MixedAsync.<N>threads`** (upstream's `mixed_async`) submits plain
-//!   bodies from the tasks of a *running* graph, which is the one of these
-//!   that #88 could run. It is held back to land with its namesake under #90,
-//!   so that both groups called `MixedAsync` arrive together rather than this
-//!   file growing a half of one.
+//!   bodies from the tasks of a *running* graph. It needs nothing this crate
+//!   lacks -- #88's `spawn` and `silent_async` are the whole of it -- and is
+//!   a follow-up rather than part of #90, which is about the runtime-shaped
+//!   bodies the group above submits.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use rustflow::{AsyncHandle, Executor};
+use rustflow::{AsyncHandle, Executor, Runtime};
 
 /// Upstream's `int N = 100000`, in both of its helpers.
 ///
@@ -157,6 +162,202 @@ fn nested_spawned_tasks(workers: usize) {
     assert_eq!(sum, expected_sum(), "{workers} workers");
 }
 
+/// Upstream's `const size_t T = 1000` in `mixed_executor_async`: how many
+/// rounds of submissions each executor gets.
+const ROUNDS: usize = 1000;
+
+/// How many workers each of the N executors is given.
+///
+/// **Upstream's `std::vector<tf::Executor> executors(N)` gives each one the
+/// hardware concurrency**, which at N = 8 is eight pools of as many threads
+/// as the machine has cores. What the case is about is which executor a
+/// worker belongs to rather than how much parallelism there is, and two
+/// workers per pool exercises both answers `this_worker_id` can give while
+/// keeping the thread count a function of N alone.
+const WORKERS_EACH: usize = 2;
+
+/// How long the case waits for the work it submitted before giving up.
+///
+/// Upstream waits with `while(counter.load() != 4000*N);`, a spin with no way
+/// out. A deadline is what turns "a body never ran" from a hung test run into
+/// a failed assertion -- and nothing here passes because of the number: the
+/// only thing that reaches it is an increment that is never coming.
+const GIVE_UP_AFTER: Duration = Duration::from_secs(120);
+
+/// What every body of `mixed_executor_async` shares: the executors it may
+/// submit to, and the two things the test thread reads afterwards.
+///
+/// One allocation shared by every body, where upstream's lambdas capture
+/// `&executors` and `&counter` out of the enclosing frame. A body here is
+/// `Send + 'static` and cannot borrow either, which is the capture
+/// `tests/corun.rs` makes the same way and for the same reason.
+struct Pools {
+    /// The N executors, named by index as upstream names them by subscript.
+    executors: Vec<Arc<Executor>>,
+    /// Upstream's `counter`: one increment per body that ran.
+    ran: AtomicUsize,
+    /// How many times a body found itself on a worker of the wrong executor,
+    /// which is upstream's `check_wid` as a number instead of as a `REQUIRE`.
+    ///
+    /// It has to come back as a number, and that is the one thing this case
+    /// cannot spell upstream's way: a panic inside a *detached* async body is
+    /// caught and delivered to a handle nobody kept, or dropped with the node
+    /// for a silent task, so an assertion in there would be swallowed and the
+    /// only symptom would be an increment that never arrives -- a timeout
+    /// rather than a failure. Counting instead keeps the regression an
+    /// assertion on the thread that can report it.
+    misplaced: AtomicUsize,
+}
+
+impl Pools {
+    /// `n` executors and two counters at zero.
+    fn new(n: usize) -> Arc<Self> {
+        Arc::new(Self {
+            executors: (0..n)
+                .map(|_| Arc::new(Executor::new(WORKERS_EACH)))
+                .collect(),
+            ran: AtomicUsize::new(0),
+            misplaced: AtomicUsize::new(0),
+        })
+    }
+
+    /// Upstream's `check_wid` plus its `counter.fetch_add`: records that a
+    /// body submitted to executor `mine` ran, and whether it ran where it was
+    /// submitted.
+    ///
+    /// The claim is about `this_worker_id` rather than about async tasks: the
+    /// map that answers it is per-executor, so a worker of one pool is a
+    /// stranger to every other pool. Upstream's `!= -1` / `== -1` pair is
+    /// `is_some` / `is_none` here.
+    fn ran_on(&self, mine: usize) {
+        for (index, executor) in self.executors.iter().enumerate() {
+            if executor.this_worker_id().is_some() != (index == mine) {
+                self.misplaced.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // Last, so that a body counted as having run has already answered the
+        // question above: the spin below is what the assertions wait on.
+        self.ran.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Spins until `self.ran` reads `target`, failing rather than hanging if
+    /// it never does: upstream's `while(counter.load() != 4000*N);`.
+    fn spin_until_ran(&self, target: usize) {
+        let deadline = Instant::now() + GIVE_UP_AFTER;
+        loop {
+            let seen = self.ran.load(Ordering::Relaxed);
+            if seen == target {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "gave up waiting for every body of every executor: {seen} of {target}"
+            );
+            thread::yield_now();
+        }
+    }
+}
+
+/// Spins until nothing but `pools` itself holds a share of it.
+///
+/// Not upstream's problem and very much this port's: every body holds a share
+/// of the [`Pools`], which holds a share of each executor, so the *last*
+/// share of an executor must be the test thread's. A worker that dropped it
+/// would run `Executor::drop` on a thread that destructor is about to join,
+/// and the node holding the last body is dropped by its worker just *after*
+/// the counter `wait_for_all` watches -- so this is a short wait rather than
+/// an invariant, and a deadline rather than a spin, for the reason
+/// [`GIVE_UP_AFTER`] gives.
+fn spin_until_sole_owner(pools: &Arc<Pools>) {
+    let deadline = Instant::now() + GIVE_UP_AFTER;
+    while Arc::strong_count(pools) != 1 {
+        assert!(
+            Instant::now() < deadline,
+            "gave up waiting for the last async node to be dropped"
+        );
+        thread::yield_now();
+    }
+}
+
+/// Upstream's `mixed_executor_async(size_t N)`: `N` executors, each handed
+/// `ROUNDS` rounds of two submissions, each of whose bodies submits a
+/// **runtime-shaped** body to one of its neighbours.
+///
+/// Four bodies per round per executor -- a `spawn` and its inner
+/// `spawn_runtime`, a `silent_async` and its inner `silent_async_runtime` --
+/// which is upstream's `4000*N` increments at `ROUNDS == 1000`. Two things
+/// are pinned at once and both need the cross-executor shape:
+///
+/// - **`this_worker_id` is per-executor.** Every one of the four bodies walks
+///   all N executors and records whether it is a worker of exactly the one it
+///   was submitted to, which is upstream's `check_wid`.
+/// - **A runtime-shaped body runs wherever it was submitted.** The inner
+///   submissions go to `j % N` and `(j + 1) % N`, so a worker of one pool
+///   hands a `Runtime` body to another pool, and the executor that runs it is
+///   the one that has to account for it -- which the `num_topologies` of each
+///   is read to check.
+///
+/// Both inner handles are dropped, which detaches, exactly as upstream
+/// discards the futures its `async` calls return: what waits for the work is
+/// the counter and then `wait_for_all`, in upstream's order. The order
+/// matters -- a `wait_for_all` on one executor says nothing about a body of
+/// *another* executor that is about to submit work to it, so the counter is
+/// the real wait and the `wait_for_all`s are what leave every pool idle.
+fn mixed_executor_async(n: usize) {
+    let pools = Pools::new(n);
+
+    for j in 0..ROUNDS {
+        for i in 0..n {
+            // Upstream's `executors[i].async([&, i, j](){ ... })`, whose body
+            // submits `executors[j % N].async([](tf::Runtime&){ ... })`.
+            let outer = Arc::clone(&pools);
+            let inner_index = j % n;
+            let _detached = pools.executors[i].spawn(move || {
+                outer.ran_on(i);
+
+                let inner = Arc::clone(&outer);
+                let _detached =
+                    outer.executors[inner_index].spawn_runtime(move |_: &mut Runtime<'_>| {
+                        inner.ran_on(inner_index);
+                    });
+            });
+
+            // And upstream's silent pair, whose inner submission goes to
+            // `(j + 1) % N` instead.
+            let outer = Arc::clone(&pools);
+            let inner_index = (j + 1) % n;
+            pools.executors[i].silent_async(move || {
+                outer.ran_on(i);
+
+                let inner = Arc::clone(&outer);
+                outer.executors[inner_index].silent_async_runtime(move |_: &mut Runtime<'_>| {
+                    inner.ran_on(inner_index);
+                });
+            });
+        }
+    }
+
+    pools.spin_until_ran(4 * ROUNDS * n);
+
+    for executor in &pools.executors {
+        executor.wait_for_all();
+        assert_eq!(
+            executor.num_topologies(),
+            0,
+            "{n} executors: every async task of this one is accounted for"
+        );
+    }
+
+    assert_eq!(
+        pools.misplaced.load(Ordering::Relaxed),
+        0,
+        "{n} executors: every body ran on a worker of the executor it was \
+         submitted to, and of no other"
+    );
+
+    spin_until_sole_owner(&pools);
+}
+
 #[test]
 fn async_1_thread() {
     spawned_tasks(1);
@@ -205,4 +406,39 @@ fn nested_async_8_threads() {
 #[test]
 fn nested_async_16_threads() {
     nested_spawned_tasks(16);
+}
+
+#[test]
+fn mixed_async_1_executor() {
+    mixed_executor_async(1);
+}
+
+#[test]
+fn mixed_async_2_executors() {
+    mixed_executor_async(2);
+}
+
+#[test]
+fn mixed_async_4_executors() {
+    mixed_executor_async(4);
+}
+
+#[test]
+fn mixed_async_5_executors() {
+    mixed_executor_async(5);
+}
+
+#[test]
+fn mixed_async_6_executors() {
+    mixed_executor_async(6);
+}
+
+#[test]
+fn mixed_async_7_executors() {
+    mixed_executor_async(7);
+}
+
+#[test]
+fn mixed_async_8_executors() {
+    mixed_executor_async(8);
 }

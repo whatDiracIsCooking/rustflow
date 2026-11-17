@@ -19,7 +19,7 @@
 //!
 //! Upstream's name for the value-returning form is `async`, which is a
 //! reserved word in Rust 2024. The port calls it `spawn` on every surface
-//! that has it -- the [`Executor`] here, later a `Runtime` (#90) and a
+//! that has it -- the [`Executor`] here, a `Runtime` (#92) and a
 //! `TaskGroup` (#94) -- and keeps the other three names verbatim, since
 //! `silent_async`, `dependent_async` and `silent_dependent_async` are all
 //! legal identifiers. A runtime-shaped body gets a `_runtime` suffix, as
@@ -157,6 +157,14 @@ use crate::executor::worker::{Release, WorkerThread};
 use crate::executor::{Executor, Shared};
 use crate::graph::{AsyncWork, Handle};
 
+/// Upstream's `ESTATE::NONE`, the estate word a free node is constructed
+/// with unless something is waiting for what runs under it.
+///
+/// A named zero because it is an argument at three call sites -- the two
+/// below and `silent_async_runtime` in `executor::runtime` -- and a bare `0`
+/// there says nothing about which word it is the absence of bits in.
+pub(crate) const ESTATE_NONE: u32 = 0;
+
 impl Executor {
     /// Runs `body` on this executor as soon as a worker picks it up, and
     /// hands back a handle on its result.
@@ -202,26 +210,13 @@ impl Executor {
         R: Send + 'static,
         F: FnOnce() -> R + Send + 'static,
     {
-        let delivery = Arc::new(Delivery::new());
-
         // Upstream's `std::packaged_task<R()>`, which is what catches the
         // exception on its way to the future: the node runs a plain body
-        // whatever `R` is, and this closure is the whole of the difference
-        // between `spawn` and `silent_async`. `AssertUnwindSafe` is the
-        // honest annotation -- the state a panicking body can leave
-        // half-written is the caller's own, reachable only through what the
-        // closure captured.
-        let wrapper = {
-            let delivery = Arc::clone(&delivery);
-            move || {
-                let outcome =
-                    panic::catch_unwind(AssertUnwindSafe(body)).map_err(RunError::Panicked);
-                delivery.deliver(outcome);
-            }
-        };
-
-        self.schedule_async_task(AsyncWork::plain(wrapper), &Parent::Run);
-        AsyncHandle { delivery }
+        // whatever `R` is, and that wrapper is the whole of the difference
+        // between `spawn` and `silent_async`.
+        let (wrapper, handle) = AsyncHandle::for_body(body);
+        self.schedule_async_task(AsyncWork::plain(wrapper), &Parent::Run, ESTATE_NONE);
+        handle
     }
 
     /// Runs `body` on this executor as soon as a worker picks it up, with no
@@ -264,7 +259,7 @@ impl Executor {
     where
         F: FnOnce() + Send + 'static,
     {
-        self.schedule_async_task(AsyncWork::plain(body), &Parent::Run);
+        self.schedule_async_task(AsyncWork::plain(body), &Parent::Run, ESTATE_NONE);
     }
 
     /// Creates the free-standing node `work` is the body of and queues it:
@@ -273,9 +268,18 @@ impl Executor {
     ///
     /// `parent` is upstream's `NodeBase* parent`, which is null for a
     /// submission to the executor and a node or an anchor for one from a
-    /// runtime body (#90) or a task group (#94). [`Parent::Run`] stands in
+    /// runtime body (#92) or a task group (#94). [`Parent::Run`] stands in
     /// for the null, as it does for every free node: `executor::topology` has
     /// why the sentinel run is a better answer there than an `Option`.
+    ///
+    /// `estate` is upstream's second argument, the `ESTATE` word it
+    /// constructs the node with: [`ESTATE_NONE`] for everything submitted
+    /// here, and `Cancellable::EXPLICITLY_ANCHORED` for the handle-returning
+    /// runtime-shaped form in `executor::runtime` -- which is what makes a
+    /// failure under such a node land on the node's own slot, where its
+    /// second entry reads it. It is set before the job is queued, because a
+    /// node that is to be an anchor has to be one before anything under it
+    /// can fail.
     ///
     /// The order is upstream's and all three steps are load-bearing. The
     /// counters go up before anything is queued, because a worker skips the
@@ -285,10 +289,14 @@ impl Executor {
     /// next, for the same reason `Shared::schedule_graph` tells it before
     /// queueing a graph's sources. Only then is the job pushed, after which it
     /// may already be running.
-    fn schedule_async_task(&self, work: AsyncWork, parent: &Parent) {
+    pub(crate) fn schedule_async_task(&self, work: AsyncWork, parent: &Parent, estate: u32) {
         self.shared.increment_async();
 
         let node = AsyncNode::new("", Handle::Async(work));
+        node.node()
+            .base()
+            .estate()
+            .fetch_or(estate, Ordering::Relaxed);
         let job = Job::free(&node, parent);
         parent.count_queued(Topology::free_standing(), 1);
 
@@ -323,6 +331,60 @@ pub struct AsyncHandle<R> {
 }
 
 impl<R> AsyncHandle<R> {
+    /// Wraps `body` as the plain closure a free node runs, and hands back
+    /// that closure together with the handle its outcome will arrive at.
+    ///
+    /// Upstream's `std::packaged_task<R()>` plus the `get_future()` beside
+    /// it, which is what [`Executor::spawn`] is built out of -- and it is a
+    /// pair rather than two calls for upstream's reason: the promise and the
+    /// future are two ends of one slot, so handing out either one without the
+    /// other is not a thing a caller should have to arrange.
+    ///
+    /// It is `pub(crate)` rather than private to this module because the
+    /// other two kinds of free node need the same pair and are not submitted
+    /// from here: `dependent_async` (#91) schedules the wrapper onto a
+    /// dependent-async node with a dependency list, and
+    /// `Executor::spawn_runtime` in `executor::runtime` needs the handle half
+    /// alone -- [`AsyncHandle::pending`] is that half. So this is the one
+    /// place in the crate that builds an [`AsyncHandle`], whichever kind of
+    /// node ends up delivering to it.
+    ///
+    /// `AssertUnwindSafe` is the honest annotation on the `catch_unwind`
+    /// inside: the state a panicking body can leave half-written is the
+    /// caller's own, reachable only through what the closure captured.
+    pub(crate) fn for_body<F>(body: F) -> (impl FnOnce() + Send + 'static, Self)
+    where
+        R: Send + 'static,
+        F: FnOnce() -> R + Send + 'static,
+    {
+        let (handle, delivery) = Self::pending();
+        let wrapper = move || {
+            let outcome = panic::catch_unwind(AssertUnwindSafe(body)).map_err(RunError::Panicked);
+            delivery.deliver(outcome);
+        };
+        (wrapper, handle)
+    }
+
+    /// An empty handle and the slot that fills it: upstream's
+    /// `std::promise<void> p; auto fu{p.get_future()};` at the top of the
+    /// runtime-shaped branch of `_async`.
+    ///
+    /// The half of [`AsyncHandle::for_body`] for a task that does **not**
+    /// deliver by returning a value. A runtime-shaped async task is entered
+    /// twice and the outcome is decided on the second entry, out of the
+    /// node's payload slot rather than out of the body's return value, so
+    /// what its submission needs is the other end of the slot and no wrapper
+    /// at all -- see `Executor::spawn_runtime` in `executor::runtime`.
+    pub(crate) fn pending() -> (Self, Arc<Delivery<R>>) {
+        let delivery = Arc::new(Delivery::new());
+        (
+            Self {
+                delivery: Arc::clone(&delivery),
+            },
+            delivery,
+        )
+    }
+
     /// Blocks until the task has run, and hands back what its body returned.
     ///
     /// Upstream's `std::future::get`, which rethrows a stored exception on
@@ -437,7 +499,7 @@ impl<R> fmt::Debug for AsyncHandle<R> {
 /// apart. A task is waited for one way or the other, never both, and keeping
 /// the slots separate is what lets the blocking path stay a condvar instead
 /// of a hand-rolled futex over the waker.
-struct Delivery<R> {
+pub(crate) struct Delivery<R> {
     /// The outcome and whoever is to be woken by it.
     slot: Mutex<Slot<R>>,
     /// Signalled by [`Delivery::deliver`], under the lock.
@@ -486,7 +548,7 @@ impl<R> Delivery<R> {
     /// this thread's last touch of the slot either way, and the waker is
     /// moved out first so that waking it touches nothing a released waiter
     /// may already have dropped.
-    fn deliver(&self, outcome: Result<R, RunError>) {
+    pub(crate) fn deliver(&self, outcome: Result<R, RunError>) {
         let mut slot = self.lock();
         slot.done = true;
         slot.outcome = Some(outcome);
@@ -636,8 +698,8 @@ impl Shared {
 /// `None` is upstream's `if(_invoke_async_task(...)) return;` -- a
 /// runtime-shaped body that preempted its own node -- and the counters are
 /// deliberately *not* touched then: the second entry is what finishes the
-/// task. Nothing can produce that answer until #90 fills in
-/// [`runtime::invoke_async`].
+/// task. [`runtime::invoke_async`] is the arm that answers that way, for a
+/// node whose runtime-shaped body left work outstanding (#90).
 pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &AsyncWork) -> Option<Release> {
     // Upstream has no equivalent and needs none; the module docs say why a
     // handle in a graph is refused rather than run, and `Topology` identity
@@ -682,7 +744,7 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &AsyncWork) -> 
                 // parks the payload on this node -- where upstream parks it
                 // too, and where `AsyncTask::take_panic` reads it for the
                 // kinds of free node that hand out a handle. A free node
-                // *under* a parent (#90's runtime child, #93's task-group
+                // *under* a parent (#92's runtime child, #93's task-group
                 // member) has an anchor on its chain, and the same call
                 // delivers it there. The module docs have why this used to
                 // drop the payload instead and what changed (#105).
@@ -692,8 +754,9 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &AsyncWork) -> 
         }
         // Upstream's cases 1 and 2, `void(Runtime&)` and `void(Runtime&,
         // bool)`, which both go to its `_invoke_runtime_task_impl` and are
-        // #90's here. One line out to the module that owns runtime tasking,
-        // so that #90 edits that file and not this one.
+        // this port's `executor::runtime` (#90). One line out to the module
+        // that owns everything that hands a body a `Runtime`, which is also
+        // where the two submitting calls for these shapes live.
         AsyncWork::Runtime(_) | AsyncWork::Reentrant { .. } => {
             runtime::invoke_async(worker, job, work)
         }
@@ -702,7 +765,7 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &AsyncWork) -> 
     // Upstream's parentless branch of `_tear_down_async`:
     // `if(node->_parent == nullptr) _decrement_topology();`, where this
     // port's null parent is `Parent::Run` on a free node. A parented one --
-    // #90's runtime child, #94's task-group member -- is not counted here
+    // #92's runtime child, #94's task-group member -- is not counted here
     // because it was not counted on submission either: only the executor's
     // own `spawn` and `silent_async` increment, as only upstream's `async`
     // and `silent_async` do.
