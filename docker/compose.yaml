@@ -64,7 +64,9 @@ x-rust: &rust
 services:
   # The gate: what CI runs and what prepush should run. `bash -c`, never
   # `bash -lc` -- a login shell sources /etc/profile, which resets PATH and
-  # loses the image's /usr/local/cargo/bin.
+  # loses the image's /usr/local/cargo/bin -- which is also where the image's
+  # pinned cargo-deny lives, so the fourth command below depends on it twice
+  # over.
   check:
     <<: *rust
     command:
@@ -75,6 +77,7 @@ services:
         cargo fmt --all --check
         cargo clippy --all-targets --all-features -- -D warnings
         cargo test --all-features ${CARGO_TEST_ARGS:-}
+        cargo deny check
 
   # The long-lived interactive container devtools/devcontainer.sh execs into,
   # and the one an in-container `claude` runs in. It holds no state of its own

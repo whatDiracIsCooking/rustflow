@@ -10,7 +10,7 @@
 #   devtools/devcontainer.sh shell         interactive bash inside it
 #   devtools/devcontainer.sh shell -c CMD  run one command inside it
 #   devtools/devcontainer.sh claude [ARGS] Claude Code inside it
-#   devtools/devcontainer.sh check         fmt + clippy + test (the CI gate)
+#   devtools/devcontainer.sh check         fmt + clippy + test + deny (the CI gate)
 #   devtools/devcontainer.sh test [ARGS]   cargo test
 #   devtools/devcontainer.sh rebuild       rebuild the image after a Dockerfile edit
 #   devtools/devcontainer.sh down          stop it (volumes survive)
@@ -105,11 +105,16 @@ case "$cmd" in
         ensure_up
         dc exec dev claude "$@"
         ;;
+    # The fourth command needs cargo-deny, which the image installs pinned by
+    # ARG CARGO_DENY_VERSION. CI runs it as a separate job on a plain runner
+    # (see .github/workflows/ci.yml) because the image CI uses is the stock
+    # rust one; the command itself is the same.
     check)
         in_dev 'set -e
                 cargo fmt --all --check
                 cargo clippy --all-targets --all-features -- -D warnings
-                cargo test --all-features'
+                cargo test --all-features
+                cargo deny check'
         ;;
     test)    in_dev "cargo test --all-features $*" ;;
     fmt)     in_dev 'cargo fmt --all' ;;

@@ -1,0 +1,70 @@
+# What "minimal dependencies" means mechanically. The README's dependency
+# policy is a judgement call -- a runtime dependency must replace something
+# upstream hand-wrote and be better tested than our own port of it -- and this
+# file is the half of it a machine can check: licenses, advisories, duplicate
+# versions, and where a crate came from. `cargo deny check` is the fourth step
+# of the gate, beside fmt, clippy and test.
+#
+# cargo-deny's own version is pinned in two places that must stay equal:
+# `ARG CARGO_DENY_VERSION` in the root Dockerfile, and the pinned
+# EmbarkStudios/cargo-deny-action commit in .github/workflows/ci.yml (that
+# action's tag ships its own cargo-deny binary). Unknown keys here are a hard
+# error, so a config written for a different version fails loudly rather than
+# silently checking less than it says.
+
+[graph]
+# The action passes --all-features and the gate's local command does not, so
+# fix it here and both check the same graph. Optional dependencies are the
+# ones most likely to escape review, so they are exactly the ones to include.
+all-features = true
+
+[advisories]
+# The RustSec database over the network, every run (the default db-urls).
+# Vulnerable, unsound and unmaintained crates are the reason this check
+# exists; `yanked` is set because a yanked version in Cargo.lock is a supply
+# chain signal and we control the lockfile.
+yanked = "deny"
+unmaintained = "all"
+# A single advisory can be waived here, with a reason, when the fix is not
+# ours to make. That is the escape hatch -- not loosening the two lines above.
+ignore = []
+
+[licenses]
+# MIT and Apache-2.0, which covers this crate (MIT, like upstream) and the
+# `MIT OR Apache-2.0` dual form the crossbeam crates and most of the ecosystem
+# publish under: an OR expression passes when either side is allowed. The LLVM
+# exception is the same Apache-2.0 text plus a linking carve-out and is what
+# the Rust project's own crates ship, so it rides along.
+#
+# Anything else -- GPL, LGPL, MPL, CDDL, a crate with no license at all -- is
+# an error, and the fix is a different dependency, never a line added here.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+]
+# This list is a policy, not an inventory of today's lockfile: the crossbeam
+# crates account for MIT and Apache-2.0, while the LLVM exception is allowed
+# ahead of anything that uses it. An allowance nothing matched is not a finding
+# worth failing or warning on.
+unused-allowed-license = "allow"
+
+[bans]
+# The one with teeth. Two versions of the same crate means two Chase-Lev
+# deques or two `CachePadded` types in one scheduler, which is a correctness
+# question and not merely bloat -- types from different copies do not unify,
+# and the duplicate is invisible in `Cargo.toml`. Fix it by moving the
+# dependency that pulled the second copy, not with a `skip` entry here.
+multiple-versions = "deny"
+# A `*` requirement pins nothing, leaving Cargo.lock as the only record of
+# what we build against.
+wildcards = "deny"
+
+[sources]
+# crates.io and nothing else. A git dependency has no version to pin -- a
+# branch moves under you -- and an alternative registry is not something a
+# reader of Cargo.toml can audit.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
