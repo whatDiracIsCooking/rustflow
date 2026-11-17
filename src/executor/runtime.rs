@@ -74,8 +74,8 @@
 //! - [`Executor::spawn_runtime`]'s node is explicitly anchored from the
 //!   moment it is constructed, rather than for the length of a wait as
 //!   [`Runtime::try_corun`]'s guard is. So the panic walk stops *there* for
-//!   anything that fails under it -- the body itself, and from #92 a child
-//!   the body spawned -- and leaves the payload in the node's own slot.
+//!   anything that fails under it -- the body itself, and a child the body
+//!   spawned (#92) -- and leaves the payload in the node's own slot.
 //!   `complete` reads that slot on the finishing entry and hands it to
 //!   [`AsyncHandle::wait`](crate::AsyncHandle::wait) as
 //!   [`RunError::Panicked`], which is upstream's `set_exception`.
@@ -116,22 +116,25 @@
 //! [`Option<Release>`](Release) this arm returns is: `None` is upstream's
 //! `true`.
 //!
-//! # What a corun waits for, and why nothing waits yet
+//! # What a corun waits for
 //!
 //! [`Runtime::corun`] waits for the node's join counter to come back to
 //! **one** -- the body's own reference, the one step 1 added -- which is
-//! upstream's predicate exactly. Until #92 gives a `Runtime` the `async`
-//! family, nothing can leave a child under a runtime node of any of the three
-//! shapes: a task the body `schedule`s is counted against the node's
-//! *parent*, not against the node, so it is a sibling rather than a child.
-//! So every corun still returns at once and the preemption branch is still
-//! unreachable from the public API -- a `spawn_runtime` body has no more way
-//! to spawn a child than a graph's runtime task does, which is why #90 is a
-//! blocker of #92 rather than the other way round. The protocol is ported in
-//! full all the same, and the cases at the bottom of this file drive the
-//! counter by hand to reach the preempted branch of each shape: an
-//! unreachable branch that is never exercised is how a latent hang gets
-//! shipped.
+//! upstream's predicate exactly. What raises it above one is the `async`
+//! family of [`Runtime`], which is `executor::runtime_async` (#92): each
+//! child a body spawns is counted against *this* node, where a task the body
+//! [`schedule`](Runtime::schedule)s is counted against the node's own parent
+//! and is therefore a sibling rather than a child. So the preemption branch
+//! above is reached by any body that spawns and does not wait, and the corun
+//! predicate has something to wait for in any body that spawns and does.
+//!
+//! The cases at the bottom of this file still drive one thing by hand, and
+//! the reason has moved: a free node's own submission is counted in
+//! `num_topologies`, so the pool's workers sweep the buffers while such a
+//! case runs and would race it for the child. A case about a *graph's*
+//! runtime node has no such count and drives real children --
+//! `executor::runtime_async` has those, and the helper there says why the
+//! pool cannot interfere.
 //!
 //! # Scheduling a sibling, and the same-graph limit
 //!
@@ -158,7 +161,6 @@
 //! orderings -- the two that are reported and the one second run that stays
 //! the caller's own doing.
 
-use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -167,6 +169,7 @@ use crate::Runtime;
 use crate::executor::Executor;
 use crate::executor::r#async::{AsyncHandle, ESTATE_NONE};
 use crate::executor::run_handle::RunError;
+use crate::executor::runtime_async::completion;
 use crate::executor::topology::{Cancellable, Job, Parent};
 use crate::executor::worker::{Release, Worker, WorkerThread, is_entered};
 use crate::graph::{AsyncWork, Node, OnceWork, RuntimeWork, Task};
@@ -375,8 +378,8 @@ impl Executor {
     ///
     /// What is different is the body and the answer. The body is handed a
     /// [`Runtime`], so it can do what a runtime task of a graph can do --
-    /// [`Runtime::schedule`] has the one limit, and from #92 it will also be
-    /// able to spawn children of its own and [`Runtime::corun`] on them. The
+    /// [`Runtime::schedule`] has the one limit, and since #92 it can also
+    /// spawn children of its own and [`Runtime::corun`] on them. The
     /// handle therefore carries no value: `AsyncHandle<()>` where
     /// [`Executor::spawn`] carries whatever the body returned, because what
     /// there is to report about a runtime-shaped task is **whether anything
@@ -387,7 +390,7 @@ impl Executor {
     ///
     /// [`AsyncHandle::wait`] answers `Ok(())` once the body *and* everything
     /// it spawned are done, and `Err(`[`RunError::Panicked`]`(payload))` if
-    /// the body panicked or (from #92) anything it spawned did. Only the
+    /// the body panicked or anything it spawned did (#92). Only the
     /// first such failure is reported, as everywhere else in the crate; the
     /// node is an explicit anchor from the moment it is created, which is
     /// what makes it the thing the panic walk stops at, and the module docs'
@@ -418,22 +421,16 @@ impl Executor {
     where
         F: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
     {
-        // Upstream's `std::promise<void> p; auto fu{p.get_future()};`. The
-        // wrapper half of that seam -- `AsyncHandle::for_body`, which is what
-        // `Executor::spawn` uses -- is deliberately not: a runtime-shaped
-        // task's outcome is decided on its finishing entry out of the node's
-        // payload slot, not by what the body returned, so what this needs is
-        // the writing end of the slot and no wrapper at all.
-        let (handle, delivery) = AsyncHandle::pending();
-
-        // Upstream's `reentered` branch in full: `eptr ?
-        // p.object.set_exception(eptr) : p.object.set_value()`.
-        let complete = move |payload: Option<Box<dyn Any + Send>>| {
-            delivery.deliver(match payload {
-                Some(payload) => Err(RunError::Panicked(payload)),
-                None => Ok(()),
-            });
-        };
+        // Upstream's `std::promise<void> p; auto fu{p.get_future()};` and
+        // the `reentered` branch that fills it, which is
+        // `runtime_async::completion` because four submissions need exactly
+        // that pair (#92). The *wrapper* half of the handle seam --
+        // `AsyncHandle::for_body`, which is what `Executor::spawn` uses -- is
+        // deliberately not used: a runtime-shaped task's outcome is decided
+        // on its finishing entry out of the node's payload slot, not by what
+        // the body returned, so what this needs is the writing end of the
+        // slot and no wrapper at all.
+        let (handle, complete) = completion();
 
         self.schedule_async_task(
             AsyncWork::reentrant(body, complete),
@@ -462,8 +459,8 @@ impl Executor {
     ///
     /// # What a caller sees
     ///
-    /// Nothing, which is what "silent" means. A panic out of `body` -- or
-    /// (from #92) out of anything it spawned -- is **dropped**, as a
+    /// Nothing, which is what "silent" means. A panic out of `body` -- or out
+    /// of anything it spawned (#92) -- is **dropped**, as a
     /// [`Executor::silent_async`](crate::Executor::silent_async) body's is
     /// and for the same reason: the payload lands in the node's own slot and
     /// goes with the node, because no handle was ever handed out to read it
@@ -776,6 +773,7 @@ impl Runtime<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, OnceLock};
     use std::thread;
@@ -880,6 +878,29 @@ mod tests {
         job
     }
 
+    /// Takes one child's job back out of the shared buffers, for a case that
+    /// runs it by hand.
+    ///
+    /// `Runtime::silent_async` queues a child through the buffers like every
+    /// other free node (`executor::runtime_async` has why), and a case about
+    /// a *graph's* runtime node can take it straight back: nothing in such a
+    /// case counts a topology, and a worker skips the steal loop entirely
+    /// while `num_topologies` is zero. The cases over a free node here are
+    /// the ones that cannot -- `free_async` counts one, as a real submission
+    /// does -- which is why those still stand a child in by hand.
+    fn child_job(executor: &Executor) -> Job {
+        let buffer = executor
+            .shared
+            .buffers
+            .first_nonempty()
+            .expect("the submission pushed a job");
+        executor
+            .shared
+            .buffers
+            .steal_from(buffer)
+            .expect("the job the submission pushed")
+    }
+
     /// The state bits of `task`, masked to the two this arm sets.
     fn entered(taskflow: &Taskflow, task: Task) -> u32 {
         taskflow.graph().node(task).nstate().load(Ordering::Relaxed) & ENTERED
@@ -942,24 +963,35 @@ mod tests {
         );
     }
 
-    /// The preemption branch, which the public API cannot reach until
-    /// milestone 5 gives a `Runtime` the `async` family: the body raises its
-    /// own node's join counter, exactly as a child spawned under the node
-    /// would, so the first entry is not the last reference and the node is
-    /// left preempted with nothing released. A hand-driven decrement to zero
-    /// is the last child's tear-down, and the second entry clears the bits
-    /// and finishes the node.
+    /// The preemption branch, reached the way a caller reaches it: the body
+    /// spawns one child, so the first entry is not the last reference and the
+    /// node is left preempted with nothing released. The child's own
+    /// tear-down drives the counter to zero and re-queues the node, and the
+    /// second entry clears the bits and finishes it.
+    ///
+    /// Driven one job at a time from this thread, which is what fixes the
+    /// order: the child is taken back out of the shared buffers rather than
+    /// left for the pool, and `executor::runtime_async` -- which has the
+    /// cases about the child's own accounting -- says why nothing can race
+    /// that. A regression therefore fails an assertion here instead of
+    /// wedging the suite.
     #[test]
     fn a_body_that_leaves_work_outstanding_is_preempted_and_resumed() {
         let runs = Arc::new(AtomicUsize::new(0));
+        let children = Arc::new(AtomicUsize::new(0));
         let mut taskflow = Taskflow::new();
         let rt = {
             let runs = Arc::clone(&runs);
+            let children = Arc::clone(&children);
             taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
                 runs.fetch_add(1, Ordering::Relaxed);
-                // What `rt.silent_async` will do: one more reference to the
-                // node, held by work that has not finished.
-                runtime.node.join_counter().fetch_add(1, Ordering::Relaxed);
+                // One more reference to the node, held by work that has not
+                // finished: upstream's `rt.silent_async`, which is what the
+                // counter below is counting.
+                let children = Arc::clone(&children);
+                runtime.silent_async(move || {
+                    children.fetch_add(1, Ordering::Relaxed);
+                });
             })
         };
         let released = Arc::new(AtomicUsize::new(0));
@@ -974,12 +1006,8 @@ mod tests {
         let executor = Executor::new(1);
         let mut worker = test_worker(&executor);
         let topology = run_of(&taskflow, || {});
-        let job = source_job(&taskflow, &topology);
-        // The job the node was dequeued as, which is what the last child
-        // re-queues to resume it.
-        let resume = job.clone();
 
-        worker.invoke(job);
+        worker.invoke(source_job(&taskflow, &topology));
 
         let node = taskflow.graph().node(rt);
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the body ran once");
@@ -1000,14 +1028,21 @@ mod tests {
             "and it released nothing to run here either"
         );
 
-        // The tear-down of the last child, by hand: `WorkerThread::finish_job`
-        // reads the parent's state word before the decrement and, finding
-        // `PREEMPTED`, re-queues the job above.
+        // The child, taken back out of the buffers and run here: its
+        // tear-down is `WorkerThread::finish_job`, which reads the parent's
+        // state word before the decrement and, finding `PREEMPTED`, re-queues
+        // the job the node was dequeued as.
+        worker.invoke(child_job(&executor));
+        assert_eq!(children.load(Ordering::Relaxed), 1, "the child ran");
         assert_eq!(
-            node.join_counter().fetch_sub(1, Ordering::AcqRel),
-            1,
-            "the last child drives the counter to zero"
+            node.join_counter().load(Ordering::Relaxed),
+            0,
+            "and drove the counter to zero"
         );
+
+        let resume = worker
+            .pop()
+            .expect("the last child re-queued the preempted node");
         worker.invoke(resume);
 
         assert_eq!(
@@ -1068,10 +1103,12 @@ mod tests {
     /// that looks.
     ///
     /// The payload is put there the way that walk puts one -- claim the slot,
-    /// then fill it -- because the walk cannot be driven from here without
-    /// the `async` family that gives a runtime node children at all: a chain
-    /// rooted at a run hands the payload to the run, which is anchored by
-    /// definition.
+    /// then fill it -- rather than by a child that panics, because a corun is
+    /// what collects it and a hand-driven case must not corun: nothing here
+    /// counts a topology, so the corun loop would find nothing to steal and
+    /// spin rather than fail. `a_failing_child_is_reported_from_its_parents_corun`
+    /// in `tests/runtimes.rs` is the same claim through the public API, where
+    /// a real run holds that count above zero.
     #[test]
     fn a_panic_under_an_implicit_anchor_comes_back_from_a_corun() {
         let mut taskflow = Taskflow::new();
@@ -1469,8 +1506,10 @@ mod tests {
             let runs = Arc::clone(&runs);
             taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
                 runs.fetch_add(1, Ordering::Relaxed);
-                // What `rt.silent_async` will do: one more reference to the
-                // node, held by work that has not finished.
+                // A child, stood in for by hand: one more reference to the
+                // node, held by work that has not finished. By hand because
+                // this case is about the *order* the bypass arrives in, and
+                // spends that reference itself further down.
                 runtime.node.join_counter().fetch_add(1, Ordering::Relaxed);
             })
         };
@@ -1674,10 +1713,12 @@ mod tests {
     ///
     /// The payload is put there the way
     /// `a_panic_under_an_implicit_anchor_comes_back_from_a_corun` puts one --
-    /// claim the slot, then fill it -- because the walk cannot be driven from
-    /// a body that has no children to fail until #92. What it stands in for
-    /// is exactly that: a child's failure, delivered here by the walk,
-    /// collected by the entry that finishes the node.
+    /// claim the slot, then fill it -- rather than by a real child, because
+    /// this node's own submission is counted in `num_topologies` and the pool
+    /// would race this thread for any child it spawned (`free_async` has that
+    /// count). What it stands in for is exactly that: a child's failure,
+    /// delivered here by the walk, collected by the entry that finishes the
+    /// node.
     #[test]
     fn a_payload_on_a_spawn_runtime_node_comes_back_from_its_handle() {
         let executor = Executor::new(2);
@@ -1826,10 +1867,9 @@ mod tests {
         assert_eq!(executor.num_topologies(), 0, "and both were accounted for");
     }
 
-    /// The preemption branch of the reentrant shape, which the public API
-    /// cannot reach until #92 gives a `Runtime` the `async` family: the body
-    /// raises its own node's join counter, exactly as a child spawned under
-    /// the node would, so the first entry is not the last reference. The
+    /// The preemption branch of the reentrant shape: the body raises its own
+    /// node's join counter, exactly as a child spawned under the node does
+    /// (#92), so the first entry is not the last reference. The
     /// node is left preempted with nothing delivered and nothing accounted
     /// for; a hand-driven decrement to zero is the last child's tear-down,
     /// and the second entry clears the bits, runs `complete` and finishes
@@ -1851,9 +1891,12 @@ mod tests {
                 let runs = Arc::clone(&runs);
                 move |runtime: &mut Runtime<'_>| {
                     runs.fetch_add(1, Ordering::Relaxed);
-                    // What `rt.silent_async` will do (#92): one more
-                    // reference to the node, held by work that has not
-                    // finished.
+                    // A child, stood in for by hand: one more reference to
+                    // the node, held by work that has not finished. By hand
+                    // because a free node's submission is counted in
+                    // `num_topologies`, so the pool would race this thread
+                    // for a real child -- and because the case spends that
+                    // reference itself below, which fixes the order.
                     runtime.node.join_counter().fetch_add(1, Ordering::Relaxed);
                 }
             },

@@ -1,6 +1,6 @@
 //! Translated from `unittests/test_dependent_asyncs.cpp` (Taskflow v4.1.0).
 //!
-//! Twelve of upstream's groups, which is every one of them that needs
+//! Fourteen of upstream's groups, which is every one of them that needs
 //! nothing but a closure, a handle and the edges between them: the graph is
 //! built one task at a time while the tasks already submitted are running,
 //! which is the whole of what `Executor::silent_dependent_async` and
@@ -8,17 +8,20 @@
 //! `#[test]` per count as it has one `TEST_CASE`, so a failure names the pool
 //! it happened on.
 //!
-//! Two groups are deliberately absent, each named with what it waits on:
+//! **`DependentAsync.FromRuntime`** and
+//! **`SilentDependentAsync.FromRuntime`** are the last two and are #92's:
+//! they build their chain from inside a *runtime body*, through
+//! [`Runtime::dependent_async`](rustflow::Runtime::dependent_async) and its
+//! three siblings, so every link is counted against the runtime task's own
+//! node and the body's implicit join is what waits for the chain.
+//!
+//! One group is deliberately absent:
 //!
 //! - **`DependentAsync.MixedAlgorithms`** and
 //!   **`SilentDependentAsync.MixedAlgorithms`** build their dependencies out
 //!   of `tf::make_for_each_task`, `make_reduce_task`, `make_sort_task` and
 //!   friends, which are the algorithm library and milestone 6. Nothing about
 //!   the dependency protocol is particular to them.
-//! - **`DependentAsync.FromRuntime`** and
-//!   **`SilentDependentAsync.FromRuntime`** name dependencies from inside a
-//!   runtime body, through `Runtime::dependent_async` -- issue #92, which is
-//!   where they land.
 //!
 //! # How the shared results are written
 //!
@@ -1379,4 +1382,132 @@ fn recursive_fibonacci_4_threads() {
 #[test]
 fn recursive_fibonacci_8_threads() {
     recursive_fibonacci(8);
+}
+
+/// Upstream's `silent_dependent_async_from_runtime(unsigned)` and
+/// `dependent_async_from_runtime(unsigned)`, which differ only in whether the
+/// chain is built with the handle-returning form.
+///
+/// A chain of a thousand and one links, built **from inside a runtime body**
+/// and left to that body's implicit join: each link names the one before it,
+/// so the asserted order is the dependency protocol's, and nothing waits for
+/// any of them -- what makes the run's `wait` enough is that every link is
+/// counted against the runtime task's own node.
+///
+/// Upstream alternates the body shape along the chain, odd links taking a
+/// `tf::Runtime&` and even links taking nothing, and that is the half worth
+/// keeping: the node kind decides the protocol -- a dependent-async node
+/// releases its successors when it finishes -- while the body shape decides
+/// only what the body is handed, so a chain that alternates pins that the two
+/// are independent.
+///
+/// `counter` is an atomic where upstream shares a plain `int`, for
+/// [`Results`]' reason: the chain serialises the accesses, so `Relaxed` is
+/// right and the ordering claim is the chain's rather than the word's.
+fn chain_from_runtime(workers: usize, handles: bool) {
+    /// Upstream's `for(size_t i=1; i<=1000; ++i)`.
+    const LINKS: usize = 1000;
+
+    let executor = Executor::new(workers);
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    let mut taskflow = Taskflow::new();
+    taskflow.emplace_runtime({
+        let counter = Arc::clone(&counter);
+        move |runtime: &mut Runtime<'_>| {
+            /// One link's body: assert that every link before it has run,
+            /// and count itself.
+            fn link(counter: &Arc<AtomicUsize>, step: usize) -> impl FnOnce() + Send + 'static {
+                let counter = Arc::clone(counter);
+                move || {
+                    assert_eq!(
+                        counter.fetch_add(1, Ordering::Relaxed),
+                        step,
+                        "a link ran before the link it depends on"
+                    );
+                }
+            }
+
+            let mut previous = if handles {
+                let (task, _value) = runtime.dependent_async(link(&counter, 0), []);
+                task
+            } else {
+                runtime.silent_dependent_async(link(&counter, 0), [])
+            };
+
+            for step in 1..=LINKS {
+                let body = link(&counter, step);
+                previous = match (handles, step % 2) {
+                    // Upstream's odd links: a runtime-shaped body, whose
+                    // `Runtime` it never uses.
+                    (true, 1) => {
+                        let (task, _value) = runtime.dependent_async_runtime(
+                            move |_: &mut Runtime<'_>| body(),
+                            [&previous],
+                        );
+                        task
+                    }
+                    (true, _) => {
+                        let (task, _value) = runtime.dependent_async(body, [&previous]);
+                        task
+                    }
+                    (false, 1) => runtime.silent_dependent_async_runtime(
+                        move |_: &mut Runtime<'_>| body(),
+                        [&previous],
+                    ),
+                    (false, _) => runtime.silent_dependent_async(body, [&previous]),
+                };
+            }
+            // No corun: the implicit join at the end of this body is what the
+            // run's own `wait` below is waiting through.
+        }
+    });
+
+    executor.run(&taskflow).wait().expect("no task panicked");
+
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        LINKS + 1,
+        "{workers} workers: every link of the chain ran, in order"
+    );
+}
+
+#[test]
+fn silent_dependent_async_from_runtime_1_thread() {
+    chain_from_runtime(1, false);
+}
+
+#[test]
+fn silent_dependent_async_from_runtime_2_threads() {
+    chain_from_runtime(2, false);
+}
+
+#[test]
+fn silent_dependent_async_from_runtime_3_threads() {
+    chain_from_runtime(3, false);
+}
+
+#[test]
+fn silent_dependent_async_from_runtime_4_threads() {
+    chain_from_runtime(4, false);
+}
+
+#[test]
+fn dependent_async_from_runtime_1_thread() {
+    chain_from_runtime(1, true);
+}
+
+#[test]
+fn dependent_async_from_runtime_2_threads() {
+    chain_from_runtime(2, true);
+}
+
+#[test]
+fn dependent_async_from_runtime_3_threads() {
+    chain_from_runtime(3, true);
+}
+
+#[test]
+fn dependent_async_from_runtime_4_threads() {
+    chain_from_runtime(4, true);
 }

@@ -303,6 +303,7 @@ pub mod queue;
 pub mod rng;
 pub mod run_handle;
 pub(crate) mod runtime;
+pub(crate) mod runtime_async;
 pub(crate) mod subflow;
 pub(crate) mod topology;
 pub mod worker;

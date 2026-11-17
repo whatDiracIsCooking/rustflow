@@ -166,16 +166,28 @@
 //!
 //! # Why nothing here can hang
 //!
-//! A dependent-async task submitted to the executor is **never skipped**,
-//! which is what makes the successor release unconditional. The early-out at
-//! the top of `WorkerThread::invoke_one` skips a job whose run is cancelled or
-//! whose parent chain is marked, and a free node submitted here has neither:
-//! its run is the sentinel, which nothing ever records anything on, and its
-//! parent is `Parent::Run` rather than a chain. So every queued
-//! dependent-async job reaches the dispatch, every dispatch reaches the
-//! tear-down below, and every tear-down sets `FINISHED` and drains the list
-//! -- including the job of a task whose body panicked, since a panic is
-//! caught rather than unwound through the tear-down.
+//! Every queued dependent-async job sets `FINISHED` and drains its list,
+//! whatever happens to it, and that is what nothing here hanging rests on: a
+//! task left on a list nothing drains again is a task that never runs, and a
+//! task that never runs is a count against its parent that is never spent.
+//!
+//! A task submitted *to the executor* gets there the easy way -- it can never
+//! be skipped at all. The early-out at the top of `WorkerThread::invoke_one`
+//! skips a job whose run is cancelled or whose parent chain is marked, and a
+//! parentless free node has neither: its run is the sentinel, which nothing
+//! ever records anything on, and its parent is `Parent::Run` rather than a
+//! chain. A body that *panicked* is not an exception to it either, since the
+//! panic is caught rather than unwound through the tear-down.
+//!
+//! A task submitted from a runtime body (#92) is the case that needs the
+//! other half. It hangs off a node of a real run, so the early-out can skip
+//! one -- the run was cancelled, or a sibling failed and the walk marked the
+//! node they share -- and a skipped job never reaches the dispatch and so
+//! never reaches [`invoke`]. [`release_skipped`] is what the early-out calls
+//! instead, which is upstream's arrangement exactly: its cancelled branch
+//! goes to `_tear_down_invoke`, which dispatches on the handle and so runs
+//! the *whole* of `_tear_down_dependent_async` for such a node rather than
+//! only the parent branch every other kind owes.
 //!
 //! # A dependent-async handle inside a graph is still refused
 //!
@@ -192,12 +204,12 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::Ordering;
 
 use crate::async_task::AsyncTask;
-use crate::executor::Executor;
 use crate::executor::r#async::{AsyncHandle, ESTATE_NONE};
 use crate::executor::async_node::AsyncNode;
 use crate::executor::runtime;
 use crate::executor::topology::{Job, Parent, Topology};
 use crate::executor::worker::{Release, WorkerThread};
+use crate::executor::{Executor, Shared};
 use crate::graph::{AsyncWork, Handle};
 
 /// The one dependency a submission in progress counts as outstanding on its
@@ -335,26 +347,55 @@ impl Executor {
 
     /// Creates the free-standing node `work` is the body of, counts the
     /// dependencies named against it, and queues it if there are none left to
+    /// wait for, through the state the submission actually needs:
+    /// [`Shared::schedule_dependent_async_task`], which is where the protocol
+    /// is argued.
+    ///
+    /// Kept as the [`Executor`]'s own call for
+    /// [`Executor::schedule_async_task`]'s reason, and moved for its reason
+    /// too: a [`Runtime`](crate::Runtime) body naming the dependencies of a
+    /// child of its own (#92) has the worker's share of [`Shared`] and no
+    /// `Executor` at all.
+    pub(crate) fn schedule_dependent_async_task<'a>(
+        &self,
+        work: AsyncWork,
+        parent: &Parent,
+        estate: u32,
+        dependencies: impl IntoIterator<Item = &'a AsyncTask>,
+    ) -> AsyncTask {
+        self.shared
+            .schedule_dependent_async_task(work, parent, estate, dependencies)
+    }
+}
+
+impl Shared {
+    /// Creates the free-standing node `work` is the body of, counts the
+    /// dependencies named against it, and queues it if there are none left to
     /// wait for: upstream's `_schedule_dependent_async_task` plus the
     /// `_process_dependent_async` it calls per dependency and the
     /// `_increment_topology` its public callers make first, which as there is
     /// taken only for a parentless submission.
     ///
     /// `parent` and `estate` are upstream's own two arguments and mean what
-    /// they mean in `Executor::schedule_async_task`: [`Parent::Run`] is its
+    /// they mean in [`Shared::schedule_async_task`]: [`Parent::Run`] is its
     /// null parent, and the estate word is the bits to start the node with.
     /// Both are parameters rather than constants because the runtime-shaped
     /// forms (#92) need the other value of each, as they do for the plain
     /// async node.
     ///
     /// The order of the three steps that are not the dependency loop is
-    /// `schedule_async_task`'s, for its reasons: the counters go up before
-    /// anything can be queued, the parent is told about the job before it is
-    /// pushed, and the push is last because the job may already be running
-    /// when it returns. What this adds in the middle is the guard, which the
-    /// module docs argue for -- and note that the guard is raised *before*
-    /// `increment_async` could matter, since a node nobody can reach yet
-    /// cannot be scheduled by anybody.
+    /// [`Shared::schedule_async_task`]'s, for its reasons: the counters go up
+    /// before anything can be queued, the parent is told about the job
+    /// before it is pushed, and the push is last because the job may
+    /// already be running when it returns. What this adds in the middle is
+    /// the guard, which the module docs argue for -- and note that the guard
+    /// is raised *before* `increment_async` could matter, since a node
+    /// nobody can reach yet cannot be scheduled by anybody.
+    ///
+    /// The receiver is [`Shared`] for [`Shared::schedule_async_task`]'s
+    /// reason, which is the same one here: `Shared` is what a worker holds,
+    /// and a [`Runtime`](crate::Runtime) body submitting a dependent child
+    /// (#92) has no `Executor` to call.
     pub(crate) fn schedule_dependent_async_task<'a>(
         &self,
         work: AsyncWork,
@@ -369,7 +410,7 @@ impl Executor {
         // has the whole of the argument, and #115 is what the two conditions
         // disagreeing cost.
         if matches!(parent, Parent::Run) {
-            self.shared.increment_async();
+            self.increment_async();
         }
 
         let node = AsyncNode::new("", Handle::DependentAsync(work));
@@ -445,7 +486,7 @@ impl Executor {
         // the release half publishes the pushes above to the tear-down that
         // is released by the predecessor's own decrement instead.
         if outstanding.fetch_sub(met + SUBMITTING, Ordering::AcqRel) == met + SUBMITTING {
-            self.shared.bulk_schedule([Job::free(&node, parent)]);
+            self.bulk_schedule([Job::free(&node, parent)]);
         }
 
         // Upstream's `AsyncTask task(animate(...))` is taken at the *top* of
@@ -547,6 +588,35 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &AsyncWork) -> 
     Some(release)
 }
 
+/// Releases whatever was waiting for `job`'s task when that job is one the
+/// dispatch **skipped**, and does nothing for a job of any other kind.
+///
+/// The half of upstream's `_tear_down_invoke` that is not
+/// `WorkerThread::finish_job`: its cancelled early-out dispatches on the
+/// handle, so a `DEPENDENT_ASYNC` node reaches the whole of
+/// `_tear_down_dependent_async` -- `FINISHED` set, the successor list drained
+/// -- where every other kind owes only the parent branch.
+///
+/// Called by that early-out for every job it skips, which is why the two
+/// questions are asked here rather than there: the node kind, and whether
+/// this is a free node at all. A [`Handle::DependentAsync`] somebody built
+/// into a taskflow's graph is the second one -- [`invoke`] refuses such a
+/// node, and a cancelled run can skip one before it is ever refused -- and it
+/// has no successor list to drain, because the list is a *free* node's state.
+///
+/// Why it matters is the module docs' hanging section: the tasks waiting on a
+/// skipped one were counted against its parent when they were submitted, so
+/// leaving them on a list nothing drains again means the parent's join
+/// counter never reaches zero. For #92's children that parent is a preempted
+/// runtime node, which is then never resumed -- a run that never finishes and
+/// a `wait` that never returns, in place of a cancellation that was supposed
+/// to end the run promptly.
+pub(crate) fn release_skipped(worker: &mut WorkerThread, job: &Job) {
+    if job.async_node().is_some() && matches!(job.node().handle(), Handle::DependentAsync(_)) {
+        release_successors(worker, job);
+    }
+}
+
 /// Marks the task finished and queues whatever that made ready: the rest of
 /// upstream's `_tear_down_dependent_async`, minus the parent branch its
 /// caller keeps.
@@ -558,7 +628,7 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &AsyncWork) -> 
 /// lock-free; a job pushed to a queue may be stolen and run before this call
 /// returns, and whatever it does must not be able to wait on the lock it was
 /// released under. `executor::async_node` has that argument in full.
-fn release_successors(worker: &mut WorkerThread, job: &Job) {
+pub(crate) fn release_successors(worker: &mut WorkerThread, job: &Job) {
     // Upstream's `std::get_if<Node::DependentAsync>(&node->_handle)`, which
     // cannot fail for the same reason: the dispatch arm this runs under is
     // chosen by the node's own handle, and only a free node carries one.

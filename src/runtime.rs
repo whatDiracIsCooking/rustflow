@@ -34,26 +34,36 @@
 //!
 //! # Which bodies are handed one, and what they can do with it
 //!
-//! Three kinds, and `executor::runtime` runs all three: a runtime task of a
+//! Two kinds of node, and `executor::runtime` runs both: a runtime task of a
 //! graph, through
 //! [`FlowBuilder::emplace_runtime`](crate::FlowBuilder::emplace_runtime), and
-//! the two runtime-shaped *async* tasks a caller submits straight to the
-//! executor -- [`Executor::spawn_runtime`](crate::Executor::spawn_runtime)
-//! and
-//! [`Executor::silent_async_runtime`](crate::Executor::silent_async_runtime),
-//! which are upstream's `is_runtime_task_v<F>` branches of `_async` and
-//! `_silent_async`. The second of upstream's two body shapes,
-//! `void(Runtime&, bool)`, is the handle-returning one of those: it is called
-//! again when the node finishes so that it can report what failed under it,
-//! and `executor::runtime` is where that second entry is argued.
+//! a *free* node whose body is runtime-shaped, which is upstream's
+//! `is_runtime_task_v<F>` branch of `_async`, `_silent_async`,
+//! `_dependent_async` and `_silent_dependent_async`. There are rather more
+//! ways to submit one of those than there are kinds of them: four on the
+//! [`Executor`](crate::Executor) --
+//! [`spawn_runtime`](crate::Executor::spawn_runtime),
+//! [`silent_async_runtime`](crate::Executor::silent_async_runtime) and the
+//! two dependent forms -- and the same four on a `Runtime`, which is what
+//! makes a child's body able to spawn children of its own. What differs
+//! between them is who waits for the task and what the task waits for, never
+//! what its body is handed.
 //!
-//! What a body cannot do yet is the other direction. Upstream's `rt.async`,
-//! `rt.silent_async` and `rt.dependent_async` are what let a body spawn work
-//! *under* its own node -- the only work a [`Runtime::corun`] can wait for --
-//! and they are #92. Until then a task a body [`schedule`](Runtime::schedule)s
-//! is a sibling, counted against this node's parent rather than against the
-//! node, so the join counter a corun watches never rises and every corun
-//! returns at once. Upstream's `NonpreemptiveRuntime` is outside this
+//! The second of upstream's two body shapes, `void(Runtime&, bool)`, is the
+//! handle-returning one of those: it is called again when the node finishes
+//! so that it can report what failed under it, and `executor::runtime` is
+//! where that second entry is argued.
+//!
+//! What a body can do in the other direction is spawn work *under* its own
+//! node, which is upstream's `rt.async`, `rt.silent_async`,
+//! `rt.dependent_async` and `rt.silent_dependent_async` and is
+//! `executor::runtime_async` (#92): eight methods, because each of the four
+//! takes either body shape. Such a child is the only work a
+//! [`Runtime::corun`] can wait for and the only thing the implicit join at
+//! the end of the body is a join *of* -- where a task a body
+//! [`schedule`](Runtime::schedule)s is a sibling, counted against this node's
+//! parent rather than against the node, which is why `schedule` is not a way
+//! to spawn anything. Upstream's `NonpreemptiveRuntime` is outside this
 //! milestone altogether.
 
 use core::fmt;
