@@ -13,7 +13,10 @@
 //! - `bit_width(num_workers)` shared buffers, upstream's `Executor::_buffers`,
 //!   whose comment records that "empirically, we find that log2(N) performs
 //!   best";
-//! - picking one of them by hashing the item, as `Executor::_spill` does.
+//! - picking one of them by hashing the item, as `Executor::_spill` does, for
+//!   a single item -- and dealing a *batch* round-robin without hashing
+//!   anything, as `Executor::_bulk_spill_round_robin` does, which is #60's one
+//!   measured win on this path.
 //!
 //! The one behavioural difference worth stating up front: upstream's per-worker
 //! queue is a `BoundedWSQ` (256 items by default) whose `try_push` can fail, so
@@ -23,6 +26,7 @@
 //! no queue of their own, i.e. threads outside the executor.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_utils::CachePadded;
@@ -140,11 +144,15 @@ impl<T> Clone for Thief<T> {
 /// point: this is the cold path, and one queue per worker would cost every
 /// thief a sweep over mostly-empty queues.
 ///
-/// An item is routed to a buffer by its hash, so that two threads scheduling
-/// two different items usually contend on two different buffers. Upstream
-/// hashes the node pointer it is about to push; there is no pointer to hash
-/// here, so the item's own [`Hash`] stands in, reduced to a buffer the same way
-/// `Executor::_spill` reduces its pointer.
+/// A *single* item is routed to a buffer by its hash, so that two threads
+/// scheduling two different items usually contend on two different buffers.
+/// Upstream hashes the node pointer it is about to push; there is no pointer to
+/// hash here, so the item's own [`Hash`] stands in, reduced to a buffer the same
+/// way `Executor::_spill` reduces its pointer.
+///
+/// A *batch* -- [`push_bulk`](Self::push_bulk) -- is dealt round-robin instead,
+/// and hashes nothing. See that method: the hash is what #60 measured as the
+/// one reducible cost on this path.
 #[derive(Debug)]
 pub struct Buffers<T> {
     // Upstream gives each queue `alignas(TF_CACHELINE_SIZE)`. crossbeam already
@@ -152,6 +160,14 @@ pub struct Buffers<T> {
     // braces, but it keeps the no-false-sharing requirement visible at the
     // layer that depends on it rather than inside a dependency.
     buffers: Vec<CachePadded<Injector<T>>>,
+    /// Where the next [`push_bulk`](Self::push_bulk) starts dealing, so that
+    /// two batches do not both begin at buffer zero. Advanced once per batch,
+    /// never per item.
+    ///
+    /// Padded because it is the one *written* field of this struct: the `Vec`'s
+    /// pointer and length are read by every steal attempt, and a counter on
+    /// their cache line would dirty it for every thief on every batch.
+    rotation: CachePadded<AtomicUsize>,
 }
 
 impl<T: Send> Buffers<T> {
@@ -169,6 +185,7 @@ impl<T: Send> Buffers<T> {
             buffers: (0..bit_width(num_workers))
                 .map(|_| CachePadded::new(Injector::new()))
                 .collect(),
+            rotation: CachePadded::new(AtomicUsize::new(0)),
         }
     }
 
@@ -230,6 +247,49 @@ impl<T: Send> Buffers<T> {
         T: Hash,
     {
         self.buffers[self.buffer_of(&item)].push(item);
+    }
+
+    /// Pushes a batch of items into the buffers, dealing them round-robin, and
+    /// returns how many there were.
+    ///
+    /// This is the whole of the external submission path: one graph's source
+    /// tasks, queued by a thread that is not a worker. Upstream's counterpart
+    /// is `Executor::_bulk_spill_round_robin`, which deals *chunks* of
+    /// `N / num_buffers` rather than single items and picks its starting buffer
+    /// by a multiplicative hash of the first node pointer. Two differences,
+    /// both measured on #60's 65536-source graph at 24 workers:
+    ///
+    /// - **Nothing is hashed per item.** [`push`](Self::push) costs a
+    ///   `DefaultHasher` run -- 14 ns an item of the ~110 ns a source task took
+    ///   end to end -- and spends it to reach a distribution this already has
+    ///   by construction. Dealing instead of hashing was worth 15% of the run
+    ///   at 65536 sources and 25% at 4096, both at 24 workers; it is the only
+    ///   reducible cost #60 found on this path.
+    /// - **Items, not chunks.** A chunked deal fills one buffer at a time, so a
+    ///   thief whose sticky victim is a buffer the producer has moved past
+    ///   finds it empty and goes looking; dealing one at a time keeps every
+    ///   buffer non-empty for as long as the batch lasts. Chunks of 16 and 64
+    ///   both measured slower than single items here.
+    ///
+    /// The starting buffer rotates per batch rather than being hashed, which
+    /// costs one relaxed `fetch_add` per call instead of one hash, and spreads
+    /// two concurrent batches the same way upstream's hash is meant to.
+    pub fn push_bulk(&self, items: impl IntoIterator<Item = T>) -> usize {
+        let num_buffers = self.buffers.len();
+        // Relaxed: nothing is ordered by this counter, and two batches that
+        // read the same value are merely dealt from the same buffer.
+        let mut index = self.rotation.fetch_add(1, Ordering::Relaxed) % num_buffers;
+
+        let mut pushed = 0;
+        for item in items {
+            self.buffers[index].push(item);
+            pushed += 1;
+            index += 1;
+            if index == num_buffers {
+                index = 0;
+            }
+        }
+        pushed
     }
 
     /// Steals an item from the buffer at `index`, or returns `None` if there
@@ -512,6 +572,63 @@ mod tests {
     }
 
     #[test]
+    fn a_bulk_push_deals_evenly_over_every_buffer() {
+        let buffers = Buffers::new(32);
+        let num_buffers = buffers.num_buffers();
+        const ITEMS: usize = 1000;
+
+        assert_eq!(buffers.push_bulk(0..ITEMS), ITEMS);
+
+        // This is the histogram #60 asked for, as an assertion: a batch dealt
+        // round-robin differs by at most one item between buffers, where the
+        // hash merely tends to.
+        let mut histogram = vec![0_usize; num_buffers];
+        for (index, count) in histogram.iter_mut().enumerate() {
+            while buffers.steal_from(index).is_some() {
+                *count += 1;
+            }
+        }
+        assert_eq!(histogram.iter().sum::<usize>(), ITEMS, "{histogram:?}");
+        let smallest = histogram.iter().min().expect("at least one buffer");
+        let largest = histogram.iter().max().expect("at least one buffer");
+        assert!(largest - smallest <= 1, "uneven deal: {histogram:?}");
+        assert!(buffers.is_empty());
+    }
+
+    #[test]
+    fn an_empty_bulk_push_pushes_nothing() {
+        let buffers = Buffers::<usize>::new(8);
+        assert_eq!(buffers.push_bulk(std::iter::empty()), 0);
+        assert!(buffers.is_empty());
+    }
+
+    #[test]
+    fn two_bulk_pushes_start_at_different_buffers() {
+        let buffers = Buffers::new(32);
+        let num_buffers = buffers.num_buffers();
+
+        // One item each, so the only thing that can separate them is the
+        // rotation: without it every batch would begin at buffer zero.
+        let starts: Vec<usize> = (0..num_buffers)
+            .map(|item| {
+                assert_eq!(buffers.push_bulk([item]), 1);
+                buffers
+                    .first_nonempty()
+                    .inspect(|&index| {
+                        assert_eq!(buffers.steal_from(index), Some(item));
+                    })
+                    .expect("the item is in some buffer")
+            })
+            .collect();
+
+        assert_eq!(
+            starts,
+            (0..num_buffers).collect::<Vec<_>>(),
+            "the deal did not rotate"
+        );
+    }
+
+    #[test]
     fn every_external_push_is_stolen_exactly_once() {
         const PUSHERS: usize = 4;
         const PER_PUSHER: usize = 2_000;
@@ -525,8 +642,15 @@ mod tests {
             for pusher in 0..PUSHERS {
                 let buffers = &buffers;
                 scope.spawn(move || {
-                    for item in 0..PER_PUSHER {
-                        buffers.push(pusher * PER_PUSHER + item);
+                    let base = pusher * PER_PUSHER;
+                    // Half the pushers go one item at a time and half in bulk,
+                    // so that the two paths are exercised against each other.
+                    if pusher % 2 == 0 {
+                        for item in 0..PER_PUSHER {
+                            buffers.push(base + item);
+                        }
+                    } else {
+                        assert_eq!(buffers.push_bulk(base..base + PER_PUSHER), PER_PUSHER);
                     }
                 });
             }
