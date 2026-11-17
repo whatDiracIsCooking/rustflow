@@ -142,9 +142,14 @@ struct InnerRun {
 
 impl InnerRun {
     /// A run that has not started.
+    ///
+    /// A corun runs its graph exactly once, so the run policy is the only one
+    /// that says "do not go round again" from the start, with no callback to
+    /// carry out: `run_n`/`run_until` are for a taskflow a caller runs, and
+    /// the whole of this topology is a counter the corun frame waits on.
     fn new() -> Self {
         Self {
-            topology: Box::new(Topology::new()),
+            topology: Box::new(Topology::new(|| true, || {})),
         }
     }
 
@@ -245,16 +250,26 @@ impl Executor {
         let id = self.this_worker_id().ok_or(CorunError::NotAWorker)?;
 
         let run = InnerRun::new();
-        if self.set_up_topology(taskflow, run.topology()) {
+        if taskflow.has_source_task() {
             let topology = run.topology();
+
+            // Counted as the `run` family counts its own, and for the reason
+            // that family's `start` gives: a worker skips the steal loop while
+            // `num_topologies` is zero, so this run has to be visible there
+            // before its sources are. The matching decrement is the one every
+            // run gets, from the tear-down of its last job.
+            self.shared.increment_topology();
+            self.shared.set_up_topology(None, taskflow, topology);
+
             // Upstream's predicate, exactly: the run is over when its join
             // counter reaches zero. `join` below, not this read, is what then
             // makes the topology safe to drop.
             WorkerThread::corun_view(Arc::clone(&self.shared), id)
                 .corun_until(|| topology.outstanding() == 0);
         } else {
-            // Nothing was scheduled, so nobody will finish the run: this
-            // frame does, as `Executor::run` does for the same graph.
+            // Nothing to schedule, so nobody will finish the run: this frame
+            // does, as `Executor::run` does for the same graph. Nothing was
+            // counted either, so there is nothing to decrement.
             run.topology().finish();
         }
 

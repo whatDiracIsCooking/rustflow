@@ -3,25 +3,31 @@
 //! The cases ported here are the ones that exercise the task handle API --
 //! `Type`, `Builder`, `Task.RemoveDependencies`, the per-task half of
 //! `Iterators`, `Hash` -- and the ones that exercise running a graph at all:
-//! `RunAndWait` and `WorkerID`. Three standing adaptations, because the port
-//! is not yet where upstream is:
+//! `Future`, `SerialRuns`, `ParallelRuns`, `RunAndWait` and `WorkerID`. Three
+//! standing adaptations, because the port is not yet where upstream is:
 //!
-//! - `corun`, `run_n` and `run_until` are later issues, so a case that nests
-//!   one run inside another says how it stands in for `corun` where it does;
-//!   `RunAndWait.Complex` is the one that cannot stand in at all, and says why.
-//!   The task bodies that assert on a counter are otherwise upstream's, run by
-//!   [`run`] through the real executor.
-//! - There is no `FlowBuilder`, so tasks are created straight off the graph
-//!   arena and `placeholder()`/`emplace()`/`linearize()` are spelled out by
-//!   hand here.
+//! - `corun` is a later issue, so a case that nests one run inside another says
+//!   how it stands in for `corun` where it does; `RunAndWait.Complex` is the
+//!   one that cannot stand in at all, and says why. The task bodies that assert
+//!   on a counter are otherwise upstream's, run by [`run`] through the real
+//!   executor.
+//! - The task-building helpers below predate [`FlowBuilder`] and are kept
+//!   rather than rewritten, so `placeholder()`, `emplace()` and `linearize()`
+//!   are spelled out by hand here; what they build is the same graph the
+//!   builder would.
 //! - `Iterators/Generic` renames tasks from inside `for_each_successor`, which
 //!   an index-handle visitor cannot do while the walk borrows the graph; the
 //!   walk collects the indices and the renaming follows it.
 
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread;
 
-use rustflow::{Executor, Handle, RunError, RunHandle, Task, TaskType, Taskflow};
+use rustflow::prelude::*;
+use rustflow::{Executor, RunError, RunHandle, TaskType};
 
 /// Adds a placeholder task, upstream's `taskflow.placeholder()`.
 fn placeholder(taskflow: &mut Taskflow, name: &str) -> Task {
@@ -703,6 +709,338 @@ fn run_and_wait_complex() {
 }
 
 // --------------------------------------------------------
+// Testcase: Future
+// --------------------------------------------------------
+
+/// Wakes the thread that parked itself waiting for a run: the whole of the
+/// runtime [`block_on`] needs, and the shape any real one has.
+struct Unpark(thread::Thread);
+
+impl Wake for Unpark {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+/// Drives `future` to completion on this thread, with no runtime and no
+/// dependency: poll, park, and let the waker unpark us.
+fn block_on<F: Future>(future: F) -> F::Output {
+    let waker = Waker::from(Arc::new(Unpark(thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let mut future = pin!(future);
+
+    loop {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+            return output;
+        }
+        thread::park();
+    }
+}
+
+/// Upstream's `Future` case is about `std::future`'s own surface -- `valid()`
+/// and `get()` on a promise somebody else fulfilled -- which in this port is
+/// `impl Future for RunHandle`: a run can be awaited instead of waited for.
+/// So the case becomes what that impl owes, driven by the four lines of
+/// executor above rather than by a runtime the crate does not depend on.
+#[test]
+fn future() {
+    let executor = Executor::new(4);
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    // A run that has nothing to run is ready on the first poll, which is
+    // upstream's "a future from an already-fulfilled promise is valid".
+    let empty = Taskflow::new();
+    block_on(executor.run(&empty)).expect("an empty run cannot panic");
+
+    // A run that does have something to run is pending first and woken by the
+    // worker that finishes it.
+    let mut taskflow = Taskflow::new();
+    let (a, b) = {
+        let first = Arc::clone(&counter);
+        let second = Arc::clone(&counter);
+        taskflow.emplace_n((
+            move || {
+                first.fetch_add(1, Ordering::Relaxed);
+            },
+            move || {
+                second.fetch_add(1, Ordering::Relaxed);
+            },
+        ))
+    };
+    taskflow.task(a).precede([b]);
+
+    block_on(executor.run_n(&taskflow, 3)).expect("no task panicked");
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        6,
+        "three runs of two tasks"
+    );
+
+    // An awaited handle is not consumed, so it is still there to drop
+    // afterwards -- and it reports a panic the way `wait` does.
+    let mut failing = Taskflow::new();
+    failing.emplace(|| panic!("boom"));
+    let handle = executor.run(&failing);
+    let error = block_on(handle).expect_err("the panic was not reported");
+    assert!(matches!(error, RunError::Panicked(_)));
+
+    executor.wait_for_all();
+    assert_eq!(executor.num_topologies(), 0);
+}
+
+// --------------------------------------------------------
+// Testcase: SerialRuns
+// --------------------------------------------------------
+
+/// Upstream's `sequential_runs(W)`, subcase by subcase.
+fn sequential_runs(workers: usize) {
+    let executor = Executor::new(workers);
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    let mut taskflow = Taskflow::new();
+    for _ in 0..NUM_TASKS {
+        let counter = Arc::clone(&counter);
+        emplace(&mut taskflow, move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    // SUBCASE("RunOnce")
+    let handle = executor.run(&taskflow);
+    assert_eq!(taskflow.num_tasks(), NUM_TASKS);
+    handle.wait().expect("a task panicked");
+    assert_eq!(counter.load(Ordering::Relaxed), NUM_TASKS);
+
+    // SUBCASE("WaitForAll"): upstream drops the future on the floor and waits
+    // on the executor instead. Dropping a handle here would block, which would
+    // make `wait_for_all` the second thing to wait rather than the first, so
+    // the handle is held *across* the wait -- the one spelling of this that
+    // still asks `wait_for_all` to do the waiting.
+    counter.store(0, Ordering::Relaxed);
+    let handle = executor.run(&taskflow);
+    executor.wait_for_all();
+    assert_eq!(counter.load(Ordering::Relaxed), NUM_TASKS);
+    assert_eq!(executor.num_topologies(), 0);
+    drop(handle);
+
+    // SUBCASE("MultipleRuns"): four taskflows, two hundred runs of each, none
+    // of them waited for as it is issued. Upstream's point is the executor
+    // soaking up eight hundred overlapping runs; this port's addition is that
+    // two hundred of them are runs of the *same* taskflow, which is exactly
+    // the queue `Taskflow` keeps -- they serialise behind each other instead
+    // of two workers meeting on one node.
+    const RUNS: usize = 200;
+    let sizes = [16, 1024, 32, 128];
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let taskflows: Vec<Taskflow> = sizes
+        .iter()
+        .map(|&size| {
+            let mut taskflow = Taskflow::new();
+            for _ in 0..size {
+                let count = Arc::clone(&count);
+                emplace(&mut taskflow, move || {
+                    count.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+            taskflow
+        })
+        .collect();
+
+    let mut handles: Vec<RunHandle<'_>> = Vec::with_capacity(RUNS * sizes.len());
+    for _ in 0..RUNS {
+        for taskflow in &taskflows {
+            handles.push(executor.run(taskflow));
+        }
+    }
+    executor.wait_for_all();
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        RUNS * sizes.iter().sum::<usize>()
+    );
+    drop(handles);
+
+    // SUBCASE, this port's own: the same two hundred runs as `run_n`, which is
+    // one topology re-armed by its own tear-down rather than two hundred
+    // queued behind each other. Upstream reaches this path from `run_n` in
+    // `WorkerID` and from `moved_run`; at eight worker counts it is worth
+    // having here too.
+    counter.store(0, Ordering::Relaxed);
+    executor
+        .run_n(&taskflow, RUNS)
+        .wait()
+        .expect("a task panicked");
+    assert_eq!(counter.load(Ordering::Relaxed), RUNS * NUM_TASKS);
+    assert_eq!(executor.num_topologies(), 0);
+}
+
+#[test]
+fn serial_runs_1_thread() {
+    sequential_runs(1);
+}
+
+#[test]
+fn serial_runs_2_threads() {
+    sequential_runs(2);
+}
+
+#[test]
+fn serial_runs_3_threads() {
+    sequential_runs(3);
+}
+
+#[test]
+fn serial_runs_4_threads() {
+    sequential_runs(4);
+}
+
+#[test]
+fn serial_runs_5_threads() {
+    sequential_runs(5);
+}
+
+#[test]
+fn serial_runs_6_threads() {
+    sequential_runs(6);
+}
+
+#[test]
+fn serial_runs_7_threads() {
+    sequential_runs(7);
+}
+
+#[test]
+fn serial_runs_8_threads() {
+    sequential_runs(8);
+}
+
+// --------------------------------------------------------
+// Testcase: ParallelRuns
+// --------------------------------------------------------
+
+/// How many threads issue runs at once, upstream's 32.
+const ISSUERS: usize = 32;
+
+/// How many `A -> B` pairs each of their taskflows holds. Upstream's 1024,
+/// quartered: the case is about many threads hitting one executor at once, and
+/// the port runs it at eight worker counts where upstream runs it at four.
+const PAIRS: usize = 256;
+
+/// Upstream's `parallel_runs(w)`: many threads, each with its own taskflow,
+/// all running on one executor.
+fn parallel_runs(workers: usize) {
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    let make_taskflow = |counter: &Arc<AtomicUsize>| {
+        let mut taskflow = Taskflow::new();
+        for _ in 0..PAIRS {
+            let bump = |counter: &Arc<AtomicUsize>| {
+                let counter = Arc::clone(counter);
+                move || {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            };
+            let (a, b) = taskflow.emplace_n((bump(counter), bump(counter)));
+            taskflow.task(a).precede([b]);
+        }
+        taskflow
+    };
+
+    // SUBCASE("RunAndWait")
+    {
+        let executor = Executor::new(workers);
+        counter.store(0, Ordering::Relaxed);
+
+        thread::scope(|scope| {
+            for _ in 0..ISSUERS {
+                scope.spawn(|| {
+                    let taskflow = make_taskflow(&counter);
+                    executor.run(&taskflow).wait().expect("a task panicked");
+                });
+            }
+        });
+
+        assert_eq!(counter.load(Ordering::Relaxed), ISSUERS * PAIRS * 2);
+        assert_eq!(executor.num_topologies(), 0);
+    }
+
+    // SUBCASE("RunAndWaitForAll"): upstream issues all 32 runs from 32 threads,
+    // counts them in with an atomic barrier and then waits on the executor. The
+    // handles stand in for that barrier here -- a run that has been issued is a
+    // handle somebody is holding -- so the taskflows live out here and the
+    // threads only start the runs.
+    {
+        let executor = Executor::new(workers);
+        counter.store(0, Ordering::Relaxed);
+
+        let taskflows: Vec<Taskflow> = (0..ISSUERS).map(|_| make_taskflow(&counter)).collect();
+        let handles = Mutex::new(Vec::with_capacity(ISSUERS));
+
+        thread::scope(|scope| {
+            for taskflow in &taskflows {
+                scope.spawn(|| {
+                    let handle = executor.run(taskflow);
+                    handles
+                        .lock()
+                        .expect("the handle list is never poisoned")
+                        .push(handle);
+                });
+            }
+        });
+
+        executor.wait_for_all();
+        assert_eq!(counter.load(Ordering::Relaxed), ISSUERS * PAIRS * 2);
+        assert_eq!(
+            handles
+                .lock()
+                .expect("the handle list is never poisoned")
+                .len(),
+            ISSUERS
+        );
+    }
+}
+
+#[test]
+fn parallel_runs_1_thread() {
+    parallel_runs(1);
+}
+
+#[test]
+fn parallel_runs_2_threads() {
+    parallel_runs(2);
+}
+
+#[test]
+fn parallel_runs_3_threads() {
+    parallel_runs(3);
+}
+
+#[test]
+fn parallel_runs_4_threads() {
+    parallel_runs(4);
+}
+
+#[test]
+fn parallel_runs_5_threads() {
+    parallel_runs(5);
+}
+
+#[test]
+fn parallel_runs_6_threads() {
+    parallel_runs(6);
+}
+
+#[test]
+fn parallel_runs_7_threads() {
+    parallel_runs(7);
+}
+
+#[test]
+fn parallel_runs_8_threads() {
+    parallel_runs(8);
+}
+
+// --------------------------------------------------------
 // Testcase: WorkerID
 // --------------------------------------------------------
 
@@ -737,17 +1075,15 @@ fn worker_id(workers: usize) {
         taskflow.task(a).precede([b]);
     }
 
-    // Upstream's `run_n(taskflow, 100)` is a later issue, so the repetition is
-    // ten sequential runs instead -- ten rather than a hundred only to keep
-    // the eight worker counts of this case inside a reasonable test runtime.
-    // The repetition itself is upstream's point and is kept: an id a worker
-    // reports correctly only on its first job would still pass if run once.
-    for _ in 0..10 {
-        executor
-            .run(&taskflow)
-            .wait()
-            .expect("a task reported a bad worker id");
-    }
+    // Upstream's `run_n(taskflow, 100)`, with ten runs rather than a hundred
+    // only to keep the eight worker counts of this case inside a reasonable
+    // test runtime. The repetition itself is upstream's point and is kept: an
+    // id a worker reports correctly only on its first job would still pass if
+    // run once.
+    executor
+        .run_n(&taskflow, 10)
+        .wait()
+        .expect("a task reported a bad worker id");
 }
 
 #[test]
@@ -788,6 +1124,230 @@ fn worker_id_7_threads() {
 #[test]
 fn worker_id_8_threads() {
     worker_id(8);
+}
+
+// --------------------------------------------------------
+// Testcase: the run family's own bar
+//
+// Upstream's `run_n`/`run_until` overloads have no unit test of their own
+// beyond the uses in `SerialRuns`, `WorkerID` and `test_movable.cpp`; these are
+// issue #15's bar for them.
+// --------------------------------------------------------
+
+/// A graph of three tasks, each bumping `counter` once per run.
+fn counting_chain(counter: &Arc<AtomicUsize>) -> Taskflow {
+    let mut taskflow = Taskflow::new();
+    let bump = |counter: &Arc<AtomicUsize>| {
+        let counter = Arc::clone(counter);
+        move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    };
+    let (a, b, c) = taskflow.emplace_n((bump(counter), bump(counter), bump(counter)));
+    taskflow.linearize([a, b, c]);
+    taskflow
+}
+
+/// `run_until` with a counter predicate runs the graph exactly as many times as
+/// the counter allows and calls the callback exactly once -- including when
+/// that number is zero, where the graph must not run at all and the callback
+/// must still fire.
+///
+/// The predicate is upstream's `[repeat]() mutable { return repeat-- == 0; }`,
+/// which is also what `run_n` passes, so this pins down both.
+#[test]
+fn run_until_runs_the_graph_k_times_and_fires_the_callback_once() {
+    const TASKS: usize = 3;
+
+    for workers in [1, 4] {
+        for runs in 0..5_usize {
+            let executor = Executor::new(workers);
+            let counter = Arc::new(AtomicUsize::new(0));
+            let taskflow = counting_chain(&counter);
+
+            let asked = Arc::new(AtomicUsize::new(0));
+            let called = Arc::new(AtomicUsize::new(0));
+
+            let predicate = {
+                let asked = Arc::clone(&asked);
+                let mut remaining = runs;
+                move || {
+                    asked.fetch_add(1, Ordering::Relaxed);
+                    let stop = remaining == 0;
+                    remaining = remaining.saturating_sub(1);
+                    stop
+                }
+            };
+            let on_finish = {
+                let called = Arc::clone(&called);
+                move || {
+                    called.fetch_add(1, Ordering::Relaxed);
+                }
+            };
+
+            executor
+                .run_until_with(&taskflow, predicate, on_finish)
+                .wait()
+                .expect("a task panicked");
+
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                runs * TASKS,
+                "{runs} runs at {workers} workers"
+            );
+            assert_eq!(
+                called.load(Ordering::Relaxed),
+                1,
+                "the callback fires once per run handle, whatever the count"
+            );
+            assert_eq!(
+                asked.load(Ordering::Relaxed),
+                runs + 1,
+                "the predicate is asked once before the first run and once after each"
+            );
+            assert_eq!(executor.num_topologies(), 0);
+        }
+    }
+}
+
+/// `run_n(.., 0)` is upstream's already-true predicate: nothing runs, the
+/// callback still fires, and no topology is ever counted.
+#[test]
+fn running_a_taskflow_no_times_still_calls_the_callback() {
+    let executor = Executor::new(2);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let taskflow = counting_chain(&counter);
+
+    let called = Arc::new(AtomicUsize::new(0));
+    let handle = {
+        let called = Arc::clone(&called);
+        executor.run_n_with(&taskflow, 0, move || {
+            called.fetch_add(1, Ordering::Relaxed);
+        })
+    };
+    assert_eq!(executor.num_topologies(), 0, "nothing was scheduled");
+    assert_eq!(
+        called.load(Ordering::Relaxed),
+        1,
+        "called before the handle"
+    );
+    handle.wait().expect("nothing ran");
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+}
+
+/// The callback runs before the handle is released, so a `wait` that has
+/// returned has already seen whatever the callback did. That is upstream's
+/// order -- `_on_finish()` before `_carry_out_promise()` -- and it is what lets
+/// a caller use the callback to publish a result the waiter then reads.
+#[test]
+fn the_callback_is_visible_by_the_time_the_wait_returns() {
+    const RUNS: usize = 200;
+
+    let executor = Executor::new(2);
+    for _ in 0..RUNS {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let taskflow = counting_chain(&counter);
+        let published = Arc::new(AtomicUsize::new(0));
+
+        let handle = {
+            let counter = Arc::clone(&counter);
+            let published = Arc::clone(&published);
+            executor.run_n_with(&taskflow, 2, move || {
+                published.store(counter.load(Ordering::Relaxed), Ordering::SeqCst);
+            })
+        };
+        handle.wait().expect("a task panicked");
+
+        assert_eq!(published.load(Ordering::SeqCst), 6, "the callback ran late");
+    }
+}
+
+/// A panic out of the callback must be reported rather than left to unwind out
+/// of the tear-down, which would skip the release of the waiting thread.
+#[test]
+fn a_panicking_callback_is_reported_and_does_not_strand_the_waiter() {
+    let executor = Executor::new(2);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let taskflow = counting_chain(&counter);
+
+    let error = executor
+        .run_with(&taskflow, || panic!("callback"))
+        .wait()
+        .expect_err("the callback's panic was not reported");
+    if let RunError::Panicked(payload) = &error {
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"callback"));
+    } else {
+        panic!("unexpected error: {error:?}");
+    }
+
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        3,
+        "the run itself finished"
+    );
+    assert_eq!(executor.num_topologies(), 0);
+    executor.wait_for_all();
+}
+
+/// Runs of one taskflow queue up behind each other: the second run's graph does
+/// not start until the first run's last task is done. The chain's counter is
+/// what shows it -- a task of run `k` that saw a count from run `k + 1` would
+/// mean two runs were sharing the graph.
+#[test]
+fn runs_of_one_taskflow_do_not_overlap() {
+    const RUNS: usize = 50;
+    const WIDTH: usize = 8;
+
+    for workers in [1, 2, 8] {
+        let executor = Executor::new(workers);
+
+        // One source fanning out to `WIDTH` tasks and a sink behind them, so a
+        // run has work in flight on every worker at once.
+        let running = Arc::new(AtomicUsize::new(0));
+        let overlaps = Arc::new(AtomicUsize::new(0));
+        let mut taskflow = Taskflow::new();
+
+        let enter = {
+            let running = Arc::clone(&running);
+            let overlaps = Arc::clone(&overlaps);
+            taskflow.emplace(move || {
+                if running.fetch_add(1, Ordering::SeqCst) != 0 {
+                    overlaps.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        let leave = {
+            let running = Arc::clone(&running);
+            let overlaps = Arc::clone(&overlaps);
+            taskflow.emplace(move || {
+                if running.fetch_sub(1, Ordering::SeqCst) != 1 {
+                    overlaps.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        for _ in 0..WIDTH {
+            let middle = taskflow.emplace(|| {});
+            taskflow.task(enter).precede([middle]);
+            taskflow.task(leave).succeed([middle]);
+        }
+
+        // Half the runs queued behind one another, half as one topology run
+        // over and over: the two paths the tear-down takes.
+        let handles: Vec<RunHandle<'_>> = (0..RUNS).map(|_| executor.run(&taskflow)).collect();
+        drop(handles);
+        executor
+            .run_n(&taskflow, RUNS)
+            .wait()
+            .expect("a task panicked");
+
+        assert_eq!(
+            overlaps.load(Ordering::SeqCst),
+            0,
+            "two runs shared the graph at {workers} workers"
+        );
+        assert_eq!(running.load(Ordering::SeqCst), 0);
+        assert_eq!(executor.num_topologies(), 0);
+    }
 }
 
 // --------------------------------------------------------

@@ -2,12 +2,14 @@
 //! in `taskflow/core/executor.hpp` (Taskflow v4.1.0).
 //!
 //! A [`Topology`] is one run of one [`Taskflow`]: the counter that says how
-//! much of the graph is still outstanding, and the slot a `wait` blocks on.
-//! Upstream keeps it in a `std::shared_ptr` that both the `tf::Future` and
-//! every queued `Node*` hold a share of; here the
-//! [`RunHandle`](crate::RunHandle) owns it outright and its borrow is what
-//! keeps it alive, which is the whole reason `run` hands back a handle with a
-//! lifetime instead of a detachable future.
+//! much of the graph is still outstanding, the policy that decides whether to
+//! run the graph again, and the slot a `wait` blocks on. Upstream keeps it in a
+//! `std::shared_ptr` that both the `tf::Future` and every queued `Node*` hold a
+//! share of; here it is an `Arc` shared by exactly two owners -- the
+//! [`RunHandle`](crate::RunHandle) the run was handed back as, and the
+//! taskflow's queue of pending runs -- and the handle's borrow is what keeps
+//! the *taskflow* alive, which is the whole reason `run` hands back a handle
+//! with a lifetime instead of a detachable future.
 //!
 //! # The one `unsafe` boundary in the executor
 //!
@@ -17,17 +19,25 @@
 //! the only place in the crate where a reference is reconstructed from a raw
 //! pointer. The argument that makes it sound is one sentence long, which is
 //! why this is the boundary worth having: a job referencing a run exists only
-//! between [`Topology::set_up`] and the moment the topology's join counter
-//! hits zero, and [`Topology::finish`] -- the release of the thread that owns
-//! the topology and the taskflow's borrow -- is the *last* thing the worker
-//! that drove the counter to zero does.
+//! between [`Topology::set_up`] and [`Topology::finish`], and `finish` -- the
+//! release of the thread that owns the topology and the taskflow's borrow --
+//! is the *last* thing the worker that ends the run does.
+//!
+//! The join counter reaching zero is not the end of that window, because a
+//! `run_n` or `run_until` topology may send its graph round again: a worker
+//! that drives the counter to zero either re-arms the graph and queues its
+//! sources afresh, in which case the run is still in flight, or ends the run
+//! -- and `finish` is the last statement of that path, after the callback,
+//! after the taskflow's next queued run has been started, and after the
+//! executor's own bookkeeping.
 //!
 //! The topology is heap-allocated before the first job that names it is
-//! built, and it has exactly two owners over its life: the stack frame of
-//! `Executor::run`, up to the point where that frame hands the box to the
-//! handle it is about to return, and the handle thereafter. Neither can go
-//! away while a job is queued -- `run` has no fallible step between
-//! scheduling and returning, and the handle blocks.
+//! built, and the `Arc` that allocates it is held by the run handle for as
+//! long as the handle lives. Nothing can take it away while a job is queued:
+//! `run` has no fallible step between scheduling and returning, and the
+//! handle blocks when it is dropped. The taskflow's run queue holds a second
+//! share, dropped by the tear-down that pops the finished run -- which is
+//! strictly before [`Topology::finish`], so a share is outstanding throughout.
 //!
 //! Two things keep that boundary as small as it is. A job addresses its node
 //! by [`Task`] index rather than by pointer, so the node comes out of the
@@ -36,10 +46,11 @@
 //! Sync` value with no raw pointer in it.
 
 use std::any::Any;
+use std::panic::{self, AssertUnwindSafe};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
-use std::task::Waker;
+use std::task::{Poll, Waker};
 
 use crate::graph::{Node, Task};
 use crate::task::TaskRef;
@@ -96,10 +107,11 @@ impl Job {
     ///
     /// The run this job belongs to must still be in flight: the
     /// [`RunHandle`](crate::RunHandle) that owns the topology must not have
-    /// been dropped, which also means the taskflow is still borrowed by it.
-    /// That holds for every job from the moment [`Topology::set_up`] counts it
-    /// until the topology's join counter reaches zero, and a job exists only
-    /// inside that window -- see the module docs.
+    /// been dropped, which also means the taskflow is still borrowed -- or
+    /// owned -- by it. That holds for every job from the moment
+    /// [`Topology::set_up`] counts it until [`Topology::finish`] releases the
+    /// handle, and a job exists only inside that window -- see the module
+    /// docs.
     ///
     /// # Panics
     ///
@@ -109,10 +121,11 @@ impl Job {
     pub(crate) unsafe fn parts<'j>(&self) -> (&'j Node, &'j Taskflow, &'j Topology) {
         // SAFETY: the caller promises the run is still in flight, which is
         // exactly the promise that both targets are still alive: the topology
-        // is the `Box` that `Executor::run` builds and its `RunHandle` then
-        // owns, and the taskflow is what that handle borrows. Neither target
-        // is ever moved -- the box is allocated before the first job is built
-        // and only the box itself, not its contents, is ever moved.
+        // is the `Arc` that a run method allocates and its `RunHandle` then
+        // holds a share of, and the taskflow is what that handle borrows -- or
+        // owns, for a run handed a taskflow by value. Neither target is ever
+        // moved: both are allocated before the first job is built, and only
+        // the `Arc` and the `Box`, not their contents, are ever moved.
         let (taskflow, topology) = unsafe { (self.taskflow.as_ref(), self.topology.as_ref()) };
         (taskflow.graph().node(self.task), taskflow, topology)
     }
@@ -120,12 +133,10 @@ impl Job {
 
 /// One run of one [`Taskflow`]: upstream's `tf::Topology`.
 ///
-/// Three upstream members are not here, each for its own reason:
+/// Two upstream members are not here, each for its own reason:
 ///
 /// - `_promise` is a [`Completion`] behind a `Mutex`, because the payload a
 ///   panicking task hands back is not a value `std::promise` would carry;
-/// - `_predicate` and `_on_finish` arrive with `run_n`/`run_until`, which is
-///   the only thing that can make a topology run more than once;
 /// - `_estate`, upstream's cancellation and exception bits, is not needed yet.
 ///   Cancellation is a later milestone, and "the first panic wins" is already
 ///   decided by the `Mutex` that [`Topology::record_panic`] takes, so a state
@@ -137,20 +148,47 @@ pub(crate) struct Topology {
     /// becomes ready and lowered by one as each node finishes, so it reaches
     /// zero exactly once -- when the last node of the run is done.
     join_counter: AtomicUsize,
+    /// What decides whether the graph runs again, and what to call when it
+    /// does not: upstream's `_predicate` and `_on_finish`.
+    policy: Mutex<RunPolicy>,
     /// Everything a waiter needs, and the flag it waits on.
     completion: Mutex<Completion>,
     /// Signalled by [`Topology::finish`], under the lock.
     finished: Condvar,
 }
 
+/// Upstream's `Topology::_predicate` and `_on_finish`, which is what makes a
+/// topology able to run its graph more than once.
+///
+/// Behind a `Mutex` because both are called on whichever worker happens to
+/// finish a run, and the predicate is `FnMut` -- upstream's is a mutable
+/// lambda too, since `run_n`'s is a counter. The lock is uncontended by
+/// construction: the only thread that ever evaluates a run's policy is the one
+/// that drove its join counter to zero, and there is exactly one of those per
+/// run. It is a lock rather than an atomic because the values behind it are
+/// arbitrary closures.
+///
+/// Both are `'static`, as [`Work`](crate::Work) is and for the same reason:
+/// the topology is `Arc`-shared with the taskflow's run queue, which has no
+/// lifetime to spare. Upstream's callbacks capture by reference; a caller that
+/// wants that here shares an `Arc` with the closure instead.
+struct RunPolicy {
+    /// Called once before the first run and once after each run finishes.
+    /// `true` means "do not run the graph again".
+    predicate: Box<dyn FnMut() -> bool + Send>,
+    /// Called once, after the last run of the graph. An `Option` because it is
+    /// `FnOnce` and therefore has to be moved out to be called.
+    on_finish: Option<Box<dyn FnOnce() + Send>>,
+}
+
 /// The completion slot, in place of upstream's `std::promise<void>`.
 ///
 /// Who gets woken is deliberately two fields rather than one: a thread
 /// blocked in [`RunHandle::wait`](crate::RunHandle::wait) is woken through the
-/// condvar, and a future polling a run is woken through the [`Waker`] it left
-/// behind. Nothing leaves a waker yet -- the async run handle and
-/// `run_n`/`run_until` are what will -- but the slot is the shape they need,
-/// so they can fill it in without reopening this file.
+/// condvar, and a future polling a run is woken through the [`Waker`] left by
+/// [`Topology::poll_join`]. A handle is waited for one way or the other, never
+/// both, but keeping the two slots separate is what lets the blocking path
+/// stay a condvar rather than becoming a hand-rolled futex over the waker.
 struct Completion {
     /// Whether the run has finished. The condvar's predicate.
     finished: bool,
@@ -164,10 +202,24 @@ struct Completion {
 }
 
 impl Topology {
-    /// A run that has not started.
-    pub(crate) fn new() -> Self {
+    /// A run that has not started, over the policy `run_until` was given:
+    /// `predicate` decides after each run whether to run the graph again, and
+    /// `on_finish` is called once the answer is no.
+    ///
+    /// Upstream's `Topology(Taskflow&, P&&, C&&)`, minus the taskflow: a
+    /// topology here deliberately holds no reference to the graph it runs, so
+    /// the taskflow is a parameter of every method that needs it.
+    pub(crate) fn new<P, C>(predicate: P, on_finish: C) -> Self
+    where
+        P: FnMut() -> bool + Send + 'static,
+        C: FnOnce() + Send + 'static,
+    {
         Self {
             join_counter: AtomicUsize::new(0),
+            policy: Mutex::new(RunPolicy {
+                predicate: Box::new(predicate),
+                on_finish: Some(Box::new(on_finish)),
+            }),
             completion: Mutex::new(Completion {
                 finished: false,
                 panic: None,
@@ -273,6 +325,59 @@ impl Topology {
         self.join_counter.load(Ordering::Acquire)
     }
 
+    /// Whether the run that has just finished should run the graph again:
+    /// upstream's `!tpg->cancelled() && !tpg->_predicate()`.
+    ///
+    /// This is the whole of the re-run decision, in one place and deliberately
+    /// not inlined into the tear-down, because it is where the next two
+    /// milestones add their terms: #29 adds the cancellation half of upstream's
+    /// condition -- a cancelled run does not go round again -- and #32 adds the
+    /// panic half that upstream keeps commented out beside it.
+    pub(crate) fn run_again(&self) -> bool {
+        !self.stop_requested()
+    }
+
+    /// Evaluates the run predicate, reporting `true` for "stop".
+    ///
+    /// A panic out of the predicate is caught and recorded as the run's
+    /// failure, and answers "stop". Upstream lets the exception propagate out
+    /// of `_tear_down_topology`; here that would unwind past
+    /// [`Topology::finish`] and leave the waiter blocked for good, so the
+    /// failure is reported the way a panicking task's is.
+    fn stop_requested(&self) -> bool {
+        // The guard is dropped before the payload is recorded, so that the two
+        // locks of a topology are never held at once.
+        let evaluated = {
+            let mut policy = self.policy();
+            panic::catch_unwind(AssertUnwindSafe(|| (policy.predicate)()))
+        };
+
+        match evaluated {
+            Ok(stop) => stop,
+            Err(payload) => {
+                self.record_panic(payload);
+                true
+            }
+        }
+    }
+
+    /// Calls the on-finish callback, once. Upstream's `tpg->_on_finish()`.
+    ///
+    /// A panic out of the callback is caught and recorded, for the reason
+    /// [`Topology::stop_requested`] gives.
+    pub(crate) fn carry_out_callback(&self) {
+        // Taken out from under the lock, so that the callback runs with no
+        // lock of this topology held: it is user code, and the only thing it
+        // may not do is reach back into the run that is finishing.
+        let on_finish = self.policy().on_finish.take();
+
+        if let Some(on_finish) = on_finish
+            && let Err(payload) = panic::catch_unwind(AssertUnwindSafe(on_finish))
+        {
+            self.record_panic(payload);
+        }
+    }
+
     /// Stores what a panicking task panicked with, keeping the first.
     ///
     /// Upstream keeps the first exception too, and for the same reason: with
@@ -329,6 +434,32 @@ impl Topology {
         completion.panic.take()
     }
 
+    /// Reports whether this run has finished, leaving `waker` to be woken when
+    /// it does if it has not, and takes the panic payload when it has.
+    ///
+    /// The non-blocking half of [`Topology::join`], and the whole of what
+    /// `impl Future for RunHandle` needs. Registering the waker and reading the
+    /// flag happen under one lock, which is what stops a run finishing between
+    /// the two and leaving nobody to wake.
+    pub(crate) fn poll_join(&self, waker: &Waker) -> Poll<Option<Box<dyn Any + Send>>> {
+        let mut completion = self.lock();
+        if completion.finished {
+            return Poll::Ready(completion.panic.take());
+        }
+
+        // Replaced rather than kept, because a future may be polled by a
+        // different task each time; `will_wake` is the cheap way to skip the
+        // clone in the common case where it is not.
+        if !completion
+            .waker
+            .as_ref()
+            .is_some_and(|current| current.will_wake(waker))
+        {
+            completion.waker = Some(waker.clone());
+        }
+        Poll::Pending
+    }
+
     /// The completion slot. A poisoned lock is taken rather than propagated,
     /// as the executor's other locks are: the panic that poisoned it is
     /// already recorded in the slot, and refusing to hand the slot back would
@@ -337,6 +468,13 @@ impl Topology {
         self.completion
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The run policy. Poisoning is taken rather than propagated, as it is for
+    /// the completion slot: a predicate or callback that panicked has already
+    /// been recorded as this run's failure.
+    fn policy(&self) -> MutexGuard<'_, RunPolicy> {
+        self.policy.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -366,8 +504,18 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::task::Wake;
+
     use super::*;
     use crate::prelude::*;
+
+    /// A run that runs its graph exactly once and has nothing to call
+    /// afterwards: upstream's `run(f)` policy, which is what most of these
+    /// cases want.
+    fn once() -> Topology {
+        Topology::new(|| true, || {})
+    }
 
     /// A diamond, which is the smallest shape with a task that is neither a
     /// source nor a sink: `a -> {b, c} -> d`.
@@ -382,7 +530,7 @@ mod tests {
     #[test]
     fn setting_up_a_graph_counts_sources_and_arms_every_join_counter() {
         let (taskflow, [a, b, c, d]) = diamond();
-        let topology = Topology::new();
+        let topology = once();
 
         assert_eq!(topology.set_up(&taskflow), 1, "only `a` is a source");
         assert_eq!(topology.join_counter.load(Ordering::Relaxed), 1);
@@ -404,7 +552,7 @@ mod tests {
     #[test]
     fn setting_up_the_same_graph_again_rearms_it() {
         let (taskflow, [_, b, _, d]) = diamond();
-        let topology = Topology::new();
+        let topology = once();
 
         topology.set_up(&taskflow);
         // Spend the counters, as a run would.
@@ -433,7 +581,7 @@ mod tests {
     #[test]
     fn the_sources_are_the_tasks_with_no_predecessors() {
         let (taskflow, [a, ..]) = diamond();
-        let topology = Topology::new();
+        let topology = once();
         topology.set_up(&taskflow);
 
         let sources: Vec<Task> = topology.sources(&taskflow).map(|job| job.task).collect();
@@ -445,7 +593,7 @@ mod tests {
     /// nothing to schedule.
     #[test]
     fn a_graph_with_no_source_sets_up_to_zero() {
-        let topology = Topology::new();
+        let topology = once();
         assert_eq!(topology.set_up(&Taskflow::new()), 0);
 
         let mut cyclic = Taskflow::new();
@@ -461,7 +609,7 @@ mod tests {
     #[test]
     fn a_run_ends_when_the_last_outstanding_job_finishes() {
         let (taskflow, _) = diamond();
-        let topology = Topology::new();
+        let topology = once();
         topology.set_up(&taskflow);
 
         // `a` finishes, having made `b` and `c` ready.
@@ -480,7 +628,7 @@ mod tests {
 
     #[test]
     fn the_first_panic_is_the_one_reported() {
-        let topology = Topology::new();
+        let topology = once();
         topology.record_panic(Box::new("first"));
         topology.record_panic(Box::new("second"));
         topology.finish();
@@ -493,10 +641,116 @@ mod tests {
 
     #[test]
     fn joining_a_finished_run_does_not_block() {
-        let topology = Topology::new();
+        let topology = once();
         topology.finish();
         assert!(topology.join().is_none());
         assert!(topology.join().is_none());
+    }
+
+    /// The predicate is upstream's, counter and all: `run_n(f, k)` asks it
+    /// once before the first run and once after each run, so a topology set up
+    /// for `k` runs has to answer "again" exactly `k - 1` times.
+    #[test]
+    fn a_counting_predicate_runs_the_graph_the_number_of_times_asked() {
+        for runs in 0..5_usize {
+            let mut remaining = runs;
+            let topology = Topology::new(
+                move || {
+                    let stop = remaining == 0;
+                    remaining = remaining.saturating_sub(1);
+                    stop
+                },
+                || {},
+            );
+
+            // The call `run_until` makes before scheduling anything, then one
+            // per tear-down, as the worker makes them.
+            let mut scheduled = 0;
+            if !topology.stop_requested() {
+                scheduled = 1;
+                while topology.run_again() {
+                    scheduled += 1;
+                }
+            }
+            assert_eq!(scheduled, runs, "a topology asked for {runs} runs");
+        }
+    }
+
+    /// A predicate that panics must not unwind out of the tear-down: that would
+    /// skip `finish` and leave the waiter blocked for good. It is recorded as
+    /// the run's failure instead, and it means "stop".
+    #[test]
+    fn a_panicking_predicate_stops_the_run_and_is_reported() {
+        let topology = Topology::new(|| panic!("predicate"), || {});
+
+        assert!(!topology.run_again(), "a failed predicate means stop");
+        topology.finish();
+
+        let payload = topology.join().expect("the panic was recorded");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"predicate"));
+    }
+
+    /// The callback is upstream's `_on_finish`: called once, after the last
+    /// run, and a panic out of it is reported rather than propagated.
+    #[test]
+    fn the_callback_is_called_once_and_its_panic_is_recorded() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let topology = {
+            let calls = Arc::clone(&calls);
+            Topology::new(
+                || true,
+                move || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                },
+            )
+        };
+
+        topology.carry_out_callback();
+        topology.carry_out_callback();
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "`FnOnce` means once");
+
+        let panicking = Topology::new(|| true, || panic!("callback"));
+        panicking.carry_out_callback();
+        panicking.finish();
+        let payload = panicking.join().expect("the panic was recorded");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"callback"));
+    }
+
+    /// `poll_join` is the non-blocking half of `join`: pending until the run
+    /// finishes, and then the same payload `join` would have handed back.
+    #[test]
+    fn polling_a_run_leaves_a_waker_and_is_woken_by_finish() {
+        let woken = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountingWaker(Arc::clone(&woken))));
+
+        let topology = once();
+        assert!(topology.poll_join(&waker).is_pending());
+        // Polling again with the same waker keeps the one already stored.
+        assert!(topology.poll_join(&waker).is_pending());
+        assert_eq!(woken.load(Ordering::Relaxed), 0);
+
+        topology.record_panic(Box::new("boom"));
+        topology.finish();
+        assert_eq!(woken.load(Ordering::Relaxed), 1, "the waker was not woken");
+
+        let Poll::Ready(payload) = topology.poll_join(&waker) else {
+            panic!("a finished run is ready");
+        };
+        let payload = payload.expect("a panic was recorded");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
+
+        // Taken, not cloned, exactly as `join` takes it.
+        assert!(matches!(topology.poll_join(&waker), Poll::Ready(None)));
+        assert_eq!(woken.load(Ordering::Relaxed), 1, "no second wake");
+    }
+
+    /// A waker that counts, in place of a runtime.
+    struct CountingWaker(Arc<AtomicUsize>);
+
+    impl Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// A waiter that arrives before the run finishes has to be released by
@@ -504,7 +758,7 @@ mod tests {
     /// test cannot reach.
     #[test]
     fn a_blocked_waiter_is_released_by_finish() {
-        let topology = Topology::new();
+        let topology = once();
         std::thread::scope(|scope| {
             let waiter = scope.spawn(|| topology.join());
             topology.record_panic(Box::new(String::from("boom")));

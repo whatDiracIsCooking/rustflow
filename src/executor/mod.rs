@@ -14,8 +14,10 @@
 //! - `topology` one run of one taskflow, and the job a queue carries -- the
 //!   one module here that is crate-private, since a caller has no business
 //!   with a run's internals;
-//! - [`run_handle`] `run` itself, and the handle whose borrow is this port's
-//!   answer to upstream's "do not mutate a running taskflow".
+//! - [`run_handle`] the `run` family itself -- `run`, `run_n`, `run_until` and
+//!   the owning half of each -- the tear-down that decides whether a finished
+//!   run goes round again, and the handle whose borrow is this port's answer to
+//!   upstream's "do not mutate a running taskflow".
 //!
 //! What is left here is what the *executor* owns: the worker array, the
 //! buffers, the notifier, the thread-id map, and the lifecycle -- spawn the
