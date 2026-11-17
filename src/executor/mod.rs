@@ -83,6 +83,11 @@
 //! the call and the pool, which is why upstream's own documentation says "we
 //! may still see some tasks complete their executions or none".
 //!
+//! "Promptly" has exactly one exception, which is upstream's too and is set
+//! out under "Semaphores" below: a task already *parked* on a semaphore is
+//! not a task the pool has yet to get to, and a cancelled run with one of
+//! those does not finish until somebody releases that semaphore.
+//!
 //! A panicking task is the second way a run gets cancelled, and it reuses all
 //! three pieces: upstream's `_process_exception` sets `ESTATE::EXCEPTION`
 //! rather than `CANCELLED`, and the early-out and the re-run decision both
@@ -202,6 +207,72 @@
 //! All three arms that can preempt a node now do: a module task (#49, #74),
 //! a runtime task that spawned work (#51) and a subflow left to its implicit
 //! join (#50).
+//!
+//! # Semaphores: what a node does before and after the dispatch
+//!
+//! A [`Semaphore`](crate::Semaphore) constrains a *set* of tasks rather than
+//! locking one, and the executor's whole part in that is two hooks around
+//! `WorkerThread::invoke`'s dispatch -- upstream's `to_acquire` block before
+//! its `invoke_task:` label and its `to_release` block after the switch:
+//!
+//! - **before the dispatch**, on a first entry only, the node acquires every
+//!   semaphore it asked for, in order. If one of them has nothing left to
+//!   give, the node does not run: the job is parked in that semaphore, which
+//!   owns a clone of it, and anything the rollback of the counts already
+//!   taken woke is queued. Whoever releases that semaphore schedules the
+//!   parked job, and it enters the dispatch again as a first entry;
+//! - **after the dispatch**, on the entry that *finishes* the node, it
+//!   releases every semaphore it asked to release, and whatever those
+//!   releases wake is queued -- before the node's own successors, as
+//!   upstream queues them.
+//!
+//! "On a first entry only" and "on the entry that finishes" are the
+//! preemption protocol above read from the semaphores' side: a module,
+//! subflow or runtime node acquires once, keeps what it took for the length
+//! of its nested graph, and gives it back when the second entry completes
+//! it. A node that acquires a semaphore its own nested graph also acquires
+//! therefore needs a count for each, which is why upstream's own test of
+//! that shape uses a semaphore of two.
+//!
+//! Parking is the one thing here that is not accounted the way everything
+//! else in the scheduler is, and it is sound for a reason worth stating: a
+//! parked job is *not* finished, so nothing is counted down. The clone in
+//! the semaphore inherits the count the dequeued job was holding against its
+//! parent, so the run stays as outstanding as it was and cannot finish while
+//! one of its tasks is parked. The jobs a release wakes are queued through
+//! the shared buffers rather than kept as this worker's continuation, which
+//! `WorkerThread::invoke_one` argues at the hook.
+//!
+//! A task that releases a semaphore already at its maximum is upstream's
+//! `TF_THROW`, and here it is that task's own failure: the payload names the
+//! maximum it would have gone past, is delivered to the same anchor a panic
+//! in the body would reach, and surfaces from
+//! [`wait`](crate::RunHandle::wait) as
+//! [`RunError::Panicked`](crate::RunError::Panicked). The semaphore's
+//! counter is left alone.
+//!
+//! ## The hazard cancellation leaves
+//!
+//! One interaction is upstream's behaviour and is **recorded rather than
+//! fixed**: a job parked on a semaphore when its run is cancelled *stays
+//! parked*. Nothing sweeps a waiting list, so that job is scheduled only
+//! when some other task releases the semaphore -- and until then the run's
+//! join counter never reaches zero, so the run does not finish and a `wait`
+//! on it does not return. A parked task of a cancelled run is therefore not
+//! like a queued one: the queued one is dequeued and torn down by the
+//! early-out at the top of the dispatch, which is what lets a cancelled run
+//! complete promptly, while the parked one has nobody to dequeue it.
+//!
+//! The order of the two hooks is what bounds this: the cancellation check
+//! comes *before* the acquire, so a job that reaches the dispatch after the
+//! cancellation tears down without acquiring anything. What is left is the
+//! race -- a cancellation between the check and the acquire -- and the case
+//! where a task that was going to do the releasing is itself one of the
+//! tasks the cancellation skipped. Both are upstream's, so cancelling a run
+//! whose tasks acquire a semaphore nothing outside that run will release is
+//! a shape to avoid rather than one the executor rescues.
+//! [`Semaphore::reset`](crate::Semaphore::reset) is not the rescue either:
+//! it drops the waiting list, which unschedules those tasks for good.
 //!
 //! # Why cancellation reads the whole chain
 //!
