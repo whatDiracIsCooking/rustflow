@@ -8,6 +8,18 @@
 //! neither is the `NodeBase`/`Node` split: the base class exists upstream so
 //! that `Topology` can share the three state words, which nothing in this port
 //! needs yet, so the words keep their upstream names in a single struct.
+//!
+//! That choice decides what erasing a node has to do. Upstream's `Graph::_erase`
+//! compacts its `_nodes` vector, which it can afford because a `tf::Task` holds
+//! a `Node*` that compaction does not move. An index handle is not so lucky: any
+//! shuffle would silently re-point live [`Task`]s at other nodes. So
+//! [`Graph::erase`] *tombstones* -- it empties the slot and leaves it empty
+//! forever. Indices stay stable, which is the promise a `Copy` handle makes, at
+//! the cost of a slot that is never reused: a graph that erases N nodes keeps N
+//! empty slots until [`Graph::clear`]. A tombstoned handle then behaves exactly
+//! like one that was never valid -- [`Graph::contains`] is `false`,
+//! [`Graph::get`] is `None`, [`Graph::node`] panics -- and [`Graph::len`] counts
+//! live nodes only, so the three iterators skip the dead.
 
 use core::fmt;
 use core::num::TryFromIntError;
@@ -306,7 +318,12 @@ impl Node {
 /// since the work closures are not.
 #[derive(Debug, Default)]
 pub struct Graph {
-    nodes: Vec<Node>,
+    /// Slots in creation order. A `None` is a tombstone left by
+    /// [`Graph::erase`]; it is never refilled, so a [`Task`] cannot come to
+    /// address a different node than the one it was handed out for.
+    nodes: Vec<Option<Node>>,
+    /// How many slots hold a node, so [`Graph::len`] stays O(1).
+    num_live: usize,
 }
 
 impl Graph {
@@ -336,49 +353,59 @@ impl Graph {
     /// Panics if the graph already holds `u32::MAX` nodes.
     pub fn add_named_node(&mut self, name: impl Into<String>, handle: Handle) -> Task {
         let task = task_at(self.nodes.len());
-        self.nodes.push(Node::new(name.into(), handle));
+        self.nodes.push(Some(Node::new(name.into(), handle)));
+        self.num_live += 1;
         task
     }
 
-    /// Returns `true` if `task` addresses a node of this graph.
+    /// Returns `true` if `task` addresses a live node of this graph.
+    ///
+    /// An erased handle is indistinguishable here from one that was never
+    /// valid: both are `false`.
     #[must_use]
     pub fn contains(&self, task: Task) -> bool {
-        task.index() < self.nodes.len()
+        self.get(task).is_some()
     }
 
-    /// Returns the node `task` addresses, or `None` if it addresses nothing in
-    /// this graph.
+    /// Returns the node `task` addresses, or `None` if it addresses nothing
+    /// live in this graph -- out of range, or erased.
     #[must_use]
     pub fn get(&self, task: Task) -> Option<&Node> {
-        self.nodes.get(task.index())
+        self.nodes.get(task.index()).and_then(Option::as_ref)
     }
 
     /// Returns the node `task` addresses mutably, or `None`.
     pub fn get_mut(&mut self, task: Task) -> Option<&mut Node> {
-        self.nodes.get_mut(task.index())
+        self.nodes.get_mut(task.index()).and_then(Option::as_mut)
     }
 
     /// Returns the node `task` addresses.
     ///
     /// # Panics
     ///
-    /// Panics if `task` does not address a node of this graph.
+    /// Panics if `task` does not address a live node of this graph, whether
+    /// because it is out of range or because it was erased.
     #[must_use]
     pub fn node(&self, task: Task) -> &Node {
-        let len = self.nodes.len();
-        self.get(task)
-            .unwrap_or_else(|| panic!("{task:?} is out of range for a graph of {len} nodes"))
+        let slots = self.nodes.len();
+        let live = self.num_live;
+        self.get(task).unwrap_or_else(|| {
+            panic!("{task:?} is out of range or erased: {live} live nodes in {slots} slots")
+        })
     }
 
     /// Returns the node `task` addresses, mutably.
     ///
     /// # Panics
     ///
-    /// Panics if `task` does not address a node of this graph.
+    /// Panics if `task` does not address a live node of this graph, whether
+    /// because it is out of range or because it was erased.
     pub fn node_mut(&mut self, task: Task) -> &mut Node {
-        let len = self.nodes.len();
-        self.get_mut(task)
-            .unwrap_or_else(|| panic!("{task:?} is out of range for a graph of {len} nodes"))
+        let slots = self.nodes.len();
+        let live = self.num_live;
+        self.get_mut(task).unwrap_or_else(|| {
+            panic!("{task:?} is out of range or erased: {live} live nodes in {slots} slots")
+        })
     }
 
     /// Returns the successors of `task`.
@@ -414,7 +441,8 @@ impl Graph {
         // leave a one-sided edge behind.
         assert!(
             self.contains(from) && self.contains(to),
-            "{from:?} -> {to:?} is out of range for a graph of {} nodes",
+            "{from:?} -> {to:?} is out of range or erased: {} live nodes in {} slots",
+            self.num_live,
             self.nodes.len()
         );
         self.node_mut(from).push_successor(to);
@@ -437,45 +465,82 @@ impl Graph {
         removed_successors
     }
 
-    /// Returns the number of nodes in the graph.
+    /// Removes the node `task` addresses together with every edge touching it,
+    /// and returns `true` if there was one. Upstream's `Graph::_erase`, plus
+    /// the neighbour patch-up that upstream leaves to `FlowBuilder::erase`.
     ///
-    /// This is the single definition of "how many tasks": [`crate::Taskflow`]
-    /// defers to it, and so should erase-by-tombstone when it lands.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.nodes.len()
+    /// A handle that addresses nothing live -- out of range, or erased already
+    /// -- is a no-op returning `false`, matching upstream's "if the task does
+    /// not belong to the graph, nothing will happen".
+    ///
+    /// The slot becomes a tombstone and is never reused, so every other
+    /// [`Task`] keeps addressing the node it always did. See the module docs
+    /// for why that is worth a permanently empty slot.
+    pub fn erase(&mut self, task: Task) -> bool {
+        if !self.contains(task) {
+            return false;
+        }
+
+        // Copy the endpoints out first: patching a neighbour borrows the graph
+        // mutably, which the edge lists being read cannot survive. The erased
+        // node's own lists need no patching -- they die with it.
+        let successors = self.node(task).successors().to_vec();
+        let predecessors = self.node(task).predecessors().to_vec();
+        for successor in successors {
+            self.node_mut(successor).remove_predecessors(task);
+        }
+        for predecessor in predecessors {
+            self.node_mut(predecessor).remove_successors(task);
+        }
+
+        self.nodes[task.index()] = None;
+        self.num_live -= 1;
+        true
     }
 
-    /// Returns `true` if the graph holds no nodes.
+    /// Returns the number of live nodes in the graph, not counting the
+    /// tombstones [`Graph::erase`] leaves behind.
+    ///
+    /// This is the single definition of "how many tasks": [`crate::Taskflow`]
+    /// defers to it.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.num_live
+    }
+
+    /// Returns `true` if the graph holds no live nodes.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Drops every node, invalidating every [`Task`] handed out so far.
+    /// Drops every node and every tombstone, invalidating every [`Task`]
+    /// handed out so far. Handles start over from zero afterwards.
     pub fn clear(&mut self) {
         self.nodes.clear();
+        self.num_live = 0;
     }
 
-    /// Iterates over the handles of every node, in creation order.
+    /// Iterates over the handles of every live node, in creation order.
     pub fn tasks(&self) -> impl Iterator<Item = Task> {
-        (0..self.nodes.len()).map(task_at)
+        self.iter().map(|(task, _)| task)
     }
 
-    /// Iterates over every node together with its handle, in creation order.
+    /// Iterates over every live node together with its handle, in creation
+    /// order.
     pub fn iter(&self) -> impl Iterator<Item = (Task, &Node)> {
         self.nodes
             .iter()
             .enumerate()
-            .map(|(index, node)| (task_at(index), node))
+            .filter_map(|(index, slot)| slot.as_ref().map(|node| (task_at(index), node)))
     }
 
-    /// Iterates mutably over every node together with its handle.
+    /// Iterates mutably over every live node together with its handle.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (Task, &mut Node)> {
         self.nodes
             .iter_mut()
             .enumerate()
-            .map(|(index, node)| (task_at(index), node))
+            .filter_map(|(index, slot)| slot.as_mut().map(|node| (task_at(index), node)))
     }
 }
 
@@ -619,6 +684,97 @@ mod tests {
         assert_eq!(graph.remove_edge(t[0], t[0]), 1);
         assert_eq!(graph.node(t[0]).num_successors(), 0);
         assert_eq!(graph.node(t[0]).num_predecessors(), 0);
+    }
+
+    /// The bar issue #10 sets for erase: a middle node goes, its neighbours
+    /// lose exactly the edges that touched it, and every other handle still
+    /// resolves to the node it always named.
+    #[test]
+    fn erase_detaches_a_middle_node_and_leaves_the_rest_addressable() {
+        let (mut graph, t) = graph_of(4);
+        // a -> b -> c -> d, plus a -> c so c has two predecessors and the
+        // erased node is not the only route into it.
+        graph.add_edge(t[0], t[1]);
+        graph.add_edge(t[1], t[2]);
+        graph.add_edge(t[2], t[3]);
+        graph.add_edge(t[0], t[2]);
+
+        assert!(graph.erase(t[1]));
+
+        // The neighbours lost b and nothing else.
+        assert_eq!(graph.node(t[0]).num_successors(), 1);
+        assert_eq!(graph.successors(t[0]), [t[2]].as_slice());
+        assert_eq!(graph.node(t[2]).num_predecessors(), 1);
+        assert_eq!(graph.predecessors(t[2]), [t[0]].as_slice());
+        assert_eq!(graph.node(t[2]).num_successors(), 1);
+        assert_eq!(graph.node(t[3]).num_predecessors(), 1);
+
+        // Every other handle resolves to the same node as before.
+        assert_eq!(graph.node(t[0]).name(), "a");
+        assert_eq!(graph.node(t[2]).name(), "c");
+        assert_eq!(graph.node(t[3]).name(), "d");
+
+        // The erased handle is now indistinguishable from a stale one.
+        assert!(!graph.contains(t[1]));
+        assert!(graph.get(t[1]).is_none());
+        assert!(graph.get_mut(t[1]).is_none());
+
+        // `len` counts the live nodes, and the iterators skip the tombstone.
+        assert_eq!(graph.len(), 3);
+        assert_eq!(graph.tasks().collect::<Vec<_>>(), vec![t[0], t[2], t[3]]);
+        let names: Vec<&str> = graph.iter().map(|(_, node)| node.name()).collect();
+        assert_eq!(names, vec!["a", "c", "d"]);
+        for (_, node) in graph.iter_mut() {
+            node.set_name("live");
+        }
+        assert_eq!(graph.iter().count(), 3);
+
+        // The slot is not reused: the next node gets a fresh index.
+        assert_eq!(graph.add_node(Handle::Placeholder), Task::new(4));
+        assert_eq!(graph.len(), 4);
+    }
+
+    #[test]
+    fn erase_takes_duplicate_edges_and_a_self_loop_with_it() {
+        let (mut graph, t) = graph_of(3);
+        graph.add_edge(t[0], t[1]);
+        graph.add_edge(t[0], t[1]);
+        graph.add_edge(t[1], t[1]);
+        graph.add_edge(t[1], t[2]);
+        graph.add_edge(t[1], t[2]);
+
+        assert!(graph.erase(t[1]));
+        assert_eq!(graph.node(t[0]).num_successors(), 0);
+        assert_eq!(graph.node(t[2]).num_predecessors(), 0);
+    }
+
+    #[test]
+    fn erase_is_a_no_op_for_a_handle_that_names_nothing_live() {
+        let (mut graph, t) = graph_of(1);
+        assert!(!graph.erase(Task::new(1)));
+        assert!(graph.erase(t[0]));
+        // Erasing the same handle twice is the "task does not belong to the
+        // graph" case upstream documents as doing nothing.
+        assert!(!graph.erase(t[0]));
+        assert_eq!(graph.len(), 0);
+        assert!(graph.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range or erased")]
+    fn add_edge_panics_on_an_erased_handle() {
+        let (mut graph, t) = graph_of(2);
+        graph.erase(t[0]);
+        graph.add_edge(t[0], t[1]);
+    }
+
+    #[test]
+    fn clear_drops_the_tombstones_too() {
+        let (mut graph, t) = graph_of(2);
+        graph.erase(t[0]);
+        graph.clear();
+        assert!(graph.is_empty());
+        assert_eq!(graph.add_node(Handle::Placeholder), Task::new(0));
     }
 
     #[test]

@@ -38,11 +38,32 @@
 #![doc(html_root_url = "https://docs.rs/rustflow/0.0.0")]
 
 pub mod dump;
+pub mod flow_builder;
 pub mod graph;
 pub mod taskflow;
 
+pub use crate::flow_builder::{Callables, FlowBuilder};
 pub use crate::graph::{Graph, Handle, Node, Task, Work};
 pub use crate::taskflow::Taskflow;
+
+/// The names you need in scope to build a graph.
+///
+/// [`FlowBuilder`] is a trait, so its methods -- `emplace`, `placeholder`,
+/// `linearize` and the rest -- are only callable where it is imported. Upstream
+/// gets them from a base class and needs no equivalent.
+///
+/// ```
+/// use rustflow::prelude::*;
+///
+/// let mut taskflow = Taskflow::with_name("example");
+/// let task = taskflow.emplace(|| println!("work"));
+/// assert!(taskflow.graph().node(task).handle().is_static());
+/// ```
+pub mod prelude {
+    pub use crate::flow_builder::FlowBuilder;
+    pub use crate::graph::{Graph, Handle, Task, Work};
+    pub use crate::taskflow::Taskflow;
+}
 
 /// The crate version, as reported by Cargo at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
