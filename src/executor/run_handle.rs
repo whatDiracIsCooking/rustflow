@@ -48,7 +48,10 @@
 //! - **Editing the taskflow panics** rather than racing the scheduler. The
 //!   taskflow holds the one share that can hand out `&mut`, so
 //!   [`Taskflow::graph_mut`] asks `Arc::get_mut` and finds the run's shares
-//!   in the way.
+//!   in the way. A run that has *finished* is never in the way, however
+//!   recently it did: `executor::topology` has the ordering that buys that,
+//!   which since #109 is the drop of the last share rather than anything the
+//!   tear-down does by hand.
 //! - **Dropping the executor is allowed**, which it otherwise is not, and
 //!   takes the pool down under the run: the workers stop, the jobs still
 //!   queued are dropped, and the run never finishes. Nothing waits for it,
@@ -324,10 +327,12 @@ impl<'a> RunHandle<'a> {
     ///
     /// When this returns, the run is not merely finished but fully accounted
     /// for: [`Executor::num_topologies`] no longer counts it, so a
-    /// [`Executor::wait_for_all`] that follows cannot block on it. Dropping
-    /// the handle without waiting gives the same guarantee, for the same
-    /// reason. Upstream's `tf::Future` does not -- see
-    /// `Shared::tear_down_topology` for the ordering that buys it.
+    /// [`Executor::wait_for_all`] that follows cannot block on it, and no job
+    /// of it holds a share of the taskflow's storage any more, so the
+    /// taskflow can be edited again at once. Dropping the handle without
+    /// waiting gives the same two guarantees, for the same reasons. Upstream's
+    /// `tf::Future` gives neither -- see `Shared::tear_down_topology` for the
+    /// accounting and `executor::topology` for the share.
     ///
     /// Waiting from inside a task body works, but it blocks the worker running
     /// that task, so the run being waited for needs another worker to make
@@ -558,11 +563,7 @@ impl Executor {
             return RunHandle::finished(None);
         }
 
-        let topology = Arc::new(Topology::new(
-            predicate,
-            on_finish,
-            Arc::clone(taskflow.flow()),
-        ));
+        let topology = Topology::for_run(predicate, on_finish, Arc::clone(taskflow.flow()));
         self.start(taskflow.flow(), &topology);
 
         RunHandle {
@@ -657,11 +658,7 @@ impl Executor {
             return RunHandle::finished(Some(taskflow));
         }
 
-        let topology = Arc::new(Topology::new(
-            predicate,
-            on_finish,
-            Arc::clone(taskflow.flow()),
-        ));
+        let topology = Topology::for_run(predicate, on_finish, Arc::clone(taskflow.flow()));
         self.start(taskflow.flow(), &topology);
 
         RunHandle {
@@ -683,7 +680,7 @@ impl Executor {
         self.shared.increment_topology();
 
         if flow.enqueue_run(Arc::clone(topology)) == 0 {
-            self.shared.set_up_topology(None, flow, topology);
+            self.shared.set_up_topology(None, topology);
         }
     }
 
@@ -788,17 +785,15 @@ impl Shared {
     /// write: a topology reaches this with nothing outstanding, whether
     /// because it has never run or because the run that just ended drove the
     /// counter to zero.
-    pub(crate) fn set_up_topology(
-        &self,
-        worker: Option<&WorkerThread>,
-        flow: &Arc<Flow>,
-        topology: &Arc<Topology>,
-    ) {
+    pub(crate) fn set_up_topology(&self, worker: Option<&WorkerThread>, topology: &Arc<Topology>) {
+        let storage = topology
+            .storage()
+            .expect("a run being set up holds a share of its hold on the storage");
         debug_assert!(
-            flow.has_source_task(),
+            storage.flow().has_source_task(),
             "a run is only ever created for a graph with a source task"
         );
-        self.schedule_graph(worker, &GraphOwner::flow(flow), topology, &Parent::Run);
+        self.schedule_graph(worker, &GraphOwner::run(&storage), topology, &Parent::Run);
     }
 
     /// Ends a run whose last job has just finished, or sends its graph round
@@ -809,25 +804,27 @@ impl Shared {
     ///
     /// The graph is not an argument, where every other method of this family
     /// takes it: the job that got here has already given its share of the
-    /// taskflow's storage up, which is what keeps a taskflow editable the
-    /// instant its run is over -- see `Job::finish`. So the share this needs
-    /// is the run's own, taken back out of the topology below.
+    /// taskflow's storage up, which keeps the window a job's share is
+    /// outstanding for as narrow as it can be -- see `Job::finish`. So what
+    /// this reaches the graph through is the run's own share of its hold on
+    /// the storage, taken back out of the topology below.
     pub(crate) fn tear_down_topology(
         &self,
         worker: Option<&WorkerThread>,
         topology: &Arc<Topology>,
     ) {
-        let flow = topology
-            .flow()
+        let storage = topology
+            .storage()
             .expect("a run in flight holds a share of the taskflow it runs");
+        let flow = storage.flow();
 
         // Upstream's case 1: the predicate says run the graph again. Same
         // topology, so it is neither counted again nor finished -- and
         // `set_up_graph` re-arms every join counter the run just spent.
-        // The run keeps its share of the storage, since it is about to need it
+        // The run keeps its hold on the storage, since it is about to need it
         // again.
         if topology.run_again() {
-            self.set_up_topology(worker, &flow, topology);
+            self.set_up_topology(worker, topology);
             return;
         }
 
@@ -850,20 +847,10 @@ impl Shared {
         // `run_owned` taskflow is named by nothing but its own handle, so its
         // queue can never hold a second run at all.
         if let Some(next) = flow.pop_finished_run(topology) {
-            self.set_up_topology(worker, &flow, &next);
+            self.set_up_topology(worker, &next);
         }
 
-        // The last two touches of the graph, in this order: this worker's own
-        // share of the storage, and then the run's. Both go before `finish`,
-        // because what `finish` releases is a thread that may edit the
-        // taskflow -- and `Taskflow::graph_mut` asks whether any share is
-        // outstanding. Dropping them here rather than letting them fall out of
-        // scope is the whole mechanism; see `executor::topology` for the order
-        // in full.
-        drop(flow);
-        topology.release_flow();
-
-        // The accounting, and only then the completion slot. This is
+        // The accounting, and only then the release below. This is
         // deliberately *not* upstream's order -- its `_tear_down_topology`
         // calls `_carry_out_promise()` and only then `_decrement_topology()`,
         // so a caller whose `tf::Future` has just come back can still see
@@ -877,10 +864,21 @@ impl Shared {
         //
         // `decrement_topology` reads only the executor's shared state, which
         // every worker holds a share of and which therefore outlives all of
-        // them, so it is free to come after the graph has gone out of reach
-        // and before the waiter is released.
+        // them, so it is free to come after the last touch of the graph and
+        // before the waiter is released.
         self.decrement_topology();
-        topology.finish();
+
+        // The last two acts, in this order: this thread's own share of the
+        // run's hold on the storage, and then the run's. What releases the
+        // waiting thread is the drop of the *last* share of that hold,
+        // wherever it is -- `Drop for Storage` -- so the two lines below are
+        // not merely before the release but are what performs it, on this
+        // thread when nothing else is still holding a copy of a preempted
+        // node's job and on the worker dropping that copy when something is.
+        // Issue #109 is why it is the share rather than this function that
+        // releases the waiter; `executor::topology` has the argument.
+        drop(storage);
+        topology.release_flow();
     }
 }
 

@@ -1032,3 +1032,85 @@ fn two_taskflows_that_compose_each_other_are_refused() {
         assert_eq!(count(&entries), 1, "{context}: the body ran once");
     }
 }
+
+// ----------------------------------------------------------------------------
+// Editing a subflow-bearing taskflow the instant its run is done
+// ----------------------------------------------------------------------------
+
+/// A subflow-bearing taskflow is editable the instant `wait` returns, and
+/// stays so under contention: this port's own case, and issue #109's.
+///
+/// The claim is `Taskflow::graph_mut`'s, and what breaks it is a node that
+/// *preempts* -- a subflow task here, a module task in
+/// `tests/modules.rs::a_composition_is_editable_the_instant_its_run_reports_done`,
+/// which has the mechanism in full. In short: the job a preempting node was
+/// dequeued as is copied, once onto the frame inside the dispatch arm and once
+/// into the parent its subgraph is scheduled under, and neither copy is the one
+/// that finishes the node. Both held a share of the taskflow's storage for a
+/// few instructions after the resumed node had ended the run, so a `wait` could
+/// return with `Arc::get_mut` on that storage still contested -- a panic in the
+/// caller's next `emplace`.
+///
+/// This is the shape CI hit in
+/// [`a_subflow_bearing_taskflow_edited_between_runs_runs_at_its_new_size`],
+/// which edits between runs and is upstream's; what it adds is the contention
+/// that makes the window reachable on purpose rather than once in forty runs
+/// of a suite. Several threads each run their own two-worker executor, which
+/// is more threads than the cores of any box this runs on: the worker that has
+/// to lose the race has to be descheduled to lose it.
+#[test]
+fn a_subflow_bearing_taskflow_is_editable_the_instant_its_run_reports_done() {
+    /// Rounds per thread. Each is a `run_n` of three and one edit, and the
+    /// edit is the assertion.
+    const ROUNDS: usize = 400;
+    /// Threads, each with a two-worker executor and a taskflow of its own.
+    const THREADS: usize = 12;
+
+    let editors: Vec<thread::JoinHandle<()>> = (0..THREADS)
+        .map(|_| {
+            thread::spawn(|| {
+                let counted = counter();
+                let executor = Executor::new(2);
+
+                for round in 0..ROUNDS {
+                    let mut taskflow = Taskflow::new();
+                    let subflow = {
+                        let counted = Arc::clone(&counted);
+                        taskflow.emplace_subflow(move |subflow: &mut Subflow<'_>| {
+                            let counted = Arc::clone(&counted);
+                            subflow.emplace(move || {
+                                bump(&counted);
+                            });
+                        })
+                    };
+                    let after = taskflow.emplace(|| {});
+                    taskflow.task(subflow).precede([after]);
+
+                    counted.store(0, Ordering::SeqCst);
+                    executor
+                        .run_n(&taskflow, 3)
+                        .wait()
+                        .unwrap_or_else(|error| panic!("round {round}: {error}"));
+                    assert_eq!(
+                        count(&counted),
+                        3,
+                        "round {round}: three runs of a one-task subgraph"
+                    );
+
+                    // The edit, with nothing in between -- not a sleep, not a
+                    // retry. `Taskflow::graph_mut` panics here if any share of
+                    // this taskflow's storage is still outstanding.
+                    taskflow.clear();
+                    assert!(taskflow.is_empty(), "round {round}: the edit took");
+                }
+            })
+        })
+        .collect();
+
+    for editor in editors {
+        assert!(
+            editor.join().is_ok(),
+            "a run reported done while a share of its taskflow was still held"
+        );
+    }
+}

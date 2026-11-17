@@ -181,10 +181,25 @@ impl Taskflow {
     /// code that got past the borrow checker by leaking its handle: a run in
     /// flight is a run whose topology and whose queued jobs hold shares of
     /// this allocation, so the uniqueness check is exactly the question "is
-    /// anything still running". It cannot fire for a run that has *finished*,
-    /// however recently: the tear-down releases the run's share of the storage
-    /// before it releases the thread waiting on the run, and each job releases
-    /// its own before the join counter that ends the run reaches zero.
+    /// anything still running".
+    ///
+    /// It cannot fire for a run that has *finished*, however recently, and
+    /// the reason is one rule rather than the pair of orderings this comment
+    /// used to name: the thread waiting on a run is released by whoever drops
+    /// the **last** share of that run's hold on this storage -- which is the
+    /// tear-down in the ordinary case and, when a node of the graph preempted,
+    /// may be a worker still dropping a copy of that node's job. So a `wait`
+    /// that has returned is a wait whose run holds no share, whichever thread
+    /// got there last. `executor::topology`'s "order the shares are released
+    /// in" has the argument, and issue #109 is the race the old pair of
+    /// orderings left: two of the three copies a preempting node's job is
+    /// made into are spent by nobody, so no per-job ordering can account for
+    /// them.
+    ///
+    /// Two runs of one taskflow are a different matter and are not this
+    /// panic's business to avoid: a second run queued behind the one that has
+    /// just finished holds a share of its own, and editing the taskflow while
+    /// it is in flight is exactly what this refuses.
     ///
     /// # Panics
     ///
