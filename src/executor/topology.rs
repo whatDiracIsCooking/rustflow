@@ -63,6 +63,21 @@
 //! what a touch after it would cost is no longer a use-after-free, but it is
 //! still a panic in somebody's `emplace`.
 //!
+//! One share is deliberately held *across* a tear-down, and it is worth
+//! saying why that does not contradict the first rule. Since #62 a worker
+//! keeps one ready successor out of its queue to run next -- upstream's
+//! `_update_cache`, the continuation loop in `WorkerThread::invoke` -- so a
+//! job of the graph exists, holding a share of the storage, while the job
+//! that readied it is spent and its join counter decremented. What makes
+//! that sound is the *counting*, which happens before the successor is kept:
+//! `Parent::count_queued` has already counted it against the same parent the
+//! finishing job is about to count down, so that counter cannot reach zero
+//! while a continuation is held. The decrement that ends a run, or that
+//! resumes a preempted parent, is therefore never one with a continuation
+//! outstanding, and the window a job's share has to stay valid for is as
+//! wide as it was: one job, from the moment it is counted to the moment it
+//! is spent.
+//!
 //! A job addresses its node by [`Task`] index rather than by pointer, which is
 //! what keeps the node itself out of the question: it comes out of the graph
 //! through safe code, and a graph nobody can edit while a job names it cannot
@@ -2470,17 +2485,22 @@ mod tests {
         );
         assert_eq!(anchor.outstanding(), 1, "one source");
 
-        // The worker's own loop, by hand: a chain, so the second job is only
-        // queued once the first has released it -- and counted against the
-        // anchor as it is.
-        let mut ran = 0;
+        // The worker's own loop, by hand. One turn of it runs both jobs: the
+        // second is a chained successor, so since #62 it is kept out of the
+        // queue and run as the first job's continuation -- counted against
+        // the anchor before it is kept, which is what makes the counter
+        // below reach zero exactly once.
+        let mut dequeued = 0;
         while let Some(job) = worker.pop() {
             worker.invoke(job);
-            ran += 1;
+            dequeued += 1;
         }
 
-        assert_eq!(ran, 2);
-        assert_eq!(counter.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            dequeued, 1,
+            "one turn: the chain's second link never reached the queue"
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 2, "both jobs ran");
         assert_eq!(anchor.outstanding(), 0, "the anchor is what went to zero");
         assert_eq!(
             topology.join_counter.load(Ordering::Relaxed),

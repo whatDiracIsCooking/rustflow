@@ -457,10 +457,67 @@ impl WorkerThread {
         self.shared.notifier.notify_one();
     }
 
-    /// Runs one job: the task's work, then the bookkeeping that decides what
-    /// becomes runnable next.
+    /// Runs `job`, and then whatever that job hands straight back to this
+    /// worker, until one of them hands back nothing.
     ///
-    /// Upstream's `_invoke`. The four node kinds it can run itself are static,
+    /// Upstream's `_invoke` is one function with a label at the top and a
+    /// `goto` at the bottom: `TF_INVOKE_CONTINUATION()` jumps back to
+    /// `begin_invoke:` with the one successor `_update_cache` kept out of the
+    /// queue. That is this loop, and [`WorkerThread::invoke_one`] is the body
+    /// it jumps back to the top of; what that method returns is upstream's
+    /// `cache`.
+    ///
+    /// # What the loop is for
+    ///
+    /// A chain runs end to end on the worker that started it. Without the
+    /// continuation every link is pushed to that worker's queue and may be
+    /// stolen before the worker gets back to it, so a thousand-task chain can
+    /// visit a thousand workers -- each steal paying a contended queue slot,
+    /// a cold cache line for the node, and (since #40) a clone and a drop of
+    /// the two shares a job carries. `BENCHMARKS.md` has what that cost on
+    /// `linear_chain` and what this bought back.
+    ///
+    /// It is also the mechanism two of upstream's own cases assert directly:
+    /// `WorkStealing.Continuation` compares `this_worker_id()` across a
+    /// thousand chained tasks, and `WorkStealing.Oversubscription` asserts
+    /// that `W/2` chains involve at most `W/2` workers. Both are in
+    /// `tests/work_stealing.rs`, and neither can pass without this.
+    ///
+    /// # Why the loop is here and not in the caller
+    ///
+    /// [`WorkerThread::exploit_task`] could take the continuation and run it
+    /// on its next turn round its own loop, which would be the same jobs in
+    /// the same order -- but not the same window: a job may only be held
+    /// while the run it belongs to cannot finish. A continuation is held
+    /// across the tear-down of the job that produced it, and what makes that
+    /// sound is that the continuation was *counted* against its parent before
+    /// it was kept (see [`WorkerThread::update_cache`]), so the counter that
+    /// job spends cannot reach zero while the continuation exists. That
+    /// argument is `invoke_one`'s to make, which is why the value never
+    /// leaves this method's `while let`.
+    ///
+    /// # What is still not ported
+    ///
+    /// Upstream caches one more thing than this does: `_tear_down_nonasync`
+    /// and `_tear_down_topology` pass their `cache` on, so a *preempted
+    /// parent* resumed by its last child is also continued on the spot.
+    /// `WorkerThread::finish_job` is where that would go, and it still
+    /// queues the parent like any other job -- which costs a chain nothing,
+    /// since a chain has no preempted parents to resume.
+    pub(crate) fn invoke(&mut self, job: Job) {
+        let mut job = job;
+        while let Some(continuation) = self.invoke_one(job) {
+            job = continuation;
+        }
+    }
+
+    /// Runs one job: the task's work, then the bookkeeping that decides what
+    /// becomes runnable next. Returns the one successor kept out of the queue
+    /// for this worker to run next, if there was one.
+    ///
+    /// Upstream's `_invoke` body, from `begin_invoke:` to the
+    /// `TF_INVOKE_CONTINUATION()` at the end of it; the `goto` itself is
+    /// [`WorkerThread::invoke`]. The four node kinds it can run itself are static,
     /// placeholder and the two conditioners; the four dynamic-tasking kinds
     /// each get one line here into the module that owns them. [`module`] runs
     /// a composed taskflow as of #49 and an adopted graph as of #74,
@@ -481,12 +538,14 @@ impl WorkerThread {
     /// Before any of that come the two things upstream does at the top of
     /// `_invoke`: the `PREEMPTED` fast path and the cancellation check.
     ///
-    /// Upstream's `_update_cache`/`TF_INVOKE_CONTINUATION` is not ported
-    /// either: it keeps one ready successor out of the queue and jumps
-    /// straight back to the top of `_invoke` with it. That is a worthwhile
-    /// optimisation and a measurable one, so it belongs with the benchmarks
-    /// rather than with the first correct version.
-    pub(crate) fn invoke(&mut self, job: Job) {
+    /// The release of the successors is where the continuation comes from:
+    /// upstream's `_update_cache` keeps the last successor it found ready and
+    /// queues whatever it was holding, so a node with one ready successor
+    /// queues nothing at all. [`WorkerThread::update_cache`] is that
+    /// function, and `None` out of here is upstream's null `cache` -- a node
+    /// that preempted, a node whose run is cancelled, or a node that left
+    /// nothing ready.
+    fn invoke_one(&mut self, job: Job) -> Option<Job> {
         // The job owns a share of the run and of the taskflow's storage, so
         // this needs no `unsafe` and no argument about who outlives whom: both
         // are alive because the job that named them is. See
@@ -509,7 +568,10 @@ impl WorkerThread {
             && job.is_parent_cancelled()
         {
             self.finish_job(job.finish());
-            return;
+            // Upstream's `_tear_down_invoke` can leave a cache here -- the
+            // preempted parent this job was the last child of -- and
+            // `finish_job` cannot, for the reason this method's docs give.
+            return None;
         }
 
         let release = match node.handle() {
@@ -591,10 +653,10 @@ impl WorkerThread {
         // done. Its own join counter is not re-armed and its successors are
         // not released, because the node has not finished -- the last job of
         // the nested graph re-queues it, and the second entry takes the fast
-        // path above and falls through to here.
-        let Some(release) = release else {
-            return;
-        };
+        // path above and falls through to here. Nothing is ready on this
+        // worker's behalf either, which is upstream's bare `return` with its
+        // `cache` still null.
+        let release = release?;
 
         // Upstream's comment, which is the whole reason this is a `fetch_add`
         // of the strong-dependency count rather than a `store`: the counter
@@ -604,6 +666,11 @@ impl WorkerThread {
         // itself have scheduled this node.
         node.join_counter()
             .fetch_add(strong_dependencies(node), Ordering::Relaxed);
+
+        // Upstream's `Node* cache {nullptr}`: the one successor this worker
+        // keeps for itself rather than queueing, which the two arms below
+        // fill through `update_cache` and the tail of this method returns.
+        let mut cache = None;
 
         // Upstream's second switch over the handle, which [`Release`] has
         // already answered. Either arm counts a successor against this node's
@@ -617,7 +684,7 @@ impl WorkerThread {
                     let next = graph.node(successor);
                     if next.join_counter().fetch_sub(1, Ordering::AcqRel) == 1 {
                         job.parent().count_queued(topology, 1);
-                        self.schedule(job.successor(successor));
+                        self.update_cache(&mut cache, job.successor(successor));
                     }
                 }
             }
@@ -643,7 +710,7 @@ impl WorkerThread {
                         .join_counter()
                         .store(0, Ordering::Relaxed);
                     job.parent().count_queued(topology, 1);
-                    self.schedule(job.successor(successor));
+                    self.update_cache(&mut cache, job.successor(successor));
                 }
             }
         }
@@ -654,7 +721,41 @@ impl WorkerThread {
         // says why. It also ends the borrows this method has been working
         // through, so the compiler is what stops anything from touching
         // `node`, `graph` or the run afterwards.
+        //
+        // A continuation is held across this call, and `executor::topology`
+        // has why that is sound rather than a share outstanding one instant
+        // too long: the continuation was counted against this job's parent
+        // before it was kept, so the counter spent here cannot be the one
+        // that ends the run.
         self.finish_job(job.finish());
+
+        // Upstream's `TF_INVOKE_CONTINUATION()`, which is a `goto` where this
+        // is a return to the `while let` in `invoke`.
+        cache
+    }
+
+    /// Keeps `job` for this worker to run next, queueing whatever was being
+    /// kept before it.
+    ///
+    /// Upstream's `_update_cache`, line for line. It is called once per
+    /// successor found ready, so a node that readies one successor queues
+    /// nothing and a node that readies `n` queues `n - 1` -- the last one
+    /// wins the cache, which is the same job this worker's own LIFO queue
+    /// would have handed back first anyway. That equivalence is why the
+    /// continuation changes no execution order at one worker: it only takes
+    /// the job a thief could have had.
+    ///
+    /// **The counting is the caller's**, and it has to happen before the job
+    /// gets here: a cached job is a job of the same graph under the same
+    /// parent as the one being torn down, so the `count_queued` that precedes
+    /// this call is what stops that tear-down from driving the parent's
+    /// counter to zero while this worker is still holding a job of it. See
+    /// `executor::topology`, which is where the order the shares are released
+    /// in is argued.
+    fn update_cache(&self, cache: &mut Option<Job>, job: Job) {
+        if let Some(previous) = cache.replace(job) {
+            self.schedule(previous);
+        }
     }
 
     /// Steals until something turns up, the worker is told to stop, or the

@@ -399,9 +399,16 @@ mod tests {
     /// runtime task in this milestone: both bits come off on the first entry
     /// and the node finishes like a static task, with its successors released
     /// exactly once.
+    ///
+    /// "Released" is counted by the successor itself rather than found on the
+    /// queue, which is what #62 changed about every case in this module: a
+    /// released successor is kept out of the queue and run as the worker's
+    /// continuation, so by the time `invoke` returns the release has already
+    /// become a run.
     #[test]
     fn a_body_that_spawns_nothing_clears_its_bits_and_releases_once() {
         let runs = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicUsize::new(0));
         let mut taskflow = Taskflow::new();
         let rt = {
             let runs = Arc::clone(&runs);
@@ -409,7 +416,12 @@ mod tests {
                 runs.fetch_add(1, Ordering::Relaxed);
             })
         };
-        let after = taskflow.emplace(|| {});
+        let after = {
+            let released = Arc::clone(&released);
+            taskflow.emplace(move || {
+                released.fetch_add(1, Ordering::Relaxed);
+            })
+        };
         taskflow.task(rt).precede([after]);
 
         let executor = Executor::new(1);
@@ -428,8 +440,16 @@ mod tests {
             0,
             "the node was re-armed to its own dependency count"
         );
-        assert!(worker.pop().is_some(), "the successor was released");
-        assert!(worker.pop().is_none(), "and released once");
+        assert_eq!(
+            released.load(Ordering::Relaxed),
+            1,
+            "the one successor was released, and released once"
+        );
+        assert!(
+            worker.pop().is_none(),
+            "and nothing was left queued: the successor ran here, as this \
+             worker's continuation"
+        );
     }
 
     /// The preemption branch, which the public API cannot reach until
@@ -452,7 +472,13 @@ mod tests {
                 runtime.node.join_counter().fetch_add(1, Ordering::Relaxed);
             })
         };
-        let after = taskflow.emplace(|| {});
+        let released = Arc::new(AtomicUsize::new(0));
+        let after = {
+            let released = Arc::clone(&released);
+            taskflow.emplace(move || {
+                released.fetch_add(1, Ordering::Relaxed);
+            })
+        };
         taskflow.task(rt).precede([after]);
 
         let executor = Executor::new(1);
@@ -478,6 +504,11 @@ mod tests {
             "a preempted node releases nothing: its successors wait for the \
              work the body spawned"
         );
+        assert_eq!(
+            released.load(Ordering::Relaxed),
+            0,
+            "and it released nothing to run here either"
+        );
 
         // The tear-down of the last child, by hand: `WorkerThread::finish_job`
         // reads the parent's state word before the decrement and, finding
@@ -500,8 +531,13 @@ mod tests {
             0,
             "the second entry clears both bits"
         );
-        assert!(worker.pop().is_some(), "and releases the successor");
-        assert!(worker.pop().is_none(), "once");
+        assert_eq!(
+            released.load(Ordering::Relaxed),
+            1,
+            "and releases the successor, once -- which since #62 means it ran \
+             here as the continuation rather than went on the queue"
+        );
+        assert!(worker.pop().is_none(), "so nothing was left queued");
     }
 
     /// A corun with nothing spawned is over before it starts: the counter is
@@ -623,6 +659,11 @@ mod tests {
     /// The shape is upstream's `Runtime.Schedule.ModuleTask` reduced to the
     /// scheduler: `other` has a strong dependency on `gate`, and the body
     /// schedules it anyway, which is the dependency bypass the method is for.
+    ///
+    /// The zeroed counter is the one thing this case no longer reads for
+    /// itself, because since #62 `gate` has already run by the time the case
+    /// looks: the comment at the drop site has why, and issue #98 has the
+    /// wrap that makes the value unreadable.
     #[test]
     fn a_scheduled_sibling_is_queued_here_and_counted_against_the_parent() {
         let order = Arc::new(AtomicUsize::new(0));
@@ -656,27 +697,27 @@ mod tests {
 
         worker.invoke(source_job(&taskflow, &topology));
 
+        // `other`'s own join counter is not read here any more. Since #62 the
+        // released successor `gate` runs as this worker's continuation, and
+        // `gate` then decrements the counter `schedule` had zeroed, which
+        // wraps it: that wrap is issue #98's and is not this case's subject.
         assert_eq!(
-            taskflow
-                .graph()
-                .node(other)
-                .join_counter()
-                .load(Ordering::Relaxed),
-            0,
-            "a scheduled task has zero dependencies, whatever its edges say"
+            order.load(Ordering::Relaxed),
+            1,
+            "the released successor ran here as the continuation, and the \
+             scheduled sibling did not: it went on the queue"
         );
         assert!(!finished.load(Ordering::Relaxed), "the run is not over");
 
-        // Both jobs are on this worker's queue: the one the body scheduled
-        // and the successor the node released. Draining them is the rest of
-        // the run.
+        // What is left on this worker's queue is the job the body scheduled.
+        // Draining it is the rest of the run.
         let mut drained = 0;
         while let Some(job) = worker.pop() {
             worker.invoke(job);
             drained += 1;
         }
 
-        assert_eq!(drained, 2, "the scheduled sibling and the successor");
+        assert_eq!(drained, 1, "the scheduled sibling, and nothing else");
         assert_eq!(order.load(Ordering::Relaxed), 2, "both bodies ran");
         assert!(
             finished.load(Ordering::Relaxed),
