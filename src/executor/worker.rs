@@ -455,17 +455,19 @@ impl WorkerThread {
     ///
     /// Upstream's `_invoke`, restricted to the four node kinds it can run --
     /// static, placeholder and the two conditioners. Upstream's six other
-    /// kinds, its semaphores, its observers and its cancellation check are
-    /// each a later milestone, and none of them is silently absent: the
-    /// `match` below is exhaustive over [`Handle`], so a new kind arrives as a
-    /// compile error here rather than as a task that mysteriously does
-    /// nothing.
+    /// kinds, its semaphores and its observers are each a later milestone, and
+    /// none of them is silently absent: the `match` below is exhaustive over
+    /// [`Handle`], so a new kind arrives as a compile error here rather than as
+    /// a task that mysteriously does nothing.
     ///
     /// The bookkeeping is upstream's two switches over the handle, in its
     /// order: run the work, re-arm this node's own join counter, then release
     /// successors -- every one of them for an ordinary task, only the selected
     /// ones for a conditioner. The module docs set out the semantics; [`Release`]
     /// is what carries the first switch's answer to the second.
+    ///
+    /// Before any of that comes upstream's cancellation check, which is the
+    /// early-out below.
     ///
     /// Upstream's `_update_cache`/`TF_INVOKE_CONTINUATION` is not ported
     /// either: it keeps one ready successor out of the queue and jumps
@@ -483,6 +485,19 @@ impl WorkerThread {
         // and a live topology. See `executor::topology` for the full argument
         // and `executor::corun` for the corun half of it.
         let (node, taskflow, topology) = unsafe { job.parts() };
+
+        // Upstream's `_is_parent_cancelled()` early-out at the top of
+        // `_invoke`: a cancelled run runs none of the work it had not started,
+        // and the job is torn down all the same -- the join counters still have
+        // to reach zero for the run to finish at all. Nothing below may touch
+        // `taskflow` or `topology` afterwards, for the reason the tail of this
+        // method gives. See `Topology::cancelled` and the `executor` module
+        // docs.
+        if topology.cancelled() {
+            self.finish_job(taskflow, topology);
+            return;
+        }
+
         let graph = taskflow.graph();
 
         let release = match node.handle() {

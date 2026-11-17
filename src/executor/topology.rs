@@ -48,8 +48,8 @@
 use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Poll, Waker};
 
 use crate::graph::{Node, Task};
@@ -131,16 +131,109 @@ impl Job {
     }
 }
 
+/// The part of a run a cancel token may touch: upstream's
+/// `NodeBase::_estate`, in an allocation of its own.
+///
+/// Upstream's `tf::Future` *is* the cancel token -- it holds a
+/// `std::weak_ptr<Topology>` and `cancel()` sets a bit through it -- and a
+/// [`Canceller`](crate::Canceller) is the same move over a
+/// `Weak<Cancellable>`. The indirection is what makes the token lifetime-free:
+/// a [`RunHandle`](crate::RunHandle) carries the lifetimes of the executor and
+/// the taskflow it borrows, and a token that a `'static` task body can capture
+/// cannot carry either.
+///
+/// A separate allocation rather than a `Weak<Topology>`, for two reasons. The
+/// module docs above rest on the topology having exactly two owners -- the run
+/// handle and the taskflow's run queue -- and a token that could upgrade to an
+/// `Arc<Topology>` would be a third; and it would hand a caller `join`,
+/// `finish` and the run policy along with the one bit it asked for.
+///
+/// The estate word carries two of upstream's `ESTATE` bits, at upstream's
+/// values: `CANCELLED`, which [`Cancellable::cancel`] sets, and `EXCEPTION`,
+/// which nothing sets yet -- a panicking task cancelling the rest of its own
+/// run is issue #32, which also brings upstream's `CAUGHT` (`0x2000_0000`).
+/// Both bits mean the same thing to the scheduler, which is why
+/// [`Cancellable::cancelled`] is a mask over the pair, as upstream's
+/// `Topology::cancelled` is.
+pub(crate) struct Cancellable {
+    /// Upstream's `_estate`, holding the two bits a topology uses.
+    estate: AtomicU32,
+    /// Whether the run is over, which is to say whether there is still
+    /// anything to cancel.
+    ///
+    /// Upstream needs no equivalent: its token's `weak_ptr` is dead once the
+    /// tear-down has popped the topology off the taskflow's queue, so the
+    /// allocation going away *is* its answer to "has this run finished". Here
+    /// a run's topology is owned by a handle that outlives the run -- a caller
+    /// may hold it long after `wait` returned -- so the allocation is still
+    /// there and the question needs its own answer. [`Topology::finish`]
+    /// writes this before it releases a waiter, so a `cancel` after a `wait`
+    /// always reports `false`.
+    finished: AtomicBool,
+}
+
+impl Cancellable {
+    /// Upstream's `ESTATE::CANCELLED`: this run has been cancelled.
+    pub(crate) const CANCELLED: u32 = 0x4000_0000;
+    /// Upstream's `ESTATE::EXCEPTION`: a task of this run failed. Nothing sets
+    /// it in this crate yet -- #32 does.
+    pub(crate) const EXCEPTION: u32 = 0x1000_0000;
+
+    /// A run that is neither cancelled nor finished.
+    fn new() -> Self {
+        Self {
+            estate: AtomicU32::new(0),
+            finished: AtomicBool::new(false),
+        }
+    }
+
+    /// Sets `bits` in the estate word, reporting whether this call was the
+    /// first to set them.
+    ///
+    /// Upstream's `_estate.fetch_or`, plus the answer #32 needs: the task that
+    /// first sets `EXCEPTION` is the one whose panic cancels the run, and
+    /// every later one is a task whose failure the run already knows about.
+    pub(crate) fn set(&self, bits: u32) -> bool {
+        // Relaxed, as every upstream read and write of `_estate` is: the word
+        // races with the scheduler by construction -- a task already running
+        // finishes whether or not it sees the bit -- and what carries a run's
+        // *results* between threads is the join counter and the completion
+        // lock, not this.
+        self.estate.fetch_or(bits, Ordering::Relaxed) & bits == 0
+    }
+
+    /// Whether this run is cancelled: upstream's `Topology::cancelled`, which
+    /// is either bit of the pair rather than `CANCELLED` alone.
+    pub(crate) fn cancelled(&self) -> bool {
+        self.estate.load(Ordering::Relaxed) & (Self::CANCELLED | Self::EXCEPTION) != 0
+    }
+
+    /// Cancels the run, reporting `false` if it had already finished.
+    ///
+    /// Upstream's `Future::cancel`, whose `false` is its `weak_ptr::lock()`
+    /// failing. Cancelling twice reports `true` twice, as upstream's does: the
+    /// answer is about the run, not about this caller.
+    pub(crate) fn cancel(&self) -> bool {
+        if self.finished.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.set(Self::CANCELLED);
+        true
+    }
+
+    /// Records that the run is over, so that a later `cancel` reports `false`.
+    fn mark_finished(&self) {
+        self.finished.store(true, Ordering::Relaxed);
+    }
+}
+
 /// One run of one [`Taskflow`]: upstream's `tf::Topology`.
 ///
-/// Two upstream members are not here, each for its own reason:
-///
-/// - `_promise` is a [`Completion`] behind a `Mutex`, because the payload a
-///   panicking task hands back is not a value `std::promise` would carry;
-/// - `_estate`, upstream's cancellation and exception bits, is not needed yet.
-///   Cancellation is a later milestone, and "the first panic wins" is already
-///   decided by the `Mutex` that [`Topology::record_panic`] takes, so a state
-///   word would be a second answer to a question already answered.
+/// One upstream member is not here: `_promise` is a [`Completion`] behind a
+/// `Mutex`, because the payload a panicking task hands back is not a value
+/// `std::promise` would carry. Upstream's `_estate` *is* here, as
+/// [`Cancellable`], but in its own allocation rather than inline -- see that
+/// type for why.
 pub(crate) struct Topology {
     /// How many nodes of this run are outstanding: upstream's
     /// `NodeBase::_join_counter` on the topology. Set to the number of source
@@ -155,6 +248,13 @@ pub(crate) struct Topology {
     completion: Mutex<Completion>,
     /// Signalled by [`Topology::finish`], under the lock.
     finished: Condvar,
+    /// The cancellation and exception bits of this run, upstream's `_estate`,
+    /// shared with every [`Canceller`](crate::Canceller) handed out for it.
+    ///
+    /// Owned here in the sense that upstream's `_estate` is a member of the
+    /// topology; the extra allocation is what lets a token outlive the run
+    /// handle's borrow. See [`Cancellable`].
+    estate: Arc<Cancellable>,
 }
 
 /// Upstream's `Topology::_predicate` and `_on_finish`, which is what makes a
@@ -226,7 +326,28 @@ impl Topology {
                 waker: None,
             }),
             finished: Condvar::new(),
+            estate: Arc::new(Cancellable::new()),
         }
+    }
+
+    /// Whether this run has been cancelled: upstream's `Topology::cancelled`.
+    ///
+    /// Read once per job, at the top of `WorkerThread::invoke`, which is
+    /// upstream's `_is_parent_cancelled` early-out at the top of `_invoke`,
+    /// and once more by [`Topology::run_again`].
+    pub(crate) fn cancelled(&self) -> bool {
+        self.estate.cancelled()
+    }
+
+    /// Cancels this run, reporting `false` if it has already finished:
+    /// upstream's `Future::cancel`.
+    pub(crate) fn cancel(&self) -> bool {
+        self.estate.cancel()
+    }
+
+    /// The state a [`Canceller`](crate::Canceller) holds a `Weak` to.
+    pub(crate) fn cancellable(&self) -> &Arc<Cancellable> {
+        &self.estate
     }
 
     /// Prepares every node of `taskflow` for a run of this topology and
@@ -326,15 +447,20 @@ impl Topology {
     }
 
     /// Whether the run that has just finished should run the graph again:
-    /// upstream's `!tpg->cancelled() && !tpg->_predicate()`.
+    /// upstream's `!tpg->cancelled() && !tpg->_predicate()`, now both halves of
+    /// it.
     ///
     /// This is the whole of the re-run decision, in one place and deliberately
-    /// not inlined into the tear-down, because it is where the next two
-    /// milestones add their terms: #29 adds the cancellation half of upstream's
-    /// condition -- a cancelled run does not go round again -- and #32 adds the
-    /// panic half that upstream keeps commented out beside it.
+    /// not inlined into the tear-down. The `&&` short-circuits, as upstream's
+    /// does, which is the one thing worth noticing about the order: a cancelled
+    /// run does not ask its predicate at all, so a `run_n` counter is not spent
+    /// by a round that will never happen.
+    ///
+    /// #32's term goes into [`Topology::cancelled`] rather than here -- the
+    /// panic half upstream keeps commented out beside this condition is a task
+    /// setting `EXCEPTION`, which is already one of the two bits this reads.
     pub(crate) fn run_again(&self) -> bool {
-        !self.stop_requested()
+        !self.cancelled() && !self.stop_requested()
     }
 
     /// Evaluates the run predicate, reporting `true` for "stop".
@@ -404,6 +530,13 @@ impl Topology {
     /// thread's last touch of the topology -- and an unlock a waiter has not
     /// yet observed cannot be a use-after-free.
     pub(crate) fn finish(&self) {
+        // Before the lock, so that it is ordered before the unlock that
+        // releases a waiter: a `cancel` that follows a `wait` -- or follows the
+        // `join` in `RunHandle::drop` -- has to report that there was nothing
+        // left to cancel. A relaxed store is enough for exactly that reason;
+        // the happens-before is the completion lock's, not this word's.
+        self.estate.mark_finished();
+
         let mut completion = self.lock();
         completion.finished = true;
         let waker = completion.waker.take();
@@ -485,6 +618,7 @@ impl core::fmt::Debug for Topology {
             .field("outstanding", &self.join_counter.load(Ordering::Relaxed))
             .field("finished", &completion.finished)
             .field("panicked", &completion.panic.is_some())
+            .field("cancelled", &self.cancelled())
             .finish()
     }
 }
@@ -500,6 +634,11 @@ const _: () = {
     assert_send_sync::<Topology>();
     assert_send_sync::<Taskflow>();
     assert_send_sync::<Node>();
+
+    // A `Canceller` is a `Weak<Cancellable>` and has to be `Send + Sync +
+    // 'static`, which it is exactly when `Cancellable` is `Send + Sync` --
+    // it holds nothing but atomics, and nothing with a lifetime.
+    assert_send_sync::<Cancellable>();
 };
 
 #[cfg(test)]
@@ -688,6 +827,83 @@ mod tests {
 
         let payload = topology.join().expect("the panic was recorded");
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"predicate"));
+    }
+
+    /// The estate word is upstream's, and the two things it owes the rest of
+    /// the port are that either bit means "cancelled" and that a setter is
+    /// told whether it was the first. #32 leans on both: a panicking task sets
+    /// `EXCEPTION`, and the first one to do it is the one whose failure the
+    /// run reports.
+    #[test]
+    fn the_estate_word_is_either_bit_and_reports_the_first_setter() {
+        let state = Cancellable::new();
+        assert!(!state.cancelled());
+
+        assert!(state.set(Cancellable::CANCELLED), "the first setter");
+        assert!(state.cancelled());
+        assert!(!state.set(Cancellable::CANCELLED), "the second setter");
+
+        // The other bit on its own means cancelled too, which is what makes
+        // #32's panic term a term of `cancelled()` rather than of `run_again`.
+        let failed = Cancellable::new();
+        assert!(failed.set(Cancellable::EXCEPTION));
+        assert!(failed.cancelled());
+        assert!(!failed.set(Cancellable::EXCEPTION));
+
+        // And they are distinct bits, so neither setter answers for the other.
+        let both = Cancellable::new();
+        assert!(both.set(Cancellable::CANCELLED));
+        assert!(both.set(Cancellable::EXCEPTION));
+    }
+
+    /// Cancelling is upstream's `Future::cancel`: `true` while the run is
+    /// there to cancel, `false` once it has finished -- which is its
+    /// `weak_ptr::lock()` failing -- and harmless twice over.
+    #[test]
+    fn cancelling_reports_false_only_once_the_run_has_finished() {
+        let topology = once();
+        assert!(!topology.cancelled());
+
+        assert!(topology.cancel(), "a run in flight can be cancelled");
+        assert!(topology.cancel(), "cancelling twice is still true");
+        assert!(topology.cancelled());
+
+        topology.finish();
+        assert!(!topology.cancel(), "a finished run has nothing to cancel");
+        // The bit stays set: a cancelled run that has finished is still a
+        // cancelled run, which is what a `was_cancelled` query would read.
+        assert!(topology.cancelled());
+    }
+
+    /// The cancellation half of upstream's
+    /// `!tpg->cancelled() && !tpg->_predicate()`: a run told to go round again
+    /// does not, once it is cancelled. The counting predicate is the one that
+    /// shows the short-circuit, since a predicate that was never asked has not
+    /// spent a round.
+    #[test]
+    fn a_cancelled_run_does_not_go_round_again() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let topology = {
+            let asked = Arc::clone(&asked);
+            Topology::new(
+                move || {
+                    asked.fetch_add(1, Ordering::Relaxed);
+                    false
+                },
+                || {},
+            )
+        };
+
+        assert!(topology.run_again(), "the predicate says go round again");
+        assert_eq!(asked.load(Ordering::Relaxed), 1);
+
+        assert!(topology.cancel());
+        assert!(!topology.run_again(), "a cancelled run stops");
+        assert_eq!(
+            asked.load(Ordering::Relaxed),
+            1,
+            "the predicate was asked by a run that will not happen"
+        );
     }
 
     /// The callback is upstream's `_on_finish`: called once, after the last
