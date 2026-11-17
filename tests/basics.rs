@@ -19,23 +19,26 @@
 //!   an index-handle visitor cannot do while the walk borrows the graph; the
 //!   walk collects the indices and the renaming follows it.
 //!
-//! The last section is not upstream's at all. Upstream has no `RunHandle` and
-//! therefore no case for leaking one, while this port's answer to "do not
-//! mutate or destroy a running taskflow" is that handle -- so what happens
-//! when a caller leaks one is a property of the port, and issue #40 is where
-//! it needed pinning down.
+//! The last two sections are not upstream's at all. Upstream has no
+//! `RunHandle` and therefore no case for leaking one, while this port's
+//! answer to "do not mutate or destroy a running taskflow" is that handle --
+//! so what happens when a caller leaks one is a property of the port, and
+//! issue #40 is where it needed pinning down. The one after it is upstream's
+//! `NSTATE` word, whose state bits share a `u32` with a node's
+//! strong-dependency count: upstream masks the two apart and a port that did
+//! not would hang, so the mask has a case of its own (issue #47).
 
 use std::future::Future;
 use std::mem;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use rustflow::prelude::*;
-use rustflow::{Executor, RunError, RunHandle, TaskType};
+use rustflow::{Executor, Node, RunError, RunHandle, TaskType};
 
 /// Adds a placeholder task, upstream's `taskflow.placeholder()`.
 fn placeholder(taskflow: &mut Taskflow, name: &str) -> Task {
@@ -1746,5 +1749,93 @@ fn a_dropped_handle_leaves_its_taskflow_editable_and_its_owned_graph_freed() {
             4 * (round + 1),
             "the handle did not free the graph it owned"
         );
+    }
+}
+
+// --------------------------------------------------------
+// the `nstate` word: a state bit is not a dependency (issue #47)
+// --------------------------------------------------------
+
+/// Not upstream's, and it exists because the port could get this wrong
+/// silently. A node's `nstate` holds its strong-dependency count in the low
+/// 28 bits with the scheduler's state bits above it, and the scheduler re-arms
+/// the node's join counter from that word every time it runs the node.
+/// Upstream masks the count out of it -- `NSTATE::STRONG_DEPENDENCIES_MASK` --
+/// and a port that read the whole word would add the bit's value, hundreds of
+/// millions, to the counter. The node would never become ready again and the
+/// failure would be a hang.
+///
+/// So the case asserts the counter rather than waiting for one: with the mask,
+/// a node with one strong dependency is re-armed to exactly one however many
+/// state bits it carries.
+///
+/// Setting a bit where the scheduler will see it takes some arranging, which
+/// is itself the point: set-up clears the word, so the bit has to be set
+/// *during* the run, by a task that runs before the marked one. A task body
+/// cannot capture the taskflow it belongs to -- that would be a share of a
+/// graph held by a closure inside that same graph -- so it captures a `Weak`,
+/// which is what [`Arc::new_cyclic`] is for.
+#[test]
+fn a_state_bit_on_a_node_is_not_added_to_its_join_counter() {
+    // Upstream's three `NSTATE` bits this port has. `PREEMPTED` is the one the
+    // scheduler sets itself, and the one that also sends the marked node
+    // through the fast path at the top of `invoke`.
+    for bit in [Node::PREEMPTED, Node::JOINED_SUBFLOW, Node::RETAIN_SUBFLOW] {
+        let executor = Executor::new(2);
+        let stale = Arc::new(AtomicUsize::new(0));
+        let marked = Task::new(0);
+
+        let taskflow = Arc::new_cyclic(|weak: &Weak<Taskflow>| {
+            let mut taskflow = Taskflow::new();
+            // The first task emplaced is arena index zero, which is the
+            // handle `marked` names from outside this closure.
+            let target = taskflow.emplace(|| {});
+            assert_eq!(target, marked);
+
+            let marker = taskflow.emplace({
+                let weak = Weak::clone(weak);
+                let stale = Arc::clone(&stale);
+                move || {
+                    let taskflow = weak.upgrade().expect("the test holds the taskflow");
+                    let node = taskflow.graph().node(target);
+                    // A bit left by the previous run would be one set-up did
+                    // not clear, which is what upstream's
+                    // `_nstate = NSTATE::NONE` promises not to leave behind.
+                    if node.nstate().load(Ordering::Relaxed) & bit != 0 {
+                        stale.fetch_add(1, Ordering::Relaxed);
+                    }
+                    node.nstate().fetch_or(bit, Ordering::Relaxed);
+                }
+            });
+            taskflow.task(marker).precede([target]);
+            taskflow
+        });
+
+        // Twice, because the second run is what shows that a bit the first run
+        // left does not accumulate into anything -- neither the word nor the
+        // counter.
+        for run in 1..=2 {
+            executor.run(&taskflow).wait().expect("no task panicked");
+
+            let node = taskflow.graph().node(marked);
+            assert_ne!(
+                node.nstate().load(Ordering::Relaxed) & bit,
+                0,
+                "run {run} of {bit:#x}: the marker did not set the bit"
+            );
+            assert_eq!(
+                node.join_counter().load(Ordering::Relaxed),
+                1,
+                "run {run} of {bit:#x}: the join counter was re-armed from the \
+                 whole state word instead of from the dependency count"
+            );
+        }
+
+        assert_eq!(
+            stale.load(Ordering::Relaxed),
+            0,
+            "{bit:#x} survived set-up into the next run"
+        );
+        executor.wait_for_all();
     }
 }

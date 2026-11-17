@@ -11,12 +11,18 @@
 //!   work;
 //! - [`rng`] the one random number the steal loop needs;
 //! - [`worker`] a worker and the scheduling loop it runs;
-//! - `topology` one run of one taskflow, the job a queue carries, and the
-//!   run's cancellation bits -- the one module here that is crate-private,
-//!   since a caller has no business with a run's internals. It is also where
-//!   the ownership argument lives: a job owns a share of its run and of the
-//!   taskflow's storage, which is what keeps a queue of jobs from being a
-//!   queue of raw pointers;
+//! - `topology` one run of one taskflow, the job a queue carries, the parent
+//!   that job's graph was scheduled under, and the run's cancellation bits --
+//!   the one module here that is crate-private, since a caller has no
+//!   business with a run's internals. It is also where the ownership
+//!   argument lives: a job owns a share of its run, of the taskflow's
+//!   storage and of its parent chain, which is what keeps a queue of jobs
+//!   from being a queue of raw pointers;
+//! - `module`, `subflow` and `runtime` one dynamic-tasking node kind each,
+//!   reached by one line from the worker's handle match. All three refuse the
+//!   run for now and say which issue lands them (#49, #50, #51); they are
+//!   separate files so that those three can land without meeting in the
+//!   worker;
 //! - [`run_handle`] the `run` family itself -- `run`, `run_n`, `run_until` and
 //!   the owning half of each -- the tear-down that decides whether a finished
 //!   run goes round again, the handle whose borrow is this port's answer to
@@ -68,12 +74,95 @@
 //! [`RunError::Panicked`](crate::RunError::Panicked) where a cancelled run
 //! gets `Ok(())`. Only the first panicking task of a run is reported;
 //! `ESTATE::CAUGHT`, set by the same atomic, is what drops the rest.
+//!
+//! # Parents, and what a nested graph counts down
+//!
+//! Every graph the executor schedules is scheduled *under* something, and
+//! that something is its **parent**: the thing whose join counter the jobs of
+//! that graph decrement as they finish, so that the last of them to reach
+//! zero is what the graph being over means. There are two kinds, upstream's
+//! `NodeBase*` either way:
+//!
+//! - **the run**, which is the parent of every node of the taskflow's own
+//!   graph. Its counter reaching zero ends the run -- the callback fires, the
+//!   next queued run of the taskflow starts, and whoever is waiting is
+//!   released;
+//! - **something nested inside the run**: a node whose own graph is running
+//!   -- a subflow's subgraph, a module's target graph -- or the anchor a
+//!   [`corun`](Executor::corun) schedules a whole taskflow under. Its counter
+//!   reaching zero means that *nested* graph is over, which ends nothing: it
+//!   either resumes the node that was waiting for it or releases the frame
+//!   that is watching the counter.
+//!
+//! The parent is carried by the job rather than stored on the node, which is
+//! what this port has instead of upstream's `node->_parent`, and
+//! `executor::topology` has the argument for why. One consequence is worth
+//! naming here: a parent chain is a chain of *jobs*, so the parent of a node
+//! is reached as the job that node was dequeued as -- which is exactly what
+//! has to be queued again to resume it.
+//!
+//! # The preemption protocol
+//!
+//! A node that is the parent of a graph cannot finish when its body returns:
+//! its successors must not run until the nested graph has. Upstream's answer,
+//! and this port's, is to enter such a node twice, with `NSTATE::PREEMPTED`
+//! ([`Node::PREEMPTED`](crate::Node::PREEMPTED)) saying which entry this is:
+//!
+//! 1. **First entry.** `WorkerThread::invoke` dispatches on the handle, the
+//!    arm runs whatever the node does -- a subflow body builds its graph, a
+//!    module task has one already -- and then, if there is a graph to run,
+//!    sets `PREEMPTED` on the node and schedules that graph *under the node*.
+//!    The arm answers "preempted", and the worker returns at once: the node's
+//!    own join counter is not re-armed and not one successor is released,
+//!    because the node has not finished.
+//! 2. **While the children run.** They are ordinary jobs. Each one that
+//!    becomes ready is counted against the node, exactly as a top-level
+//!    node's successors are counted against the run, so the node's counter
+//!    tracks its nested graph the way the run's tracks the whole graph.
+//! 3. **Last child.** The tear-down of the last job of the nested graph finds
+//!    the node's counter at zero and the `PREEMPTED` bit set, and queues the
+//!    node's own job a second time. The bit is read *before* the decrement,
+//!    because the instant the counter reaches zero another worker may be
+//!    running the node already.
+//! 4. **Second entry.** The `PREEMPTED` fast path at the top of `invoke`
+//!    skips the cancellation check -- a node that has been entered has to come
+//!    back out through the dispatch whatever happened in the meantime -- the
+//!    arm clears the bit and answers with an ordinary release, and the node
+//!    finishes like any other: counter re-armed, successors released,
+//!    tear-down against its own parent.
+//!
+//! The protocol costs one requeue per nested graph where upstream, whose
+//! `_update_cache` is not ported, resumes the parent on the worker that
+//! finished the last child.
+//!
+//! None of the three arms that could preempt a node does so yet -- they
+//! refuse the run instead, each naming its issue -- so what is here is the
+//! protocol without a caller. #50's subflows are the first to use it.
+//!
+//! # Why cancellation reads the whole chain
+//!
+//! The early-out at the top of `invoke` is upstream's
+//! `Node::_is_parent_cancelled`, and with parents it has two terms rather
+//! than one: the run's own cancellation bits, and the estate of every parent
+//! above this job. The second term is what stops the children of a failed
+//! subflow from running when the run as a whole is still going -- a failure
+//! inside a nested graph is the nested graph's, and the node that owns it is
+//! where it is recorded.
+//!
+//! Upstream reads only the immediate parent, because its `_process_exception`
+//! walks the chain *upwards* and marks every ancestor as it records the
+//! failure. That walk, and the anchor bits that tell it where to stop, are
+//! issue #48; until they land the check is the half that walks, which answers
+//! the same question at the cost of one relaxed load per level of nesting.
 
 pub mod corun;
+pub(crate) mod module;
 pub mod notifier;
 pub mod queue;
 pub mod rng;
 pub mod run_handle;
+pub(crate) mod runtime;
+pub(crate) mod subflow;
 pub(crate) mod topology;
 pub mod worker;
 
