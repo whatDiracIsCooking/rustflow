@@ -2,14 +2,17 @@
 //!
 //! Upstream's file is nine cases over one shape: submit a graph far too long
 //! to finish, cancel it, and check that it stopped early and still completed.
-//! Four of them are gated here -- `EmptyFuture`, `Future`,
-//! `BasicCancellation` and `MultipleCancellations` -- and the other five need
-//! machinery this port does not have yet, so they are named rather than
-//! half-ported: `CancelInfiniteLoop` and `CancelFromAnother` need condition
-//! tasks (issue #33), `CancelSubflow` and `CancelComposition` need subflows
-//! and module tasks (M4), and `CancelFromAsync` needs async tasks (M5).
+//! Six of them are here. Four arrived with the cancellation issue (#29) --
+//! `EmptyFuture`, `Future`, `BasicCancellation` and `MultipleCancellations` --
+//! and `CancelInfiniteLoop` and `CancelFromAnother` with issue #33, once there
+//! were condition tasks to loop with.
 //!
-//! Three adaptations, and the first is the only one that changes what is
+//! The remaining three need machinery this port does not have yet, so they are
+//! named rather than half-ported: `CancelSubflow` and `CancelComposition` need
+//! subflows and module tasks (M4), and `CancelFromAsync` needs async tasks
+//! (M5). Upstream's commented-out `CancelLinearChain` is left commented out.
+//!
+//! Four adaptations, and the first is the only one that changes what is
 //! being asserted:
 //!
 //! - **`EmptyFuture` becomes a token whose run has completed.** Upstream
@@ -27,6 +30,9 @@
 //! - **The shared counter is an `AtomicUsize`** where upstream's is an
 //!   `std::atomic<int>&` captured by reference. Task bodies here are
 //!   `Send + 'static`, so the sharing is spelled as an [`Arc`].
+//! - **A task cancels another run through a token, not a captured future.**
+//!   `cancel_from_another` says why, and it is the reason
+//!   [`Canceller`](rustflow::Canceller) exists.
 //!
 //! The sleeping task bodies and the task counts are upstream's, down to the
 //! `counter < 10000` bound: 10000 tasks of 100ms each is a graph no pool
@@ -251,5 +257,85 @@ fn a_cancelled_run_still_calls_back_and_starts_the_next_queued_run() {
         "a cancelled run still calls back"
     );
     assert!(counter.load(Ordering::Relaxed) < TASKS);
+    assert_eq!(executor.num_topologies(), 0);
+}
+
+/// Upstream's `CancelInfiniteLoop`: a hundred condition tasks that each
+/// precede themselves, cancelled, and then waited for.
+///
+/// Nothing here terminates on its own, so this is the case that says
+/// cancellation reaches the conditional branch at all: a `cancel` consulted
+/// only at the re-run decision would leave a hundred weak edges rescheduling
+/// each other for ever and this test would hang rather than fail. The pairs
+/// are independent, so a four-worker pool has every one of them live at once.
+#[test]
+fn cancel_infinite_loop() {
+    let executor = Executor::new(4);
+    let mut taskflow = Taskflow::new();
+
+    for _ in 0..100 {
+        let a = taskflow.emplace(|| {});
+        let b = taskflow.emplace_condition(|| 0);
+        taskflow.task(a).precede([b]);
+        taskflow.task(b).precede([b]);
+    }
+
+    let run = executor.run(&taskflow);
+    assert!(run.cancel(), "an endless run cannot have finished");
+    run.wait().expect("a cancelled run completes normally");
+
+    assert_eq!(executor.num_topologies(), 0);
+}
+
+/// Upstream's `CancelFromAnother`: a task of a second taskflow cancels the
+/// first run, which is a single endless loop, and the first run's wait is
+/// still pending when it does.
+///
+/// Upstream's task captures the `tf::Future` by reference. A task body here is
+/// `FnMut() + Send + 'static`, so it cannot capture a [`RunHandle`] -- the
+/// handle borrows the executor and the taskflow -- and a
+/// [`Canceller`](rustflow::Canceller), which is `Clone + Send + Sync +
+/// 'static`, is the part of it that can. That is the whole reason the token
+/// exists; see `RunHandle::canceller`.
+///
+/// Upstream arranges the ordering with `fu.wait_for(100ms) == timeout`, which
+/// is a hopeful 100 ms rather than a guarantee. No wait is needed here and
+/// none is used: the first graph is `a -> b`, `b -> b`, which cannot terminate
+/// by itself, so a poll of its handle is `Pending` by construction however
+/// slow or fast the pool is, and the poll happens on this thread strictly
+/// before the second run is submitted. The cancel is therefore observed to be
+/// what ends the first run, with no race to lose.
+#[test]
+fn cancel_from_another() {
+    let executor = Executor::new(4);
+    let mut taskflow = Taskflow::new();
+
+    // Upstream's single infinite loop.
+    let a = taskflow.emplace(|| {});
+    let b = taskflow.emplace_condition(|| 0);
+    taskflow.task(a).precede([b]);
+    taskflow.task(b).precede([b]);
+
+    let mut run = executor.run(&taskflow);
+    assert!(
+        poll_once(&mut run).is_pending(),
+        "an endless run cannot have finished"
+    );
+
+    // Upstream's `another`, whose one task cancels the run above. The
+    // assertion inside it is upstream's `REQUIRE(fu.cancel() == true)`, and
+    // the `expect` below is what reports it: a panicking task body is stored
+    // on its own topology and raised from `wait`.
+    let mut another = Taskflow::new();
+    let canceller = run.canceller();
+    another.emplace(move || {
+        assert!(canceller.cancel(), "the endless run had already finished");
+    });
+    executor
+        .run(&another)
+        .wait()
+        .expect("a task of the second taskflow panicked");
+
+    run.wait().expect("a cancelled run completes normally");
     assert_eq!(executor.num_topologies(), 0);
 }
