@@ -4,10 +4,11 @@
 //!
 //! # `RunHandle` where upstream has `tf::Future`
 //!
-//! Upstream's `run` hands back a `tf::Future<void>` that shares ownership of
-//! the topology with every queued node, and documents a rule it cannot
-//! enforce: *do not mutate a taskflow while it is running*. Break it and the
-//! scheduler walks edges the user is editing.
+//! Upstream's `run` hands back a `tf::Future<void>`: a `std::future` with a
+//! `std::weak_ptr<Topology>` beside it, which owns nothing and is there so
+//! that `cancel()` has something to reach through. The rule upstream documents
+//! and cannot enforce is *do not mutate a taskflow while it is running*. Break
+//! it and the scheduler walks edges the user is editing.
 //!
 //! Here the rule is the type system's. [`Executor::run`] borrows the executor
 //! and the taskflow for the same lifetime and puts that lifetime on the
@@ -16,20 +17,54 @@
 //! allowed, as it is upstream, and is what the queue on [`Taskflow`] is for:
 //! two runs of one taskflow take its graph in turn rather than at once.
 //!
-//! That leaves one hole, the one `std::thread::scope` has: a handle the caller
-//! simply forgets about would end the borrow while the run is still going. So
-//! [`Drop`] blocks, exactly as a scope's does, and the borrow becomes
-//! airtight.
+//! [`Drop`] then blocks until the run is over, so that the ordinary way of
+//! using a handle -- take it, maybe wait on it, let it go -- never leaves a
+//! run going on behind the caller's back.
 //!
-//! Two things follow from that, and both are deliberate:
+//! # What a leaked handle does, and what it does not
+//!
+//! Blocking in `Drop` is not a guarantee, because `Drop` is not guaranteed to
+//! run: [`std::mem::forget`], a [`ManuallyDrop`](std::mem::ManuallyDrop), a
+//! [`Box::leak`] and an [`Rc`](std::rc::Rc) cycle all skip it, and under NLL
+//! the borrow this handle holds ends at the handle's last use -- the `forget`
+//! call. So a caller *can* end the borrow with the run still in flight, in
+//! safe code, and then drop or edit the taskflow the workers are walking.
+//!
+//! This is not the hole [`std::thread::scope`] has, because `scope` has no
+//! such hole: it is closure-based, so there is no guard value to forget. The
+//! shape that *did* have it is `std::thread::scoped`, removed before Rust 1.0
+//! for exactly this reason (RFC 1084, "leakpocalypse"). An earlier version of
+//! this module claimed a blocking `Drop` made the borrow airtight; it did not,
+//! and the gap was a use-after-free reachable from safe code (issue #40).
+//!
+//! What closes it is ownership rather than `Drop`: every queued job holds a
+//! share of the run *and* of the taskflow's storage, so the storage cannot be
+//! freed while a job can name it, whatever happens to the handle.
+//! `executor::topology` has that argument in full. A leaked handle therefore
+//! leaks -- the run still finishes, the storage is freed when the last share
+//! of it goes, and the handle's own topology is never freed at all -- and
+//! leaking is safe. The two observable consequences are worth naming:
+//!
+//! - **Editing the taskflow panics** rather than racing the scheduler. The
+//!   taskflow holds the one share that can hand out `&mut`, so
+//!   [`Taskflow::graph_mut`] asks `Arc::get_mut` and finds the run's shares
+//!   in the way.
+//! - **Dropping the executor is allowed**, which it otherwise is not, and
+//!   takes the pool down under the run: the workers stop, the jobs still
+//!   queued are dropped, and the run never finishes. Nothing waits for it,
+//!   since the thing that would have waited is the handle that was leaked.
+//!
+//! Two things follow from the design as a whole, and both are deliberate:
 //!
 //! - There is no detached run and no `std::future`-style transfer of the
-//!   result to somewhere else in the program. A topology outliving its handle
-//!   is the one thing the design does not allow.
-//! - [`Executor::wait_for_all`] cannot be the thing that makes dropping an
-//!   executor safe, because it is already impossible to drop an executor with
-//!   a run in flight. It is here because upstream has it and because the
-//!   async run handle will need the count it reads.
+//!   result to somewhere else in the program. A run outliving its handle is
+//!   the one thing the design does not *offer*, as distinct from the one thing
+//!   it cannot survive.
+//! - [`Executor::wait_for_all`] is not what makes dropping an executor safe:
+//!   an executor with a run in flight is one some handle borrows, so only the
+//!   leaked-handle case above can reach `Drop` at all. It is here because
+//!   upstream has it and because the async run handle will need the count it
+//!   reads.
 //!
 //! # The `run` family
 //!
@@ -52,10 +87,10 @@ use std::pin::Pin;
 use std::sync::{Arc, PoisonError, Weak};
 use std::task::{Context, Poll};
 
-use crate::executor::topology::{Cancellable, Topology};
+use crate::executor::topology::{Cancellable, Job, Topology};
 use crate::executor::worker::WorkerThread;
 use crate::executor::{Executor, Shared};
-use crate::taskflow::Taskflow;
+use crate::taskflow::{Flow, Taskflow};
 
 /// Why a run did not finish cleanly.
 ///
@@ -142,18 +177,19 @@ impl std::error::Error for RunError {}
 /// executor.run(&taskflow).wait().expect("no task panicked");
 /// ```
 pub struct RunHandle<'a> {
-    /// The run. Heap-allocated because every queued job holds its address, so
-    /// it has to stay put while this handle moves -- out of [`Executor::run`],
-    /// for one -- and shared because the taskflow's run queue holds the other
-    /// share until the tear-down pops it.
+    /// The run, shared with the taskflow's queue of runs and with every job
+    /// of this one still in a worker's queue.
     topology: Arc<Topology>,
     /// The taskflow, for a run that was handed one by value.
     ///
     /// [`Executor::run_owned`] is upstream's `run(Taskflow&&)`: the run owns
     /// the taskflow and nothing outside it can name it, so it is dropped here
     /// -- after the blocking [`Drop`] below has seen the last run finish, since
-    /// a field is dropped after the body of its owner's `drop`.
-    taskflow: Option<Box<Taskflow>>,
+    /// a field is dropped after the body of its owner's `drop`. What that drop
+    /// releases is the last share of the taskflow's storage, the run's own
+    /// having been released by its tear-down; the graph and the task bodies go
+    /// with it.
+    taskflow: Option<Taskflow>,
     /// The borrows that make "do not mutate a running taskflow" a compile
     /// error. A marker rather than two reference fields because nothing reads
     /// either one: their whole job is to be held.
@@ -246,7 +282,13 @@ impl<'a> RunHandle<'a> {
     /// }
     ///
     /// let run = executor.run(&taskflow);
-    /// assert!(run.cancel(), "the run had not finished");
+    ///
+    /// // What `cancel` *reports* is deliberately not asserted here, and is
+    /// // not to be "tightened" into an `assert!` (#67): a run that has
+    /// // already finished answers `false`, which is this method's contract
+    /// // rather than a fault, and whether this one has is a race with the
+    /// // pool. `tests/cancellation.rs` is where the behaviour is pinned.
+    /// run.cancel();
     ///
     /// // A cancelled run completes normally; what it does not do is finish
     /// // the work it had not started.
@@ -299,15 +341,12 @@ impl<'a> RunHandle<'a> {
     /// behaves like every other one. `taskflow` is `Some` only for the
     /// `run_owned` family, which owns what it was handed even when it runs
     /// nothing with it.
-    fn finished(taskflow: Option<Box<Taskflow>>) -> Self {
-        // The policy is never consulted: the topology is finished before it is
-        // ever handed out, so nothing can ask it to run again, and the
-        // callback has already been called by the run method itself.
-        let topology = Topology::new(|| true, || {});
-        topology.finish();
-
+    fn finished(taskflow: Option<Taskflow>) -> Self {
         Self {
-            topology: Arc::new(topology),
+            // Finished before it is handed out, and holding no share of any
+            // taskflow: `Topology::nothing_to_run` says what follows from
+            // that.
+            topology: Arc::new(Topology::nothing_to_run()),
             taskflow,
             borrow: PhantomData,
         }
@@ -323,10 +362,14 @@ fn outcome(panic: Option<Box<dyn Any + Send>>) -> Result<(), RunError> {
 }
 
 impl Drop for RunHandle<'_> {
-    /// Blocks until the run finishes, as [`std::thread::scope`] does.
+    /// Blocks until the run finishes.
     ///
-    /// This is what makes the handle's borrow mean something: a run can never
-    /// outlive it, so a queued job can never outlive what it points at. After
+    /// This is what makes the handle's borrow mean something *in practice*: a
+    /// handle that is dropped rather than leaked cannot leave a run going
+    /// after the borrow it was scheduled under has ended, so the ordinary
+    /// program never has a run and an edit in the air at once. What makes the
+    /// leaked case safe as well is that a job owns what it names -- see the
+    /// module docs, which also say why this `Drop` is not a guarantee. After
     /// [`RunHandle::wait`] it finds the run already over and returns at once.
     fn drop(&mut self) {
         // A panic payload nobody waited for is dropped here rather than
@@ -353,9 +396,9 @@ impl Drop for RunHandle<'_> {
 ///   it, which on an async runtime means blocking a runtime thread. A cancelled
 ///   task holding a `RunHandle` therefore waits out its run.
 /// - Neither the blocking nor the awaiting path can do anything about a handle
-///   that is leaked rather than dropped: [`std::mem::forget`] skips the `Drop`
-///   that the borrow leans on, and what to do about that is the open question
-///   of issue #40 rather than something this impl settles.
+///   that is leaked rather than dropped, since [`std::mem::forget`] skips the
+///   `Drop` they both lean on. What makes that a leak rather than a
+///   use-after-free is ownership, not either path: see the module docs.
 ///
 /// ```
 /// use std::future::Future;
@@ -506,13 +549,17 @@ impl Executor {
         C: FnOnce() + Send + 'static,
     {
         // Upstream's `if(f.empty() || p()) { c(); return ready future; }`.
-        if !taskflow.has_source_task() || predicate() {
+        if !taskflow.flow().has_source_task() || predicate() {
             on_finish();
             return RunHandle::finished(None);
         }
 
-        let topology = Arc::new(Topology::new(predicate, on_finish));
-        self.start(taskflow, &topology);
+        let topology = Arc::new(Topology::new(
+            predicate,
+            on_finish,
+            Arc::clone(taskflow.flow()),
+        ));
+        self.start(taskflow.flow(), &topology);
 
         RunHandle {
             topology,
@@ -598,17 +645,20 @@ impl Executor {
         P: FnMut() -> bool + Send + 'static,
         C: FnOnce() + Send + 'static,
     {
-        // Boxed before anything can name it: a job holds the taskflow's
-        // address, so it has to stay put while this handle moves.
-        let taskflow = Box::new(taskflow);
-
-        if !taskflow.has_source_task() || predicate() {
+        // Nothing is boxed and nothing has to stay put: what a job names is
+        // the taskflow's *storage*, which is already a shared allocation of
+        // its own, so this value is free to move into the handle below.
+        if !taskflow.flow().has_source_task() || predicate() {
             on_finish();
             return RunHandle::finished(Some(taskflow));
         }
 
-        let topology = Arc::new(Topology::new(predicate, on_finish));
-        self.start(&taskflow, &topology);
+        let topology = Arc::new(Topology::new(
+            predicate,
+            on_finish,
+            Arc::clone(taskflow.flow()),
+        ));
+        self.start(taskflow.flow(), &topology);
 
         RunHandle {
             topology,
@@ -625,11 +675,11 @@ impl Executor {
     /// the queue. A run queued behind another is counted here all the same, so
     /// that [`Executor::wait_for_all`] waits for it and the worker loop's fast
     /// path knows there is something coming.
-    fn start(&self, taskflow: &Taskflow, topology: &Arc<Topology>) {
+    fn start(&self, flow: &Arc<Flow>, topology: &Arc<Topology>) {
         self.shared.increment_topology();
 
-        if taskflow.enqueue_run(Arc::clone(topology)) == 0 {
-            self.shared.set_up_topology(None, taskflow, topology);
+        if flow.enqueue_run(Arc::clone(topology)) == 0 {
+            self.shared.set_up_topology(None, flow, topology);
         }
     }
 
@@ -674,7 +724,7 @@ fn repeat(times: usize) -> impl FnMut() -> bool + Send + 'static {
 }
 
 impl Shared {
-    /// Arms `topology` over `taskflow`'s graph and queues its source tasks.
+    /// Arms `topology` over `flow`'s graph and queues its source tasks.
     ///
     /// Upstream's `_set_up_topology(Worker*, Topology*)`, whose `Worker*` is
     /// this `worker`: a thread that is one of this executor's workers pushes
@@ -689,10 +739,10 @@ impl Shared {
     pub(crate) fn set_up_topology(
         &self,
         worker: Option<&WorkerThread>,
-        taskflow: &Taskflow,
-        topology: &Topology,
+        flow: &Arc<Flow>,
+        topology: &Arc<Topology>,
     ) {
-        let num_sources = topology.set_up(taskflow);
+        let num_sources = topology.set_up(flow);
         debug_assert!(
             num_sources > 0,
             "a run is only ever created for a graph with a source task"
@@ -703,11 +753,11 @@ impl Shared {
             // `WorkerThread::schedule` per job here: the deque behind a
             // worker's queue grows, so there is no bulk push to make.
             Some(worker) => {
-                for job in topology.sources(taskflow) {
+                for job in Job::sources(flow, topology) {
                     worker.schedule(job);
                 }
             }
-            None => self.bulk_schedule(topology.sources(taskflow)),
+            None => self.bulk_schedule(Job::sources(flow, topology)),
         }
     }
 
@@ -715,18 +765,29 @@ impl Shared {
     /// again. Upstream's `_tear_down_topology`.
     ///
     /// Called by the worker that drove the topology's join counter to zero,
-    /// and the last thing that worker does with any of its three arguments.
+    /// and the last thing that worker does with either argument.
+    ///
+    /// The graph is not an argument, where every other method of this family
+    /// takes it: the job that got here has already given its share of the
+    /// taskflow's storage up, which is what keeps a taskflow editable the
+    /// instant its run is over -- see `Job::into_run`. So the share this needs
+    /// is the run's own, taken back out of the topology below.
     pub(crate) fn tear_down_topology(
         &self,
         worker: Option<&WorkerThread>,
-        taskflow: &Taskflow,
-        topology: &Topology,
+        topology: &Arc<Topology>,
     ) {
+        let flow = topology
+            .flow()
+            .expect("a run in flight holds a share of the taskflow it runs");
+
         // Upstream's case 1: the predicate says run the graph again. Same
         // topology, so it is neither counted again nor finished -- and
         // `Topology::set_up` re-arms every join counter the run just spent.
+        // The run keeps its share of the storage, since it is about to need it
+        // again.
         if topology.run_again() {
-            self.set_up_topology(worker, taskflow, topology);
+            self.set_up_topology(worker, &flow, topology);
             return;
         }
 
@@ -743,18 +804,24 @@ impl Shared {
 
         // Then the next run of this taskflow, if one queued up behind this
         // one, started *before* this run is released rather than after it as
-        // upstream does. The reason is this port's lifetimes: `finish` below
-        // releases the thread that owns this run's handle, and for a
-        // `run_owned` handle that is the thread which then drops the taskflow,
-        // so nothing may touch `taskflow` after it. Starting the next run here
-        // is safe for the converse reason -- a taskflow with a run queued
-        // behind this one is one that some other handle still borrows, which
-        // is to say one nobody can be about to drop. A `run_owned` taskflow is
-        // named by nothing but its own handle, so its queue can never hold a
-        // second run.
-        if let Some(next) = taskflow.pop_finished_run(topology) {
-            self.set_up_topology(worker, taskflow, &next);
+        // upstream does. The reason is what the next few lines are about: the
+        // thread `finish` releases is free to edit the taskflow the moment it
+        // wakes, so the last touch of the graph has to come first. A
+        // `run_owned` taskflow is named by nothing but its own handle, so its
+        // queue can never hold a second run at all.
+        if let Some(next) = flow.pop_finished_run(topology) {
+            self.set_up_topology(worker, &flow, &next);
         }
+
+        // The last two touches of the graph, in this order: this worker's own
+        // share of the storage, and then the run's. Both go before `finish`,
+        // because what `finish` releases is a thread that may edit the
+        // taskflow -- and `Taskflow::graph_mut` asks whether any share is
+        // outstanding. Dropping them here rather than letting them fall out of
+        // scope is the whole mechanism; see `executor::topology` for the order
+        // in full.
+        drop(flow);
+        topology.release_flow();
 
         // The accounting, and only then the completion slot. This is
         // deliberately *not* upstream's order -- its `_tear_down_topology`
@@ -768,12 +835,10 @@ impl Shared {
         // `fetch_sub` and the lock `finish` takes are what carry that to the
         // waiting thread, whose own read of the count is relaxed.
         //
-        // The order is also the only one the port's lifetimes allow, which is
-        // what makes it free: `finish` releases the thread that owns the
-        // topology *and* the taskflow's borrow, so it has to be this worker's
-        // last touch of either, while `decrement_topology` reads only the
-        // executor's shared state -- which every worker holds a share of, and
-        // which therefore outlives all of them.
+        // `decrement_topology` reads only the executor's shared state, which
+        // every worker holds a share of and which therefore outlives all of
+        // them, so it is free to come after the graph has gone out of reach
+        // and before the waiter is released.
         self.decrement_topology();
         topology.finish();
     }
@@ -786,9 +851,8 @@ impl WorkerThread {
     /// module because every line of it is about the run rather than about the
     /// worker; what the worker brings is the queue the next run's source tasks
     /// go onto.
-    pub(crate) fn tear_down_topology(&self, taskflow: &Taskflow, topology: &Topology) {
-        self.shared
-            .tear_down_topology(Some(self), taskflow, topology);
+    pub(crate) fn tear_down_topology(&self, topology: &Arc<Topology>) {
+        self.shared.tear_down_topology(Some(self), topology);
     }
 
     /// Accounts for one job of `topology` having finished, ending the run if it
@@ -801,11 +865,13 @@ impl WorkerThread {
     /// upstream's cancelled branch goes to `_tear_down_invoke` rather than
     /// simply returning.
     ///
-    /// **The last thing the caller may do with either argument**, for the
-    /// reason [`Shared::tear_down_topology`] gives.
-    pub(crate) fn finish_job(&self, taskflow: &Taskflow, topology: &Topology) {
+    /// **The last thing the caller may do with the run**, for the reason
+    /// [`Shared::tear_down_topology`] gives -- and the caller must already
+    /// have given up its share of the taskflow's storage, which is why the
+    /// only way to reach this is through `Job::into_run`.
+    pub(crate) fn finish_job(&self, topology: &Arc<Topology>) {
         if topology.job_finished() {
-            self.tear_down_topology(taskflow, topology);
+            self.tear_down_topology(topology);
         }
     }
 }

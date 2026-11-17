@@ -44,19 +44,19 @@
 //!
 //! # The inner run's topology
 //!
-//! Every queued job holds the address of the topology it belongs to, and
-//! `executor::topology` sets out what keeps that address valid: the run's
-//! topology must outlive every job that names it. For [`Executor::run`] the
-//! owner is the [`RunHandle`](crate::RunHandle) it returns, which is also
-//! where that argument has a hole worth knowing about -- `mem::forget` skips
-//! the handle's blocking `Drop` and ends its borrow with the run still going
-//! (issue #40).
+//! Every queued job holds a share of the run it belongs to and of the storage
+//! of the taskflow it walks, which is what `executor::topology` rests on:
+//! neither can be freed while a job can name it. A corun adds nothing to that
+//! argument and takes nothing away. What it does add is a second reason the
+//! inner run cannot be left behind: its topology is owned by `InnerRun`, a
+//! value this module creates on the corun frame and never hands out, so a
+//! caller cannot hold it and therefore cannot leak it either -- and the `Drop`
+//! that waits for the run is the only way the frame can be left, an unwind
+//! through it included.
 //!
-//! `corun` has no such exposure, and not because it is more careful: the
-//! topology is owned by `InnerRun`, a value this module creates on the corun
-//! frame and never hands out. A caller cannot hold it, so a caller cannot
-//! forget it, and the `Drop` that waits for the run is the only way the frame
-//! can be left -- including an unwind through it.
+//! That makes a corun the closure-shaped version of the promise
+//! [`Executor::run`] makes with a lifetime: the borrow of `taskflow` ends when
+//! this function returns, and it cannot return until the run is over.
 
 use std::fmt;
 use std::sync::Arc;
@@ -65,7 +65,7 @@ use crate::executor::Executor;
 use crate::executor::run_handle::RunError;
 use crate::executor::topology::Topology;
 use crate::executor::worker::WorkerThread;
-use crate::taskflow::Taskflow;
+use crate::taskflow::{Flow, Taskflow};
 
 /// Why a [`Executor::corun`] or [`Executor::corun_until`] call did not do what
 /// it was asked.
@@ -135,39 +135,41 @@ impl std::error::Error for CorunError {
     }
 }
 
-/// The topology of one [`Executor::corun`], owned for exactly as long as a
-/// queued job can name it.
+/// The topology of one [`Executor::corun`], held for as long as the corun
+/// frame runs.
 ///
 /// Upstream's local `NodeBase anchor` in `corun`, which plays the same part:
 /// the thing the inner graph's nodes count down to, living on the corunning
 /// worker's stack for the duration.
 ///
-/// Boxed, as [`Executor::run`] boxes its own, so that the address every job
-/// carries cannot be invalidated by the value moving. [`Drop`] is what makes
-/// the ownership mean something, and it is the reason this is a type rather
-/// than a local: an unwind through the corun frame -- which a scheduler bug
-/// could cause, since a *task*'s panic is caught and recorded instead -- must
-/// not free a topology while a job still names it.
+/// Shared, as [`Executor::run`]'s own topology is, because every queued job of
+/// the run holds a share of it -- so a job of a corun cannot outlive its run
+/// any more than a job of a `run` can. [`Drop`] is then not what keeps the
+/// topology alive but what keeps the *frame* honest, and it is the reason this
+/// is a type rather than a local: an unwind through the corun frame -- which a
+/// scheduler bug could cause, since a *task*'s panic is caught and recorded
+/// instead -- must not take the caller's borrow of the taskflow with it while
+/// a job of this run is still in a queue.
 struct InnerRun {
-    /// The run. Nothing else owns it, and nothing outside this module can.
-    topology: Box<Topology>,
+    /// The run. Nothing outside this module can name it.
+    topology: Arc<Topology>,
 }
 
 impl InnerRun {
-    /// A run that has not started.
+    /// A run of `flow`'s graph that has not started.
     ///
     /// A corun runs its graph exactly once, so the run policy is the only one
     /// that says "do not go round again" from the start, with no callback to
     /// carry out: `run_n`/`run_until` are for a taskflow a caller runs, and
     /// the whole of this topology is a counter the corun frame waits on.
-    fn new() -> Self {
+    fn new(flow: &Arc<Flow>) -> Self {
         Self {
-            topology: Box::new(Topology::new(|| true, || {})),
+            topology: Arc::new(Topology::new(|| true, || {}, Arc::clone(flow))),
         }
     }
 
     /// The topology, to arm and to schedule from.
-    fn topology(&self) -> &Topology {
+    fn topology(&self) -> &Arc<Topology> {
         &self.topology
     }
 
@@ -262,8 +264,8 @@ impl Executor {
     pub fn corun(&self, taskflow: &Taskflow) -> Result<(), CorunError> {
         let id = self.this_worker_id().ok_or(CorunError::NotAWorker)?;
 
-        let run = InnerRun::new();
-        if taskflow.has_source_task() {
+        let run = InnerRun::new(taskflow.flow());
+        if taskflow.flow().has_source_task() {
             let topology = run.topology();
 
             // Counted as the `run` family counts its own, and for the reason
@@ -272,7 +274,7 @@ impl Executor {
             // before its sources are. The matching decrement is the one every
             // run gets, from the tear-down of its last job.
             self.shared.increment_topology();
-            self.shared.set_up_topology(None, taskflow, topology);
+            self.shared.set_up_topology(None, taskflow.flow(), topology);
 
             // Upstream's predicate, exactly: the run is over when its join
             // counter reaches zero. `join` below, not this read, is what then

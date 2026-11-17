@@ -443,8 +443,14 @@ impl Drop for Executor {
     /// Upstream first calls `wait_for_all`, so that a topology still running
     /// finishes before the pool goes away. There is deliberately no such call
     /// here: a [`RunHandle`](crate::RunHandle) borrows the executor and blocks
-    /// when it is dropped, so a run in flight already keeps the executor
-    /// alive, and this method cannot be reached with a topology outstanding.
+    /// when it is dropped, so a run in flight is a run whose handle is keeping
+    /// the executor alive. The one way past that is a handle the caller
+    /// *leaked*, and then this runs with a topology outstanding: the workers
+    /// stop where they are, the jobs still queued are dropped, and the run
+    /// never finishes -- which nothing is waiting for, the thing that would
+    /// have waited being the handle that was leaked. See [`run_handle`] for
+    /// the rest of what a leaked handle does.
+    ///
     /// Not waiting here is also what keeps a worker that died of a bug from
     /// turning shutdown into a hang -- the pool still comes down.
     fn drop(&mut self) {

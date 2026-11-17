@@ -476,30 +476,23 @@ impl WorkerThread {
     /// optimisation and a measurable one, so it belongs with the benchmarks
     /// rather than with the first correct version.
     pub(crate) fn invoke(&mut self, job: Job) {
-        // SAFETY: a job reaches a worker only through a queue, and the only
-        // things that put one there are a run whose `RunHandle` is alive and a
-        // corun whose frame has not returned. Both own the topology and both
-        // block until the run is over, and `Topology::finish` -- the release
-        // of that very owner -- is the last thing the worker that ends the run
-        // does with the topology, the taskflow or a node of the graph. So
-        // every job that can be dequeued names a live node of a borrowed graph
-        // and a live topology. See `executor::topology` for the full argument
-        // and `executor::corun` for the corun half of it.
-        let (node, taskflow, topology) = unsafe { job.parts() };
+        // The job owns a share of the run and of the taskflow's storage, so
+        // this needs no `unsafe` and no argument about who outlives whom: both
+        // are alive because the job that named them is. See
+        // `executor::topology`.
+        let (node, flow, topology) = job.parts();
 
         // Upstream's `_is_parent_cancelled()` early-out at the top of
         // `_invoke`: a cancelled run runs none of the work it had not started,
         // and the job is torn down all the same -- the join counters still have
-        // to reach zero for the run to finish at all. Nothing below may touch
-        // `taskflow` or `topology` afterwards, for the reason the tail of this
-        // method gives. See `Topology::cancelled` and the `executor` module
-        // docs.
+        // to reach zero for the run to finish at all. The tail of this method
+        // says what spending the job here does; it is the same line.
         if topology.cancelled() {
-            self.finish_job(taskflow, topology);
+            self.finish_job(&job.into_run());
             return;
         }
 
-        let graph = taskflow.graph();
+        let graph = flow.graph();
 
         let release = match node.handle() {
             // Upstream's `_invoke_static_task`, whose
@@ -568,7 +561,7 @@ impl WorkerThread {
                     let next = graph.node(successor);
                     if next.join_counter().fetch_sub(1, Ordering::AcqRel) == 1 {
                         topology.job_queued();
-                        self.schedule(Job::new(successor, taskflow, topology));
+                        self.schedule(job.successor(successor));
                     }
                 }
             }
@@ -594,17 +587,18 @@ impl WorkerThread {
                         .join_counter()
                         .store(0, Ordering::Relaxed);
                     topology.job_queued();
-                    self.schedule(Job::new(successor, taskflow, topology));
+                    self.schedule(job.successor(successor));
                 }
             }
         }
 
-        // Upstream's `_tear_down_nonasync`. Nothing below may touch `node`,
-        // `graph`, `taskflow` or `topology`: the tear-down releases the thread
-        // that owns all four.
-        if topology.job_finished() {
-            self.tear_down_topology(taskflow, topology);
-        }
+        // Upstream's `_tear_down_nonasync`. Spending the job here is what
+        // releases its share of the taskflow's storage, and it has to happen
+        // before the join counter below may end the run -- `Job::into_run`
+        // says why. It also ends the borrows this method has been working
+        // through, so the compiler is what stops anything from touching
+        // `node`, `graph` or `flow` afterwards.
+        self.finish_job(&job.into_run());
     }
 
     /// Steals until something turns up, the worker is told to stop, or the

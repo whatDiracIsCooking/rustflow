@@ -18,13 +18,21 @@
 //! - `Iterators/Generic` renames tasks from inside `for_each_successor`, which
 //!   an index-handle visitor cannot do while the walk borrows the graph; the
 //!   walk collects the indices and the renaming follows it.
+//!
+//! The last section is not upstream's at all. Upstream has no `RunHandle` and
+//! therefore no case for leaking one, while this port's answer to "do not
+//! mutate or destroy a running taskflow" is that handle -- so what happens
+//! when a caller leaks one is a property of the port, and issue #40 is where
+//! it needed pinning down.
 
 use std::future::Future;
+use std::mem;
 use std::pin::pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use rustflow::prelude::*;
 use rustflow::{Executor, RunError, RunHandle, TaskType};
@@ -1513,5 +1521,230 @@ fn a_thousand_runs_of_a_diamond_chain() {
             "at {workers} workers"
         );
         assert_eq!(executor.num_topologies(), 0);
+    }
+}
+
+// --------------------------------------------------------
+// what a leaked run handle does: issue #40
+// --------------------------------------------------------
+
+/// How long a case here waits for the pool to reach a state before it gives
+/// up and lets the assertions report what went wrong. Generous: it is only
+/// ever reached when the test is about to fail anyway, and a spin that gave up
+/// early would turn a slow machine into a failure.
+const GIVE_UP_AFTER: Duration = Duration::from_secs(10);
+
+/// Spins until `flag` is set, or until [`GIVE_UP_AFTER`] has passed.
+///
+/// A spin rather than a condvar because one end of every use of it is a task
+/// body: a worker that parked would be a worker not running the rest of the
+/// run, and these cases are about what the pool does while a run is in
+/// flight. Bounded, so that nothing here can hang a test binary -- including
+/// when the thread that would have set the flag is unwinding.
+fn spin_until(flag: &AtomicBool) {
+    let start = Instant::now();
+    while !flag.load(Ordering::Acquire) && start.elapsed() < GIVE_UP_AFTER {
+        std::hint::spin_loop();
+    }
+}
+
+/// Sets a flag when it is dropped, including during an unwind.
+struct ReleaseOnDrop(Arc<AtomicBool>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Upstream has no `RunHandle` and so no case for this: a handle the caller
+/// leaks rather than drops.
+///
+/// [`std::mem::forget`] skips the blocking `Drop` the handle's borrow leans
+/// on, and under NLL the borrow ends at the handle's last use -- the `forget`
+/// call -- so this program compiles and the taskflow is moved and then freed
+/// with the run still in flight. It is issue #40's probe, which used to be a
+/// use-after-free: workers held raw pointers into storage the main thread had
+/// just dropped.
+///
+/// What makes it safe now is ownership rather than the handle: every queued
+/// job holds a share of the run and of the taskflow's storage, so neither can
+/// be freed while a job can name it. The run therefore finishes, every task
+/// runs, and the executor ends up idle; what leaks is the topology of the
+/// handle nobody dropped.
+#[test]
+fn a_leaked_handle_leaks_rather_than_freeing_a_graph_under_the_pool() {
+    const TASKS: usize = 200;
+
+    let executor = Executor::new(4);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let running = Arc::new(AtomicBool::new(false));
+    let released = Arc::new(AtomicBool::new(false));
+
+    let mut taskflow = Taskflow::new();
+    for _ in 0..TASKS {
+        let counter = Arc::clone(&counter);
+        let running = Arc::clone(&running);
+        let released = Arc::clone(&released);
+        taskflow.emplace(move || {
+            // The first task to run says so, and every task waits for the
+            // main thread below: that is what makes the overlap this case is
+            // about a certainty rather than a race won on most machines.
+            running.store(true, Ordering::Release);
+            spin_until(&released);
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    mem::forget(executor.run(&taskflow));
+    spin_until(&running);
+
+    // Both of the things the borrow was there to prevent, with the run
+    // provably in flight: the taskflow is moved out of, which no job notices
+    // because what a job names is the storage and a move does not touch it,
+    // and then what was moved out is freed.
+    let moved = mem::take(&mut taskflow);
+    assert_eq!(taskflow.num_tasks(), 0, "the taskflow was moved out");
+    drop(moved);
+
+    released.store(true, Ordering::Release);
+    executor.wait_for_all();
+
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        TASKS,
+        "the run did not finish on storage its taskflow had let go of"
+    );
+    assert_eq!(executor.num_topologies(), 0, "the run is accounted for");
+}
+
+/// The other half of what a leaked handle can reach: editing the taskflow
+/// instead of freeing it.
+///
+/// The borrow makes this a compile error for a handle that is still alive, so
+/// only a leak gets here -- and then the graph is one the workers are walking,
+/// which an `emplace` would reallocate under them. So it panics, which is the
+/// price of `Arc::get_mut` being what `Taskflow::graph_mut` asks: a run in
+/// flight is a run holding shares of the storage.
+///
+/// The run is held open by a task waiting on `released`, so the panic is not a
+/// race either: a share is outstanding for certain when the edit lands. The
+/// guard is what lets the pool come down afterwards, since it is dropped --
+/// and releases that task -- on the way out of the unwind.
+#[test]
+#[should_panic(expected = "a taskflow cannot be edited while a run of it is in flight")]
+fn editing_a_taskflow_whose_handle_was_leaked_panics_rather_than_racing() {
+    let executor = Executor::new(2);
+    let running = Arc::new(AtomicBool::new(false));
+    let released = Arc::new(AtomicBool::new(false));
+
+    let mut taskflow = Taskflow::new();
+    taskflow.emplace({
+        let running = Arc::clone(&running);
+        let released = Arc::clone(&released);
+        move || {
+            running.store(true, Ordering::Release);
+            spin_until(&released);
+        }
+    });
+
+    mem::forget(executor.run(&taskflow));
+    spin_until(&running);
+
+    let _release = ReleaseOnDrop(Arc::clone(&released));
+    taskflow.emplace(|| {});
+}
+
+/// A taskflow whose runs have all *finished* is editable at once, which is the
+/// other thing the shares have to be right about: the panic above must not be
+/// reachable one instruction after a `wait` returns.
+///
+/// Every run of the loop below edits the graph the moment the run before it
+/// reported done, so a share released a moment too late -- by a job already
+/// torn down, or by a tear-down that let its own go after releasing the
+/// waiter -- would show up here as that panic. A thousand rounds at two
+/// worker counts because the window it guards is a handful of instructions
+/// wide, which is also why the edit is inside the loop rather than after it.
+#[test]
+fn a_taskflow_is_editable_the_instant_its_run_reports_done() {
+    const ROUNDS: usize = 1000;
+
+    for workers in [1, 4] {
+        let executor = Executor::new(workers);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let mut taskflow = Taskflow::new();
+        for _ in 0..8 {
+            let counter = Arc::clone(&counter);
+            taskflow.emplace(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+
+        for round in 0..ROUNDS {
+            executor.run(&taskflow).wait().expect("a task panicked");
+            // The edit a stale share would turn into a panic. `set_name`
+            // never asks, since a run reads no name; `graph_mut` -- which
+            // `clear` and the builder both go through -- always does.
+            taskflow.clear();
+            assert_eq!(taskflow.num_tasks(), 0, "round {round} at {workers}w");
+
+            let counter = Arc::clone(&counter);
+            taskflow.emplace(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+
+        // Eight tasks for the first run, then one per round after it.
+        assert_eq!(counter.load(Ordering::Relaxed), 8 + ROUNDS - 1);
+    }
+}
+
+/// The same promise for a handle that was dropped without being waited on,
+/// since `Drop` and `wait` owe the same thing, and for the `run_owned` family
+/// -- where the last share of the storage is the handle's own, so the graph is
+/// freed by the drop rather than kept by the caller.
+#[test]
+fn a_dropped_handle_leaves_its_taskflow_editable_and_its_owned_graph_freed() {
+    let executor = Executor::new(4);
+    let drops = Arc::new(AtomicUsize::new(0));
+
+    /// Counts its own drop, which is what says when the graph was freed.
+    struct CountOnDrop(Arc<AtomicUsize>);
+
+    impl Drop for CountOnDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let mut borrowed = Taskflow::new();
+    for _ in 0..16 {
+        borrowed.emplace(|| {});
+    }
+
+    for _ in 0..100 {
+        drop(executor.run(&borrowed));
+        // No `wait`, so the only thing that can have released the run's share
+        // of the storage is the tear-down.
+        borrowed.emplace(|| {});
+    }
+    assert_eq!(borrowed.num_tasks(), 116);
+
+    for round in 0..100 {
+        let mut owned = Taskflow::new();
+        for _ in 0..4 {
+            let counted = CountOnDrop(Arc::clone(&drops));
+            owned.emplace(move || {
+                let _ = &counted;
+            });
+        }
+
+        drop(executor.run_owned(owned));
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            4 * (round + 1),
+            "the handle did not free the graph it owned"
+        );
     }
 }
