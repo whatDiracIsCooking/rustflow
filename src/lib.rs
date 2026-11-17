@@ -3,9 +3,10 @@
 //!
 //! # Status
 //!
-//! Scaffolding only. Nothing of the upstream API is ported yet; the first
-//! slice is the static task graph (`Taskflow`/`Task`) and the work-stealing
-//! `Executor` that runs it.
+//! The static task graph is the first slice: a [`Taskflow`] owns a [`Graph`]
+//! of [`Node`]s, each addressed by a [`Task`] index into that graph's arena.
+//! The task-building API and the work-stealing executor that runs the graph
+//! are still to come.
 //!
 //! The port follows **Taskflow v4.1.0** (commit `45366fe5`, 2026-06-19). See
 //! the README's "Upstream pin" section before translating anything.
@@ -35,6 +36,12 @@
 //! See the README's "Provenance and attribution" section.
 
 #![doc(html_root_url = "https://docs.rs/rustflow/0.0.0")]
+
+pub mod graph;
+pub mod taskflow;
+
+pub use crate::graph::{Graph, Handle, Node, Task, Work};
+pub use crate::taskflow::Taskflow;
 
 /// The crate version, as reported by Cargo at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
