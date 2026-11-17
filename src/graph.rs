@@ -35,8 +35,9 @@ use std::any::Any;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
-use crate::executor::topology::Cancellable;
+use crate::executor::topology::{Cancellable, Job};
 use crate::runtime::Runtime;
+use crate::semaphore::{Semaphore, SemaphoreError};
 use crate::subflow::Subflow;
 use crate::taskflow::Taskflow;
 
@@ -609,6 +610,28 @@ impl Drop for ExplicitAnchor<'_> {
     }
 }
 
+/// What a node acquires before its work runs and releases after it:
+/// upstream's `Node::Semaphores`.
+///
+/// Upstream stores `Semaphore*` and leaves the caller to keep each one alive
+/// for as long as the graph refers to it, which is a promise a safe API cannot
+/// ask for; these are `Arc<Semaphore>` instead, so a node's claim on a
+/// semaphore is a share of it. The *same* semaphore is what constrains a set
+/// of tasks, so every node of that set holds a clone of one `Arc` -- see
+/// [`TaskMut::acquire`](crate::TaskMut::acquire).
+///
+/// Crate-private, like upstream's nested struct: what a caller edits is the
+/// task handle's `acquire`/`release`, and what a caller can ask is how many of
+/// each there are.
+#[derive(Debug, Default)]
+pub(crate) struct Semaphores {
+    /// Acquired in this order before the node's work, and given back in
+    /// reverse if one of them cannot be had -- see [`Node::acquire_all`].
+    pub(crate) to_acquire: Vec<Arc<Semaphore>>,
+    /// Released in this order after the node's work.
+    pub(crate) to_release: Vec<Arc<Semaphore>>,
+}
+
 /// A single task of a [`Graph`]: its name, its work, its edges and the state
 /// words a run mutates.
 ///
@@ -627,6 +650,11 @@ pub struct Node {
     edges: Vec<Task>,
     /// The state words a run writes, upstream's `NodeBase` subobject.
     base: NodeBase,
+    /// What this node acquires and releases around its work, `None` until a
+    /// caller asks for either: upstream's `unique_ptr<Semaphores>`, boxed for
+    /// the same reason -- a graph in which nothing acquires anything pays one
+    /// pointer per node rather than two empty vectors.
+    semaphores: Option<Box<Semaphores>>,
 }
 
 impl Node {
@@ -639,6 +667,7 @@ impl Node {
             num_successors: 0,
             edges: Vec::new(),
             base: NodeBase::new(),
+            semaphores: None,
         }
     }
 
@@ -780,6 +809,98 @@ impl Node {
     #[must_use]
     pub fn join_counter(&self) -> &AtomicUsize {
         self.base.join_counter()
+    }
+
+    /// What this node acquires and releases around its work, `None` if nothing
+    /// ever asked it to.
+    pub(crate) fn semaphores(&self) -> Option<&Semaphores> {
+        self.semaphores.as_deref()
+    }
+
+    /// The same, for editing, allocating the lists on first use: upstream's
+    /// `if(!_semaphores) _semaphores = make_unique<Semaphores>()`, which it
+    /// repeats in each of the four `Task` methods.
+    pub(crate) fn semaphores_mut(&mut self) -> &mut Semaphores {
+        self.semaphores.get_or_insert_default()
+    }
+
+    /// Acquires every semaphore this node asked for, in order, and answers
+    /// whether the node may run: upstream's `Node::_acquire_all`.
+    ///
+    /// `false` means a clone of `job` is parked on the first semaphore that
+    /// could not be had, and the caller must not run the node -- whoever
+    /// releases that semaphore will schedule the job. The ones already taken
+    /// are given back before returning, newest first, which is upstream's
+    /// inner loop: a node that holds half of what it needs would otherwise
+    /// deadlock the rest of its set against a task that is itself parked.
+    /// Anything those releases wake goes into `woken`, for the caller to
+    /// schedule.
+    ///
+    /// `&self`, because a worker reaches its node through a shared graph. It
+    /// is each semaphore's own lock that makes the counter and the waiting
+    /// list sound under that sharing; nothing is written here.
+    //
+    // The only caller outside the tests below is the executor, and the
+    // executor does not look at a semaphore until #89 -- so `dead_code` is
+    // right about the library build and the fix is that issue, not an
+    // `allow`. `expect` is what keeps that honest: it fails the build the
+    // moment a caller appears, so #89 cannot leave it behind. The `cfg_attr`
+    // is because the unit tests *are* a caller, and a lint expectation that
+    // holds of one build and not the other has to say which.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the executor acquires in #89"))]
+    pub(crate) fn acquire_all(&self, job: &Job, woken: &mut Vec<Job>) -> bool {
+        // Upstream asserts `_semaphores != nullptr` (commented out) because
+        // only its executor calls this, and only for a node that has them. A
+        // node with nothing to acquire trivially may run.
+        let Some(semaphores) = self.semaphores() else {
+            return true;
+        };
+
+        let to_acquire = &semaphores.to_acquire;
+        for (taken, semaphore) in to_acquire.iter().enumerate() {
+            if !semaphore.try_acquire_or_wait(job) {
+                for held in to_acquire[..taken].iter().rev() {
+                    // This cannot be an over-release: the count being given
+                    // back is one this loop took a moment ago and still
+                    // holds. Only a `reset_to` racing a run of this graph
+                    // could make it one, which that method documents as not
+                    // allowed -- and a rollback has nobody to report it to
+                    // anyway.
+                    let _ = held.release(woken);
+                }
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Releases every semaphore this node asked to release, in order:
+    /// upstream's `Node::_release_all`.
+    ///
+    /// Whatever those releases wake goes into `woken`, for the caller to
+    /// schedule.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SemaphoreError`] from the first semaphore that was already at
+    /// its maximum, leaving the ones after it unreleased -- which is where
+    /// upstream's throw leaves the loop too. What a task that over-releases
+    /// has done is the executor's decision, not this module's.
+    //
+    // Dead in the library build until #89, exactly as `acquire_all` above is,
+    // and expected for the same reason.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the executor releases in #89"))]
+    pub(crate) fn release_all(&self, woken: &mut Vec<Job>) -> Result<(), SemaphoreError> {
+        let Some(semaphores) = self.semaphores() else {
+            return Ok(());
+        };
+
+        for semaphore in &semaphores.to_release {
+            semaphore.release(woken)?;
+        }
+
+        Ok(())
     }
 
     /// Appends `to` to the successor half, upstream's `Node::_precede` minus
@@ -1093,6 +1214,10 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
+
+    // `Job` is in scope from the module above; these three are the rest of
+    // what it takes to build one.
+    use crate::executor::topology::{GraphOwner, Parent, Topology};
 
     /// Builds `n` placeholder nodes named `a`, `b`, ... for edge tests.
     fn graph_of(n: usize) -> (Graph, Vec<Task>) {
@@ -1738,5 +1863,122 @@ mod tests {
         // racing: `try_lock` cannot tell the two apart.
         let _guard = work.0.try_lock().expect("uncontended");
         work.invoke();
+    }
+
+    /// The job of the one source task of `taskflow`, which is how a case here
+    /// gets hold of something a semaphore can park.
+    ///
+    /// The taskflow must be finished with by the time this is called:
+    /// `Taskflow::graph_mut` refuses once a share of the storage is
+    /// outstanding, and the job holds one.
+    fn source_job(taskflow: &Taskflow) -> Job {
+        let flow = Arc::clone(taskflow.flow());
+        let topology = Arc::new(Topology::new(|| true, || {}, Arc::clone(&flow)));
+        let owner = GraphOwner::flow(&flow);
+        let mut sources = Job::sources(&owner, &topology, &Parent::Run);
+        let job = sources.next().expect("the graph has a source task");
+        assert!(sources.next().is_none(), "the cases here have one source");
+        job
+    }
+
+    /// A node that acquires nothing may run, and asks no semaphore anything:
+    /// every node of every other case in this crate is this one.
+    #[test]
+    fn acquire_all_of_a_node_with_no_semaphores_succeeds() {
+        let mut taskflow = Taskflow::new();
+        taskflow
+            .graph_mut()
+            .add_named_node("a", Handle::Placeholder);
+        let job = source_job(&taskflow);
+
+        let mut woken = Vec::new();
+        assert!(job.node().acquire_all(&job, &mut woken));
+        assert!(job.node().release_all(&mut woken).is_ok());
+        assert!(woken.is_empty());
+    }
+
+    /// Upstream's `_acquire_all` loop exactly: the first semaphore that cannot
+    /// be had parks the job, and the ones already taken are given back rather
+    /// than held by a task that is not going to run.
+    #[test]
+    fn acquire_all_rolls_back_what_it_took_before_it_parked() {
+        let free = Arc::new(Semaphore::new(1));
+        let exhausted = Arc::new(Semaphore::new(0));
+
+        let mut taskflow = Taskflow::new();
+        let a = taskflow
+            .graph_mut()
+            .add_named_node("a", Handle::Placeholder);
+        let semaphores = taskflow.graph_mut().node_mut(a).semaphores_mut();
+        semaphores.to_acquire.push(Arc::clone(&free));
+        semaphores.to_acquire.push(Arc::clone(&exhausted));
+        let job = source_job(&taskflow);
+
+        let mut woken = Vec::new();
+        assert!(!job.node().acquire_all(&job, &mut woken));
+
+        // Given back, and parked on the one that could not be had.
+        assert_eq!(free.value(), 1);
+        assert_eq!(free.num_waiters(), 0);
+        assert_eq!(exhausted.num_waiters(), 1);
+        // The rollback woke nothing, because nothing was waiting on `free`.
+        assert!(woken.is_empty());
+    }
+
+    /// The whole of what the executor will do with a node of a semaphore of
+    /// one: acquire, run, release -- and the release hands back whoever was
+    /// parked in the meantime.
+    #[test]
+    fn release_all_gives_back_every_semaphore_and_collects_the_woken() {
+        let semaphore = Arc::new(Semaphore::new(1));
+
+        let mut taskflow = Taskflow::new();
+        let a = taskflow
+            .graph_mut()
+            .add_named_node("a", Handle::Placeholder);
+        let semaphores = taskflow.graph_mut().node_mut(a).semaphores_mut();
+        semaphores.to_acquire.push(Arc::clone(&semaphore));
+        semaphores.to_release.push(Arc::clone(&semaphore));
+        let job = source_job(&taskflow);
+
+        let mut woken = Vec::new();
+        assert!(job.node().acquire_all(&job, &mut woken));
+        assert_eq!(semaphore.value(), 0);
+
+        // A second task of the same set, parked while the first holds the one
+        // count there is.
+        assert!(!semaphore.try_acquire_or_wait(&job));
+
+        job.node()
+            .release_all(&mut woken)
+            .expect("the node holds the count it is giving back");
+        assert_eq!(semaphore.value(), 1);
+        assert_eq!(woken.len(), 1, "the parked job came back to be scheduled");
+    }
+
+    /// A node may release a semaphore it never acquired -- upstream's way of
+    /// opening a gate for another task -- and that is the one way a release
+    /// can fail.
+    #[test]
+    fn release_all_reports_an_over_release() {
+        let semaphore = Arc::new(Semaphore::new(1));
+
+        let mut taskflow = Taskflow::new();
+        let a = taskflow
+            .graph_mut()
+            .add_named_node("a", Handle::Placeholder);
+        taskflow
+            .graph_mut()
+            .node_mut(a)
+            .semaphores_mut()
+            .to_release
+            .push(Arc::clone(&semaphore));
+        let job = source_job(&taskflow);
+
+        let error = job
+            .node()
+            .release_all(&mut Vec::new())
+            .expect_err("the semaphore is already at its maximum");
+        assert_eq!(error.max_value(), 1);
     }
 }
