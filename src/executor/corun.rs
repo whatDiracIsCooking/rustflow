@@ -70,8 +70,21 @@ use crate::taskflow::Taskflow;
 /// Why a [`Executor::corun`] or [`Executor::corun_until`] call did not do what
 /// it was asked.
 ///
-/// `#[non_exhaustive]` for the same reason [`RunError`] is: cancellation is a
-/// later milestone and will add to this.
+/// `#[non_exhaustive]` for the same reason [`RunError`] is: later milestones
+/// have more ways for a nested run to fail. Cancellation turned out not to be
+/// one of them, which is worth recording because it was the reason this was
+/// written that way. A corun's topology is the one `InnerRun` owns on the
+/// corunning frame: nothing outside this module can name it and no
+/// [`Canceller`](crate::Canceller) is ever handed out for it, so there is no
+/// way to cancel a corun, and cancelling the *outer* run does not reach it
+/// either -- the task that called `corun` was already running, and
+/// cancellation is not preemptive. Upstream agrees by construction: its
+/// `Executor::corun` schedules the graph with a null topology and a fresh
+/// local anchor as the parent, so the `_is_parent_cancelled` check at the top
+/// of its `_invoke` answers no for every node of it. Where that stops being
+/// true is the corun upstream *does* pass an enclosing topology for -- a
+/// subflow or a module task, which is M4, and which is also where this enum
+/// is likeliest to gain a variant.
 #[non_exhaustive]
 pub enum CorunError {
     /// The calling thread is not a worker of this executor.
