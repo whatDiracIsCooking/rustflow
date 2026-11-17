@@ -262,8 +262,9 @@ the same split:
   that graph** (issue #48), not to the run. Upstream calls the thing that is
   waiting an *anchor* and finds it by walking the failing node's parent chain;
   the walk is ported as it stands, including the priority — an explicit anchor
-  (a frame blocked in a `corun` or a `join`) beats an implicit one (a node that
-  preempted itself and will look when resumed) beats the run, which is every
+  (a frame blocked in a `corun` today, a subflow's `join` once #50 lands) beats
+  an implicit one (a node that preempted itself and looks when it is resumed,
+  which is #51's runtime tasks and nothing yet) beats the run, which is every
   chain's root and is anchored by definition. Two decisions came out of it that
   upstream does not have to make.
 

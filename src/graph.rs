@@ -407,14 +407,17 @@ impl Handle {
 /// anchor with no `NodeBase` is the run itself, whose payload slot is the
 /// completion slot a `wait` already reads.
 ///
-/// The cost is a `Mutex` per node where upstream has a pointer. It is never
-/// contended: which thread may write the slot is settled by an atomic
-/// `fetch_or` of `CAUGHT` on the estate word before the lock is taken, so at
-/// most one writer ever arrives, and the reader is the frame or the entry
-/// that waited for the nested graph. What the lock buys over a raw pointer is
-/// that it is safe code, and it carries the payload's own happens-before: a
-/// taker sees the write because it took the same lock, not because it read
-/// some counter in the right order.
+/// The cost is a `Mutex` per node where upstream has a pointer, and it is
+/// uncontended by construction. Which thread may *write* the slot is settled
+/// by an atomic `fetch_or` of `CAUGHT` on the estate word before the lock is
+/// taken, so at most one writer ever arrives; the only readers are the frame
+/// or the second entry that waited for the nested graph, which run when no
+/// job of it is left, and the clearing a re-run does, which `set_up_graph`
+/// skips unless that same bit says there is something under the lock. What
+/// the lock buys over a raw pointer is that it is safe code, and that it
+/// carries the payload's own happens-before: a taker sees the write because
+/// it took the same lock, not because it read some counter in the right
+/// order.
 #[derive(Default)]
 pub(crate) struct NodeBase {
     /// Upstream's `_nstate`: the strong-dependency count in the low 28 bits
@@ -463,10 +466,11 @@ impl NodeBase {
     /// guard is dropped: upstream's `ExplicitAnchorGuard`.
     ///
     /// Taken by whoever is about to wait for a graph scheduled under this
-    /// base -- `_corun_graph`, in `executor::corun` -- and taken *before* the
-    /// graph is scheduled, because a source of that graph can fail before the
-    /// call that scheduled it has returned and a failure that arrives while
-    /// the bit is clear walks straight past the frame that is waiting for it.
+    /// base -- `corun_graph` in `executor::corun`, which is upstream's
+    /// `_corun_graph` -- and taken *before* the graph is scheduled, because a
+    /// source of that graph can fail before the call that scheduled it has
+    /// returned, and a failure that arrives while the bit is clear walks
+    /// straight past the frame that is waiting for it.
     pub(crate) fn anchor_explicitly(&self) -> ExplicitAnchor<'_> {
         self.estate
             .fetch_or(Cancellable::EXPLICITLY_ANCHORED, Ordering::Relaxed);
@@ -480,8 +484,12 @@ impl NodeBase {
     }
 
     /// Whether this base is an anchor of last resort: upstream's
-    /// `NSTATE::IMPLICITLY_ANCHORED`, set on a node that preempted itself and
-    /// will look at the slot when it is resumed.
+    /// `NSTATE::IMPLICITLY_ANCHORED`, which marks a node that preempted
+    /// itself and will look at its slot when it is resumed.
+    ///
+    /// No node kind this port runs sets the bit yet -- #51's runtime tasks
+    /// are the first -- so the implicit case of the walk is ported and
+    /// covered by its unit test rather than reached by a running graph.
     pub(crate) fn is_implicitly_anchored(&self) -> bool {
         self.nstate.load(Ordering::Relaxed) & Node::IMPLICITLY_ANCHORED != 0
     }
@@ -540,9 +548,10 @@ impl NodeBase {
         payload
     }
 
-    /// Empties the slot, as `_set_up_graph` does to every node of a graph it
-    /// is arming: a payload nobody came for must not be reported by the next
-    /// run of the same graph.
+    /// Empties the slot, which is what arming a graph does to a node whose
+    /// slot it finds claimed -- `set_up_graph` in `executor::topology`,
+    /// upstream's `_set_up_graph`: a payload nobody came for must not be
+    /// reported by the next run of the same graph.
     pub(crate) fn clear_panic(&self) {
         drop(self.lock_panic().take());
     }
@@ -745,6 +754,13 @@ impl Node {
     }
 
     /// Returns the exception state word, upstream's `_estate`.
+    ///
+    /// Three kinds of thing live in it, all of them the scheduler's: whether
+    /// the graph under this node has been cancelled or has failed, whether
+    /// this node's one payload slot is taken, and whether something is
+    /// blocked waiting for a graph scheduled under it. The bit values are
+    /// upstream's `ESTATE` and are crate-private, since a caller has no
+    /// business setting them; what a caller can do with the word is read it.
     #[must_use]
     pub fn estate(&self) -> &AtomicU32 {
         self.base.estate()

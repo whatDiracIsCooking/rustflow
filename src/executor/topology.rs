@@ -193,7 +193,8 @@ pub(crate) enum Parent {
 pub(crate) struct Nested {
     /// The state words when there is no node, which is upstream's local
     /// `NodeBase anchor` in `corun`: a counter of its own for the frame that
-    /// is waiting to poll.
+    /// is waiting to poll, the explicit-anchor bit that frame holds while it
+    /// waits, and the payload slot a failure under it is delivered to.
     ///
     /// Unused when `resume` is set, because then the words that matter are the
     /// parent node's own -- its join counter is what a nested graph counts
@@ -403,19 +404,21 @@ impl Job {
     /// in a `corun` or a `join`, which is waiting for exactly this graph and
     /// will re-raise the payload itself. Failing that, the innermost base
     /// seen carrying `IMPLICITLY_ANCHORED` gets it -- a node that preempted
-    /// itself and means to look. Failing *that*, the payload stays on the
-    /// failing node, where upstream also leaves it: an execution with nothing
-    /// above it to report to.
+    /// itself and means to look. Failing *that* -- no anchor anywhere on the
+    /// chain, which takes a chain rooted at neither a run nor a frame that is
+    /// waiting -- the payload stays on the failing node, where upstream also
+    /// leaves it: an execution with nothing above it to report to.
     ///
     /// The run is the chain's root and is always anchored, which upstream
     /// says by constructing its topology `EXPLICITLY_ANCHORED` and this port
     /// says by [`Parent::Run`] being an anchor by definition. So a plain
     /// static graph behaves exactly as it did before anchors existed: the
-    /// failing node is marked, the walk reaches the run, and
-    /// [`Topology::record_panic`] keeps the first payload -- which is why the
-    /// implicit and node-local cases below are unreachable from a top-level
-    /// task and are nevertheless ported, since a corun's anchor is a chain
-    /// root that can in principle be un-anchored.
+    /// failing node is marked, the walk reaches the run, and the run's own
+    /// claim keeps the first payload -- the same pair of steps
+    /// [`Topology::record_panic`] takes for a failure that has no chain to
+    /// walk at all. That is also why the implicit and node-local cases below
+    /// are unreachable from a top-level task and are ported all the same: a
+    /// corun's anchor is a chain root that can in principle be un-anchored.
     ///
     /// Whichever anchor is chosen, the `fetch_or` of `EXCEPTION | CAUGHT` on
     /// it decides whether this payload is the first one and therefore the one
@@ -668,13 +671,17 @@ impl std::hash::Hash for Job {
 /// And it would hand a caller `join`, `finish` and the run policy along with
 /// the one bit it asked for.
 ///
-/// The estate word carries three of upstream's `ESTATE` bits, at upstream's
-/// values: `CANCELLED`, which [`Cancellable::cancel`] sets, and the
-/// `EXCEPTION | CAUGHT` pair that [`Topology::record_panic`] sets together.
+/// This type is also where the port keeps upstream's `ESTATE` vocabulary,
+/// since it is the one estate word with a name of its own; the other is a
+/// `NodeBase`'s, which reads the same constants. A *run's* word carries three
+/// of the four: `CANCELLED`, which [`Cancellable::cancel`] sets, and the
+/// `EXCEPTION | CAUGHT` pair that [`Cancellable::claim_panic`] sets together.
 /// `CANCELLED` and `EXCEPTION` mean the same thing to the scheduler, which is
 /// why [`Cancellable::cancelled`] is a mask over those two, as upstream's
 /// `Topology::cancelled` is; `CAUGHT` is not part of that mask and says only
-/// that the payload slot is taken.
+/// that the payload slot is taken. The fourth, `EXPLICITLY_ANCHORED`, is
+/// never set on a run -- a run is the chain's root and is anchored by
+/// definition, which [`Job::record_panic`] spells out.
 pub(crate) struct Cancellable {
     /// Upstream's `_estate`, holding the three bits a topology uses.
     estate: AtomicU32,
@@ -1088,11 +1095,14 @@ impl Topology {
     /// about should be the one that failed first, not the one that happened to
     /// finish unwinding last.
     ///
-    /// A payload that arrives when the slot is already taken is dropped here
-    /// rather than reported, which is the one difference from a `NodeBase`
-    /// anchor: a node hands the loser's payload to the failing node's own
-    /// slot, because a node's slot is read by code that knows to look. A run
-    /// has nowhere further to put it.
+    /// A payload that arrives when the slot is already taken is dropped, and
+    /// that is every anchor's answer rather than this one's: a `NodeBase`
+    /// anchor drops its loser too, because the only way to write either slot
+    /// is to have claimed it first -- [`Topology::claim_panic`] here,
+    /// `NodeBase::claim_panic` there -- so dropping the loser is structural
+    /// and not a choice made twice. Where that leaves upstream, which parks
+    /// the loser somewhere this port cannot read it back from, is set out
+    /// once in [`Job::record_panic`].
     pub(crate) fn record_panic(&self, payload: Box<dyn Any + Send>) {
         if self.claim_panic() {
             self.keep_panic(payload);
@@ -1237,10 +1247,6 @@ impl Topology {
 ///   [`Task`] at another node. So the sources are found twice instead, here
 ///   and in [`Job::sources`], which costs a second walk over the graph and
 ///   saves the allocation that collecting them would need.
-/// - **The payload slot is emptied as well as the state words.** Upstream's
-///   `node->_exception_ptr = nullptr` is in the same loop and is here for the
-///   same reason the state bits are cleared: the slot is where an anchor's
-///   failure waits, and a run must not report one left by the last.
 /// - **The state word is written through the mask.** Upstream assigns
 ///   `NSTATE::NONE` and then accumulates the count into the word with `+=`,
 ///   masking it back out when it arms the join counter. Here the count is
@@ -1255,7 +1261,20 @@ impl Topology {
 /// treat its first entry as a resumption and skip its body. Nothing a run
 /// does can reach this through a node that is still carrying live state: the
 /// nodes set up here are the ones about to start, and a parent whose nested
-/// graph is being set up is never a node of that graph.
+/// graph is being set up is never a node of that graph. That last clause
+/// carries more weight than it did: the estate word now holds the
+/// explicit-anchor bit as well, and arming a graph clears the word, so what
+/// keeps a waiting frame's anchor from being wiped by the very call that
+/// schedules the graph it waits for is that the anchor is not in it.
+///
+/// Emptying the payload slot is upstream's `node->_exception_ptr = nullptr`,
+/// in the same loop and for the same reason: the slot is where an anchor's
+/// failure waits, and a run must not report one the last run left. The one
+/// thing this adds is the `CAUGHT` test that guards it. A payload reaches a
+/// slot only through a claimant that set that bit in the estate word, so the
+/// word the clearing is about to overwrite says whether there is anything
+/// under the lock -- and a run in which nothing failed never takes a node's
+/// lock at all.
 ///
 /// # Panics
 ///
@@ -2134,8 +2153,10 @@ mod tests {
 
     /// The third: two failures under one anchor keep the first, which is the
     /// rule a run has always applied, now applied at the anchor. The loser is
-    /// left on the node that raised it -- upstream's fall-through -- rather
-    /// than dropped.
+    /// dropped rather than parked on the node that raised it, which is where
+    /// upstream's fall-through leaves it and where this port deliberately
+    /// does not -- [`Job::record_panic`] says why, and this is what pins it:
+    /// neither failing node holds anything afterwards.
     #[test]
     fn two_failures_under_one_anchor_keep_the_first() {
         let chain = Chain::new(2, &Parent::Run);

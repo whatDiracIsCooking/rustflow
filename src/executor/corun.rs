@@ -80,6 +80,12 @@
 //! there is no handle to wait on, and the task body that called `corun` is
 //! the only code that knows what the inner graph was for.
 //!
+//! The inner run's own payload slot is still read, as a backstop, because one
+//! kind of failure has no node to walk up from and lands there instead: this
+//! run's policy callbacks, which a corun gives nothing to do, and a node kind
+//! the executor refuses rather than runs, which reports against a topology
+//! directly until #49, #50 and #51 land.
+//!
 //! Which leaves the question of what to *do* with it, and both answers are
 //! wanted often enough that this module offers each by name:
 //!
@@ -187,10 +193,13 @@ pub(crate) fn corun_graph(
 /// cancellation is not preemptive. Upstream agrees by construction: its
 /// `Executor::corun` schedules the graph with a null topology and a fresh
 /// local anchor as the parent, so the `_is_parent_cancelled` check at the top
-/// of its `_invoke` answers no for every node of it. Where that stops being
-/// true is the corun upstream *does* pass an enclosing topology for -- a
-/// subflow or a module task, which is M4, and which is also where this enum
-/// is likeliest to gain a variant.
+/// of its `_invoke` answers no for the nodes of it -- until one of them
+/// fails. A failure under the anchor marks it, which is how the rest of a
+/// corun graph is skipped, and that is a failure rather than a cancellation
+/// however much the scheduler reads the two as one bit. Where the
+/// cancellation question does come back is the corun upstream *does* pass an
+/// enclosing topology for -- a subflow or a module task, which is M4, and
+/// which is also where this enum is likeliest to gain a variant.
 #[non_exhaustive]
 pub enum CorunError {
     /// The calling thread is not a worker of this executor.
@@ -209,6 +218,11 @@ pub enum CorunError {
     /// The same failure [`Executor::run`] reports, carried unchanged so that
     /// there is one answer in the crate to "a task panicked" and one place
     /// ([`RunError::Panicked`]) that says what to do with the payload.
+    ///
+    /// Returned by [`Executor::try_corun`] only. The other two calls of this
+    /// module cannot produce it: [`Executor::corun`] re-raises that failure
+    /// instead of reporting it, and [`Executor::corun_until`] waits on a
+    /// predicate rather than on a graph of its own.
     Run(RunError),
 }
 
@@ -241,21 +255,26 @@ impl std::error::Error for CorunError {
     }
 }
 
-/// The topology of one [`Executor::corun`], held for as long as the corun
-/// frame runs.
+/// The run and the anchor of one [`Executor::corun`], held for as long as the
+/// corun frame runs.
 ///
-/// Upstream's local `NodeBase anchor` in `corun`, which plays the same part:
-/// the thing the inner graph's nodes count down to, living on the corunning
-/// worker's stack for the duration.
+/// The anchor is upstream's local `NodeBase anchor` in `corun` and plays the
+/// same part: the thing the inner graph's nodes count down to, and the thing
+/// a failure inside that graph is delivered to, belonging to the corunning
+/// frame for the duration.
 ///
 /// Shared, as [`Executor::run`]'s own topology is, because every queued job of
 /// the run holds a share of it -- so a job of a corun cannot outlive its run
 /// any more than a job of a `run` can. [`Drop`] is then not what keeps the
 /// topology alive but what keeps the *frame* honest, and it is the reason this
-/// is a type rather than a local: an unwind through the corun frame -- which a
-/// scheduler bug could cause, since a *task*'s panic is caught and recorded
-/// instead -- must not take the caller's borrow of the taskflow with it while
-/// a job of this run is still in a queue.
+/// is a type rather than a local: an unwind through the frame holding one --
+/// which only a scheduler bug could cause, since a *task*'s panic is caught
+/// and recorded instead -- must not take the caller's borrow of the taskflow
+/// with it while a job of this run is still in a queue.
+///
+/// The unwind [`Executor::corun`] *does* raise is not that frame's: it is
+/// raised by `corun` itself once `corun_payload` has returned and this value
+/// has been dropped, which is why those are two functions.
 struct InnerRun {
     /// The run. Nothing outside this module can name it.
     topology: Arc<Topology>,
@@ -280,7 +299,10 @@ impl InnerRun {
         }
     }
 
-    /// The topology, to report failures to and to wait on.
+    /// The topology, which is what the run policy reports to and what `join`
+    /// waits on. A failing *task* of the inner graph reports to the anchor
+    /// instead -- the module docs say why -- so this is the backstop rather
+    /// than the usual path.
     fn topology(&self) -> &Arc<Topology> {
         &self.topology
     }
@@ -309,12 +331,16 @@ impl InnerRun {
         self.topology.finish();
     }
 
-    /// Blocks until the run is over and hands back what its first panicking
-    /// task panicked with, if any.
+    /// Blocks until the run is over and hands back whatever reached the
+    /// run's own payload slot, if anything.
     ///
     /// Called after [`InnerRun::end`], so it does not actually block; what it
     /// is for is the payload, which it takes so that the caller reports it
-    /// once.
+    /// once. A failing task of the inner graph does not come through here --
+    /// it reports to the anchor, which `corun_graph` takes the payload from
+    /// -- so what this can still find is a failure with no node to walk up
+    /// from: this run's policy callbacks, or a node kind that records against
+    /// a topology directly.
     fn join(&self) -> Option<Box<dyn std::any::Any + Send>> {
         self.topology.join()
     }
@@ -485,12 +511,13 @@ impl Executor {
 
     /// Both shapes of corun, up to what is done with the payload.
     ///
-    /// The whole of upstream's `corun` template: a stack anchor, the graph
-    /// scheduled under it, and the calling worker kept in the loop until that
-    /// anchor's counter reaches zero. What this adds is the topology, which
-    /// upstream passes as `nullptr` here and this port cannot: a queued job
-    /// owns a share of its run, and the run is what the policy callbacks
-    /// report to.
+    /// The whole of upstream's `corun` template: an anchor this frame owns --
+    /// upstream's local `NodeBase`, in an [`Arc`] here because every job of
+    /// the graph holds a share of it -- the graph scheduled under it, and the
+    /// calling worker kept in the loop until that anchor's counter reaches
+    /// zero. What this adds is the topology, which upstream passes as
+    /// `nullptr` here and this port cannot: a queued job owns a share of its
+    /// run, and the run is what the policy callbacks report to.
     fn corun_payload(
         &self,
         taskflow: &Taskflow,
@@ -548,9 +575,10 @@ impl Executor {
     /// upstream's behaviour and is the same bug as a `while` loop that never
     /// exits.
     ///
-    /// A panic in a job this loop happens to run is recorded on *that* job's
-    /// own run and reported to whoever waits for it, so there is nothing for
-    /// this method to report but the one failure below.
+    /// A panic in a job this loop happens to run is delivered to whatever is
+    /// waiting for *that* job's graph -- its own run, or a frame blocked on a
+    /// nested graph it belongs to -- and reported to whoever waits there, so
+    /// there is nothing for this method to report but the one failure below.
     ///
     /// ```
     /// use std::sync::Arc;

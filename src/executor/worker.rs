@@ -67,9 +67,10 @@
 //!   them for a multi-condition one -- and each named successor is scheduled
 //!   outright. An index that is negative or past the last successor names
 //!   nothing, which is how a branch ends, and so does a conditioner whose body
-//!   panics: the panic is recorded on the topology and the selection stays
-//!   empty. A panic also cancels the rest of the run, so for a conditioner the
-//!   empty selection is belt and braces -- there is nothing left to select
+//!   panics: the panic is delivered to whatever is waiting for this node's
+//!   graph -- the run, for a top-level conditioner -- and the selection stays
+//!   empty. A panic also cancels the rest of that graph, so for a conditioner
+//!   the empty selection is belt and braces: there is nothing left to select
 //!   into.
 //!
 //! A selected successor has its join counter *stored to zero* rather than
