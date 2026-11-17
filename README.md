@@ -3,12 +3,24 @@
 A Rust port of [Taskflow](https://github.com/taskflow/taskflow), a C++
 task-parallel programming system built around task dependency graphs.
 
-**Status: the static graph is in; the executor is being ported.** Those are
-steps 1 and 2 of "Order of work" at the end of this file, which is where the
-status is kept rather than duplicated here: each step is a GitHub milestone, so
-the closed ones are what is merged and the open one is where the work is. The
-toolchain, container setup and CI gate all of it rides on were in place and
-verified first.
+**Status: steps 1 to 4 are in** — the static graph, the work-stealing
+executor, condition tasks and cancellation, and dynamic tasking: subflows,
+runtime tasks and module composition. Those are steps of "Order of work" at
+the end of this file, which is where the status is kept rather than duplicated
+here: each step is a GitHub milestone, so its issues are what is merged and
+what is not, and a milestone still open after the feature it names works is
+open on follow-ups rather than on the feature — the performance ones are named
+under "Performance", below. The toolchain, container setup and CI gate all of
+it rides on were in place and verified first.
+
+All of that is written with **no `unsafe` outside one module**: every `unsafe`
+block in the crate is in `src/executor/notifier.rs`, where a worker about to
+park publishes its thread handle into the lock-free waiter stack and the
+notifier that pops it reads it back. The scheduler itself has none — it was
+the ownership discipline described under "A run owns the graph it walks" below
+that removed the last one, and every slice of dynamic tasking since has stayed
+inside it, which is worth saying out loud because a work-stealing scheduler is
+not where a reader expects to find that.
 
 ## Getting a toolchain
 
@@ -238,12 +250,14 @@ the same split:
   rather than reallocating a vector workers are walking; and the executor's
   one `unsafe` boundary is gone, leaving the notifier's as the only one in the
   crate. The cost is four atomic refcount operations per task and one
-  `Arc::get_mut` per graph edit, measured in `BENCHMARKS.md`: +35 to +41 ns a
-  task at 24 workers on `linear_chain` (+19%, the shape that measures nothing
-  but scheduler overhead), +4 ns on `embarrassing_parallelism` at the same
-  width (+2.4%), +1 to +4 ns at one worker, and +2 ns per `emplace`. A real
-  regression, and the right one to accept: the alternative was a safe API with
-  a reachable use-after-free.
+  `Arc::get_mut` per graph edit, and it was measured rather than estimated:
+  the figures, the method and the two ids this box could not resolve are in
+  [`BENCHMARKS.md`](BENCHMARKS.md) under "The #40 decision", which is the one
+  place they live, since a number copied into prose is a number that drifts.
+  The worst of them is +19% on `linear_chain` at 24 workers, the shape that
+  measures nothing but scheduler overhead. A real regression, and the right
+  one to accept: the alternative was a safe API with a reachable
+  use-after-free.
 - **Task bodies are `FnMut() + Send + 'static`.** Condition tasks create
   cycles, so a body runs many times per run and upstream invokes it mutably;
   the scheduler's one-worker-per-node guarantee is the safety argument.
@@ -262,11 +276,12 @@ the same split:
   that graph** (issue #48), not to the run. Upstream calls the thing that is
   waiting an *anchor* and finds it by walking the failing node's parent chain;
   the walk is ported as it stands, including the priority — an explicit anchor
-  (a frame blocked in a `corun` today, a subflow's `join` once #50 lands) beats
-  an implicit one (a node that preempted itself and looks when it is resumed,
-  which is #51's runtime tasks and nothing yet) beats the run, which is every
-  chain's root and is anchored by definition. Two decisions came out of it that
-  upstream does not have to make.
+  (a frame blocked right now in an `Executor::corun`, a `Subflow::join` or a
+  `Runtime::corun`) beats an implicit one (a node that preempted itself and
+  means to read its payload slot when it is resumed, which a runtime task does
+  and no other node kind here does) beats the run, which is every chain's root
+  and is anchored by definition. Two decisions came out of it that upstream
+  does not have to make.
 
   The payload slot is **on the node**, as upstream's `_exception_ptr` is, even
   though a chain of parents in this port is a chain of `Nested` allocations
@@ -330,7 +345,12 @@ the same split:
   `Subflow::num_workers` stand in its place; a body that genuinely needs the
   executor captures an `Arc<Executor>`, as upstream's own
   `Runtime.ExternalGraph.Simple` captures a reference and as this crate's
-  `corun` doctests already do.
+  `corun` doctests already do. "Almost" is the word that matters, and it was
+  counted rather than assumed: of the 26 uses of the accessor in upstream's
+  `algorithm/` headers at the pinned tag, 25 are `rt.executor().num_workers()`
+  in the algorithms of step 6 below, and the twenty-sixth is `scan.hpp`
+  calling `rt.executor().corun_until(..)`. So step 6 is the moment to revisit
+  this — when that scan is ported, and not before.
 - **A subgraph is *leased* for the length of its run, and the last share of
   the lease is what puts it back** (issues #74, #50). Running a graph needs
   whatever owns it, because every job of a graph owns what it names, and a
@@ -349,6 +369,37 @@ the same split:
   blocking one, because the thread holding the last share is a worker that
   something else may be waiting for; and `retain(true)` is reliable set
   *before* the join it is meant to keep, not after.
+
+### Performance
+
+Every measured number this port has is in [`BENCHMARKS.md`](BENCHMARKS.md) —
+four of upstream's benchmarks ported to criterion with a rayon baseline in the
+role TBB's flow graph plays upstream, the machine and the load it was under
+recorded beside them, and after the four tables the per-decision measurements
+behind #40, #74 and the `Work` question. They are kept there rather than
+repeated here, so each figure has one owner. Benchmarks are deliberately
+outside the gate: a benchmark answers "how fast", which is not a pass or a
+fail, so what CI holds the suite to is that it still compiles.
+
+Two of those results are bad, and both are tracked rather than filed away,
+because the honest state of play is more useful than a table of the shapes
+that happen to look good:
+
+- **External submission** (issue #60). A graph submitted from a thread that is
+  not one of the executor's workers reaches the pool only through the shared
+  overflow buffers, and from there one steal at a time, so a graph that is
+  nothing but independent sources is distributed entirely by stealing:
+  `embarrassing_parallelism` at 65536 tasks and 24 workers measures about 5x
+  rayon on the same box in the same run.
+- **The continuation optimisation** (issue #62). Upstream's `_update_cache` /
+  `TF_INVOKE_CONTINUATION` keeps one ready successor out of the queue and
+  resumes it on the worker that just finished its predecessor, so a chain runs
+  end to end where it started instead of being pushed and re-stolen per link.
+  It is unported, which is also the main lever on the `linear_chain`
+  regression above — under a job that owns what it names it saves the clone
+  and the drop as well as the queue push — and two of the stress cases
+  translated in #17 assert the locality it produces and had to be left out
+  without it.
 
 ### Order of work
 

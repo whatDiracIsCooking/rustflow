@@ -3,7 +3,7 @@
 //!
 //! # Status
 //!
-//! What the crate exposes is a static task graph and the work-stealing
+//! What the crate exposes is a task dependency graph and the work-stealing
 //! executor that runs it. A [`Taskflow`] owns a [`Graph`] of [`Node`]s, each
 //! addressed by a [`Task`] index into that graph's arena and built through
 //! the [`FlowBuilder`] API, and [`dump`] writes the result out as Graphviz
@@ -55,8 +55,41 @@
 //! exception, so no worker dies of it, and what it adds to a cancellation is
 //! the payload, which `wait` hands back as [`RunError::Panicked`]. Only the
 //! first panicking task of a run is reported, and a later run of the same
-//! taskflow starts clean. What a failure cannot yet do is propagate out of a
-//! subflow or a runtime task, neither of which this port runs at all.
+//! taskflow starts clean.
+//!
+//! A task can also be the thing that builds the graph.
+//! [`FlowBuilder::emplace_subflow`] hands its body a [`Subflow`], itself a
+//! [`FlowBuilder`] over a subgraph the node owns, and that subgraph runs
+//! when the body calls [`Subflow::join`] or, if it never does, once the body
+//! has returned. [`FlowBuilder::emplace_runtime`] hands its body a
+//! [`Runtime`] instead, whose [`schedule`](Runtime::schedule) puts a task of
+//! its own graph straight onto the worker's queue past that task's
+//! dependencies, and whose [`corun`](Runtime::corun) waits for whatever the
+//! body left outstanding under the node -- which is nothing until the async
+//! family of the README's step 5 gives a body a way to leave anything there.
+//! And [`FlowBuilder::composed_of`] runs another taskflow's graph in place of
+//! a task, as many times and in as many taskflows as the caller likes, since
+//! the module task owns a share of its target; [`FlowBuilder::adopt`] is the
+//! same thing for a graph that has no other owner.
+//!
+//! One mechanism carries all three, and it is upstream's: a node with work
+//! of its own still outstanding -- a subgraph, a composed graph, or whatever
+//! a runtime body spawned -- does not finish when its body returns but is
+//! entered a second time, by the last job of that work to count it down, and
+//! only then releases its successors. So a failure inside a nested graph is
+//! not automatically the run's. It goes to whoever is *waiting* for that graph
+//! -- a [`Subflow::join`], a [`Runtime::corun`], an [`Executor::corun`] --
+//! and reaches `wait` only when nobody is, which is what lets the task that
+//! asked for the nested work be the task that answers for it.
+//!
+//! None of that is paid for with `unsafe`: the executor has none at all, and
+//! the crate's only `unsafe` blocks are in [`notifier`](executor::notifier),
+//! in the lock-free waiter stack, where a worker about to park publishes its
+//! [`Thread`](std::thread::Thread) handle into a slot only the notifier that
+//! has popped it may read. A scheduler of this shape usually has more; this
+//! one does without because a queued job *owns* everything it names rather
+//! than pointing at it.
+//!
 //! The README's "Order of work" section is the sequence the whole port
 //! follows, and reading what is next there beats a list here that would go
 //! stale the week after it was written.
