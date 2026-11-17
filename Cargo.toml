@@ -83,3 +83,11 @@ harness = false
 [[bench]]
 name = "embarrassing_parallelism"
 harness = false
+
+[[bench]]
+name = "async_task"
+harness = false
+
+[[bench]]
+name = "fibonacci"
+harness = false

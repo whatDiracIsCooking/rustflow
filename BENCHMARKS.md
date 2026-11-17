@@ -1,12 +1,18 @@
 # Benchmarks
 
-Four of upstream's benchmarks, ported to criterion with a rayon baseline in the
+Six of upstream's benchmarks, ported to criterion with a rayon baseline in the
 role TBB's flow graph plays upstream: `linear_chain`, `binary_tree`,
-`graph_traversal` and `embarrassing_parallelism`, each translated from the
-matching directory under Taskflow v4.1.0's `benchmarks/`. The shapes and the
-measured regions are upstream's; what the sizes, the baseline and the harness
-are is set out below, because a number whose provenance is unstated is not a
-result.
+`graph_traversal` and `embarrassing_parallelism` from #18, then `async_task`
+and `fibonacci` from #96, each translated from the matching directory under
+Taskflow v4.1.0's `benchmarks/`. The shapes and the measured regions are
+upstream's; what the sizes, the baseline and the harness are is set out below,
+because a number whose provenance is unstated is not a result.
+
+The two shapes #96 added are the two with **no graph in them at all** --
+`silent_async` submissions and a recursive spawn -- so the construction
+asymmetry the first four have to warn about is absent from their tables, and
+they were measured in a separate run with a load of their own. Their section
+records both.
 
 ```sh
 devtools/devcontainer.sh bench                        # the whole suite
@@ -258,14 +264,32 @@ the one in the first bullet:
   most is the shape that regressed most.
 - **One allocation instead of two**, putting the `Topology` and the share of
   the storage in the same `Arc` so a job clones one refcount rather than two.
-  It was not taken here because the storage share has to be *released* at a
-  particular instant -- before the join counter can end the run -- and a share
-  inside the run's own allocation cannot be, which would make
-  `taskflow.emplace()` panic at random for a few instructions after a `wait`
-  returned. `tests/basics.rs`'s
+  It was not taken, because the release of that share and the end of the run
+  have to happen in that order and in that order only -- otherwise a `wait`
+  can return while a job still holds the taskflow's storage and the caller's
+  next `taskflow.emplace()` panics. `tests/basics.rs`'s
   `a_taskflow_is_editable_the_instant_its_run_reports_done` is the case that
-  would fail. Half the atomics for a racy panic is the wrong trade; the
-  continuation optimisation is the one to do first.
+  pins it.
+
+  **#109 changed which way round that ordering is enforced, and the
+  conclusion survives it twice over.** The share is no longer required to be
+  given up *before* the decrement that ends the run: #109 found that a job
+  copied out of a preempted node cannot do that, and so made the run end
+  *after* the share instead. `Drop for Storage` in `executor::topology` is the
+  whole of it -- the last share of the run's hold drops the storage and
+  *then* releases the waiter, in one destructor, whichever thread runs it. So
+  the hold has to be a thing whose last share can go away while the run is
+  still live. A hold merged into the `Topology` allocation could not be: every
+  job holds an `Arc<Topology>` beside its share, and since #109 so does the
+  thread being released, so the merged refcount could never reach the point
+  that releases anything -- the waiter would be waiting on itself. #112 then
+  made the same hold what a `corun` frame waits to become unique, which a
+  pool-wide `Topology` could not answer either.
+
+  The trade is therefore the same one and it is still wrong: half the atomics
+  for a `wait` that cannot say when a run is over. The continuation
+  optimisation was the one to do first, and the bullet above is the one that
+  landed.
 
 ## The #74 decision: a job names which of four graphs it walks, at one word
 
@@ -659,3 +683,204 @@ splittable source range, i.e. something `tf::Taskflow` does not have and
 `tf::TaskGroup`'s `for_each` is the nearest thing to; it is a milestone, not a
 patch. **That is the recorded cost of the architecture, with the numbers above
 as the evidence.**
+
+## The two shapes #96 added, and how they were measured
+
+`async_task` and `fibonacci` were ported and measured after #18's four, so
+their numbers are a **separate run** under a load of their own and are not
+comparable with the tables at the top of this file except in the way every
+figure here is: within a row.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id |
+| Date | 2026-11-17 |
+| **Load average, `async_task` run** | **4.7 rising to 15.7 over the run** |
+| **Load average, `fibonacci` run** | **25.2 falling to 10.4 over the run** |
+
+At least one sibling agent was building this crate and running its test suite
+on this box throughout both runs, which is what those two rows are: not a quiet machine,
+and the `fibonacci` run started on the busiest part of it. The load is recorded
+per id in the run logs and is why the method below is what it is.
+
+**The method is order-swapped interleaving, and it is not optional here.** The
+"#60 finding" section measured the cost of that: the same two ids read **+61%**
+in a fixed order and **−25%** when the order was swapped every round, which is
+a wrong answer rather than a noisy one. So each id was run in its own criterion
+process, the ids of one row back to back, and the order *within* a row reversed
+between round 1 and round 2 -- for `async_task` that is
+`rustflow, rayon, rustflow-group` and then its reverse, for `fibonacci`
+`rustflow-group, rustflow-runtime, rayon` and then its reverse. Every cell
+below therefore carries **two point estimates of the mean, round 1 then round
+2**, in the style of the #40 and #62 tables rather than the ± of #18's: on this
+box the spread between two rounds minutes apart is the larger of the two
+uncertainties, and hiding it behind criterion's within-id interval would
+overstate what is known. Where that interval is itself the point, it is quoted
+in the text.
+
+Every number in the two tables comes from this run, measured on #96's branch
+over `3bc9cdf` (#121) and shipped rebased onto `d966b28` (#122) -- which moves
+`FlowBuilder`'s task accessors and touches nothing on the submission or
+scheduling path these two shapes measure. #18's, #60's and #62's tables are
+untouched.
+
+### async_task
+
+`N` independent asynchronous submissions and one wait, with a task body of one
+relaxed increment: upstream's `async_task_taskflow` calls `silent_async` `N`
+times and then `executor.wait_for_all()`. There is no graph, so both columns
+measure the same thing for once -- the per-task cost of getting work to a
+worker and the wait that notices it is done.
+
+Three variants, because the submitting *thread* is the whole question here:
+
+- **`rustflow`** submits from the benchmark's own thread, which is not a
+  worker, so every job goes into the shared overflow buffers. This is the
+  external-submission path, and the "#60 finding" section above is the crate's
+  one measurement of it -- the figures below are to be read against it rather
+  than to re-derive it.
+- **`rustflow-group`** submits the same `N` tasks from *inside* one `spawn`ed
+  body, into a `TaskGroup`, so they go onto that worker's own LIFO queue. It
+  is upstream's `async_task_tbb` -- `tbb::task_group`, `tg.run` `N` times,
+  `tg.wait` -- translated literally, and what it costs against the first id is
+  what the buffers cost.
+- **`rayon`** is `rayon::scope` plus `N` `spawn`s, which is the rayon form that
+  matches upstream's TBB variant. `ThreadPool::install` makes the submitting
+  thread a worker of the pool, so rayon has no external-submission variant to
+  offer: its spawns always go onto a worker's own deque, which is the
+  `rustflow-group` row's path rather than the `rustflow` row's.
+
+| size | workers | rustflow | rustflow-group | rayon | upstream C++ |
+|---|---|---|---|---|---|
+| 4096 | 1 | *3.582* / 1.939 ms | 773.5 / 801.6 µs | 178.5 / 182.1 µs | not published |
+| 4096 | 24 | 5.134 / 4.741 ms | 4.931 / 5.020 ms | 1.676 / 1.660 ms | not published |
+| 65536 | 1 | 28.98 / 29.21 ms | 18.77 / 21.25 ms | 2.074 / 2.118 ms | not published |
+| 65536 | 24 | 78.50 / 63.56 ms | 78.23 / 75.99 ms | 26.64 / 22.07 ms | not published |
+
+The italicised 3.582 ms is not a result: criterion put a ±19% interval on it
+(2.936 to 4.258 ms) where the same id in round 2 read 1.939 ms ±0.7%, and that
+is the same unresolvable `1w/4096` id the #40 table had to drop. Read the
+round-2 number; every other cell above agrees between rounds to better than
+±12%, and most to better than ±3%.
+
+What the table says, per task at 65536 and one worker, where the ids are
+tightest:
+
+- **An externally submitted async task costs ~440 ns**, against the ~100 ns a
+  job of an externally submitted *graph* costs on the same path (#60). So the
+  shape with no graph in it is four times more expensive per task than the
+  shape with one, which is the opposite of what "no graph to build" suggests.
+  Reading `Shared::schedule_async_task` says where that goes, and this run
+  measured none of it -- no counters were added for it, and that is the
+  follow-up: a free node is **allocated per task** where a graph's nodes
+  already exist, two counters go up and down per task (`increment_async` is
+  both `num_topologies` and `num_asyncs`, and the last decrement of each takes
+  a mutex to meet a waiter), and `bulk_schedule` is called with **one** job,
+  so the notifier is poked once per task where a run of 65536 sources pokes it
+  once for the batch.
+- **Submitting from a worker saves 30%** -- 305 ns against 440 -- and that is
+  the buffers against a worker's own queue, measured with everything else held
+  the same. It is the same route #119 is about on the recursive shape below.
+- **rayon's scope costs ~32 ns a task** at one worker, 14x less. A scope's
+  spawn is a push onto the deque of the thread that is already running the
+  scope, with no allocation beyond the closure and nothing to notify while the
+  pool is awake; there is no graph and no topology to count.
+- **More workers make every variant worse**, which is #60's finding reproduced
+  on a shape with no graph at all: ours goes from 29 ms to 63-79 ms and
+  rayon's from 2.1 ms to 22-27 ms. Nothing in 65536 one-increment tasks
+  parallelises, so all 24 workers buy is cache-coherence traffic -- and
+  because rayon loses an order of magnitude to it too, the gap *narrows* from
+  14x at one worker to ~3x at 24. The honest summary of this shape is that
+  neither framework should be handed 65536 tasks this small, and that ours
+  pays four times as much as it does for the same tasks in a graph.
+
+### fibonacci
+
+The naive recursion, one branch spawned and the other computed on the calling
+worker -- upstream's "tail optimization" -- with a wait that keeps that worker
+in the pool. Upstream's `fibonacci_taskflow` wraps the whole recursion in one
+`executor.async(...)`, because it has to start on a worker; so does each
+`rustflow` id here. `rustflow-group` is upstream's `fibonacci/taskflow.cpp`
+line for line; `rustflow-runtime` is the same recursion through a runtime task
+(`rt.silent_async` with a runtime-shaped body, which this port spells
+`silent_async_runtime`), which is upstream's own `Runtime.Fibonacci` unit test
+rather than its benchmark; `rayon` is `rayon::join`.
+
+**`n` is 12 and 15 where upstream's unit test asserts `fib(25)` and its
+benchmark sweeps to `fib(40)`, and issue #119 is why.** A corun keeps its
+worker in the work-stealing loop, so every job that worker picks up while
+waiting nests one frame deeper, and a child submitted from a task body goes
+into the shared FIFO buffers rather than onto the submitting worker's LIFO
+queue. A coruning worker therefore gets the oldest outstanding job in the pool
+-- somebody else's unfinished subtree -- rather than its own newest child, and
+the nesting grows one frame per outstanding *child* instead of one per level of
+recursion, until a worker's 2 MiB stack runs out. The figure
+`tests/runtimes.rs` records is a debug one, so this profile's cliff was
+measured rather than assumed, with a release build of both recursions driven
+straight (no criterion):
+
+| variant | workers | largest `n` that passes | smallest `n` that aborts |
+|---|---|---|---|
+| `rustflow-group` | 1 | 17, over 100 rounds | 18, all 3 attempts |
+| `rustflow-runtime` | 1 | 17, over 100 rounds | 18, all 3 attempts |
+| `rustflow-group` | 24 | 23, over 20 rounds | 24 |
+| `rustflow-runtime` | 24 | 23, over 20 rounds | 24 |
+
+**One worker is the binding end, and that is #119's mechanism showing itself**:
+the one worker that coruns is the only worker there is to pick the outstanding
+children up, so it nests a frame for every one of them, while 24 workers spread
+the same tree over 24 stacks and reach six levels further. Since both worker
+counts measure the same `n`, the one-worker cliff is what sets the sizes:
+`fib(15)` is 986 spawned children and sits three levels, a factor of four in
+task count, inside it, which is the margin `tests/runtimes.rs` and
+`tests/task_group.rs` chose for the same reason. **Upstream's `fib(25)` is not
+reachable today at any worker count** -- it is 121392 spawned children, two
+orders of magnitude past the one-worker cliff -- and #119's comment thread has a prototype that reaches it
+by giving a task body's submission the submitting worker's queue. This
+benchmark measures what ships.
+
+| `n` | workers | rustflow-group | rustflow-runtime | rayon | upstream C++ |
+|---|---|---|---|---|---|
+| 12 | 1 | 111.2 / 84.93 µs | 108.8 / 82.13 µs | 6.219 / 6.707 µs | not published |
+| 12 | 24 | 1.289 / 1.231 ms | 1.262 / 1.302 ms | 16.49 / 16.71 µs | not published |
+| 15 | 1 | 454.4 / 331.9 µs | 336.3 / 338.2 µs | 12.73 / 12.95 µs | not published |
+| 15 | 24 | 2.880 / 3.664 ms | 2.308 / 2.399 ms | 23.06 / 23.17 µs | not published |
+
+The one-worker rows of the two `rustflow` variants are the pair the load moved:
+round 1 ran at a load average above 20 and round 2 below 15, and the `n = 12`
+cells fell by 22 to 25% between them while the ratio against rayon held to
+within 10%. That is this box, not the variants, and it is why the rows carry
+two numbers.
+
+What the table says:
+
+- **The two `rustflow` variants are the same scheduler and measure the same**:
+  a group per level and a runtime task per level cost the same thing, because
+  what they both do per level is submit one child through
+  `schedule_async_task` and corun. At one worker they are indistinguishable
+  (332-454 µs against 336-338 at `n = 15`, the group's own two rounds
+  disagreeing by more than the two variants do). At 24 workers the runtime
+  variant reads lower in both rounds -- 2.31-2.40 ms against 2.88-3.66 -- which
+  is the group allocation per level it does not make, but the group row's own
+  spread is as wide as the difference, so this run does not separate them.
+- **~340 ns per spawned child at one worker** (335 µs over 986 children), which
+  is the `async_task` table's worker-submitted figure (305 ns) to within 12% --
+  the same path measured from a recursion rather than a loop, and a useful
+  cross-check that this shape has no cost of its own at one worker.
+- **24 workers make it 7x slower**, 335 µs to 2.3 ms for the same 986 children,
+  or ~2.4 µs each. This is the worst 1-to-24 scaling in the file and it is the
+  same cause as the stack cliff above: every child crosses into the shared
+  buffers and has to be stolen back out, and a parent that coruns is competing
+  for its own children with 23 other workers. Upstream's LIFO branch is what
+  this shape is built to exploit and the port does not have it yet (#119).
+- **`rayon::join` costs ~13 ns a level at one worker**, 26x less, and that is
+  the comparison being made rather than a scheduler being beaten: a `join`
+  nobody steals from *is* direct recursion -- two closure calls and one atomic
+  -- while a group or a runtime task queues a job per level whatever the pool
+  is doing. rayon also barely notices 24 workers (12.7 to 23 µs) because most
+  of its levels still run inline. The 100-150x ratio in the 24-worker rows is
+  therefore a statement about work granularity: `fib(15)` has no work in it for
+  a scheduler to amortise against, and ours schedules every level of it.
