@@ -4,9 +4,10 @@
 //! Upstream's `tf::FlowBuilder` is a base class holding a `Graph&`, which
 //! `tf::Taskflow` and `tf::Subflow` inherit to get the task-building API.
 //! Inheritance for code reuse translates to a trait with provided methods, so
-//! here [`FlowBuilder`] asks implementors for one thing -- a `&mut Graph` --
-//! and builds everything else on top. M4's `Subflow` then reuses the whole
-//! trait by answering that one question, exactly as upstream reuses the base.
+//! here [`FlowBuilder`] asks implementors for one thing -- the graph they
+//! build into, borrowed either way -- and builds everything else on top. M4's
+//! `Subflow` then reuses the whole trait by answering that one question,
+//! exactly as upstream reuses the base.
 //!
 //! One group of upstream `FlowBuilder` members is deliberately absent: the
 //! algorithm builders (`for_each`, `reduce`, `sort`, ...), which are M6.
@@ -21,14 +22,21 @@ use std::sync::{Arc, Mutex};
 use crate::graph::{Graph, Handle, RuntimeWork, SubflowWork, Task, Work};
 use crate::runtime::Runtime;
 use crate::subflow::Subflow;
+use crate::task::{TaskMut, TaskRef};
 use crate::taskflow::Taskflow;
 
 /// The task-building half of a taskflow: upstream's `tf::FlowBuilder`.
 ///
-/// Implementors supply [`FlowBuilder::graph_mut`]; every other method is
-/// provided. The trait is generic over the callable types it takes, so it is
-/// not usable as `dyn FlowBuilder` -- nothing in this port needs that, and
-/// upstream's base class is likewise only ever used statically.
+/// Implementors supply the graph, as [`FlowBuilder::graph`] and
+/// [`FlowBuilder::graph_mut`]; every other method is provided. The trait is
+/// generic over the callable types it takes, so it is not usable as
+/// `dyn FlowBuilder` -- nothing in this port needs that, and upstream's base
+/// class is likewise only ever used statically.
+///
+/// [`Taskflow`] and [`Subflow`] are the two implementors, which is upstream's
+/// pair of derived classes. [`Runtime`] is deliberately not one and so has no
+/// [`task`](FlowBuilder::task): the graph a runtime task runs in is the
+/// enclosing one, which it schedules into but never edits.
 ///
 /// ```
 /// use rustflow::prelude::*;
@@ -44,8 +52,16 @@ use crate::taskflow::Taskflow;
 pub trait FlowBuilder {
     /// Returns the graph this builder builds into.
     ///
-    /// This is upstream's `FlowBuilder::_graph` member, turned into the single
-    /// requirement the provided methods are written against.
+    /// Upstream's `FlowBuilder::_graph` member, read-only. Both borrows are
+    /// required because a provided method that only queries --
+    /// [`FlowBuilder::task_ref`] -- must not ask for `&mut`, and both
+    /// implementors have an inherent `graph()` of this shape already.
+    fn graph(&self) -> &Graph;
+
+    /// Returns the graph this builder builds into, mutably.
+    ///
+    /// This is upstream's `FlowBuilder::_graph` member again, and the
+    /// requirement the building methods below are written against.
     fn graph_mut(&mut self) -> &mut Graph;
 
     /// Creates a static task running `callable`, and returns its handle.
@@ -362,6 +378,74 @@ pub trait FlowBuilder {
     fn remove_dependency(&mut self, from: Task, to: Task) {
         self.graph_mut().remove_edge(from, to);
     }
+
+    /// Returns an editing handle to `task`: upstream's `tf::Task`.
+    ///
+    /// Upstream's `emplace` hands the handle straight back, and it goes on
+    /// aliasing the graph the caller keeps mutating. Here the lasting handle
+    /// is the [`Task`] index `emplace` returns and the fluent methods live on
+    /// [`TaskMut`], a short-lived borrow of the builder -- which is why they
+    /// are reached through this method rather than being the return value
+    /// (README's "Graph as an arena").
+    ///
+    /// Being on the trait is what makes a subflow body read like the taskflow
+    /// half of the same program. Upstream's subflow example ports as:
+    ///
+    /// ```
+    /// use rustflow::prelude::*;
+    /// use rustflow::Executor;
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// let b = taskflow.emplace_subflow(|subflow: &mut Subflow<'_>| {
+    ///     let b1 = subflow.emplace(|| {});
+    ///     subflow.task(b1).name("B1");
+    ///     let b2 = subflow.emplace(|| {});
+    ///     subflow.task(b2).name("B2");
+    ///     let b3 = subflow.emplace(|| {});
+    ///     subflow.task(b3).name("B3").succeed([b1, b2]);
+    /// });
+    /// taskflow.task(b).name("B");
+    ///
+    /// Executor::new(2).run(&taskflow).wait().unwrap();
+    /// ```
+    ///
+    /// Naming a task is two statements rather than upstream's
+    /// `emplace(..).name("B")` chain, and that is a decision rather than a
+    /// gap: README's "Design decisions already taken" has the reason.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `task` does not address a task of this builder's graph.
+    fn task(&mut self, task: Task) -> TaskMut<'_> {
+        TaskMut::new(self.graph_mut(), task)
+    }
+
+    /// Returns a read-only handle to `task`, the query half of the pair.
+    ///
+    /// This is upstream's `tf::TaskView` as much as its `tf::Task`; the two
+    /// differ only in the editing methods, which are on [`TaskMut`].
+    ///
+    /// The trait is all it takes to reach either handle, so importing it is
+    /// enough -- with or without the rest of the prelude:
+    ///
+    /// ```
+    /// use rustflow::{FlowBuilder, Taskflow};
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// let a = taskflow.emplace(|| {});
+    /// taskflow.task(a).name("a");
+    ///
+    /// assert_eq!(taskflow.task_ref(a).name(), "a");
+    /// assert!(taskflow.task_ref(a).has_work());
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `task` does not address a task of this builder's graph.
+    #[must_use]
+    fn task_ref(&self, task: Task) -> TaskRef<'_> {
+        TaskRef::new(self.graph(), task)
+    }
 }
 
 /// A tuple of callables that [`FlowBuilder::emplace_n`] can turn into a tuple
@@ -417,6 +501,12 @@ impl_callables!(C0 c0, C1 c1, C2 c2, C3 c3, C4 c4, C5 c5, C6 c6);
 impl_callables!(C0 c0, C1 c1, C2 c2, C3 c3, C4 c4, C5 c5, C6 c6, C7 c7);
 
 impl FlowBuilder for Taskflow {
+    fn graph(&self) -> &Graph {
+        // As below: the inherent accessor, not a recursive call into the
+        // trait.
+        Taskflow::graph(self)
+    }
+
     fn graph_mut(&mut self) -> &mut Graph {
         // Inherent methods win over trait methods in resolution, so this is
         // `Taskflow`'s own accessor and not a recursive call into the trait.
@@ -750,6 +840,33 @@ mod tests {
         let mut visited = Vec::new();
         taskflow.for_each_task(|task| visited.push(task));
         assert_eq!(visited, vec![a, c]);
+    }
+
+    /// The acceptance bar for issue #120: both handle accessors are provided
+    /// methods, so code that knows only that it holds *a* builder can name a
+    /// task and wire it up -- which is exactly what a subflow body knows
+    /// about itself.
+    #[test]
+    fn the_task_handles_are_reachable_through_the_trait_alone() {
+        fn build(builder: &mut impl FlowBuilder) -> (Task, Task) {
+            let first = builder.emplace(|| {});
+            let second = builder.emplace(|| {});
+            builder.task(second).name("second").succeed([first]);
+            (first, second)
+        }
+
+        // The query half takes `&self`, which is why the trait needs both
+        // borrows of the graph and not just the mutable one.
+        fn name_of(builder: &impl FlowBuilder, task: Task) -> String {
+            builder.task_ref(task).name().to_string()
+        }
+
+        let mut taskflow = Taskflow::new();
+        let (first, second) = build(&mut taskflow);
+
+        assert_eq!(name_of(&taskflow, second), "second");
+        assert_eq!(taskflow.task_ref(first).num_successors(), 1);
+        assert_eq!(taskflow.task_ref(second).num_predecessors(), 1);
     }
 
     #[test]

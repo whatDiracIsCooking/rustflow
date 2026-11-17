@@ -258,6 +258,21 @@ the same split:
   measures nothing but scheduler overhead. A real regression, and the right
   one to accept: the alternative was a safe API with a reachable
   use-after-free.
+- **Naming a task is two statements, not `emplace(..).name("A")`** (issue
+  #120). Upstream's `emplace` returns a `tf::Task` by value, so a name chains
+  straight onto it; here `emplace` returns the `Copy` index and the fluent
+  methods live on `TaskMut`, which is a `&mut` borrow of the builder. Handing
+  that borrow back from `emplace` is what the chain would cost: a
+  `let a = tf.emplace(..)` would then hold the taskflow borrowed until `a`
+  dies, so a second `emplace` on the next line would not borrow-check, and
+  every example in the crate would break. So it is `let a = tf.emplace(..);`
+  and then `tf.task(a).name("a");`. The two other shapes considered are rejected for
+  their own reasons: a consuming `TaskMut::name(self) -> Task` breaks the
+  documented `tf.task(a).name("a").work(..).precede([b, c])` chain, and an
+  `emplace_named` family needs a twin for each of the five emplace kinds plus
+  `placeholder` to save one line. What the port does instead is put `task()`
+  and `task_ref()` on `FlowBuilder` rather than on `Taskflow`, so that the
+  two-statement form reads the same inside a subflow body as outside one.
 - **Task bodies are `FnMut() + Send + 'static`.** Condition tasks create
   cycles, so a body runs many times per run and upstream invokes it mutably;
   the scheduler's one-worker-per-node guarantee is the safety argument.

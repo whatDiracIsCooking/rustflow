@@ -68,7 +68,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustflow::prelude::*;
-use rustflow::{Executor, TaskMut, Xorshift32};
+use rustflow::{Executor, Xorshift32};
 
 /// How long a spin waits for what it is spinning on before it gives up.
 ///
@@ -629,7 +629,7 @@ fn subflow_starvation(workers: usize) {
                 })
             };
             if let Some(prev) = prev {
-                TaskMut::new(subflow.graph_mut(), curr).succeed([prev]);
+                subflow.task(curr).succeed([prev]);
             }
             if l == 1 {
                 second = Some(curr);
@@ -639,7 +639,7 @@ fn subflow_starvation(workers: usize) {
         let curr = prev.expect("the chain has a hundred tasks");
         let second = second.expect("the chain has a second task");
 
-        TaskMut::new(subflow.graph_mut(), cond).precede([second, stop]);
+        subflow.task(cond).precede([second, stop]);
 
         for _ in 0..B {
             let executor = Arc::clone(&pool);
@@ -656,12 +656,10 @@ fn subflow_starvation(workers: usize) {
 
                 counter.fetch_add(1, Ordering::Relaxed);
             });
-            TaskMut::new(subflow.graph_mut(), branch)
-                .succeed([curr])
-                .precede([merge]);
+            subflow.task(branch).succeed([curr]).precede([merge]);
         }
 
-        TaskMut::new(subflow.graph_mut(), merge).precede([cond]);
+        subflow.task(merge).precede([cond]);
     });
 
     run_n(&executor, &taskflow, 5);

@@ -56,7 +56,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustflow::prelude::*;
-use rustflow::{Executor, Node, RunHandle, SubflowWork, TaskMut};
+use rustflow::{Executor, Node, RunHandle, SubflowWork};
 
 /// A counter shared with the task bodies that bump it.
 type Counter = Arc<AtomicUsize>;
@@ -758,7 +758,7 @@ fn a_retained_subgraph_survives_the_run_and_dumps() {
             let mut taskflow = Taskflow::with_name("dynamic");
             let spawner = taskflow.emplace_subflow(move |subflow: &mut Subflow<'_>| {
                 let child = subflow.emplace(|| {});
-                TaskMut::new(subflow.graph_mut(), child).name("child");
+                subflow.task(child).name("child");
                 if joined {
                     subflow.join().expect("a fresh subflow is joinable");
                 }
@@ -820,7 +820,7 @@ fn a_subflow_runs_and_retains_one_graph_down() {
                 let child = subflow.emplace(move || {
                     bump(&counted);
                 });
-                TaskMut::new(subflow.graph_mut(), child).name("child");
+                subflow.task(child).name("child");
                 subflow.set_retain(true);
             }
         });
@@ -855,7 +855,7 @@ fn a_subflow_runs_and_retains_one_graph_down() {
                         let child = subflow.emplace(move || {
                             bump(&counted);
                         });
-                        TaskMut::new(subflow.graph_mut(), child).name("child");
+                        subflow.task(child).name("child");
                         subflow.set_retain(true);
                     }
                 }),
