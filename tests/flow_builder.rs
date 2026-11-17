@@ -1,4 +1,4 @@
-//! Translated from `unittests/test_basics.cpp` (Taskflow v4.1.0): the
+//! Translated from `unittests/test_basics.cpp` (Taskflow v4.1.0): the `Type`,
 //! `Creation`, `Taskflow.RemoveDependency` and `STDFunction` cases, and the
 //! per-taskflow half of `Iterators`; plus, from
 //! `unittests/test_control_flow.cpp`, the `Cond.Types` and `MultiCond.Types`
@@ -428,4 +428,167 @@ fn erase_a_middle_task() {
     assert_ne!(f, c);
     assert!(!taskflow.graph().contains(c));
     assert_eq!(taskflow.num_tasks(), 5);
+}
+
+/// `TEST_CASE("Type")`: every builder reports the task type upstream's
+/// `type()` gives it, over all four node kinds dynamic tasking adds.
+///
+/// Upstream's `t7`, the `[](tf::NonpreemptiveRuntime&){}` body, is left out:
+/// that second runtime shape is outside this milestone, and it reports
+/// `RUNTIME` there only because upstream folds the two together. Upstream's
+/// `static_assert(tf::is_subflow_task_v<...>)` block has no translation
+/// either, for the reason `cond_types` gives: the bound on each method *is*
+/// the concept check here, and a body of the wrong shape is a compile error
+/// rather than a failing assertion. `adopt` is not in upstream's case at all;
+/// it belongs beside `composed_of`, so it is here.
+#[test]
+fn task_type() {
+    let mut taskflow = Taskflow::new();
+    let target = Arc::new(Taskflow::with_name("target"));
+
+    let t1 = taskflow.emplace(|| {});
+    let t2 = taskflow.emplace_condition(|| 1);
+    let t3 = taskflow.emplace_subflow(|_: &mut Subflow<'_>| {});
+    let t4 = taskflow.composed_of(Arc::clone(&target));
+    let t5 = taskflow.emplace_multi_condition(|| vec![1, 2]);
+    let t6 = taskflow.emplace_runtime(|_: &mut Runtime<'_>| {});
+    let t7 = taskflow.adopt(Graph::new());
+
+    assert_eq!(taskflow.task_ref(t1).task_type(), TaskType::Static);
+    assert_eq!(taskflow.task_ref(t2).task_type(), TaskType::Condition);
+    assert_eq!(taskflow.task_ref(t3).task_type(), TaskType::Subflow);
+    assert_eq!(taskflow.task_ref(t4).task_type(), TaskType::Module);
+    assert_eq!(taskflow.task_ref(t5).task_type(), TaskType::Condition);
+    assert_eq!(taskflow.task_ref(t6).task_type(), TaskType::Runtime);
+    // Upstream has no `ADOPTED_MODULE` task type: the owned form reports
+    // `MODULE` like the shared one.
+    assert_eq!(taskflow.task_ref(t7).task_type(), TaskType::Module);
+
+    // The handle predicates agree with the task types, and the module pair is
+    // the one place where two handles answer one predicate.
+    assert!(taskflow.graph().node(t3).handle().is_subflow());
+    assert!(taskflow.graph().node(t6).handle().is_runtime());
+    assert!(taskflow.graph().node(t4).handle().is_module());
+    assert!(taskflow.graph().node(t7).handle().is_module());
+    assert_eq!(taskflow.num_tasks(), 7);
+}
+
+/// Composing one taskflow into another twice hands out two shares of the same
+/// target rather than copying it.
+///
+/// Upstream's `composed_of(taskflow2)` takes a reference and leaves the
+/// lifetime to the caller; an `Arc<Taskflow>` is this port's answer, so what
+/// there is to check from outside the crate is the share count and that both
+/// module tasks point at the one graph.
+#[test]
+fn composed_of_shares_one_target() {
+    let mut target = Taskflow::with_name("target");
+    let (first_inner, second_inner) = target.emplace_n((|| {}, || {}));
+    target.linearize([first_inner, second_inner]);
+    let target = Arc::new(target);
+
+    let mut taskflow = Taskflow::new();
+    let first = taskflow.composed_of(Arc::clone(&target));
+    let second = taskflow.composed_of(Arc::clone(&target));
+    taskflow.linearize([first, second]);
+
+    // One target, two module tasks, three shares: theirs and this test's.
+    assert_eq!(Arc::strong_count(&target), 3);
+    let Handle::Module(from_first) = taskflow.graph().node(first).handle() else {
+        panic!("composed_of left something else behind");
+    };
+    let Handle::Module(from_second) = taskflow.graph().node(second).handle() else {
+        panic!("composed_of left something else behind");
+    };
+    assert!(Arc::ptr_eq(from_first, from_second));
+    assert!(Arc::ptr_eq(from_first, &target));
+
+    // The target is reachable through the module task, which is what running
+    // one will need: its name and its whole graph.
+    assert_eq!(from_first.name(), "target");
+    assert_eq!(from_first.num_tasks(), 2);
+    assert_eq!(
+        from_first.graph().successors(first_inner),
+        [second_inner].as_slice()
+    );
+
+    // Erasing one module task gives up one share and leaves the other's.
+    taskflow.erase(second);
+    assert_eq!(Arc::strong_count(&target), 2);
+    assert_eq!(target.num_tasks(), 2);
+}
+
+/// `adopt` moves the graph into the task: upstream's `adopt(Graph&&)`, whose
+/// doc comment is "transfers ownership of the given tf::Graph into the task".
+///
+/// The move is a compile-time fact -- the graph is passed by value and the
+/// caller has no handle on it afterwards -- so what is left to assert is that
+/// the task kept all of it, and that it is the task which owns it now.
+#[test]
+fn adopt_moves_the_graph_into_the_task() {
+    let witness = Arc::new(());
+    let held = Arc::clone(&witness);
+
+    // Upstream builds the adopted graph with `tf::FlowBuilder{g}.emplace(...)`.
+    // There is no such borrowing builder here -- `FlowBuilder` is implemented
+    // for the types that own a graph -- so the nodes go in through the arena.
+    let mut module = Graph::new();
+    let inner = module.add_named_node(
+        "adopted",
+        Handle::Static(Work::new(move || {
+            let _ = &held;
+        })),
+    );
+    module.add_named_node("second", Handle::Placeholder);
+    module.add_edge(inner, Task::new(1));
+    assert_eq!(Arc::strong_count(&witness), 2);
+
+    let mut taskflow = Taskflow::new();
+    let task = taskflow.adopt(module);
+    taskflow.graph_mut().node_mut(task).set_name("module");
+
+    // The task holds the whole graph, edges and all, and the composing
+    // taskflow is still one task big.
+    let Handle::AdoptedModule(adopted) = taskflow.graph().node(task).handle() else {
+        panic!("adopt left something else behind");
+    };
+    assert_eq!(adopted.len(), 2);
+    assert_eq!(adopted.node(inner).name(), "adopted");
+    assert_eq!(adopted.successors(inner), [Task::new(1)].as_slice());
+    assert_eq!(taskflow.num_tasks(), 1);
+    // Moved in, not cloned: the witness still has exactly one holder besides
+    // this test's own.
+    assert_eq!(Arc::strong_count(&witness), 2);
+
+    // And the task owning the graph is what erasing it proves.
+    taskflow.erase(task);
+    assert_eq!(Arc::strong_count(&witness), 1);
+}
+
+/// A subflow task owns an empty graph from the moment it is built, and what
+/// the body will build goes in there rather than into the taskflow.
+///
+/// The body itself cannot run outside a worker -- a [`Subflow`] borrows the
+/// executor and the worker that spawned it -- so the builder half of that is
+/// asserted in `src/subflow.rs`, where the crate can construct one.
+#[test]
+fn a_subflow_task_carries_its_own_graph() {
+    let mut taskflow = Taskflow::new();
+    let spawner = taskflow.emplace_subflow(|subflow: &mut Subflow<'_>| {
+        let children: Vec<Task> = (0..3).map(|_| subflow.emplace(|| {})).collect();
+        subflow.linearize(children);
+    });
+    let after = taskflow.emplace(|| {});
+    taskflow.task(spawner).precede([after]);
+
+    let Handle::Subflow { subgraph, .. } = taskflow.graph().node(spawner).handle() else {
+        panic!("emplace_subflow left something else behind");
+    };
+    assert!(subgraph.lock().expect("uncontended").is_empty());
+
+    // The subflow node is an ordinary citizen of the graph it lives in: not a
+    // conditioner, so the dependency it hands `after` is strong.
+    assert_eq!(taskflow.num_tasks(), 2);
+    assert_eq!(taskflow.task_ref(after).num_strong_dependencies(), 1);
+    assert_eq!(taskflow.task_ref(after).num_weak_dependencies(), 0);
 }

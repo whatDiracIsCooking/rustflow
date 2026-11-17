@@ -8,12 +8,19 @@
 //! and builds everything else on top. M4's `Subflow` then reuses the whole
 //! trait by answering that one question, exactly as upstream reuses the base.
 //!
-//! Two things that are upstream `FlowBuilder` members are deliberately absent:
-//! the module-task builders (`composed_of`, `adopt`), which need a node kind
-//! [`Handle`] does not have yet, and the algorithm builders (`for_each`,
-//! `reduce`, `sort`, ...), which are M6. Neither is stubbed.
+//! One group of upstream `FlowBuilder` members is deliberately absent: the
+//! algorithm builders (`for_each`, `reduce`, `sort`, ...), which are M6.
+//! Nothing stands in for them. Everything else upstream builds is here,
+//! including the four dynamic-tasking builders --
+//! [`FlowBuilder::emplace_subflow`], [`FlowBuilder::emplace_runtime`],
+//! [`FlowBuilder::composed_of`] and [`FlowBuilder::adopt`] -- whose node kinds
+//! the executor does not run yet.
 
-use crate::graph::{Graph, Handle, Task, Work};
+use std::sync::{Arc, Mutex};
+
+use crate::graph::{Graph, Handle, RuntimeWork, SubflowWork, Task, Work};
+use crate::runtime::Runtime;
+use crate::subflow::Subflow;
 use crate::taskflow::Taskflow;
 
 /// The task-building half of a taskflow: upstream's `tf::FlowBuilder`.
@@ -118,6 +125,145 @@ pub trait FlowBuilder {
     {
         self.graph_mut()
             .add_node(Handle::MultiCondition(Work::new(callable)))
+    }
+
+    /// Creates a subflow task running `callable`, and returns its handle.
+    ///
+    /// Upstream's `emplace` overload for a `SubflowTaskLike` callable. The body
+    /// is handed the [`Subflow`] it builds into, so what the task spawns can
+    /// depend on anything known only while it runs; the executor then runs
+    /// that child graph before this task's own successors.
+    ///
+    /// The node owns the graph the body builds -- see [`Handle::Subflow`] --
+    /// and a fresh entry to the same node starts from an empty one, which is
+    /// what makes a subflow inside a loop behave.
+    ///
+    /// Running one is issue #50: today this builds a graph citizen that reports
+    /// [`crate::TaskType::Subflow`], and a run that reaches it is refused.
+    ///
+    /// ```
+    /// use rustflow::prelude::*;
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// let spawner = taskflow.emplace_subflow(|subflow: &mut Subflow<'_>| {
+    ///     let children: Vec<Task> =
+    ///         (0..3).map(|_| subflow.emplace(|| {})).collect();
+    ///     subflow.linearize(children);
+    /// });
+    ///
+    /// assert!(taskflow.graph().node(spawner).handle().is_subflow());
+    /// ```
+    fn emplace_subflow<C>(&mut self, callable: C) -> Task
+    where
+        C: for<'a> FnMut(&mut Subflow<'a>) + Send + 'static,
+    {
+        self.graph_mut().add_node(Handle::Subflow {
+            work: SubflowWork::new(callable),
+            subgraph: Mutex::new(Graph::new()),
+        })
+    }
+
+    /// Creates a runtime task running `callable`, and returns its handle.
+    ///
+    /// Upstream's `emplace` overload for a `RuntimeTaskLike` callable. The body
+    /// is handed the [`Runtime`] it is running on, which is upstream's way of
+    /// giving a task the scheduler itself: it can schedule a task of its own
+    /// graph outright and wait for work it spawned.
+    ///
+    /// Upstream's second runtime shape, the one taking a
+    /// `tf::NonpreemptiveRuntime&`, is outside this milestone; it would be a
+    /// third method here rather than an overload of this one.
+    ///
+    /// Running one is issue #51, and [`Runtime`]'s scheduling methods land with
+    /// it: today this builds a graph citizen that reports
+    /// [`crate::TaskType::Runtime`], and a run that reaches it is refused.
+    ///
+    /// ```
+    /// use rustflow::prelude::*;
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// let task = taskflow.emplace_runtime(|runtime: &mut Runtime<'_>| {
+    ///     // What a body does with the handle is #51's; where it is running
+    ///     // it can already ask.
+    ///     let _ = runtime.worker().id();
+    /// });
+    ///
+    /// assert!(taskflow.graph().node(task).handle().is_runtime());
+    /// ```
+    fn emplace_runtime<C>(&mut self, callable: C) -> Task
+    where
+        C: for<'a> FnMut(&mut Runtime<'a>) + Send + 'static,
+    {
+        self.graph_mut()
+            .add_node(Handle::Runtime(RuntimeWork::new(callable)))
+    }
+
+    /// Creates a module task standing for `target`, and returns its handle.
+    ///
+    /// Upstream's `composed_of`, which is how one taskflow is composed into
+    /// another: running this task runs the whole of `target`'s graph, and this
+    /// task's successors wait for all of it.
+    ///
+    /// Upstream takes anything graph-like by reference, as
+    /// `taskflow.composed_of(other)`, and leaves the caller to keep `other`
+    /// alive for as long as any run of the composing taskflow may be in
+    /// flight. A safe Rust API cannot state
+    /// that obligation, so the target is an [`Arc`] and the module shares it;
+    /// composing one taskflow into two others, or twice into one, hands out
+    /// more shares of the same graph rather than copying it. The owned form of
+    /// the same thing is [`FlowBuilder::adopt`].
+    ///
+    /// What the share does *not* buy is permission to run one target twice at
+    /// once: a graph's per-node counters belong to one run at a time, which is
+    /// upstream's rule too (`composed_of` is "thread-safe as long as the target
+    /// is not concurrently ran by two or more threads"). Running one is issue
+    /// #49.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use rustflow::prelude::*;
+    ///
+    /// let mut library = Taskflow::with_name("library");
+    /// library.emplace(|| println!("shared work"));
+    /// let library = Arc::new(library);
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// let first = taskflow.composed_of(Arc::clone(&library));
+    /// let second = taskflow.composed_of(Arc::clone(&library));
+    /// taskflow.linearize([first, second]);
+    ///
+    /// // Two module tasks, one target.
+    /// assert!(taskflow.graph().node(first).handle().is_module());
+    /// assert_eq!(Arc::strong_count(&library), 3);
+    /// ```
+    fn composed_of(&mut self, target: Arc<Taskflow>) -> Task {
+        self.graph_mut().add_node(Handle::Module(target))
+    }
+
+    /// Creates a module task owning `graph`, and returns its handle.
+    ///
+    /// Upstream's `adopt(Graph&&)`: the same composition as
+    /// [`FlowBuilder::composed_of`] with the ownership question settled the
+    /// other way -- the graph is moved into the task, so there is no target to
+    /// keep alive and no share to count. It is the form to reach for when the
+    /// composed graph has no other owner.
+    ///
+    /// Running one is issue #49; the two forms differ there only in where the
+    /// arm finds the graph.
+    ///
+    /// ```
+    /// use rustflow::prelude::*;
+    ///
+    /// let mut module = Graph::new();
+    /// module.add_node(Handle::Static(Work::new(|| println!("adopted"))));
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// let task = taskflow.adopt(module);
+    ///
+    /// assert!(taskflow.graph().node(task).handle().is_module());
+    /// ```
+    fn adopt(&mut self, graph: Graph) -> Task {
+        self.graph_mut().add_node(Handle::AdoptedModule(graph))
     }
 
     /// Creates one static task per callable in a tuple, and returns a tuple of
@@ -296,6 +442,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::task::TaskType;
+
     /// Runs every task's work once, in creation order, standing in for the
     /// executor that does not exist yet.
     fn run_in_order(taskflow: &Taskflow) {
@@ -365,6 +513,131 @@ mod tests {
 
         assert!(taskflow.graph().node(one).handle().is_conditioner());
         assert!(taskflow.graph().node(many).handle().is_conditioner());
+    }
+
+    /// Every dynamic-tasking builder attaches the handle it is named for, and
+    /// nothing else about the graph changes: four builders, four node kinds,
+    /// one node each.
+    #[test]
+    fn the_dynamic_tasking_builders_attach_their_own_handles() {
+        let mut taskflow = Taskflow::new();
+        let spawner = taskflow.emplace_subflow(|_| {});
+        let runtime = taskflow.emplace_runtime(|_| {});
+        let module = taskflow.composed_of(Arc::new(Taskflow::with_name("target")));
+        let adopted = taskflow.adopt(Graph::new());
+
+        assert_eq!(taskflow.num_tasks(), 4);
+        assert!(taskflow.graph().node(spawner).handle().is_subflow());
+        assert!(taskflow.graph().node(runtime).handle().is_runtime());
+        assert!(taskflow.graph().node(module).handle().is_module());
+        assert!(taskflow.graph().node(adopted).handle().is_module());
+
+        // Each reports its own task type, with both module forms sharing one
+        // name as upstream's `TaskType` does.
+        assert_eq!(taskflow.task_ref(spawner).task_type(), TaskType::Subflow);
+        assert_eq!(taskflow.task_ref(runtime).task_type(), TaskType::Runtime);
+        assert_eq!(taskflow.task_ref(module).task_type(), TaskType::Module);
+        assert_eq!(taskflow.task_ref(adopted).task_type(), TaskType::Module);
+
+        // None of them is a conditioner, so a dependency on one is strong.
+        for task in [spawner, runtime, module, adopted] {
+            assert!(!taskflow.graph().node(task).handle().is_conditioner());
+        }
+    }
+
+    /// A subflow node carries an empty graph of its own from the moment it is
+    /// built, which is the node field the body writes into.
+    #[test]
+    fn a_fresh_subflow_task_owns_an_empty_subgraph() {
+        let mut taskflow = Taskflow::new();
+        let spawner = taskflow.emplace_subflow(|_| {});
+
+        let Handle::Subflow { subgraph, .. } = taskflow.graph().node(spawner).handle() else {
+            panic!("emplace_subflow left something else behind");
+        };
+        assert!(subgraph.lock().expect("uncontended").is_empty());
+    }
+
+    /// Composing one taskflow twice hands out two shares of the same target
+    /// rather than copying it, which is the whole of the `Arc<Taskflow>`
+    /// decision: upstream's `Graph&` would be two references to one graph, and
+    /// this is the safe spelling of that.
+    #[test]
+    fn composed_of_twice_shares_one_target() {
+        let mut target = Taskflow::with_name("target");
+        target.emplace(|| {});
+        let target = Arc::new(target);
+        assert_eq!(Arc::strong_count(&target), 1);
+
+        let mut taskflow = Taskflow::new();
+        let first = taskflow.composed_of(Arc::clone(&target));
+        let second = taskflow.composed_of(Arc::clone(&target));
+
+        // Two module nodes, two shares beside the caller's own.
+        assert_eq!(Arc::strong_count(&target), 3);
+        let Handle::Module(from_first) = taskflow.graph().node(first).handle() else {
+            panic!("composed_of left something else behind");
+        };
+        let Handle::Module(from_second) = taskflow.graph().node(second).handle() else {
+            panic!("composed_of left something else behind");
+        };
+        assert!(Arc::ptr_eq(from_first, from_second));
+        assert!(Arc::ptr_eq(from_first, &target));
+        assert_eq!(from_first.name(), "target");
+        assert_eq!(from_first.graph().len(), 1);
+
+        // Erasing one module task drops one share and leaves the other.
+        taskflow.erase(first);
+        assert_eq!(Arc::strong_count(&target), 2);
+    }
+
+    /// `adopt` moves the graph in: the task owns it afterwards, which is what
+    /// the strong count of something the graph captured can show.
+    #[test]
+    fn adopt_moves_the_graph_into_the_task() {
+        let witness = Arc::new(());
+        let held = Arc::clone(&witness);
+        let mut module = Graph::new();
+        module.add_named_node(
+            "inner",
+            Handle::Static(Work::new(move || {
+                let _ = &held;
+            })),
+        );
+        module.add_node(Handle::Placeholder);
+        assert_eq!(Arc::strong_count(&witness), 2);
+
+        let mut taskflow = Taskflow::new();
+        let task = taskflow.adopt(module);
+
+        // The adopted graph is reachable through the handle, nodes and all,
+        // and the taskflow's own graph is still one node big.
+        let Handle::AdoptedModule(adopted) = taskflow.graph().node(task).handle() else {
+            panic!("adopt left something else behind");
+        };
+        assert_eq!(adopted.len(), 2);
+        assert_eq!(adopted.node(Task::new(0)).name(), "inner");
+        assert_eq!(taskflow.num_tasks(), 1);
+        // Moved in, not cloned: still exactly one holder of the witness.
+        assert_eq!(Arc::strong_count(&witness), 2);
+
+        // And the task owning it means erasing the task drops it.
+        taskflow.erase(task);
+        assert_eq!(Arc::strong_count(&witness), 1);
+    }
+
+    /// The bodies are `FnMut`, so the same closure must survive being handed
+    /// over already boxed, as [`FlowBuilder::emplace`]'s does.
+    #[test]
+    fn the_dynamic_builders_take_already_boxed_callables() {
+        let mut taskflow = Taskflow::new();
+        let boxed: Box<dyn for<'a> FnMut(&mut Subflow<'a>) + Send> = Box::new(|_| {});
+        let spawner = taskflow.emplace_subflow(boxed);
+        let boxed: Box<dyn for<'a> FnMut(&mut Runtime<'a>) + Send> = Box::new(|_| {});
+        let runtime = taskflow.emplace_runtime(boxed);
+
+        assert!(taskflow.graph().node(spawner).handle().is_subflow());
+        assert!(taskflow.graph().node(runtime).handle().is_runtime());
     }
 
     #[test]

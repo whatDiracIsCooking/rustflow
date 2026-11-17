@@ -24,7 +24,11 @@
 use core::fmt;
 use core::num::TryFromIntError;
 use std::sync::atomic::{AtomicU32, AtomicUsize};
-use std::sync::{Mutex, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+
+use crate::runtime::Runtime;
+use crate::subflow::Subflow;
+use crate::taskflow::Taskflow;
 
 /// A handle to one node of a [`Graph`], as an index into that graph's arena.
 ///
@@ -108,18 +112,116 @@ impl<R> Work<R> {
     /// Panics if the work is already running on another thread, which means
     /// the scheduler's one-worker-per-node invariant was violated.
     pub fn invoke(&self) -> R {
-        let mut callable = match self.0.try_lock() {
-            Ok(callable) => callable,
-            // A task that panics poisons its own work. Handing the closure
-            // back out keeps the failure reported as that original panic
-            // rather than as a lock error raised by whoever touches the node
-            // next; what to do about the panic itself is the executor's call.
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => {
-                panic!("work is already running: one worker per node was violated")
-            }
-        };
-        callable()
+        lock_callable(&self.0)()
+    }
+}
+
+/// Takes the lock the callable of a work handle sits behind.
+///
+/// The three work handles -- [`Work`], [`SubflowWork`] and [`RuntimeWork`] --
+/// differ only in what they call and share this discipline, so it is written
+/// once here rather than three times.
+///
+/// # Panics
+///
+/// Panics if the work is already running on another thread, which means the
+/// scheduler's one-worker-per-node invariant was violated.
+fn lock_callable<F: ?Sized>(callable: &Mutex<Box<F>>) -> MutexGuard<'_, Box<F>> {
+    match callable.try_lock() {
+        Ok(callable) => callable,
+        // A task that panics poisons its own work. Handing the closure back
+        // out keeps the failure reported as that original panic rather than as
+        // a lock error raised by whoever touches the node next; what to do
+        // about the panic itself is the executor's call.
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            panic!("work is already running: one worker per node was violated")
+        }
+    }
+}
+
+/// The callable behind a subflow task, which is handed the [`Subflow`] it
+/// builds into.
+///
+/// Upstream's `std::function<void(tf::Subflow&)>`. The body builds a graph
+/// while it runs, so it cannot be a [`Work`]: what it returns is nothing and
+/// what it needs is the handle. The `Mutex` is [`Work`]'s, for [`Work`]'s
+/// reason and under the same discipline -- a second worker on one node is a
+/// reported panic, not a race.
+///
+/// The bound is higher-ranked over the subflow's own lifetime because the
+/// handle borrows the node the body is running on, which is a lifetime no
+/// stored closure can name.
+pub struct SubflowWork(Mutex<SubflowBody>);
+
+/// The boxed body of a subflow task. Named rather than written inline because
+/// the lock, the box and the higher-ranked bound together are past what
+/// clippy's `type_complexity` admits in a field.
+type SubflowBody = Box<dyn for<'a> FnMut(&mut Subflow<'a>) + Send + 'static>;
+
+impl SubflowWork {
+    /// Wraps a callable as the work of a subflow task.
+    pub fn new<C>(callable: C) -> Self
+    where
+        C: for<'a> FnMut(&mut Subflow<'a>) + Send + 'static,
+    {
+        Self(Mutex::new(Box::new(callable)))
+    }
+
+    /// Runs the callable against `subflow`, which is what the body builds its
+    /// child graph into.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the work is already running on another thread, which means
+    /// the scheduler's one-worker-per-node invariant was violated.
+    pub fn invoke(&self, subflow: &mut Subflow<'_>) {
+        lock_callable(&self.0)(subflow);
+    }
+}
+
+impl fmt::Debug for SubflowWork {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SubflowWork(..)")
+    }
+}
+
+/// The callable behind a runtime task, which is handed the [`Runtime`] of the
+/// node it runs on.
+///
+/// Upstream's `std::function<void(tf::Runtime&)>`, under [`SubflowWork`]'s
+/// discipline and for the same reasons. Upstream's second runtime shape,
+/// `std::function<void(tf::NonpreemptiveRuntime&)>`, is excluded from this
+/// milestone.
+pub struct RuntimeWork(Mutex<RuntimeBody>);
+
+/// The boxed body of a runtime task, named for [`SubflowBody`]'s reason.
+type RuntimeBody = Box<dyn for<'a> FnMut(&mut Runtime<'a>) + Send + 'static>;
+
+impl RuntimeWork {
+    /// Wraps a callable as the work of a runtime task.
+    pub fn new<C>(callable: C) -> Self
+    where
+        C: for<'a> FnMut(&mut Runtime<'a>) + Send + 'static,
+    {
+        Self(Mutex::new(Box::new(callable)))
+    }
+
+    /// Runs the callable against `runtime`, which is the body's handle on the
+    /// scheduler.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the work is already running on another thread, which means
+    /// the scheduler's one-worker-per-node invariant was violated.
+    pub fn invoke(&self, runtime: &mut Runtime<'_>) {
+        lock_callable(&self.0)(runtime);
+    }
+}
+
+impl fmt::Debug for RuntimeWork {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RuntimeWork(..)")
     }
 }
 
@@ -159,6 +261,38 @@ pub enum Handle {
     /// allocation per invocation is a known cost, to revisit with a bench
     /// before hand-rolling a small-vector type for it.
     MultiCondition(Work<Vec<i32>>),
+    /// A callable that builds a graph of its own while it runs, which the
+    /// executor then runs before this node's successors: upstream's
+    /// `Node::Subflow`.
+    ///
+    /// `subgraph` is upstream's `Graph subgraph` field, behind a `Mutex`
+    /// because the body mutates it through a node the run only *borrows*: a
+    /// worker reaches the node as `&Node`, so the graph it writes into has to
+    /// carry its own interior mutability. It cannot deadlock a body either,
+    /// since a nested subflow locks its own node's graph and never this one
+    /// again. See [`crate::subflow`] for what holds the guard.
+    Subflow {
+        /// The body, which is handed the [`Subflow`] it builds into.
+        work: SubflowWork,
+        /// The graph the body builds, upstream's `Node::Subflow::subgraph`.
+        subgraph: Mutex<Graph>,
+    },
+    /// A callable handed the scheduler itself, upstream's `Node::Runtime`.
+    Runtime(RuntimeWork),
+    /// A task that stands for another whole taskflow, upstream's
+    /// `Node::Module`.
+    ///
+    /// Upstream stores a bare `Graph&` and leaves it to the caller to keep the
+    /// target alive for as long as any graph composed of it may run; a safe
+    /// Rust API cannot state that obligation, so the module *shares* ownership
+    /// of its target instead. The run needs no more than that: the `Arc` hands
+    /// out `&Graph` through [`Taskflow::graph`], and running the target writes
+    /// its nodes only through their atomic state words.
+    Module(Arc<Taskflow>),
+    /// A task that stands for a graph it owns, upstream's
+    /// `Node::AdoptedModule` -- the `adopt(Graph&&)` form of the variant
+    /// above, which moves the graph in rather than sharing it.
+    AdoptedModule(Graph),
 }
 
 impl Handle {
@@ -184,6 +318,31 @@ impl Handle {
     #[must_use]
     pub fn is_multi_condition(&self) -> bool {
         matches!(self, Self::MultiCondition(_))
+    }
+
+    /// Returns `true` for [`Handle::Subflow`].
+    #[must_use]
+    pub fn is_subflow(&self) -> bool {
+        matches!(self, Self::Subflow { .. })
+    }
+
+    /// Returns `true` for [`Handle::Runtime`].
+    #[must_use]
+    pub fn is_runtime(&self) -> bool {
+        matches!(self, Self::Runtime(_))
+    }
+
+    /// Returns `true` for either module handle, [`Handle::Module`] and
+    /// [`Handle::AdoptedModule`].
+    ///
+    /// The two are one task kind as far as anything outside the executor is
+    /// concerned -- upstream's `TaskType` has no separate name for the adopted
+    /// form either -- and they differ only in who owns the target graph, which
+    /// is a question only the arm that runs one asks. Match the handle to tell
+    /// them apart.
+    #[must_use]
+    pub fn is_module(&self) -> bool {
+        matches!(self, Self::Module(_) | Self::AdoptedModule(_))
     }
 
     /// Returns `true` if this handle picks its own successors at runtime,
@@ -286,7 +445,29 @@ impl Node {
         &self.edges[self.num_successors..]
     }
 
+    /// Upstream's `NSTATE::RETAIN_SUBFLOW`: set on a subflow node whose body
+    /// asked, through [`Subflow::set_retain`], for its subgraph to survive
+    /// the join instead of being cleared.
+    pub const RETAIN_SUBFLOW: u32 = 0x4000_0000;
+
+    /// Upstream's `NSTATE::JOINED_SUBFLOW`: set on a subflow node whose
+    /// subgraph has been joined, which is what makes [`Subflow::joinable`]
+    /// answer `false`.
+    pub const JOINED_SUBFLOW: u32 = 0x8000_0000;
+
     /// Returns the scheduler state word, upstream's `_nstate`.
+    ///
+    /// The two constants above are the only bits of upstream's `NSTATE`
+    /// vocabulary this port has; `IMPLICITLY_ANCHORED`, `PREEMPTED` and the
+    /// `STRONG_DEPENDENCIES_MASK` arrive with the executor half of dynamic
+    /// tasking. The mask is the one that matters for the pair above: upstream
+    /// keeps the strong-dependency count in the low 28 bits and masks it out
+    /// of the word on every read, where this port's run stores and re-arms
+    /// from the whole 32 bits. Nothing can set these two bits on a node a run
+    /// will reach yet -- only [`crate::subflow`] writes them, from a path the
+    /// executor still refuses -- but the mask has to come back in that same
+    /// change, or a node carrying one of them would re-arm its join counter
+    /// with the bit's value.
     #[must_use]
     pub fn nstate(&self) -> &AtomicU32 {
         &self.nstate
@@ -603,6 +784,8 @@ const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Task>();
     assert_send_sync::<Work>();
+    assert_send_sync::<SubflowWork>();
+    assert_send_sync::<RuntimeWork>();
     assert_send_sync::<Handle>();
     assert_send_sync::<Node>();
     assert_send_sync::<Graph>();
@@ -991,6 +1174,117 @@ mod tests {
             .set_handle(Handle::Static(Work::new(|| {})));
         assert!(graph.node(one).handle().is_static());
         assert!(!graph.node(one).handle().is_conditioner());
+    }
+
+    /// The four dynamic-tasking handles answer their own predicate and
+    /// nobody else's. Both module forms answer [`Handle::is_module`], which is
+    /// the one predicate that deliberately covers two variants.
+    #[test]
+    fn the_handle_predicates_cover_the_dynamic_tasking_kinds() {
+        let spawner = Handle::Subflow {
+            work: SubflowWork::new(|_| {}),
+            subgraph: Mutex::new(Graph::new()),
+        };
+        let runtime = Handle::Runtime(RuntimeWork::new(|_| {}));
+        let module = Handle::Module(Arc::new(Taskflow::new()));
+        let adopted = Handle::AdoptedModule(Graph::new());
+
+        assert!(spawner.is_subflow());
+        assert!(runtime.is_runtime());
+        assert!(module.is_module());
+        assert!(adopted.is_module());
+
+        for handle in [&spawner, &runtime, &module, &adopted] {
+            // A dynamic task is none of the static kinds, and above all it is
+            // not a conditioner: a dependency on one of these is strong.
+            assert!(!handle.is_placeholder());
+            assert!(!handle.is_static());
+            assert!(!handle.is_conditioner());
+        }
+        assert!(!spawner.is_runtime());
+        assert!(!spawner.is_module());
+        assert!(!runtime.is_subflow());
+        assert!(!runtime.is_module());
+        assert!(!module.is_subflow());
+        assert!(!module.is_runtime());
+        assert!(!Handle::Placeholder.is_subflow());
+        assert!(!Handle::Static(Work::new(|| {})).is_module());
+    }
+
+    /// A node carries each of the four whole, which is what the builders and
+    /// the executor arms rely on: the graph a subflow owns, the taskflow a
+    /// module shares and the graph an adopted module took over all come back
+    /// out of the node unchanged.
+    #[test]
+    fn a_node_carries_each_dynamic_tasking_handle() {
+        let mut target = Taskflow::with_name("target");
+        target.graph_mut().add_node(Handle::Placeholder);
+        let target = Arc::new(target);
+
+        let mut adopted = Graph::new();
+        adopted.add_named_node("inner", Handle::Placeholder);
+
+        let mut graph = Graph::new();
+        let spawner = graph.add_named_node(
+            "spawner",
+            Handle::Subflow {
+                work: SubflowWork::new(|_| {}),
+                subgraph: Mutex::new(Graph::new()),
+            },
+        );
+        let module = graph.add_named_node("module", Handle::Module(Arc::clone(&target)));
+        let owned = graph.add_named_node("owned", Handle::AdoptedModule(adopted));
+
+        let Handle::Subflow { subgraph, .. } = graph.node(spawner).handle() else {
+            panic!("the subflow handle did not survive add_named_node");
+        };
+        // The subgraph is the node's own, reachable through a shared borrow of
+        // the graph -- which is the whole reason it is behind a `Mutex`.
+        subgraph
+            .lock()
+            .expect("uncontended")
+            .add_node(Handle::Placeholder);
+        assert_eq!(subgraph.lock().expect("uncontended").len(), 1);
+
+        let Handle::Module(shared) = graph.node(module).handle() else {
+            panic!("the module handle did not survive add_named_node");
+        };
+        assert!(Arc::ptr_eq(shared, &target));
+        assert_eq!(shared.graph().len(), 1);
+        assert_eq!(Arc::strong_count(&target), 2);
+
+        let Handle::AdoptedModule(owned) = graph.node(owned).handle() else {
+            panic!("the adopted module handle did not survive add_named_node");
+        };
+        assert_eq!(owned.node(Task::new(0)).name(), "inner");
+    }
+
+    /// The two `nstate` bits are upstream's, which means two distinct top
+    /// bits: a value that is both of them is neither of anything else, and
+    /// neither can be confused with the strong-dependency count the port
+    /// keeps in the same word.
+    #[test]
+    fn the_subflow_state_bits_are_upstreams_two_top_bits() {
+        assert_eq!(Node::RETAIN_SUBFLOW, 0x4000_0000);
+        assert_eq!(Node::JOINED_SUBFLOW, 0x8000_0000);
+        assert_eq!(Node::RETAIN_SUBFLOW & Node::JOINED_SUBFLOW, 0);
+        assert_eq!(Node::RETAIN_SUBFLOW.count_ones(), 1);
+        assert_eq!(Node::JOINED_SUBFLOW.count_ones(), 1);
+
+        // And they are bits of a node's own word, writable through a shared
+        // node like every other piece of run state.
+        let (graph, t) = graph_of(1);
+        let node = graph.node(t[0]);
+        node.nstate()
+            .fetch_or(Node::JOINED_SUBFLOW, Ordering::Relaxed);
+        assert_eq!(
+            node.nstate().load(Ordering::Relaxed) & Node::RETAIN_SUBFLOW,
+            0
+        );
+        assert_ne!(
+            node.nstate().load(Ordering::Relaxed) & Node::JOINED_SUBFLOW,
+            0
+        );
     }
 
     #[test]
