@@ -184,8 +184,10 @@ the same split:
 - A **runtime** dependency must replace something upstream hand-wrote *and* be
   better tested than our own port of it would be. Today that admits
   `crossbeam-deque` (the Chase-Lev deque behind `wsq.hpp`) and `crossbeam-utils`
-  (cache-line padding and backoff), and nothing else. Anything optional goes
-  behind a Cargo feature so the default build stays at those two.
+  (cache-line padding and backoff), and nothing else — both are in as of the
+  work-stealing queue layer, and the only other crate in the tree is
+  `crossbeam-epoch`, which `crossbeam-deque` pulls in itself. Anything optional
+  goes behind a Cargo feature so the default build stays at those two.
 - **Dev** dependencies need only be useful: `loom` for the lock-free parts,
   `criterion` for the ported benchmarks, `rayon` as the baseline those
   benchmarks compare against, in the role TBB plays upstream.

@@ -38,11 +38,13 @@
 #![doc(html_root_url = "https://docs.rs/rustflow/0.0.0")]
 
 pub mod dump;
+pub mod executor;
 pub mod flow_builder;
 pub mod graph;
 pub mod task;
 pub mod taskflow;
 
+pub use crate::executor::queue::{Buffers, Thief, WorkerQueue};
 pub use crate::flow_builder::{Callables, FlowBuilder};
 pub use crate::graph::{Graph, Handle, Node, Task, Work};
 pub use crate::task::{TaskMut, TaskRef, TaskType};

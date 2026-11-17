@@ -10,6 +10,13 @@ keywords = ["taskflow", "task-parallel", "dataflow", "concurrency", "dag"]
 categories = ["concurrency"]
 
 [dependencies]
+# The crate's only runtime dependencies, and the ones the README's dependency
+# policy admits: the Chase-Lev deque behind upstream's `wsq.hpp`, and the
+# cache-line padding behind its `alignas(TF_CACHELINE_SIZE)`. Pinned exactly,
+# for the same reason `RUST_VERSION` is pinned in the `Dockerfile`: moving a
+# pin is a deliberate, repo-wide change rather than a side effect of a build.
+crossbeam-deque = "=0.8.8"
+crossbeam-utils = "=0.8.23"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
