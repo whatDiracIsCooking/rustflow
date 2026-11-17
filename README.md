@@ -302,6 +302,35 @@ the same split:
   mutability of its own. The `Subflow` handle holds the guard for the body's
   duration, which cannot deadlock one — a nested subflow locks its own node's
   graph, so no body ever takes the same lock twice.
+- **`Runtime::schedule` is limited to a task of the runtime task's own
+  graph** (issue #51). Upstream's `schedule` takes a `tf::Task`, which is a
+  pointer to a node, and reaches that node's parent and topology through it;
+  a `Task` here is an index into one arena, so the only graph that can resolve
+  one is the graph the scheduling job already holds. That limit is what makes
+  the accounting answerable: the parent to count a scheduled task against is
+  the runtime node's own parent — the run for a top-level task, the enclosing
+  node for a task of a nested graph — which is upstream's
+  `node->_parent ? … : node->_topology` with the choice made by the job rather
+  than by a null check. It is not fully checkable, and the port does not
+  pretend otherwise: an index this graph does not have panics as any stale
+  index does, and an index that happens to be live here schedules *this*
+  graph's node at it. Scheduling a task of a graph that is not running is the
+  caller's error upstream too.
+- **A runtime or subflow handle cannot hand back the executor** (issues #50,
+  #51). Upstream's `tf::Runtime` and `tf::Subflow` hold an `Executor&`, and
+  this port's cannot, because the two are not the same object here: upstream's
+  executor *is* the state its workers share, where an `Executor` here is a
+  handle over an `Arc` of that state plus the pool's join handles, owned by
+  value with no `Arc<Executor>` for a worker to keep a `Weak` of. The handles
+  are built on a worker thread, which holds the shared state and nothing else,
+  so reproducing the member would take a raw back-pointer from that state to
+  the value owning it — and the executor has had no `unsafe` since #40. What
+  upstream's own callers ask `rt.executor()` for is almost always the worker
+  count, which *is* in the shared state, so `Runtime::num_workers` and
+  `Subflow::num_workers` stand in its place; a body that genuinely needs the
+  executor captures an `Arc<Executor>`, as upstream's own
+  `Runtime.ExternalGraph.Simple` captures a reference and as this crate's
+  `corun` doctests already do.
 
 ### Order of work
 
