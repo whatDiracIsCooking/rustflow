@@ -194,15 +194,6 @@ impl AsyncNode {
     /// tests `ESTATE::FINISHED` and either pushes onto `_edges` or counts the
     /// dependency as already met. The two branches have to be one atomic
     /// step, and the module docs say what a lost race would cost.
-    // Nothing in the library names a dependency yet: #91's
-    // `silent_dependent_async` is the call that will. `expect` rather than
-    // `allow`, and `not(test)` rather than unconditional, so that the
-    // attribute cannot outlive the gap -- the build fails the moment the item
-    // is used, in the test build today and in #91's library code tomorrow.
-    // The one on `finish` below and the one on `AsyncTask::new` are the same
-    // statement about the same gap, which #88 retired for the two items it
-    // supplied a caller for.
-    #[cfg_attr(not(test), expect(dead_code, reason = "naming a dependency is #91"))]
     pub(crate) fn push_successor(&self, job: Job) -> bool {
         let mut successors = self.lock_successors();
         if self.is_finished() {
@@ -231,10 +222,6 @@ impl AsyncNode {
     // tear-down landed without calling this: upstream sets `ESTATE::FINISHED`
     // in `_tear_down_dependent_async` only, since a `Handle::Async` node has
     // no handle through which anybody could ask whether it is done.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the dependent-async tear-down is #91")
-    )]
     pub(crate) fn finish(&self) -> Vec<Job> {
         let mut successors = self.lock_successors();
         self.finished.store(true, Ordering::Release);

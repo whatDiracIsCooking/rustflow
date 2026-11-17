@@ -58,14 +58,25 @@ impl AsyncTask {
     /// submission that created the task, because a handle on a node nobody
     /// submitted would be a task that is never going to finish and whose
     /// [`AsyncTask::is_done`] would never become `true`.
-    // Nothing mints a handle yet; `executor::async_node` says what the
-    // attribute is and why it is `expect` under `not(test)`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the call that mints one is #91")
-    )]
     pub(crate) fn new(node: Arc<AsyncNode>) -> Self {
         Self(Some(node))
+    }
+
+    /// The free-standing node this handle shares, `None` for an empty
+    /// handle.
+    ///
+    /// Crate-private for the reason [`AsyncTask::new`] is: upstream reaches
+    /// `task._node` from `_process_dependent_async` through its `friend class
+    /// Executor` and exposes nothing of the kind to a caller. This is that
+    /// access and has that one caller -- `executor::dependent_async`, which
+    /// pushes the job of a new task onto the successor list of every
+    /// dependency named -- and `None` is upstream's `task.empty()` branch,
+    /// the dependency it counts off instead of waiting for.
+    ///
+    /// The share rather than a borrow of the node, because what the caller
+    /// does with it is build a [`Job`](crate::executor) that keeps it alive.
+    pub(crate) fn node(&self) -> Option<&Arc<AsyncNode>> {
+        self.0.as_ref()
     }
 
     /// Whether this handle is associated with no task at all: upstream's
