@@ -79,6 +79,15 @@
 //! makes the parent question answerable: a sibling's parent is this node's
 //! own parent, which the job in hand already holds. See the method's own
 //! docs, and the README's design decisions.
+//!
+//! What `schedule` bypasses is the target's dependency *count*, not its
+//! edges: a strong predecessor of a scheduled task still releases it when it
+//! finishes, onto the zero `schedule` stored. Upstream's release arm wraps
+//! that zero to `SIZE_MAX`, which is a counter no corun predicate and no
+//! resume ever matches again; this port floors the decrement at zero
+//! instead, the one departure its successor arm makes from upstream's bare
+//! `fetch_sub`. That is issue #98, and [`Runtime::schedule`] works through
+//! what the floor fixes and what stays the caller's precondition.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
@@ -258,6 +267,34 @@ impl Runtime<'_> {
     /// port's answer to, and that scheduling a *runtime* task is "currently
     /// not supported", which this port does not diagnose either.
     ///
+    /// # A bypassed dependency is still an edge
+    ///
+    /// Zeroing the target's join counter bypasses what it owes; it does not
+    /// remove the edges that made it owe anything. A strong predecessor of
+    /// the target that has yet to run therefore still releases it when it
+    /// finishes, and that release lands on the zero stored here. Issue #98
+    /// is what used to happen then: upstream's release arm is a bare
+    /// `fetch_sub` on a `size_t`, so the counter wrapped to `SIZE_MAX`, and
+    /// a counter past zero never again equals the one
+    /// [`Runtime::try_corun`] waits for nor the zero a preempted node is
+    /// resumed on -- a silent wrap one `schedule` and one `precede` away
+    /// from a hang. This port floors that decrement at zero instead, so the
+    /// zero stored here is the zero the target is dequeued with, and the
+    /// departure is noted where the floor is.
+    ///
+    /// What the floor does not and cannot do is make the *order* harmless.
+    /// If the target has already run and re-armed its counter to its strong
+    /// dependency count by the time that predecessor releases it, the
+    /// release is an ordinary one and the target runs again -- a second run
+    /// for a plain task, and for a task that preempts itself (a runtime,
+    /// module or subflow task) a reference taken from under an invocation
+    /// that was counting on it. Upstream neither diagnoses that nor
+    /// survives it, and its own answer is the rule its `ConditionalTasking`
+    /// page states for the other bypass: **schedule a task the graph cannot
+    /// otherwise reach.** Upstream's example gates the target's one strong
+    /// predecessor behind a condition that is never taken, and this crate's
+    /// `Runtime.Schedule.ModuleTask` port is built the same way.
+    ///
     /// # Panics
     ///
     /// Panics if `task` is not a live task of this runtime task's own graph
@@ -270,8 +307,12 @@ impl Runtime<'_> {
         // task, the task must have zero dependency (join counter is 0) or we
         // can encounter bug when inserting a nested flow (e.g., module
         // task)". A stored zero rather than an arithmetic one, for the reason
-        // a conditioner's selected successor gets one -- nothing is going to
-        // decrement this counter to the zero that means ready.
+        // a conditioner's selected successor gets one: the count the target
+        // is carrying is exactly what this call means to bypass, so there is
+        // no arithmetic that would arrive at zero. What may still decrement
+        // the zero afterwards is a strong predecessor of the target, which
+        // the docs above work through -- it is issue #98, and the release arm
+        // is where the answer to it lives.
         let target = self.job.graph().node(task);
         target.join_counter().store(0, Ordering::Relaxed);
 
@@ -299,6 +340,18 @@ impl Runtime<'_> {
     /// back to one, that one being this body's own reference -- so a body
     /// that has spawned nothing returns immediately, which in this milestone
     /// is every body there is.
+    ///
+    /// Being an *equality* rather than a `<=`, the predicate is only as good
+    /// as the guarantee that nothing drives the counter below the reference
+    /// the first entry added. Two things make that guarantee, and together
+    /// they are issue #98: the successor arm of `WorkerThread::invoke_one`
+    /// floors its decrement at zero, so a node whose counter was zeroed by
+    /// [`Runtime::schedule`] or by a conditioner still enters its body at
+    /// exactly one rather than at `usize::MAX + 1`; and the one remaining
+    /// way to lose the reference -- a strong predecessor releasing this node
+    /// after it had re-armed, while this body runs -- is the precondition
+    /// [`Runtime::schedule`] documents, since a runtime task the graph
+    /// cannot otherwise reach has no such predecessor.
     ///
     /// The node is explicitly anchored for the length of the wait, which is
     /// what makes a failure under it *this frame's*: the panic walk in
@@ -705,10 +758,12 @@ mod tests {
     /// scheduler: `other` has a strong dependency on `gate`, and the body
     /// schedules it anyway, which is the dependency bypass the method is for.
     ///
-    /// The zeroed counter is the one thing this case no longer reads for
-    /// itself, because since #62 `gate` has already run by the time the case
-    /// looks: the comment at the drop site has why, and issue #98 has the
-    /// wrap that makes the value unreadable.
+    /// The zeroed counter is read here too, and since #62 it is read *after*
+    /// `gate` has run -- the released successor is this worker's
+    /// continuation, so the release of `other` that bypasses nothing has
+    /// already happened by the time the case looks. Zero is what it finds,
+    /// because that release is floored rather than wrapped; issue #98 has
+    /// why that floor is in the successor arm at all.
     #[test]
     fn a_scheduled_sibling_is_queued_here_and_counted_against_the_parent() {
         let order = Arc::new(AtomicUsize::new(0));
@@ -742,10 +797,15 @@ mod tests {
 
         worker.invoke(source_job(&taskflow, &topology));
 
-        // `other`'s own join counter is not read here any more. Since #62 the
-        // released successor `gate` runs as this worker's continuation, and
-        // `gate` then decrements the counter `schedule` had zeroed, which
-        // wraps it: that wrap is issue #98's and is not this case's subject.
+        let other_node = taskflow.graph().node(other);
+        assert_eq!(
+            other_node.join_counter().load(Ordering::Relaxed),
+            0,
+            "the scheduled sibling is queued with the zero `schedule` stored, \
+             and `gate` -- which has already run here as the continuation, \
+             and which `other` has a strong dependency on -- decremented \
+             that zero without taking it below zero"
+        );
         assert_eq!(
             order.load(Ordering::Relaxed),
             1,
@@ -764,10 +824,102 @@ mod tests {
 
         assert_eq!(drained, 1, "the scheduled sibling, and nothing else");
         assert_eq!(order.load(Ordering::Relaxed), 2, "both bodies ran");
+        assert_eq!(
+            other_node.join_counter().load(Ordering::Relaxed),
+            1,
+            "and its own arm re-armed it to its one strong dependency, which \
+             it could not have reached from a wrapped counter"
+        );
         assert!(
             finished.load(Ordering::Relaxed),
             "the run finished exactly when its last job did, so the \
              scheduled job was counted against the parent"
+        );
+    }
+
+    /// Issue #98's hazard, reached the way a caller reaches it and closed:
+    /// `schedule` zeroes its target's join counter, a strong predecessor of
+    /// that target decrements it anyway, and the target is a *runtime* task
+    /// whose body coruns.
+    ///
+    /// The decrement of a counter already at zero is floored in
+    /// `WorkerThread::invoke_one`'s successor arm rather than left to wrap,
+    /// so the scheduled node is dequeued holding the zero `schedule` stored
+    /// and its own first entry raises that to the one reference
+    /// [`Runtime::try_corun`]'s predicate waits for. Before the floor the
+    /// counter was `usize::MAX`, the entry's `fetch_add(1)` carried it to
+    /// zero rather than to one, and the corun below never terminated -- a
+    /// hang reachable from `emplace_runtime`, `precede` and `schedule`
+    /// alone.
+    ///
+    /// Two things keep that hang out of this suite if the floor ever goes
+    /// away. The jobs are driven by hand, one at a time, so the order the
+    /// counter is touched in is fixed rather than raced for -- a real
+    /// `Executor::run` of this graph reaches the same state at one worker,
+    /// but a regression there would wedge the run instead of failing it. And
+    /// the body coruns only if its counter is the one a corun can wait for,
+    /// which turns a regression into the failed assertion below.
+    #[test]
+    fn a_scheduled_runtime_task_released_by_its_predecessor_can_still_corun() {
+        let seen = Arc::new(AtomicUsize::new(usize::MAX));
+        let coruned = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let mut taskflow = Taskflow::new();
+
+        let other = {
+            let seen = Arc::clone(&seen);
+            let coruned = Arc::clone(&coruned);
+            taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
+                let counter = runtime.node.join_counter().load(Ordering::Relaxed);
+                seen.store(counter, Ordering::Relaxed);
+                if counter == 1 {
+                    runtime.try_corun().expect("nothing was spawned to fail");
+                    coruned.store(true, Ordering::Relaxed);
+                }
+            })
+        };
+        let gate = taskflow.emplace(|| {});
+        let rt = taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
+            runtime.schedule(other);
+        });
+        taskflow.task(rt).precede([gate]);
+        taskflow.task(gate).precede([other]);
+
+        let executor = Executor::new(1);
+        let mut worker = test_worker(&executor);
+        let topology = run_of(&taskflow, {
+            let finished = Arc::clone(&finished);
+            move || finished.store(true, Ordering::Relaxed)
+        });
+
+        worker.invoke(source_job(&taskflow, &topology));
+
+        let other_node = taskflow.graph().node(other);
+        assert_eq!(
+            other_node.join_counter().load(Ordering::Relaxed),
+            0,
+            "`gate` released a counter that `schedule` had already zeroed, \
+             and the release left it at zero rather than at `usize::MAX`"
+        );
+
+        let job = worker.pop().expect("the scheduled runtime task is queued");
+        worker.invoke(job);
+
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            1,
+            "the body's own reference is the whole of the counter, which is \
+             what the corun predicate waits for"
+        );
+        assert!(coruned.load(Ordering::Relaxed), "and the corun returned");
+        assert!(
+            worker.pop().is_none(),
+            "the runtime task has no successors, so nothing was left queued"
+        );
+        assert!(
+            finished.load(Ordering::Relaxed),
+            "the node finished like a static task, so the run's accounting \
+             balanced"
         );
     }
 }
