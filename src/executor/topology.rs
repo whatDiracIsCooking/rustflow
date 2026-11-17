@@ -1,60 +1,80 @@
 //! Translated from `Topology` in `taskflow/core/graph.hpp` and `_set_up_graph`
 //! in `taskflow/core/executor.hpp` (Taskflow v4.1.0).
 //!
-//! A [`Topology`] is one run of one [`Taskflow`]: the counter that says how
-//! much of the graph is still outstanding, the policy that decides whether to
-//! run the graph again, and the slot a `wait` blocks on. Upstream keeps it in a
-//! `std::shared_ptr` that both the `tf::Future` and every queued `Node*` hold a
-//! share of; here it is an `Arc` shared by exactly two owners -- the
-//! [`RunHandle`](crate::RunHandle) the run was handed back as, and the
-//! taskflow's queue of pending runs -- and the handle's borrow is what keeps
-//! the *taskflow* alive, which is the whole reason `run` hands back a handle
-//! with a lifetime instead of a detachable future.
+//! A [`Topology`] is one run of one [`Taskflow`](crate::Taskflow): the counter
+//! that says how much of the graph is still outstanding, the policy that
+//! decides whether to run the graph again, and the slot a `wait` blocks on. A
+//! [`Job`] is one queued task of one such run -- upstream's `Node*`, plus
+//! what upstream reaches through the node's `_topology` pointer.
 //!
-//! # The one `unsafe` boundary in the executor
+//! # Why a job owns what it names
 //!
-//! A worker queue is `WorkerQueue<Job>` -- one type, built when the executor
-//! is, with no lifetime to spare -- while the thing a job points at lives for
-//! exactly one run. Erasing that lifetime is what [`Job`] is for, and it is
-//! the only place in the crate where a reference is reconstructed from a raw
-//! pointer. The argument that makes it sound is one sentence long, which is
-//! why this is the boundary worth having: a job referencing a run exists only
-//! between [`Topology::set_up`] and [`Topology::finish`], and `finish` -- the
-//! release of the thread that owns the topology and the taskflow's borrow --
-//! is the *last* thing the worker that ends the run does.
+//! Upstream's links between the three are all non-owning. A queued `Node`
+//! holds a raw `Topology*`, a `Topology` holds a `Taskflow&`, and the only
+//! `shared_ptr<Topology>` in the program sits in the taskflow's own run
+//! queue -- `tf::Future` holds a `weak_ptr` and keeps nothing alive at all.
+//! What makes that sound upstream is a rule in its documentation: do not
+//! destroy or modify a taskflow while it is running.
 //!
-//! The join counter reaching zero is not the end of that window, because a
-//! `run_n` or `run_until` topology may send its graph round again: a worker
-//! that drives the counter to zero either re-arms the graph and queues its
-//! sources afresh, in which case the run is still in flight, or ends the run
-//! -- and `finish` is the last statement of that path, after the callback,
-//! after the taskflow's next queued run has been started, and after the
-//! executor's own bookkeeping.
+//! A port cannot rest on a rule the caller can break, because breaking this
+//! one would be *safe* Rust causing a use-after-free. So both links are
+//! owning here, and that is the whole of the argument:
 //!
-//! The topology is heap-allocated before the first job that names it is
-//! built, and the `Arc` that allocates it is held by the run handle for as
-//! long as the handle lives. Nothing can take it away while a job is queued:
-//! `run` has no fallible step between scheduling and returning, and the
-//! handle blocks when it is dropped. The taskflow's run queue holds a second
-//! share, dropped by the tear-down that pops the finished run -- which is
-//! strictly before [`Topology::finish`], so a share is outstanding throughout.
+//! - a [`Job`] holds an `Arc<Topology>`, so the run it belongs to outlives
+//!   it;
+//! - a [`Job`] holds an `Arc<Flow>` -- the taskflow's storage, which is the
+//!   graph it walks and the queue of runs of that graph -- so the nodes it
+//!   addresses outlive it too;
+//! - a [`Topology`] holds a share of that same storage for the length of the
+//!   run, which is what the thread that ends a run tears it down through.
 //!
-//! Two things keep that boundary as small as it is. A job addresses its node
-//! by [`Task`] index rather than by pointer, so the node comes out of the
-//! graph through safe code; and the pointer to the taskflow lives in the job
-//! rather than in the topology, so [`Topology`] itself is an ordinary `Send +
-//! Sync` value with no raw pointer in it.
+//! Nothing here reconstructs a reference from a raw pointer, and no part of
+//! this module is `unsafe`. The lifetime on [`RunHandle`](crate::RunHandle)
+//! is still what makes "do not mutate a running taskflow" a compile error;
+//! what the shares add is what happens to a caller who gets *past* that
+//! lifetime by leaking the handle. [`std::mem::forget`] on one ends the
+//! borrow with the run still in flight, and the consequence is now a leak
+//! rather than a dangling pointer: the run finishes, the storage is freed
+//! when the last share of it goes, and an edit of the taskflow in the
+//! meantime panics in [`Taskflow::graph_mut`](crate::Taskflow::graph_mut)
+//! rather than racing the workers walking the graph. Issue #40 is where that
+//! argument was wrong; `run_handle` has the rest of it.
+//!
+//! # The order the shares are released in
+//!
+//! One thing is load-bearing beyond mere liveness, and it is why the shares
+//! are released where they are rather than wherever they fall out of scope.
+//! `Arc::get_mut` is what `Taskflow::graph_mut` rests on, so a share
+//! outstanding one instant too long would turn an ordinary edit of a taskflow
+//! whose run has finished into a panic. Two rules stop that, and the compiler
+//! enforces both rather than a comment, because each releases its share by
+//! *consuming* the value that holds it:
+//!
+//! - a job releases its share of the storage before it decrements the join
+//!   counter that may end the run -- [`Job::into_run`];
+//! - the tear-down releases the run's own share before [`Topology::finish`]
+//!   releases the waiting thread -- [`Topology::release_flow`].
+//!
+//! So by the time a `wait` returns, the taskflow's own share is the only one
+//! left and the graph can be edited again at once. That is also why
+//! `Topology::finish` is still the last thing the worker that ends a run does:
+//! what a touch after it would cost is no longer a use-after-free, but it is
+//! still a panic in somebody's `emplace`.
+//!
+//! A job addresses its node by [`Task`] index rather than by pointer, which is
+//! what keeps the node itself out of the question: it comes out of the graph
+//! through safe code, and a graph nobody can edit while a job names it cannot
+//! invalidate an index either.
 
 use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
-use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Poll, Waker};
 
 use crate::graph::{Node, Task};
 use crate::task::TaskRef;
-use crate::taskflow::Taskflow;
+use crate::taskflow::Flow;
 
 /// One unit of work in a worker's queue: upstream's `Node*`, plus what
 /// upstream reaches through the node's `_topology` and `_parent` pointers.
@@ -62,72 +82,132 @@ use crate::taskflow::Taskflow;
 /// Upstream's queues hold a bare `Node*` because a `Node` knows its own
 /// topology; a node here is a slot in an arena that knows nothing about the
 /// run it is taking part in, so the job carries the run instead. The three
-/// fields are the thin pair that costs: a [`Task`] index, and one pointer
-/// each to the taskflow and to the run.
-///
-/// See the module docs for why the pointers are raw and what keeps them
-/// valid.
-#[derive(Debug, Hash)]
+/// fields are a [`Task`] index and one share each of the run and of the
+/// taskflow's storage -- two atomic increments per queued task, which is what
+/// the module docs' argument costs and what buys a queue of jobs that cannot
+/// dangle.
 pub(crate) struct Job {
-    /// Which task of the taskflow's graph to run.
+    /// Which task of the graph to run.
     task: Task,
-    /// The taskflow being run, whose graph `task` indexes.
-    taskflow: NonNull<Taskflow>,
+    /// The storage whose graph `task` indexes.
+    ///
+    /// Held by the job as well as by the topology so that the scheduling path
+    /// reaches the graph without taking a lock: the run's own share has to be
+    /// *takeable* -- see [`Topology::release_flow`] -- and therefore lives
+    /// behind a mutex, which is no place for a hot path to go.
+    flow: Arc<Flow>,
     /// The run `task` is part of.
-    topology: NonNull<Topology>,
+    topology: Arc<Topology>,
 }
 
-// SAFETY: a `Job` is created on the thread that schedules a task and
-// dereferenced on whichever worker dequeues it, so sending it across threads
-// amounts to sharing the three values it addresses. All three are `Sync` --
-// asserted below, rather than assumed -- and none of them is mutated through
-// anything but an atomic or a lock while the run is in flight: the graph is
-// borrowed immutably for the whole run, and the topology's own fields are an
-// `AtomicUsize` and a `Mutex`. What keeps the *targets* alive is the run
-// handle, as the module docs set out.
-unsafe impl Send for Job {}
-
 impl Job {
-    /// Builds the job that runs `task` of `taskflow` as part of `topology`.
-    ///
-    /// Safe: it only takes addresses. Turning them back into references is
-    /// [`Job::parts`], and that is where the obligation sits.
-    pub(crate) fn new(task: Task, taskflow: &Taskflow, topology: &Topology) -> Self {
+    /// Builds the job that runs `task` of `flow`'s graph as part of
+    /// `topology`.
+    fn new(task: Task, flow: &Arc<Flow>, topology: &Arc<Topology>) -> Self {
         Self {
             task,
-            taskflow: NonNull::from(taskflow),
-            topology: NonNull::from(topology),
+            flow: Arc::clone(flow),
+            topology: Arc::clone(topology),
         }
     }
 
-    /// Resolves this job into the node to run, the taskflow it belongs to and
-    /// the run it is part of.
+    /// The jobs that start a run: one per source task of `flow`'s graph.
     ///
-    /// # Safety
+    /// Call it only on a topology [`Topology::set_up`] has just returned a
+    /// non-zero count for, since that count is what the run's join counter was
+    /// set to.
     ///
-    /// The run this job belongs to must still be in flight: the
-    /// [`RunHandle`](crate::RunHandle) that owns the topology must not have
-    /// been dropped, which also means the taskflow is still borrowed -- or
-    /// owned -- by it. That holds for every job from the moment
-    /// [`Topology::set_up`] counts it until [`Topology::finish`] releases the
-    /// handle, and a job exists only inside that window -- see the module
-    /// docs.
+    /// An associated function rather than a method on [`Topology`] because
+    /// what it needs is the topology's *share*, and `self: &Arc<Self>` is not
+    /// a receiver Rust has.
+    pub(crate) fn sources<'a>(
+        flow: &'a Arc<Flow>,
+        topology: &'a Arc<Topology>,
+    ) -> impl Iterator<Item = Self> + 'a {
+        flow.graph()
+            .iter()
+            .filter(|(_, node)| node.num_predecessors() == 0)
+            .map(move |(task, _)| Self::new(task, flow, topology))
+    }
+
+    /// Resolves this job into the node to run, the storage holding it and the
+    /// run it is part of.
+    ///
+    /// Safe, and that is the point of the type: the job owns a share of both
+    /// of the last two, so neither can have gone away, and the first comes out
+    /// of the graph by index through ordinary safe code.
     ///
     /// # Panics
     ///
-    /// Panics if the job's task is not a live node of the taskflow's graph,
-    /// which cannot happen for a job built by the scheduler: a run borrows the
-    /// graph immutably, so no node can be erased while a job names it.
-    pub(crate) unsafe fn parts<'j>(&self) -> (&'j Node, &'j Taskflow, &'j Topology) {
-        // SAFETY: the caller promises the run is still in flight, which is
-        // exactly the promise that both targets are still alive: the topology
-        // is the `Arc` that a run method allocates and its `RunHandle` then
-        // holds a share of, and the taskflow is what that handle borrows -- or
-        // owns, for a run handed a taskflow by value. Neither target is ever
-        // moved: both are allocated before the first job is built, and only
-        // the `Arc` and the `Box`, not their contents, are ever moved.
-        let (taskflow, topology) = unsafe { (self.taskflow.as_ref(), self.topology.as_ref()) };
-        (taskflow.graph().node(self.task), taskflow, topology)
+    /// Panics if the job's task is not a live node of the graph, which cannot
+    /// happen for a job built by the scheduler: a node can only be erased
+    /// through `&mut Taskflow`, and `Taskflow::graph_mut` refuses while a
+    /// share of the storage -- this job's own, for one -- is outstanding.
+    pub(crate) fn parts(&self) -> (&Node, &Flow, &Topology) {
+        (
+            self.flow.graph().node(self.task),
+            &self.flow,
+            &self.topology,
+        )
+    }
+
+    /// The job that runs `task` as part of the same run of the same graph.
+    ///
+    /// What a worker releasing a successor queues, and the only other way a
+    /// job is ever made: a job's successors are jobs of its own run, so the
+    /// two shares are cloned from the ones already in hand rather than looked
+    /// up again.
+    pub(crate) fn successor(&self, task: Task) -> Self {
+        Self::new(task, &self.flow, &self.topology)
+    }
+
+    /// Spends this job, handing back the run it was part of.
+    ///
+    /// The job's share of the taskflow's storage is released here, and *here*
+    /// is the point: the caller's next move is to decrement the join counter
+    /// that may end the run, and a share still outstanding when the waiting
+    /// thread is released would be a share outstanding when that thread edits
+    /// its taskflow. Consuming the job is what makes the compiler enforce it
+    /// -- the node and the graph a worker was holding are borrows of this
+    /// value, so nothing can touch them afterwards. See the module docs.
+    pub(crate) fn into_run(self) -> Arc<Topology> {
+        let Self {
+            task: _,
+            flow,
+            topology,
+        } = self;
+
+        // Before the caller's `job_finished`, which is the whole reason this
+        // method exists rather than letting the job fall out of scope.
+        drop(flow);
+        topology
+    }
+}
+
+impl core::fmt::Debug for Job {
+    /// Hand-written because the derived one would print the whole graph: a
+    /// job's share of the storage is an owning handle, not a field worth
+    /// expanding. The two addresses are what identifies a job, as upstream's
+    /// `Node*` identifies its own.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Job")
+            .field("task", &self.task)
+            .field("flow", &Arc::as_ptr(&self.flow))
+            .field("topology", &Arc::as_ptr(&self.topology))
+            .finish()
+    }
+}
+
+impl std::hash::Hash for Job {
+    /// Hand-written for the same reason [`Debug`](core::fmt::Debug) is, and it
+    /// has one caller: `Buffers::push` routes a job to one of the shared
+    /// overflow buffers by its hash, where upstream hashes the `Node*` it is
+    /// about to push. The two allocation addresses stand in for that pointer,
+    /// and the task index is what separates two jobs of one run.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.task.hash(state);
+        Arc::as_ptr(&self.flow).hash(state);
+        Arc::as_ptr(&self.topology).hash(state);
     }
 }
 
@@ -142,11 +222,14 @@ impl Job {
 /// the taskflow it borrows, and a token that a `'static` task body can capture
 /// cannot carry either.
 ///
-/// A separate allocation rather than a `Weak<Topology>`, for two reasons. The
-/// module docs above rest on the topology having exactly two owners -- the run
-/// handle and the taskflow's run queue -- and a token that could upgrade to an
-/// `Arc<Topology>` would be a third; and it would hand a caller `join`,
-/// `finish` and the run policy along with the one bit it asked for.
+/// A separate allocation rather than a `Weak<Topology>`, for two reasons. A
+/// token that could upgrade to an `Arc<Topology>` would hold a share of the
+/// run for the length of the call, and a run holds a share of the taskflow's
+/// storage -- so a stray `cancel` would briefly keep the graph of a run that
+/// has already finished alive, which is exactly the thing
+/// `Taskflow::graph_mut` refuses, and an edit racing that call would panic.
+/// And it would hand a caller `join`, `finish` and the run policy along with
+/// the one bit it asked for.
 ///
 /// The estate word carries three of upstream's `ESTATE` bits, at upstream's
 /// values: `CANCELLED`, which [`Cancellable::cancel`] sets, and the
@@ -164,9 +247,9 @@ pub(crate) struct Cancellable {
     /// Upstream needs no equivalent: its token's `weak_ptr` is dead once the
     /// tear-down has popped the topology off the taskflow's queue, so the
     /// allocation going away *is* its answer to "has this run finished". Here
-    /// a run's topology is owned by a handle that outlives the run -- a caller
-    /// may hold it long after `wait` returned -- so the allocation is still
-    /// there and the question needs its own answer. [`Topology::finish`]
+    /// a run's topology is shared with a handle that outlives the run -- a
+    /// caller may hold it long after `wait` returned -- so the allocation is
+    /// still there and the question needs its own answer. [`Topology::finish`]
     /// writes this before it releases a waiter, so a `cancel` after a `wait`
     /// always reports `false`.
     finished: AtomicBool,
@@ -261,6 +344,24 @@ pub(crate) struct Topology {
     /// topology; the extra allocation is what lets a token outlive the run
     /// handle's borrow. See [`Cancellable`].
     estate: Arc<Cancellable>,
+    /// This run's share of the taskflow's storage, until the tear-down takes
+    /// it back out.
+    ///
+    /// Upstream's `Topology::_taskflow`, which is a `Taskflow&` -- a reference
+    /// that the taskflow outliving its runs is what keeps valid. A share
+    /// instead, because this port makes no such assumption about the caller,
+    /// and an `Option` behind a lock because the share has to be released at a
+    /// particular moment rather than whenever the topology happens to be
+    /// dropped: see [`Topology::release_flow`] and the module docs.
+    ///
+    /// `None` means there is no graph to run, which is a run that was over
+    /// before it was handed out -- [`Topology::nothing_to_run`]. Those are
+    /// never set up, never queued and never torn down, so nothing ever asks
+    /// them for a graph.
+    ///
+    /// The lock is never held while either of the other two is, and never
+    /// across anything but a clone or a drop of the share.
+    flow: Mutex<Option<Arc<Flow>>>,
 }
 
 /// Upstream's `Topology::_predicate` and `_on_finish`, which is what makes a
@@ -308,14 +409,43 @@ struct Completion {
 }
 
 impl Topology {
-    /// A run that has not started, over the policy `run_until` was given:
-    /// `predicate` decides after each run whether to run the graph again, and
-    /// `on_finish` is called once the answer is no.
+    /// A run of `flow`'s graph that has not started, over the policy
+    /// `run_until` was given: `predicate` decides after each run whether to
+    /// run the graph again, and `on_finish` is called once the answer is no.
     ///
-    /// Upstream's `Topology(Taskflow&, P&&, C&&)`, minus the taskflow: a
-    /// topology here deliberately holds no reference to the graph it runs, so
-    /// the taskflow is a parameter of every method that needs it.
-    pub(crate) fn new<P, C>(predicate: P, on_finish: C) -> Self
+    /// Upstream's `Topology(Taskflow&, P&&, C&&)`, whose `Taskflow&` this
+    /// share of the taskflow's storage is: upstream can hold a reference
+    /// because its rule says the taskflow outlives its runs, and this port
+    /// holds a share because it does not take the caller's word for that. The
+    /// methods that walk the graph still take it as a parameter all the same,
+    /// since every caller of them has it in hand already; what this share is
+    /// for is the tear-down, which is reached from a job that has given its
+    /// own share up. See the module docs.
+    pub(crate) fn new<P, C>(predicate: P, on_finish: C, flow: Arc<Flow>) -> Self
+    where
+        P: FnMut() -> bool + Send + 'static,
+        C: FnOnce() + Send + 'static,
+    {
+        Self::over(predicate, on_finish, Some(flow))
+    }
+
+    /// A run that is over before it begins and has no graph at all: what
+    /// [`RunHandle::finished`](crate::RunHandle) is built on.
+    ///
+    /// Upstream hands back a ready `std::future` from a promise it fulfils on
+    /// the spot and keeps no topology for it at all. There is one here so that
+    /// every handle has the same shape, and it is finished before it is handed
+    /// out: nothing can ask it to run again, so its policy is never consulted,
+    /// and it holds no share of any taskflow, so a caller who leaks such a
+    /// handle leaks nothing but the topology itself.
+    pub(crate) fn nothing_to_run() -> Self {
+        let topology = Self::over(|| true, || {}, None);
+        topology.finish();
+        topology
+    }
+
+    /// The one constructor, over a run that may or may not have a graph.
+    fn over<P, C>(predicate: P, on_finish: C, flow: Option<Arc<Flow>>) -> Self
     where
         P: FnMut() -> bool + Send + 'static,
         C: FnOnce() + Send + 'static,
@@ -333,7 +463,40 @@ impl Topology {
             }),
             finished: Condvar::new(),
             estate: Arc::new(Cancellable::new()),
+            flow: Mutex::new(flow),
         }
+    }
+
+    /// This run's share of the taskflow's storage, or `None` once the
+    /// tear-down has released it.
+    ///
+    /// The tear-down is the only caller, and the share it hands back is what
+    /// it reaches the graph and the run queue through -- the job that got it
+    /// there having released its own, for the reason [`Job::into_run`] gives.
+    pub(crate) fn flow(&self) -> Option<Arc<Flow>> {
+        self.lock_flow().clone()
+    }
+
+    /// Releases this run's share of the taskflow's storage.
+    ///
+    /// Called by the tear-down of the *final* run of a graph, immediately
+    /// before [`Topology::finish`] and after the last thing that needed the
+    /// graph. That order is what leaves the taskflow's own share the only one
+    /// outstanding when the waiting thread wakes, so that a caller whose
+    /// `wait` has returned can edit the taskflow again at once. See the module
+    /// docs.
+    ///
+    /// Idempotent, because a run that went round again releases nothing and a
+    /// run that is over has nothing left to release.
+    pub(crate) fn release_flow(&self) {
+        drop(self.lock_flow().take());
+    }
+
+    /// The share slot. Poisoning is taken rather than propagated, as the rest
+    /// of this type's locks are: the slot holds one `Option` and nothing under
+    /// the lock can panic.
+    fn lock_flow(&self) -> MutexGuard<'_, Option<Arc<Flow>>> {
+        self.flow.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Whether this run has been cancelled: upstream's `Topology::cancelled`.
@@ -356,7 +519,7 @@ impl Topology {
         &self.estate
     }
 
-    /// Prepares every node of `taskflow` for a run of this topology and
+    /// Prepares every node of `flow`'s graph for a run of this topology and
     /// returns how many of them are source tasks.
     ///
     /// Upstream's `_set_up_graph` plus the `_join_counter.store` that
@@ -364,16 +527,20 @@ impl Topology {
     /// the sources: upstream swaps them to the front of its node vector and
     /// then bulk-schedules that prefix, which an arena cannot do -- a shuffle
     /// would re-point every live [`Task`] at another node. So the sources are
-    /// found twice instead, here and in [`Topology::sources`], which costs a
-    /// second walk over the graph and saves the allocation that collecting
-    /// them would need.
+    /// found twice instead, here and in [`Job::sources`], which costs a second
+    /// walk over the graph and saves the allocation that collecting them would
+    /// need.
+    ///
+    /// The graph is a parameter rather than this run's own share of it because
+    /// every caller has one in hand: the `run` family from the taskflow it was
+    /// handed, the tear-down from the share it took out of the topology.
     ///
     /// # Panics
     ///
     /// Panics if some task has 2^32 or more strong dependencies, which needs
     /// more duplicate edges than a [`Task`] index can address nodes.
-    pub(crate) fn set_up(&self, taskflow: &Taskflow) -> usize {
-        let graph = taskflow.graph();
+    pub(crate) fn set_up(&self, flow: &Flow) -> usize {
+        let graph = flow.graph();
         let mut num_sources = 0;
 
         for (task, node) in graph.iter() {
@@ -405,19 +572,6 @@ impl Topology {
         // has returned.
         self.join_counter.store(num_sources, Ordering::Relaxed);
         num_sources
-    }
-
-    /// The jobs that start a run: one per source task of `taskflow`.
-    ///
-    /// Call it only on a topology [`Topology::set_up`] has just returned a
-    /// non-zero count for, since the count is what the join counter was set
-    /// to.
-    pub(crate) fn sources<'t>(&'t self, taskflow: &'t Taskflow) -> impl Iterator<Item = Job> + 't {
-        taskflow
-            .graph()
-            .iter()
-            .filter(|(_, node)| node.num_predecessors() == 0)
-            .map(move |(task, _)| Job::new(task, taskflow, self))
     }
 
     /// Accounts for one more node of this run becoming ready, before it is
@@ -554,15 +708,23 @@ impl Topology {
     /// Marks this run finished and releases whoever is waiting for it.
     /// Upstream's `_carry_out_promise`.
     ///
-    /// **This is the last thing the caller may do with the topology.** The
-    /// thread it releases owns the topology and frees it on the way out, and
-    /// it owns the taskflow's borrow, so every node of the graph goes out of
-    /// reach at the same moment. The notification is therefore sent *under*
-    /// the lock, not after it: a waiter cannot return from
-    /// [`Condvar::wait`](std::sync::Condvar::wait) until it has the mutex
-    /// back, so holding it until the notify is sent makes the unlock this
-    /// thread's last touch of the topology -- and an unlock a waiter has not
-    /// yet observed cannot be a use-after-free.
+    /// **This is the last thing the caller may do with the run or with the
+    /// graph.** The thread it releases is the one that can edit the taskflow
+    /// again the moment it wakes, so a touch of the graph after this point
+    /// would be a share of the storage outstanding during that edit -- which
+    /// is a panic in the caller's `emplace` rather than anything a worker
+    /// would notice. [`Topology::release_flow`], called immediately before
+    /// this, is what makes the rule keepable; the module docs have the order
+    /// in full.
+    ///
+    /// The notification is sent *under* the lock rather than after it: a
+    /// waiter cannot return from [`Condvar::wait`](std::sync::Condvar::wait)
+    /// until it has the mutex back, so the unlock is this thread's last touch
+    /// of the topology either way. That used to be the difference between a
+    /// correct unlock and a use-after-free, since the released thread freed
+    /// the topology; it no longer is -- the worker calling this holds a share
+    /// of its own -- and it stays because it costs nothing and keeps the
+    /// ordering above to one rule instead of two.
     pub(crate) fn finish(&self) {
         // Before the lock, so that it is ordered before the unlock that
         // releases a waiter: a `cancel` that follows a `wait` -- or follows the
@@ -659,14 +821,18 @@ impl core::fmt::Debug for Topology {
 
 const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
+    const fn assert_send<T: Send>() {}
 
-    // The `Send` impl on `Job` rests on these three: a job hands out a
-    // `&Node`, a `&Taskflow` and a `&Topology` on whichever worker dequeues
-    // it, so all three have to be shareable across threads for that to mean
-    // anything. `Topology` is also moved into the run handle, which a caller
-    // may move to another thread.
+    // A job is built on the thread that schedules a task and dequeued by
+    // whichever worker takes it, so it has to be `Send` -- which, now that it
+    // owns its two shares rather than pointing at them, it is derived rather
+    // than asserted: `Arc<T>` is `Send` exactly when `T` is `Send + Sync`.
+    // The three below are what that resolves to, and `Node` is there because a
+    // job hands out a `&Node` on the worker that runs it. `Topology` is also
+    // shared with the run handle, which a caller may move to another thread.
+    assert_send::<Job>();
     assert_send_sync::<Topology>();
-    assert_send_sync::<Taskflow>();
+    assert_send_sync::<Flow>();
     assert_send_sync::<Node>();
 
     // A `Canceller` is a `Weak<Cancellable>` and has to be `Send + Sync +
@@ -686,8 +852,12 @@ mod tests {
     /// A run that runs its graph exactly once and has nothing to call
     /// afterwards: upstream's `run(f)` policy, which is what most of these
     /// cases want.
+    ///
+    /// The share of a taskflow's storage it holds is the one the tear-down
+    /// would take back out, and no case here reaches a tear-down: the methods
+    /// that walk a graph take it as a parameter, so an empty one will do.
     fn once() -> Topology {
-        Topology::new(|| true, || {})
+        Topology::new(|| true, || {}, Arc::default())
     }
 
     /// A diamond, which is the smallest shape with a task that is neither a
@@ -705,7 +875,7 @@ mod tests {
         let (taskflow, [a, b, c, d]) = diamond();
         let topology = once();
 
-        assert_eq!(topology.set_up(&taskflow), 1, "only `a` is a source");
+        assert_eq!(topology.set_up(taskflow.flow()), 1, "only `a` is a source");
         assert_eq!(topology.join_counter.load(Ordering::Relaxed), 1);
 
         let graph = taskflow.graph();
@@ -727,7 +897,7 @@ mod tests {
         let (taskflow, [_, b, _, d]) = diamond();
         let topology = once();
 
-        topology.set_up(&taskflow);
+        topology.set_up(taskflow.flow());
         // Spend the counters, as a run would.
         taskflow
             .graph()
@@ -740,7 +910,7 @@ mod tests {
             .join_counter()
             .store(0, Ordering::Relaxed);
 
-        assert_eq!(topology.set_up(&taskflow), 1);
+        assert_eq!(topology.set_up(taskflow.flow()), 1);
         assert_eq!(
             taskflow
                 .graph()
@@ -755,9 +925,12 @@ mod tests {
     fn the_sources_are_the_tasks_with_no_predecessors() {
         let (taskflow, [a, ..]) = diamond();
         let topology = once();
-        topology.set_up(&taskflow);
+        topology.set_up(taskflow.flow());
 
-        let sources: Vec<Task> = topology.sources(&taskflow).map(|job| job.task).collect();
+        let topology = Arc::new(topology);
+        let sources: Vec<Task> = Job::sources(taskflow.flow(), &topology)
+            .map(|job| job.task)
+            .collect();
         assert_eq!(sources, vec![a]);
     }
 
@@ -767,13 +940,13 @@ mod tests {
     #[test]
     fn a_graph_with_no_source_sets_up_to_zero() {
         let topology = once();
-        assert_eq!(topology.set_up(&Taskflow::new()), 0);
+        assert_eq!(topology.set_up(&Flow::default()), 0);
 
         let mut cyclic = Taskflow::new();
         let (a, b) = cyclic.emplace_n((|| {}, || {}));
         cyclic.task(a).precede([b]);
         cyclic.task(b).precede([a]);
-        assert_eq!(topology.set_up(&cyclic), 0);
+        assert_eq!(topology.set_up(cyclic.flow()), 0);
     }
 
     /// The join counter is the whole of the run's bookkeeping, so the shape of
@@ -783,7 +956,7 @@ mod tests {
     fn a_run_ends_when_the_last_outstanding_job_finishes() {
         let (taskflow, _) = diamond();
         let topology = once();
-        topology.set_up(&taskflow);
+        topology.set_up(taskflow.flow());
 
         // `a` finishes, having made `b` and `c` ready.
         topology.job_queued();
@@ -859,6 +1032,7 @@ mod tests {
                     stop
                 },
                 || {},
+                Arc::default(),
             );
 
             // The call `run_until` makes before scheduling anything, then one
@@ -879,7 +1053,7 @@ mod tests {
     /// the run's failure instead, and it means "stop".
     #[test]
     fn a_panicking_predicate_stops_the_run_and_is_reported() {
-        let topology = Topology::new(|| panic!("predicate"), || {});
+        let topology = Topology::new(|| panic!("predicate"), || {}, Arc::default());
 
         assert!(!topology.run_again(), "a failed predicate means stop");
         topology.finish();
@@ -958,6 +1132,7 @@ mod tests {
                     false
                 },
                 || {},
+                Arc::default(),
             )
         };
 
@@ -985,6 +1160,7 @@ mod tests {
                 move || {
                     calls.fetch_add(1, Ordering::Relaxed);
                 },
+                Arc::default(),
             )
         };
 
@@ -992,7 +1168,7 @@ mod tests {
         topology.carry_out_callback();
         assert_eq!(calls.load(Ordering::Relaxed), 1, "`FnOnce` means once");
 
-        let panicking = Topology::new(|| true, || panic!("callback"));
+        let panicking = Topology::new(|| true, || panic!("callback"), Arc::default());
         panicking.carry_out_callback();
         panicking.finish();
         let payload = panicking.join().expect("the panic was recorded");

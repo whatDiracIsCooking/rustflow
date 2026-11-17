@@ -29,8 +29,11 @@
 //! [`Executor::run_until`] submit a graph for one run, a fixed number of
 //! them, or as many as a predicate keeps asking for, and each hands back a
 //! [`RunHandle`]: wait on it for a [`RunError`], poll it as a [`Future`], or
-//! just drop it, which blocks until the run is over so that a queued job can
-//! never outlive the borrow it was scheduled under. The `_with` variant of
+//! just drop it, which blocks until the run is over. That borrow is what
+//! makes "do not mutate a running taskflow" a compile error, and a handle a
+//! caller *leaks* rather than drops ends it early -- which is a leak and not
+//! a use-after-free, because every queued job owns a share of the run and of
+//! the taskflow's storage. The `_with` variant of
 //! each attaches a callback that the last job of a run calls, the `run_owned`
 //! family takes the taskflow by value for a caller with no borrow to lend,
 //! [`Executor::corun`] and [`Executor::corun_until`] let a worker wait on a
