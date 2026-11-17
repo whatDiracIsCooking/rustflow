@@ -522,9 +522,10 @@ impl WorkerThread {
     /// each get one line here into the module that owns them. [`module`] runs
     /// a composed taskflow as of #49 and an adopted graph as of #74,
     /// [`runtime`] runs a runtime task as of #51 and [`subflow`] a subflow
-    /// task as of #50. Upstream's three remaining kinds, its semaphores and
-    /// its observers are each a later milestone, and none of them is silently
-    /// absent: the `match` below is exhaustive over
+    /// task as of #50. Upstream's two async kinds -- which belong to a
+    /// free-standing node rather than to a graph -- and its observers are
+    /// each a later milestone, and none of them is silently absent: the
+    /// `match` below is exhaustive over
     /// [`Handle`], so a new kind arrives as a compile error here rather than
     /// as a task that mysteriously does nothing.
     ///
@@ -535,16 +536,23 @@ impl WorkerThread {
     /// before it is queued. The module docs set out the semantics; [`Release`]
     /// is what carries the first switch's answer to the second.
     ///
-    /// Before any of that come the two things upstream does at the top of
-    /// `_invoke`: the `PREEMPTED` fast path and the cancellation check.
+    /// Before any of that come the three things upstream does at the top of
+    /// `_invoke`: the `PREEMPTED` fast path, the cancellation check and the
+    /// acquire of whatever semaphores this node asked for. The last two are
+    /// *inside* the fast path -- a resumed node has already been entered, so
+    /// it neither re-checks the cancellation nor acquires a second time --
+    /// and the release of whatever it asked to release is after the dispatch,
+    /// on the entry that finishes the node. The two semaphore hooks are #89's
+    /// and the module docs' "Semaphores" section has what they promise; the
+    /// comments in the body have why a woken job is queued rather than kept.
     ///
     /// The release of the successors is where the continuation comes from:
     /// upstream's `_update_cache` keeps the last successor it found ready and
     /// queues whatever it was holding, so a node with one ready successor
     /// queues nothing at all. [`WorkerThread::update_cache`] is that
     /// function, and `None` out of here is upstream's null `cache` -- a node
-    /// that preempted, a node whose run is cancelled, or a node that left
-    /// nothing ready.
+    /// that preempted, a node whose run is cancelled, a node parked on a
+    /// semaphore, or a node that left nothing ready.
     fn invoke_one(&mut self, job: Job) -> Option<Job> {
         // The job owns a share of the run and of the taskflow's storage, so
         // this needs no `unsafe` and no argument about who outlives whom: both
@@ -555,23 +563,47 @@ impl WorkerThread {
         // Upstream's `if(node->_nstate & NSTATE::PREEMPTED) goto invoke_task`:
         // this is the *second* entry into a node whose nested graph has just
         // finished, so the work below is a resumption rather than a start, and
-        // the cancellation check is deliberately skipped. A parent that was
-        // cancelled while its children ran still has to come back through the
-        // dispatch, because that is where it clears its own `PREEMPTED` bit
-        // and releases what the run still owes.
-        if node.nstate().load(Ordering::Relaxed) & Node::PREEMPTED == 0
+        // the cancellation check -- and the acquire with it -- is deliberately
+        // skipped. A parent that was cancelled while its children ran still
+        // has to come back through the dispatch, because that is where it
+        // clears its own `PREEMPTED` bit and releases what the run still
+        // owes, and a parent that acquired on its first entry still holds
+        // what it took.
+        if node.nstate().load(Ordering::Relaxed) & Node::PREEMPTED == 0 {
             // Upstream's `_is_parent_cancelled()` early-out: a cancelled run
             // runs none of the work it had not started, and the job is torn
             // down all the same -- the join counters still have to reach zero
             // for the run to finish at all. The tail of this method says what
             // spending the job here does; it is the same line.
-            && job.is_parent_cancelled()
-        {
-            self.finish_job(job.finish());
-            // Upstream's `_tear_down_invoke` can leave a cache here -- the
-            // preempted parent this job was the last child of -- and
-            // `finish_job` cannot, for the reason this method's docs give.
-            return None;
+            if job.is_parent_cancelled() {
+                self.finish_job(job.finish());
+                // Upstream's `_tear_down_invoke` can leave a cache here -- the
+                // preempted parent this job was the last child of -- and
+                // `finish_job` cannot, for the reason this method's docs give.
+                return None;
+            }
+
+            // Upstream's `to_acquire` block, the first of the two semaphore
+            // hooks: a node that cannot have every count it asked for does
+            // not run, and this job is now parked on the semaphore that
+            // refused -- which owns a clone of it and will schedule that
+            // clone when somebody releases.
+            //
+            // The job is *not* finished here, and that is the accounting:
+            // the clone inherits the one count this job holds against its
+            // parent, so the counter stays exactly as outstanding as it was
+            // and the run cannot finish while a task of it is parked. What
+            // `woken` holds is whatever the rollback inside `acquire_all`
+            // woke on the semaphores this node did get -- see that method,
+            // which is where the rollback is argued.
+            let mut woken = Vec::new();
+            if !node.acquire_all(&job, &mut woken) {
+                self.shared.bulk_schedule(woken);
+                // Upstream's bare `return` with its `cache` still null: this
+                // worker has kept nothing, because the only jobs it made
+                // ready belong to semaphores rather than to this node.
+                return None;
+            }
         }
 
         let release = match node.handle() {
@@ -657,6 +689,46 @@ impl WorkerThread {
         // worker's behalf either, which is upstream's bare `return` with its
         // `cache` still null.
         let release = release?;
+
+        // Upstream's `to_release` block, the second hook, and it is here --
+        // after the dispatch and before the counters -- because this is the
+        // entry on which the node *finished*: an arm that preempted returned
+        // through the `?` above, holding what it acquired until the entry
+        // that resumes it gets this far.
+        //
+        // The woken jobs go to the shared buffers rather than into `cache`,
+        // which is the one place the continuation loop and the semaphores
+        // meet. Three reasons, and the first is the decisive one:
+        // [`WorkerThread::update_cache`] is for a job of *this* node's graph
+        // under *this* node's parent, counted against that parent by the
+        // caller a line earlier -- and a woken job is none of those. A
+        // semaphore is shared by whoever acquires it, so the job it hands
+        // back may belong to another graph and another run entirely, and
+        // nothing counts it now because the count it carries is the one it
+        // has held since it was first queued. Second, a release wakes a
+        // *set* -- the whole waiting list, which is exactly the jobs that
+        // may now run at once -- and the cache holds one, so picking a
+        // winner would be arbitrary where `bulk_schedule` costs one
+        // `notify_n` for the lot. Third, those jobs have no affinity with
+        // this worker to preserve: it never ran them, and some other worker
+        // parked most of them.
+        let mut woken = Vec::new();
+        if let Err(error) = node.release_all(&mut woken) {
+            // Upstream's `TF_THROW` out of `Semaphore::_release`, which
+            // escapes the worker loop; here it is a failure of the task that
+            // over-released, recorded on whatever anchor is waiting for that
+            // task's graph and surfaced from `wait` as
+            // `RunError::Panicked`. A `String` payload because that is what a
+            // `panic!` of a formatted message leaves and what `RunError`'s
+            // own `Display` can read back.
+            job.record_panic(Box::new(error.to_string()));
+        }
+        // Outside the `if`, because the failing release is the *first* one at
+        // its maximum and the ones before it succeeded: their waiting lists
+        // are already in `woken`, and dropping those jobs would leave their
+        // counts outstanding for ever -- a hang in place of a reported
+        // failure.
+        self.shared.bulk_schedule(woken);
 
         // Upstream's comment, which is the whole reason this is a `fetch_add`
         // of the strong-dependency count rather than a `store`: the counter
@@ -1017,6 +1089,57 @@ fn seed_from_current_thread() -> u32 {
 mod tests {
     use super::*;
     use crate::graph::Graph;
+    use crate::{Executor, FlowBuilder, RunError, Semaphore, Taskflow};
+
+    /// Upstream's `TF_THROW("can't release the semaphore more than its
+    /// maximum value: ", _max_value)`, which escapes its worker loop: here
+    /// the over-release is the failing *task's* own, so it is recorded like a
+    /// panic in its body and reported from `wait`.
+    ///
+    /// The second half is the part a weaker implementation would get wrong by
+    /// being helpful: the counter is left exactly as it was, so a release
+    /// that was refused has not quietly happened anyway.
+    #[test]
+    fn an_over_release_fails_the_run_and_leaves_the_counter_alone() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let executor = Executor::new(2);
+        let mut taskflow = Taskflow::new();
+
+        // Releasing without acquiring, which upstream allows -- it is how a
+        // task hands out a count another task will take -- so the failure is
+        // the *maximum*, not the missing acquire.
+        let task = taskflow.emplace(|| {});
+        taskflow.task(task).release(&semaphore);
+
+        let error = executor
+            .run(&taskflow)
+            .wait()
+            .expect_err("an over-release fails its run");
+        assert!(matches!(error, RunError::Panicked(_)), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "a task panicked: can't release the semaphore more than its maximum value: 1"
+        );
+
+        assert_eq!(semaphore.value(), 1);
+        assert_eq!(semaphore.max_value(), 1);
+    }
+
+    /// The same node, releasing a count it did take: the run succeeds and the
+    /// counter comes back. Without this the case above would pass just as
+    /// well against a hook that failed *every* release.
+    #[test]
+    fn a_task_that_acquires_and_releases_leaves_the_counter_as_it_found_it() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let executor = Executor::new(2);
+        let mut taskflow = Taskflow::new();
+
+        let task = taskflow.emplace(|| {});
+        taskflow.task(task).acquire(&semaphore).release(&semaphore);
+
+        executor.run(&taskflow).wait().expect("the run succeeds");
+        assert_eq!(semaphore.value(), 1);
+    }
 
     /// The victim map has to be a bijection onto `0..max_victim` minus `id`,
     /// which is small enough to check exhaustively: a worker that can steal

@@ -1064,14 +1064,9 @@ impl Node {
     /// is each semaphore's own lock that makes the counter and the waiting
     /// list sound under that sharing; nothing is written here.
     //
-    // The only caller outside the tests below is the executor, and the
-    // executor does not look at a semaphore until #89 -- so `dead_code` is
-    // right about the library build and the fix is that issue, not an
-    // `allow`. `expect` is what keeps that honest: it fails the build the
-    // moment a caller appears, so #89 cannot leave it behind. The `cfg_attr`
-    // is because the unit tests *are* a caller, and a lint expectation that
-    // holds of one build and not the other has to say which.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the executor acquires in #89"))]
+    // The caller is `WorkerThread::invoke_one`, which acquires on a first
+    // entry into a node only: #89 is where that arrived and where the
+    // `expect(dead_code)` this carried until then came off.
     pub(crate) fn acquire_all(&self, job: &Job, woken: &mut Vec<Job>) -> bool {
         // Upstream asserts `_semaphores != nullptr` (commented out) because
         // only its executor calls this, and only for a node that has them. A
@@ -1112,9 +1107,9 @@ impl Node {
     /// upstream's throw leaves the loop too. What a task that over-releases
     /// has done is the executor's decision, not this module's.
     //
-    // Dead in the library build until #89, exactly as `acquire_all` above is,
-    // and expected for the same reason.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the executor releases in #89"))]
+    // Called from `WorkerThread::invoke_one` on the entry that finishes the
+    // node, which is what #89 added and what the `expect(dead_code)` here
+    // was waiting for.
     pub(crate) fn release_all(&self, woken: &mut Vec<Job>) -> Result<(), SemaphoreError> {
         let Some(semaphores) = self.semaphores() else {
             return Ok(());
