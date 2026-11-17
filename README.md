@@ -20,7 +20,7 @@ either means the same thing:
 
 ```sh
 devtools/devcontainer.sh up             # start the container
-devtools/devcontainer.sh check          # fmt + clippy -D warnings + test
+devtools/devcontainer.sh check          # fmt + clippy -D warnings + test + deny
 devtools/devcontainer.sh shell          # bash inside it
 devtools/devcontainer.sh claude         # Claude Code inside it
 devtools/devcontainer.sh test graph::   # cargo test, filtered
@@ -29,7 +29,14 @@ devtools/devcontainer.sh down           # stop it (volumes survive)
 
 `check` is the gate: `cargo fmt --all --check`, then
 `cargo clippy --all-targets --all-features -- -D warnings`, then
-`cargo test --all-features`. Anything that passes locally should pass in CI.
+`cargo test --all-features`, then `cargo deny check` — licenses, RustSec
+advisories, duplicate crate versions and crate sources, configured in
+[`deny.toml`](deny.toml) and pinned by `ARG CARGO_DENY_VERSION`. Anything that
+passes locally should pass in CI, with one wrinkle in the shape rather than the
+result: CI runs the first three commands in this image and the fourth as a
+separate `deny` job on a plain runner, because the image CI uses is the stock
+`rust` one and building cargo-deny from source there would cost every PR
+minutes.
 
 ## Working inside the container
 
@@ -106,7 +113,7 @@ fixups come with the copy, both explained where they happen in that script.
 
 **Two things the container cannot do.** `docker` is not installed in it, so
 `devtools/devcontainer.sh` and `docker/compose.yaml` are host-only — from
-inside, run the three `cargo` commands of the gate directly. And git does not
+inside, run the four `cargo` commands of the gate directly. And git does not
 work inside a `.claude/worktrees/` checkout mounted into the container: a
 worktree's `.git` is a *file* holding an absolute host path, which resolves to
 nothing under `/workspace`. The devcontainer is for the main checkout; worktree

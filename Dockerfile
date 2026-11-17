@@ -28,6 +28,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git ca-certificates pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# cargo-deny, the gate's fourth step (see deny.toml). Pinned like everything
+# else here, and from source rather than a release tarball because `cargo
+# install --locked` is itself the thing being asserted: the binary is built
+# from the lockfile the authors published, with this image's toolchain.
+#
+# It lands in /usr/local/cargo/bin -- CARGO_HOME, which stays at the image
+# default, so it is on the PATH of whatever uid runs later. The advisory
+# database it fetches at run time goes to $CARGO_HOME/advisory-dbs, outside
+# the registry volume, so each container re-clones it once; that is seconds
+# and it must be fresh to mean anything.
+#
+# The crate sources the install downloaded are dropped again: both front ends
+# mount a named volume over /usr/local/cargo/registry, so a copy baked into
+# the layer is shadowed at run time and pure weight.
+#
+# CI does NOT use this image (see .github/workflows/ci.yml) and gets the same
+# version from a pinned action instead -- keep the two equal.
+ARG CARGO_DENY_VERSION=0.21.0
+RUN cargo install cargo-deny --locked --version ${CARGO_DENY_VERSION} \
+ && cargo deny --version \
+ && rm -rf /usr/local/cargo/registry/*
+
 # --- What the in-container agent needs --------------------------------------
 # curl: fetches the Claude Code installer below.
 # python3: `.claude/settings.json` wires devtools/hooks/session-env.py as a

@@ -1,8 +1,11 @@
 # The gate, named `ci` because the `pr` skill and automerge.yml both key off
-# that exact name. It runs the same three commands as
+# that exact name. Its first three steps run the same three commands as
 # `devtools/devcontainer.sh check` and the `check` service in
 # docker/compose.yaml, in the same container image -- so a green run here and a
-# green run on your machine mean the same thing.
+# green run on your machine mean the same thing. The gate's fourth step,
+# `cargo deny check`, is the separate `deny` job below rather than a fourth
+# step here, for the reason given there; this workflow is green only when both
+# jobs are, which is also what automerge.yml waits on.
 #
 # The toolchain pin lives in ONE place: `ARG RUST_VERSION` in the root
 # Dockerfile. The image below must be kept equal to it by hand; there is no
@@ -60,3 +63,38 @@ jobs:
       # dependencies, so a cache round-trip would cost more than the build it
       # saves. Add actions/cache on ~/.cargo/registry and ./target once there
       # is a dependency tree worth restoring.
+
+  # The gate's fourth step: `cargo deny check` against deny.toml -- licenses,
+  # RustSec advisories, duplicate versions, crate sources.
+  #
+  # A separate job, and NOT a step in `ci` above, because the image that job
+  # runs in is the stock rust one, which has no cargo-deny. (The repo's own
+  # Dockerfile installs one, pinned by ARG CARGO_DENY_VERSION, but CI does not
+  # build that image.) Adding `cargo install cargo-deny --locked` to `ci`
+  # would compile a few hundred crates on every PR for a check whose only
+  # inputs are Cargo.toml, Cargo.lock and deny.toml. The action below brings a
+  # prebuilt musl binary instead, and the job runs in parallel with `ci`, so
+  # the cost to a green PR is the ~1 min this takes end to end, not added
+  # wall-clock.
+  #
+  # Pinned to a commit SHA with the tag beside it, rather than `@v2.1.2`: a
+  # git tag can be moved and this third-party action executes arbitrary code
+  # in CI, which is precisely the risk the rest of this PR is about. That
+  # commit's image carries cargo-deny 0.21.0 -- keep it equal to
+  # `ARG CARGO_DENY_VERSION` in the root Dockerfile when bumping either.
+  #
+  # The advisory database is cloned fresh on every run and deliberately not
+  # cached: it is the one input that must not be stale, and it is seconds.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deny
+        uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
+        # The action's own defaults, spelled out so this reads as the same
+        # command the local gate runs. `--all-features` is also set in
+        # deny.toml's [graph], so the local run checks the same graph.
+        with:
+          command: check
+          arguments: --all-features
