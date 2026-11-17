@@ -17,6 +17,28 @@
 # fix it here and both check the same graph. Optional dependencies are the
 # ones most likely to escape review, so they are exactly the ones to include.
 all-features = true
+# The platforms a dependency may be built for. Naming them is what lets this
+# file see the same graph a build does: a dependency behind a `[target.'cfg(..)']`
+# expression is only in the graph for the targets whose cfg satisfies it, and
+# with no targets named at all, cargo-deny has to assume every such dependency
+# is always in. The three below are the ones a crate is expected to build on;
+# the first is the only one this repo builds in, and the other two are here so
+# that naming a target narrows *which build* is audited and not *how much* of
+# the ecosystem.
+#
+# What this excludes today is `loom`, which `Cargo.toml` declares under
+# `cfg(loom)` -- a cfg no target sets and only `RUSTFLAGS` does, for the
+# notifier's model in `tests/loom_notifier.rs`. That is the honest answer to
+# the duplicate crate versions in its tree (`windows-link`, two majors deep
+# under `generator`): they are not two copies of anything this crate builds,
+# links or ships, so they are not the correctness problem the `deny` below is
+# there to catch. The cost is that `loom`'s own tree is audited by nothing
+# here; it is MIT, it is pinned exactly, and it is in no artifact.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
 
 [advisories]
 # The RustSec database over the network, every run (the default db-urls).
