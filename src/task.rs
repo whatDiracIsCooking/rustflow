@@ -70,11 +70,11 @@ use crate::taskflow::Taskflow;
 
 /// What a task does when the executor reaches it, as a flat enumeration.
 ///
-/// This is upstream's `tf::TaskType`, kept complete even though
-/// [`TaskType::Async`] cannot be built yet: the variants name the port's own
-/// roadmap, and the DOT output and the profiler want the whole set. Upstream's
-/// `UNDEFINED` is kept for the same reason, though nothing can produce it
-/// while every [`Handle`] variant maps to a type of its own.
+/// This is upstream's `tf::TaskType`, which was kept complete from the first
+/// milestone rather than grown with [`Handle`]: the variants name the port's
+/// own roadmap, and the DOT output and the profiler want the whole set.
+/// Upstream's `UNDEFINED` is kept for the same reason, though nothing can
+/// produce it while every [`Handle`] variant maps to a type of its own.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum TaskType {
     /// A task with no work attached, upstream's `PLACEHOLDER`.
@@ -90,7 +90,9 @@ pub enum TaskType {
     Condition,
     /// A task that runs another graph, upstream's `MODULE`.
     Module,
-    /// A task submitted outside any graph, upstream's `ASYNC`.
+    /// A task submitted outside any graph, upstream's `ASYNC`. Both async
+    /// handles fold into it, as upstream's `DEPENDENT_ASYNC` folds into its
+    /// `ASYNC`.
     Async,
     /// Upstream's `UNDEFINED`, for internal use only.
     Undefined,
@@ -140,6 +142,13 @@ fn task_type_of(handle: &Handle) -> TaskType {
         // reason: upstream's `TaskType` has no name for the adopted one, so
         // `ADOPTED_MODULE` reports `MODULE` there too.
         Handle::Module(_) | Handle::AdoptedModule(_) => TaskType::Module,
+        // And so do the two async forms, which is upstream's `case
+        // Node::ASYNC: case Node::DEPENDENT_ASYNC: return TaskType::ASYNC`.
+        // A node of either kind is normally free-standing and has no `Task`
+        // index to ask this of at all; one put in a taskflow's graph through
+        // `Graph::add_node` reports `async` here, which is what the DOT dump
+        // and the profiler want to call it.
+        Handle::Async(_) | Handle::DependentAsync(_) => TaskType::Async,
     }
 }
 
@@ -689,6 +698,7 @@ impl Taskflow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::AsyncWork;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -980,6 +990,22 @@ mod tests {
         assert_eq!(source.num_successors(), 2);
         assert_eq!(source.num_weak_dependencies(), 0);
         assert_eq!(source.num_strong_dependencies(), 0);
+    }
+
+    /// Both async handles report `async`, which is upstream's two `case`
+    /// labels on one `return`. A node of either kind is normally
+    /// free-standing; one put in a graph is what has a [`Task`] index to ask.
+    #[test]
+    fn both_async_handles_report_the_async_task_type() {
+        let mut taskflow = Taskflow::new();
+        let graph = taskflow.graph_mut();
+        let free = graph.add_named_node("free", Handle::Async(AsyncWork::plain(|| {})));
+        let dependent =
+            graph.add_named_node("dependent", Handle::DependentAsync(AsyncWork::plain(|| {})));
+
+        assert_eq!(taskflow.task_ref(free).task_type(), TaskType::Async);
+        assert_eq!(taskflow.task_ref(dependent).task_type(), TaskType::Async);
+        assert_eq!(TaskType::Async.to_string(), "async");
     }
 
     #[test]

@@ -68,36 +68,88 @@
 //! through safe code, and a graph nobody can edit while a job names it cannot
 //! invalidate an index either.
 //!
-//! # The four graphs a job can walk
+//! # The five graphs a job can walk
 //!
 //! Upstream settles this before a job exists. `_schedule_graph` takes a
 //! `Graph&`, every node of that graph then holds nothing but its own state
 //! and its own pointers, and what keeps the reference valid is the same
 //! sentence of documentation as the rest. A port whose jobs own what they
 //! name has to say instead *who owns* each graph the scheduler can be asked
-//! to run, and the four answers are not one shape: that choice is
+//! to run, and the five answers are not one shape: that choice is
 //! [`GraphOwner`], and issue #74 is where it was made once rather than three
 //! times over the hottest struct in the crate.
 //!
-//! Two of the four are a share of a taskflow's storage -- the run's own
+//! Two of the five are a share of a taskflow's storage -- the run's own
 //! graph, and the target of a module task composed of an `Arc<Taskflow>` --
 //! which is why a module task was schedulable (#49) before this field was
-//! widened at all. The other two live *inside* the handle of the node they
-//! hang off, an adopted module's `Graph` and a subflow's `Mutex<Graph>`, so
-//! the only thing that names one is the owner of the *outer* graph plus that
+//! widened at all. Two more live *inside* the handle of the node they hang
+//! off, an adopted module's `Graph` and a subflow's `Mutex<Graph>`, so the
+//! only thing that names one is the owner of the *outer* graph plus that
 //! node's index as a path. [`Inside`] is that path, and it is recursive
 //! because the nesting is: a subflow of an adopted module of a composed
 //! taskflow is three links. It cannot close into a cycle, because a graph a
 //! node owns cannot contain the node that owns it.
 //!
-//! What this buys is the thing a `Graph&` cannot say. A job of an adopted
+//! The fifth is #86's and is the one that belongs to nobody: the one-node
+//! graph an *async task* is, which is in no taskflow and under no node.
+//! `executor::async_node` owns that shape and says why an async task carries
+//! a whole arena for its one node; what this module adds is the owner
+//! variant that resolves it and the job that names it.
+//!
+//! What all this buys is the thing a `Graph&` cannot say. A job of an adopted
 //! module's graph used to resolve its [`Task`] against the *root* arena --
 //! silently, against whatever node happened to sit at that index -- which is
 //! why the arm that ran one refused the run until this landed.
 //!
+//! # The run a free node claims to be part of
+//!
+//! A [`Job`] holds an `Arc<Topology>` because every job upstream can reach a
+//! `Topology*` through its node, and nothing in the scheduler asks whether
+//! that pointer is null before using it: `Job::parts` hands one out,
+//! `is_parent_cancelled` reads one, and the tear-down accounts a finished job
+//! to one. Upstream's async node has `_topology == nullptr`, and its
+//! `_tear_down_async` is a *separate* tear-down precisely so that the null
+//! never reaches the code that would dereference it.
+//!
+//! So a free node needs an answer to "which run is this part of", and #86
+//! had two to choose between: make the field an `Option`, or share one
+//! sentinel run that never finishes. **It is the sentinel**, and the reason
+//! is that the other answer spreads: `Topology` is reached through
+//! [`Job::parts`], [`Job::topology`] and [`Job::topology_share`], so an
+//! `Option` there would put a `None` case into the worker's dispatch, into
+//! every arm that schedules a nested graph, into the corun path and into the
+//! tear-down -- five files of plumbing to express one thing that is already
+//! expressible, since a run nothing can wait for and nothing can cancel is
+//! exactly what a free node wants to be part of.
+//!
+//! [`Topology::free_standing`] is that run, and three properties make it
+//! sound rather than merely convenient:
+//!
+//! - **It never finishes.** Its join counter is born at one, for a job that
+//!   does not exist and will never be completed. Every real job raises that
+//!   counter before it is queued and lowers it as it finishes -- the
+//!   scheduler's rule for every topology, not this one's -- so the counter is
+//!   one plus the number of free nodes in flight and the `fetch_sub` that
+//!   ends a job can never see it at one. The tear-down, which would evaluate
+//!   a run policy and release a waiter that does not exist, is therefore
+//!   unreachable. That is what "never finishes" has to mean here, and it is
+//!   why the sentinel is not simply a `Topology::nothing_to_run`, which is
+//!   finished before it is handed out.
+//! - **It is never cancelled.** Nothing hands out a
+//!   [`Canceller`](crate::Canceller) for it and nothing records a failure on
+//!   it -- a failure on a free node goes to the node's own slot, which is
+//!   [`Job::record_panic`]'s last case -- so [`Job::is_parent_cancelled`]
+//!   reads `false` for a free node with no parent, and reads the chain above
+//!   it when there is one. A task group cancels its children through exactly
+//!   that chain.
+//! - **It holds no taskflow.** Its `flow` slot is `None`, so sharing it
+//!   keeps nothing alive but itself: one allocation for the whole process,
+//!   which is what keeps an async task at upstream's one allocation per task
+//!   beyond its body.
+//!
 //! # Why a subgraph comes out of its lock to be run
 //!
-//! The subflow is the one of the four that needs more than a path, because a
+//! The subflow is the one of the five that needs more than a path, because a
 //! `Mutex<Graph>` cannot be read without a guard. Three ways to answer that
 //! were on the table and only one of them schedules a graph whose jobs can
 //! run at the same time as each other:
@@ -202,9 +254,10 @@
 use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::task::{Poll, Waker};
 
+use crate::executor::async_node::AsyncNode;
 use crate::executor::subflow;
 use crate::graph::{Graph, Handle, Node, NodeBase, Task};
 use crate::task::TaskRef;
@@ -236,7 +289,7 @@ pub(crate) struct Job {
     /// Which task of the graph to run.
     task: Task,
     /// Who owns the graph `task` indexes, which is the whole of what makes
-    /// that index resolvable: one of the four kinds the module docs set out.
+    /// that index resolvable: one of the five kinds the module docs set out.
     ///
     /// The job holds its own owner rather than reading the run's, and for a
     /// top-level node the two are the same `Arc<Flow>`: the run's share has
@@ -245,7 +298,7 @@ pub(crate) struct Job {
     ///
     /// This is the field #74 widened, and what it widened from is where the
     /// shape came from: it was an `Arc<Flow>`, which already covered two of
-    /// the four kinds, and the other two needed a path rather than a share.
+    /// the kinds, and two more needed a path rather than a share.
     /// [`Job::graph`] is the single place that resolves whichever it is, and
     /// nothing above it has to know which it was.
     owner: GraphOwner,
@@ -260,23 +313,33 @@ pub(crate) struct Job {
 /// Which graph a [`Job`]'s [`Task`] indexes, and what keeps that graph alive:
 /// upstream's `Graph&`, as a choice of owner rather than a reference.
 ///
-/// Two variants for the four kinds of graph the scheduler can run, because
-/// what differs between the four is only who owns them, and on that question
-/// they pair up. The module docs have the argument in full, including why the
-/// subflow's is the one that cannot be read where it lies.
+/// Three variants for the five kinds of graph the scheduler can run, because
+/// what differs between the five is only who owns them, and on that question
+/// the first four pair up. The module docs have the argument in full,
+/// including why the subflow's is the one that cannot be read where it lies
+/// and why a free async node's arena is nobody's but its own.
 ///
 /// `Clone` because every job of a graph holds an owner of its own, so
 /// scheduling a graph of `n` sources clones this `n` times: one atomic
 /// increment each, whichever variant it is.
 #[derive(Clone)]
 pub(crate) enum GraphOwner {
-    /// A taskflow's storage, which is two of the four kinds: the graph of the
+    /// A taskflow's storage, which is two of the five kinds: the graph of the
     /// run itself, and the target of a module task composed of an
     /// `Arc<Taskflow>`.
     Flow(Arc<Flow>),
-    /// A graph that one node of another graph owns, which is the other two:
+    /// A graph that one node of another graph owns, which is the next two:
     /// an adopted module's graph, and a subflow's subgraph.
     Inside(Arc<Inside>),
+    /// The one-node arena an async task is, which belongs to no taskflow and
+    /// to no node: `executor::async_node`, whose own docs say why a free node
+    /// carries a graph at all.
+    ///
+    /// The share is upstream's reference count on the node, which the queued
+    /// job holds for as long as it is queued -- so a caller who drops the
+    /// last [`AsyncTask`](crate::AsyncTask) handle on a task that has not run
+    /// yet does not take the node out from under the worker.
+    Async(Arc<AsyncNode>),
 }
 
 /// A graph owned by one node of another graph, named by that node.
@@ -493,6 +556,7 @@ impl GraphOwner {
         match self {
             Self::Flow(flow) => flow.graph(),
             Self::Inside(inside) => inside.graph(),
+            Self::Async(node) => node.graph(),
         }
     }
 
@@ -522,11 +586,11 @@ impl GraphOwner {
     /// be ruled out and what it costs.
     ///
     /// Also `None` for an owner that is not a lease at all, which no caller
-    /// has reason to ask about: a taskflow's storage and an adopted module's
-    /// graph are read where they lie.
+    /// has reason to ask about: a taskflow's storage, an adopted module's
+    /// graph and an async task's own arena are read where they lie.
     pub(crate) fn take_lease(self) -> Option<Graph> {
         match self {
-            Self::Flow(_) => None,
+            Self::Flow(_) | Self::Async(_) => None,
             // Taking the field rather than moving it out, because `Inside`
             // implements `Drop` -- and leaving `None` behind is exactly what
             // keeps that `Drop` from returning the graph a second time.
@@ -553,6 +617,7 @@ impl GraphOwner {
         match self {
             Self::Flow(flow) => Arc::as_ptr(flow).cast(),
             Self::Inside(inside) => Arc::as_ptr(inside).cast(),
+            Self::Async(node) => Arc::as_ptr(node).cast(),
         }
     }
 }
@@ -629,6 +694,38 @@ impl Job {
         }
     }
 
+    /// The job that runs the free-standing node of `node`, which belongs to
+    /// no run and to no graph the caller built.
+    ///
+    /// Upstream's `_schedule(Worker&, Node*)` over an async node, where the
+    /// node it is handed carries `_topology == nullptr` and the parent it was
+    /// given at construction. Here both travel with the job, as they do for
+    /// every other node: the parent is whatever scheduled this task -- the
+    /// run itself, standing in for upstream's null, or a
+    /// [`Parent::Nested`] for a task spawned by a runtime body or owned by a
+    /// task group -- and the run is the sentinel
+    /// [`Topology::free_standing`], which the module docs argue for at
+    /// length.
+    ///
+    /// The share of the node is what keeps it alive while the job is queued,
+    /// which is upstream's reference count on the same node for the same
+    /// reason: a caller who drops the last handle on a task that has not run
+    /// yet must not free the node under the worker that is about to run it.
+    // Nothing queues a free node yet; `executor::async_node` says what the
+    // attribute is and why it is `expect` under `not(test)`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the path that queues one is #88")
+    )]
+    pub(crate) fn free(node: &Arc<AsyncNode>, parent: &Parent) -> Self {
+        Self {
+            task: AsyncNode::TASK,
+            owner: GraphOwner::Async(Arc::clone(node)),
+            topology: Arc::clone(Topology::free_standing()),
+            parent: parent.clone(),
+        }
+    }
+
     /// The jobs that start a graph: one per source task of it.
     ///
     /// Call it only after [`set_up_graph`] has returned a non-zero count for
@@ -650,7 +747,7 @@ impl Job {
             .map(move |(task, _)| Self::new(task, owner, topology, parent))
     }
 
-    /// The graph this job's node lives in, whichever of the four kinds it is:
+    /// The graph this job's node lives in, whichever of the five kinds it is:
     /// [`GraphOwner::graph`] is the resolution and the `owner` field is why
     /// there is one.
     pub(crate) fn graph(&self) -> &Graph {
@@ -804,8 +901,10 @@ impl Job {
             // it, which is upstream's own description of it. Unreachable from
             // anything the executor runs today, since every chain roots
             // either at a run or at an anchor somebody is blocked on, and
-            // ported because #51's async tasks are where a chain can root at
-            // neither.
+            // ported because a *silent* async task is where a chain can root
+            // at neither: its node's own slot is what
+            // `AsyncTask::take_panic` reads, which is #86's half of upstream's
+            // `exception_ptr()`.
             (None, None) => Anchor::Base(node),
         };
 
@@ -846,6 +945,12 @@ impl Job {
     /// it at all: a job of a cancelled run is skipped by the first term, and a
     /// job whose *parent* failed -- a subflow whose body panicked, say -- by
     /// the second, even though the run as a whole is still going.
+    ///
+    /// A free async node answers through the same two terms and needs no case
+    /// of its own: the first reads the sentinel run, which is never
+    /// cancelled, so a task with no parent is never skipped, and the second
+    /// walks whatever chain is above it -- which is how a task group cancels
+    /// the children it owns. The module docs have the sentinel's side of it.
     pub(crate) fn is_parent_cancelled(&self) -> bool {
         self.topology.cancelled() || self.parent.ancestor_cancelled()
     }
@@ -1273,6 +1378,44 @@ impl Topology {
         C: FnOnce() + Send + 'static,
     {
         Self::over(predicate, on_finish, Some(flow))
+    }
+
+    /// The one run every free-standing async node claims to be part of:
+    /// a sentinel that is never cancelled, never finished and holds no
+    /// taskflow.
+    ///
+    /// Upstream needs nothing here -- its async node's `_topology` is null,
+    /// and the tear-down written for such a node never reads it. The module
+    /// docs have why this port answers with a sentinel instead of an
+    /// `Option<Arc<Topology>>` on every job in the crate, and what the three
+    /// properties above rest on.
+    ///
+    /// One per process rather than one per [`Executor`](crate::Executor),
+    /// which is the stronger form of "shared": it is immutable in every way
+    /// a run can be read -- its policy is never consulted, its completion
+    /// slot is never written, its estate word is never set -- so there is
+    /// nothing for two executors to disagree about, and nothing of either
+    /// one's that it keeps alive.
+    pub(crate) fn free_standing() -> &'static Arc<Self> {
+        /// The sentinel itself, built on the first async task of the process
+        /// and never dropped. One allocation, which is what keeps an async
+        /// task at upstream's one-allocation cost.
+        static FREE_STANDING: OnceLock<Arc<Topology>> = OnceLock::new();
+
+        FREE_STANDING.get_or_init(|| {
+            let topology = Self::over(|| true, || {}, None);
+            // The phantom job that makes "never finishes" structural rather
+            // than a rule somebody has to keep. Every job raises this counter
+            // before it is queued and lowers it as it finishes -- which is
+            // the scheduler's rule for every topology, not this one's -- so
+            // the counter is one plus the number of free nodes in flight: it
+            // can be driven down to one but never to zero, `job_finished`
+            // never reports a last job, and the tear-down is unreachable. A
+            // sentinel that *could* be torn down would evaluate a run policy
+            // and release a waiter that does not exist.
+            topology.join_counter.store(1, Ordering::Relaxed);
+            Arc::new(topology)
+        })
     }
 
     /// A run that is over before it begins and has no graph at all: what
@@ -1732,6 +1875,10 @@ const _: () = {
     assert_send_sync::<GraphOwner>();
     assert_send_sync::<Graph>();
     assert_send_sync::<Nested>();
+    // The free-standing node a `GraphOwner::Async` holds: shared with every
+    // handle on the task and with the worker that runs it, so it is the same
+    // requirement the two other owners make of what they hold.
+    assert_send_sync::<AsyncNode>();
     assert_send_sync::<Topology>();
     assert_send_sync::<Flow>();
     assert_send_sync::<Node>();
@@ -1751,7 +1898,7 @@ mod tests {
     use crate::Executor;
     use crate::executor::queue::WorkerQueue;
     use crate::executor::worker::WorkerThread;
-    use crate::graph::SubflowWork;
+    use crate::graph::{AsyncWork, SubflowWork};
     use crate::prelude::*;
 
     /// A run that runs its graph exactly once and has nothing to call
@@ -2800,5 +2947,87 @@ mod tests {
     fn a_job_is_five_words() {
         assert_eq!(size_of::<GraphOwner>(), 16, "a tag and one pointer");
         assert_eq!(size_of::<Job>(), 40);
+    }
+
+    /// The free-standing node of a silent async task, which is the fifth
+    /// kind of graph a job can walk.
+    fn free_node() -> Arc<AsyncNode> {
+        AsyncNode::new("free", Handle::Async(AsyncWork::plain(|| {})))
+    }
+
+    /// A job of a free node resolves like a job of any other graph: the one
+    /// node of the task's own arena, the arena itself, and the sentinel run.
+    /// That is the whole point of giving an async task a one-node graph --
+    /// the dispatch learns nothing new.
+    #[test]
+    fn a_job_of_a_free_node_resolves_to_that_node() {
+        let node = free_node();
+        let job = Job::free(&node, &Parent::Run);
+
+        let (resolved, graph, topology) = job.parts();
+        assert!(
+            std::ptr::eq(resolved, node.node()),
+            "the job names the task's one node"
+        );
+        assert!(
+            std::ptr::eq(graph, node.graph()),
+            "and resolves it against the task's own arena"
+        );
+        assert!(
+            std::ptr::eq(topology, &**Topology::free_standing()),
+            "the run is the sentinel every free node shares"
+        );
+        assert_eq!(resolved.name(), "free");
+        assert!(resolved.handle().is_async());
+    }
+
+    /// Both halves of what the sentinel has to make true. A free node with
+    /// no parent is never skipped -- the sentinel is never cancelled, which
+    /// is what makes the first term of `is_parent_cancelled` harmless -- and
+    /// a free node *under* a parent still answers for that parent, which is
+    /// how a task group cancels the children it owns.
+    #[test]
+    fn a_free_node_is_cancelled_only_by_a_parent_above_it() {
+        let node = free_node();
+
+        assert!(
+            !Job::free(&node, &Parent::Run).is_parent_cancelled(),
+            "nothing cancels the run a free node claims to be part of"
+        );
+
+        let parent = Nested::new(None);
+        let under_parent = Job::free(&node, &parent.as_parent());
+        assert!(!under_parent.is_parent_cancelled());
+
+        // Upstream's `ESTATE::CANCELLED` on the parent, which is what a task
+        // group's cancel sets on the anchor its children hang off.
+        parent
+            .base()
+            .estate()
+            .fetch_or(Cancellable::CANCELLED, Ordering::Relaxed);
+        assert!(
+            under_parent.is_parent_cancelled(),
+            "a cancelled parent skips the free nodes under it"
+        );
+    }
+
+    /// The sentinel never reports a last job, which is what keeps the
+    /// tear-down -- a run policy and a waiter that do not exist -- out of
+    /// reach. Queue and finish are paired here as the scheduler pairs them,
+    /// which is the condition the phantom job is counted on top of.
+    #[test]
+    fn the_sentinel_run_never_finishes() {
+        let node = free_node();
+        let job = Job::free(&node, &Parent::Run);
+
+        job.parent().count_queued(job.topology(), 1);
+        let (parent, topology) = job.finish().into_parts();
+
+        assert!(matches!(parent, Parent::Run));
+        assert!(
+            !topology.job_finished(),
+            "the phantom job is what the counter can never get past"
+        );
+        assert!(!topology.cancelled(), "and nothing can cancel the sentinel");
     }
 }
