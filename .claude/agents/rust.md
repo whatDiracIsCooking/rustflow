@@ -97,9 +97,14 @@ Rough order of the work overall: static graph -> executor -> control flow
   `Dockerfile` -- never `rustup update` or let a tool self-update; bump the
   arg and let the image rebuild.
 - Unit tests live beside the code in `#[cfg(test)] mod tests`.
-- Dependencies are a decision, not a convenience: the crate has none yet. If
-  you genuinely need one, add it and run a `cargo` command so `Cargo.lock`
-  updates in the same change, and call it out in the summary.
+- Dependencies are a decision, not a convenience. The crate has two runtime
+  ones today, both exact-pinned, plus what they pull in transitively, and the
+  README's "Dependency policy" section is the authority on which crates that
+  admits and why -- read it there rather than trusting a list repeated here,
+  because two lists drift. Adding one means running a `cargo` command so
+  `Cargo.lock` updates in the same change, satisfying `deny.toml` (the gate's
+  `cargo deny check` is what enforces the policy now -- licenses, sources,
+  duplicate versions), and calling it out in the summary.
 - Match the surrounding code's comment density and voice. Comments here
   explain *why* a choice was made; they do not narrate the code.
 
