@@ -42,17 +42,28 @@
 //!   fine, and still costs a thread. Two pools cannot starve each other the
 //!   way one pool starves itself.
 //!
-//! # The inner run's topology
+//! # The inner run's anchor and topology
 //!
-//! Every queued job holds a share of the run it belongs to and of the storage
-//! of the taskflow it walks, which is what `executor::topology` rests on:
-//! neither can be freed while a job can name it. A corun adds nothing to that
-//! argument and takes nothing away. What it does add is a second reason the
-//! inner run cannot be left behind: its topology is owned by `InnerRun`, a
-//! value this module creates on the corun frame and never hands out, so a
-//! caller cannot hold it and therefore cannot leak it either -- and the `Drop`
-//! that waits for the run is the only way the frame can be left, an unwind
-//! through it included.
+//! Every queued job holds a share of the run it belongs to, of the storage of
+//! the taskflow it walks and of the parent its graph was scheduled under,
+//! which is what `executor::topology` rests on: none of the three can be
+//! freed while a job can name it. A corun adds nothing to that argument and
+//! takes nothing away. What it does add is a second reason the inner run
+//! cannot be left behind: both the anchor and the topology are owned by
+//! `InnerRun`, a value this module creates on the corun frame and never hands
+//! out, so a caller cannot hold either and therefore cannot leak them -- and
+//! the `Drop` that ends the run is the only way the frame can be left, an
+//! unwind through it included.
+//!
+//! The anchor is what the inner graph is scheduled *under*, and it is
+//! upstream's local `NodeBase anchor` in `corun`: the jobs of the graph count
+//! it down rather than counting down the topology, and the corunning frame
+//! waits for it to reach zero. The topology is still there and still the run
+//! -- it is what a failing task reports to and what `join` waits on -- but
+//! nothing drives *its* counter to zero, so this frame is its own tear-down.
+//! Scheduling under an anchor rather than under the topology is what the
+//! parent machinery of #47 is for, and what #48's explicit-anchor guard will
+//! hang the exception half of upstream's `_corun_graph` on.
 //!
 //! That makes a corun the closure-shaped version of the promise
 //! [`Executor::run`] makes with a lifetime: the borrow of `taskflow` ends when
@@ -63,7 +74,7 @@ use std::sync::Arc;
 
 use crate::executor::Executor;
 use crate::executor::run_handle::RunError;
-use crate::executor::topology::Topology;
+use crate::executor::topology::{Nested, Topology};
 use crate::executor::worker::WorkerThread;
 use crate::taskflow::{Flow, Taskflow};
 
@@ -153,47 +164,94 @@ impl std::error::Error for CorunError {
 struct InnerRun {
     /// The run. Nothing outside this module can name it.
     topology: Arc<Topology>,
+    /// What the inner graph is scheduled under, and what the corun frame
+    /// waits for: upstream's local `NodeBase anchor`.
+    anchor: Arc<Nested>,
 }
 
 impl InnerRun {
-    /// A run of `flow`'s graph that has not started.
+    /// A run of `flow`'s graph that has not started, with an anchor of its
+    /// own to count down.
     ///
     /// A corun runs its graph exactly once, so the run policy is the only one
     /// that says "do not go round again" from the start, with no callback to
-    /// carry out: `run_n`/`run_until` are for a taskflow a caller runs, and
-    /// the whole of this topology is a counter the corun frame waits on.
+    /// carry out: `run_n`/`run_until` are for a taskflow a caller runs. The
+    /// anchor has no node to resume, which is what tells the last job of the
+    /// graph that nothing is waiting to be re-queued -- this frame is.
     fn new(flow: &Arc<Flow>) -> Self {
         Self {
             topology: Arc::new(Topology::new(|| true, || {}, Arc::clone(flow))),
+            anchor: Nested::new(None),
         }
     }
 
-    /// The topology, to arm and to schedule from.
+    /// The topology, to report failures to and to wait on.
     fn topology(&self) -> &Arc<Topology> {
         &self.topology
+    }
+
+    /// The anchor, to schedule the graph under.
+    fn anchor(&self) -> &Arc<Nested> {
+        &self.anchor
+    }
+
+    /// Whether every job of the inner graph has finished.
+    ///
+    /// Upstream's `_corun_graph` predicate exactly:
+    /// `p->_join_counter.load(acquire) == 0` over the anchor it scheduled the
+    /// graph under. [`InnerRun::end`] is what then makes the run safe to
+    /// leave behind.
+    fn finished(&self) -> bool {
+        self.anchor.outstanding() == 0
+    }
+
+    /// Ends the run: the last touch of the graph, and then the completion
+    /// slot.
+    ///
+    /// With an anchor as the parent, no job of this run ever drives the
+    /// topology's counter to zero, so nothing reaches
+    /// `Shared::tear_down_topology` and this frame owes what that function
+    /// would have done. Two of its steps do not apply -- a corun's policy
+    /// cannot ask for another round and its topology is never on a taskflow's
+    /// run queue -- which leaves releasing the run's share of the storage and
+    /// releasing whoever waits, in that order, for the reason
+    /// `executor::topology` gives: by the time this frame returns, its
+    /// caller may edit the taskflow again.
+    ///
+    /// Idempotent, so that [`Drop`] can call it after the frame already has.
+    fn end(&self) {
+        self.topology.release_flow();
+        self.topology.finish();
     }
 
     /// Blocks until the run is over and hands back what its first panicking
     /// task panicked with, if any.
     ///
-    /// Called when the join counter has already reached zero, so what it
-    /// actually waits for is the few instructions between the last job's
-    /// counter decrement and the `Topology::finish` that releases this frame.
-    /// That is also the point of calling it at all: `finish` is the finishing
-    /// worker's last touch of the topology, so returning from here is what
-    /// makes the topology safe to drop.
+    /// Called after [`InnerRun::end`], so it does not actually block; what it
+    /// is for is the payload, which it takes so that the caller reports it
+    /// once.
     fn join(&self) -> Option<Box<dyn std::any::Any + Send>> {
         self.topology.join()
     }
 }
 
 impl Drop for InnerRun {
-    /// Waits for the run, as [`RunHandle`](crate::RunHandle)'s does.
+    /// Ends the run if the frame did not get that far.
+    ///
+    /// On the ordinary path this is a second, idempotent `end` and a `join`
+    /// that finds the payload already taken. What it is here for is an unwind
+    /// through the corun frame -- which a scheduler bug could cause, since a
+    /// *task*'s panic is caught and recorded instead: a corun's topology is
+    /// finished by its own frame, so a frame that unwound past that point
+    /// would leave a run nothing could ever complete, and a `join` waiting on
+    /// it would block for ever.
     fn drop(&mut self) {
+        self.end();
+
         // A payload nobody asked for is dropped here rather than re-raised,
         // for the reason the run handle gives: this may be running during an
         // unwind, and a panic from a `Drop` in an unwind aborts the process.
-        drop(self.topology.join());
+        drop(self.join());
     }
 }
 
@@ -266,27 +324,32 @@ impl Executor {
 
         let run = InnerRun::new(taskflow.flow());
         if taskflow.flow().has_source_task() {
-            let topology = run.topology();
-
             // Counted as the `run` family counts its own, and for the reason
             // that family's `start` gives: a worker skips the steal loop while
             // `num_topologies` is zero, so this run has to be visible there
-            // before its sources are. The matching decrement is the one every
-            // run gets, from the tear-down of its last job.
+            // before its sources are.
             self.shared.increment_topology();
-            self.shared.set_up_topology(None, taskflow.flow(), topology);
+            self.shared.schedule_graph(
+                None,
+                taskflow.flow(),
+                run.topology(),
+                &run.anchor().as_parent(),
+            );
 
-            // Upstream's predicate, exactly: the run is over when its join
-            // counter reaches zero. `join` below, not this read, is what then
-            // makes the topology safe to drop.
-            WorkerThread::corun_view(Arc::clone(&self.shared), id)
-                .corun_until(|| topology.outstanding() == 0);
-        } else {
-            // Nothing to schedule, so nobody will finish the run: this frame
-            // does, as `Executor::run` does for the same graph. Nothing was
-            // counted either, so there is nothing to decrement.
-            run.topology().finish();
+            // Upstream's `_corun_graph`: work until the anchor's counter says
+            // every job of the inner graph has finished.
+            WorkerThread::corun_view(Arc::clone(&self.shared), id).corun_until(|| run.finished());
+
+            // The decrement every run gets, which for a corun is this frame's
+            // rather than a tear-down's -- see `InnerRun::end`, which is the
+            // rest of what the tear-down would have done.
+            self.shared.decrement_topology();
         }
+
+        // Nothing to schedule means nobody to finish the run either, and the
+        // line below covers both cases: a graph with no source was never
+        // counted, so there is nothing to decrement for it.
+        run.end();
 
         match run.join() {
             Some(payload) => Err(CorunError::Run(RunError::Panicked(payload))),

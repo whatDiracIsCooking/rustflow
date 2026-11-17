@@ -57,7 +57,7 @@
 //! owed.
 //!
 //! - An edge out of a *non*-conditioner is a **strong** dependency. It is
-//!   counted into the successor's join counter by `Topology::set_up` in the
+//!   counted into the successor's join counter by `set_up_graph` in the
 //!   crate-private `executor::topology`, and finishing the predecessor
 //!   decrements that counter; the successor becomes ready when the count
 //!   reaches zero, which is when every strong predecessor has run.
@@ -93,7 +93,7 @@
 //! and upstream does not diagnose them either.
 //!
 //! None of this state outlives a run. `run_n`/`run_until` re-arm every node
-//! through `Topology::set_up` before queueing the next run's sources, so the
+//! through `set_up_graph` before queueing the next run's sources, so the
 //! counters a cycle drove to zero start the next run at their strong counts and
 //! two runs of one taskflow cannot see each other's arithmetic.
 
@@ -109,7 +109,8 @@ use crate::executor::notifier::Notifier;
 use crate::executor::queue::{Thief, WorkerQueue};
 use crate::executor::rng::Xorshift32;
 use crate::executor::topology::Job;
-use crate::graph::Handle;
+use crate::executor::{module, runtime, subflow};
+use crate::graph::{Handle, Node};
 
 /// A worker of an [`Executor`](crate::Executor), as every thread but its own
 /// sees it.
@@ -303,7 +304,11 @@ impl WorkerThread {
 
     /// Takes the next job from this worker's own queue, or `None` if it held
     /// none. Upstream's `w._wsq.pop()`.
-    fn pop(&self) -> Option<Job> {
+    ///
+    /// `pub(crate)` for the unit tests in `executor::topology`, which drive
+    /// the scheduler one job at a time: what a worker's queue holds after a
+    /// job has been invoked is how the preemption protocol is observed.
+    pub(crate) fn pop(&self) -> Option<Job> {
         match &self.queue {
             LocalQueue::Owned(queue) => queue.pop(),
             // The same queue through the other end, which is what a view
@@ -454,23 +459,25 @@ impl WorkerThread {
     /// Runs one job: the task's work, then the bookkeeping that decides what
     /// becomes runnable next.
     ///
-    /// Upstream's `_invoke`, restricted to the four node kinds it can run --
-    /// static, placeholder and the two conditioners. The four dynamic-tasking
-    /// kinds are graph citizens as of #45 and each has an arm below that
-    /// refuses the run; upstream's three remaining kinds, its semaphores and
-    /// its observers are each a later milestone, and none of them is silently
-    /// absent: the `match` below is exhaustive over [`Handle`], so a new kind
-    /// arrives as a compile error here rather than as a task that mysteriously
-    /// does nothing.
+    /// Upstream's `_invoke`. The four node kinds it can run itself are static,
+    /// placeholder and the two conditioners; the four dynamic-tasking kinds
+    /// each get one line here into the module that owns them, and each of
+    /// those three modules refuses the run for now (see [`module`],
+    /// [`subflow`] and [`runtime`]). Upstream's three remaining kinds, its
+    /// semaphores and its observers are each a later milestone, and none of
+    /// them is silently absent: the `match` below is exhaustive over
+    /// [`Handle`], so a new kind arrives as a compile error here rather than
+    /// as a task that mysteriously does nothing.
     ///
     /// The bookkeeping is upstream's two switches over the handle, in its
     /// order: run the work, re-arm this node's own join counter, then release
     /// successors -- every one of them for an ordinary task, only the selected
-    /// ones for a conditioner. The module docs set out the semantics; [`Release`]
+    /// ones for a conditioner, and each one counted against this node's parent
+    /// before it is queued. The module docs set out the semantics; [`Release`]
     /// is what carries the first switch's answer to the second.
     ///
-    /// Before any of that comes upstream's cancellation check, which is the
-    /// early-out below.
+    /// Before any of that come the two things upstream does at the top of
+    /// `_invoke`: the `PREEMPTED` fast path and the cancellation check.
     ///
     /// Upstream's `_update_cache`/`TF_INVOKE_CONTINUATION` is not ported
     /// either: it keeps one ready successor out of the queue and jumps
@@ -482,19 +489,26 @@ impl WorkerThread {
         // this needs no `unsafe` and no argument about who outlives whom: both
         // are alive because the job that named them is. See
         // `executor::topology`.
-        let (node, flow, topology) = job.parts();
+        let (node, graph, topology) = job.parts();
 
-        // Upstream's `_is_parent_cancelled()` early-out at the top of
-        // `_invoke`: a cancelled run runs none of the work it had not started,
-        // and the job is torn down all the same -- the join counters still have
-        // to reach zero for the run to finish at all. The tail of this method
-        // says what spending the job here does; it is the same line.
-        if topology.cancelled() {
-            self.finish_job(&job.into_run());
+        // Upstream's `if(node->_nstate & NSTATE::PREEMPTED) goto invoke_task`:
+        // this is the *second* entry into a node whose nested graph has just
+        // finished, so the work below is a resumption rather than a start, and
+        // the cancellation check is deliberately skipped. A parent that was
+        // cancelled while its children ran still has to come back through the
+        // dispatch, because that is where it clears its own `PREEMPTED` bit
+        // and releases what the run still owes.
+        if node.nstate().load(Ordering::Relaxed) & Node::PREEMPTED == 0
+            // Upstream's `_is_parent_cancelled()` early-out: a cancelled run
+            // runs none of the work it had not started, and the job is torn
+            // down all the same -- the join counters still have to reach zero
+            // for the run to finish at all. The tail of this method says what
+            // spending the job here does; it is the same line.
+            && job.is_parent_cancelled()
+        {
+            self.finish_job(job.finish());
             return;
         }
-
-        let graph = flow.graph();
 
         let release = match node.handle() {
             // Upstream's `_invoke_static_task`, whose
@@ -514,86 +528,50 @@ impl WorkerThread {
                 if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| work.invoke())) {
                     topology.record_panic(payload);
                 }
-                Release::Strong
+                Some(Release::Strong)
             }
             // Upstream's `std::monostate` case: a placeholder has no work, and
             // it still has successors to release.
-            Handle::Placeholder => Release::Strong,
+            Handle::Placeholder => Some(Release::Strong),
             // Upstream's `_invoke_condition_task`, which is the static invoker
             // plus a return value: the same exception handler, and `conds = {
             // work() }` where the static one discards what it called. A panic
             // is therefore recorded exactly as a static task's is -- rest of
             // the run cancelled and all -- and the selection it leaves behind
             // is empty, which selects no successor and ends the branch.
-            Handle::Condition(work) => Release::Selected(
+            Handle::Condition(work) => Some(Release::Selected(
                 panic::catch_unwind(AssertUnwindSafe(|| work.invoke()))
                     .map_err(|payload| topology.record_panic(payload))
                     .ok(),
-            ),
+            )),
             // Upstream's `_invoke_multi_condition_task`, the same again over
             // however many indices the body returns.
-            Handle::MultiCondition(work) => Release::SelectedMany(
+            Handle::MultiCondition(work) => Some(Release::SelectedMany(
                 panic::catch_unwind(AssertUnwindSafe(|| work.invoke()))
                     .map_err(|payload| topology.record_panic(payload))
                     .unwrap_or_default(),
-            ),
-            // The four dynamic-tasking handles, which #45 made graph citizens
-            // and nothing here can run yet. Each of them needs a piece of the
-            // scheduler that does not exist: a subflow or a module node is the
-            // *parent* of a nested graph, so running one means scheduling that
-            // graph and leaving this node preempted until its children are
-            // done, and a runtime node hands its body the scheduler itself.
-            // None of that can be approximated from here, so each arm refuses
-            // the run instead of guessing, through the channel the static arm
-            // above already uses for a task that fails -- and the work is not
-            // invoked at all.
-            //
-            // A bare `panic!` would be the worse failure rather than the
-            // louder one, which is what #28 established when the conditioner
-            // arms sat here: it unwinds into `WorkerThread::run`'s
-            // `catch_unwind` with this job never counted as finished, so
-            // `Topology::join` never completes and `RunHandle::drop` blocks
-            // for ever. A hang says less than an error does.
-            //
-            // The refusal is louder than #28's was, though, and deliberately
-            // so: `Topology::record_panic` sets `EXCEPTION` beside `CAUGHT` as
-            // of #32, and `EXCEPTION` is half of `Topology::cancelled`, so
-            // refusing one node now cancels the rest of the run -- every task
-            // the run had not started is skipped. That is the better of the
-            // two failures available here, since `wait` still hands back the
-            // payload rather than hanging, but it is no longer "one task
-            // refused, the others ran".
-            //
-            // It is also why the unconditional release below may treat a
-            // refused node as an ordinary one, rather than needing the
-            // preemption special case #47 gives these kinds. The successors
-            // are counted on the topology and queued exactly as a static
-            // task's are, and every one of them then takes the early-out at
-            // the top of this method, because the run it belongs to is
-            // cancelled by the line above. So the join counters still reach
-            // zero -- which is the only way the run finishes at all -- and no
-            // successor of a refused node runs its body.
-            Handle::Subflow { .. } => {
-                topology.record_panic(Box::new(
-                    "running a subflow task is not supported yet: \
-                     subflow tasks are issue #50",
-                ));
-                Release::Strong
-            }
-            Handle::Runtime(_) => {
-                topology.record_panic(Box::new(
-                    "running a runtime task is not supported yet: \
-                     runtime tasks are issue #51",
-                ));
-                Release::Strong
-            }
-            Handle::Module(_) | Handle::AdoptedModule(_) => {
-                topology.record_panic(Box::new(
-                    "running a module task is not supported yet: \
-                     module tasks are issue #49",
-                ));
-                Release::Strong
-            }
+            )),
+            // The four dynamic-tasking handles, each upstream's
+            // `_invoke_*_task` and each one line so that the three modules
+            // below are the only ones #49, #50 and #51 have to edit. Every one
+            // of them may preempt this node rather than finish it, which is
+            // what the `None` under the match is about.
+            Handle::Subflow { work, subgraph } => subflow::invoke(self, &job, work, subgraph),
+            Handle::Runtime(work) => runtime::invoke(self, &job, work),
+            Handle::Module(target) => module::invoke(self, &job, target.graph()),
+            Handle::AdoptedModule(adopted) => module::invoke(self, &job, adopted),
+        };
+
+        // Upstream's `return true` out of `_invoke_subflow_task`,
+        // `_invoke_module_task_impl` and `_invoke_runtime_task`, which its
+        // `_invoke` turns into a bare `return`: this node is the parent of a
+        // graph that is now running, and it owes nothing until that graph is
+        // done. Its own join counter is not re-armed and its successors are
+        // not released, because the node has not finished -- the last job of
+        // the nested graph re-queues it, and the second entry takes the fast
+        // path above and falls through to here.
+        let Some(release) = release else {
+            return;
         };
 
         // Upstream's comment, which is the whole reason this is a `fetch_add`
@@ -602,16 +580,13 @@ impl WorkerThread {
         // cycle -- which only a conditioner can create -- finds this node
         // ready again, and it has to be an add because the body just run may
         // itself have scheduled this node.
-        node.join_counter().fetch_add(
-            usize::try_from(node.nstate().load(Ordering::Relaxed))
-                .expect("a u32 always fits in a usize on a 32-bit target or wider"),
-            Ordering::Relaxed,
-        );
+        node.join_counter()
+            .fetch_add(strong_dependencies(node), Ordering::Relaxed);
 
         // Upstream's second switch over the handle, which [`Release`] has
-        // already answered. Either arm counts a successor on the topology
-        // before queueing it, or the run could look finished with a job still
-        // in flight.
+        // already answered. Either arm counts a successor against this node's
+        // parent before queueing it, or the run could look finished with a job
+        // still in flight.
         match release.selected() {
             // Upstream's `default` arm: every successor, each the moment its
             // last strong dependency is spent.
@@ -619,7 +594,7 @@ impl WorkerThread {
                 for &successor in node.successors() {
                     let next = graph.node(successor);
                     if next.join_counter().fetch_sub(1, Ordering::AcqRel) == 1 {
-                        topology.job_queued();
+                        job.parent().count_queued(topology, 1);
                         self.schedule(job.successor(successor));
                     }
                 }
@@ -645,7 +620,7 @@ impl WorkerThread {
                         .node(successor)
                         .join_counter()
                         .store(0, Ordering::Relaxed);
-                    topology.job_queued();
+                    job.parent().count_queued(topology, 1);
                     self.schedule(job.successor(successor));
                 }
             }
@@ -653,11 +628,11 @@ impl WorkerThread {
 
         // Upstream's `_tear_down_nonasync`. Spending the job here is what
         // releases its share of the taskflow's storage, and it has to happen
-        // before the join counter below may end the run -- `Job::into_run`
+        // before the join counter below may end the run -- `Job::finish`
         // says why. It also ends the borrows this method has been working
         // through, so the compiler is what stops anything from touching
-        // `node`, `graph` or `flow` afterwards.
-        self.finish_job(&job.into_run());
+        // `node`, `graph` or the run afterwards.
+        self.finish_job(job.finish());
     }
 
     /// Steals until something turns up, the worker is told to stop, or the
@@ -820,7 +795,10 @@ impl WorkerThread {
 /// says which it is, which is what keeps the two passes over the handle from
 /// being able to disagree: a conditioner that panicked selects nothing, and
 /// that is a `Selected(None)`, never a `Strong`.
-enum Release {
+///
+/// The three modules that run a nested graph answer with one of these too, or
+/// with `None` for a node they have preempted: see [`WorkerThread::invoke`].
+pub(crate) enum Release {
     /// Every successor, each once its own strong dependencies are spent: the
     /// rule for every handle that is not a conditioner.
     Strong,
@@ -848,6 +826,21 @@ impl Release {
             Self::SelectedMany(conditions) => Some(conditions),
         }
     }
+}
+
+/// How many strong dependencies `node` has, out of the state word that holds
+/// the count and the scheduler's state bits together.
+///
+/// Upstream's `node->_nstate & NSTATE::STRONG_DEPENDENCIES_MASK`, and the mask
+/// is not decoration: the three state bits live above the count in the same
+/// word, so re-arming a join counter from the unmasked word would add
+/// 536,870,912 or more to it. The node would then never reach zero again and
+/// the failure would be a hang rather than a wrong answer -- which is why the
+/// mask arrived in the same change as `PREEMPTED`, the first bit the scheduler
+/// itself sets on a node it means to come back to.
+fn strong_dependencies(node: &Node) -> usize {
+    usize::try_from(node.nstate().load(Ordering::Relaxed) & Node::STRONG_DEPENDENCIES_MASK)
+        .expect("a u32 always fits in a usize on a 32-bit target or wider")
 }
 
 /// Narrows one index a conditioner returned onto a successor position, or
@@ -900,6 +893,7 @@ fn seed_from_current_thread() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::Graph;
 
     /// The victim map has to be a bijection onto `0..max_victim` minus `id`,
     /// which is small enough to check exhaustively: a worker that can steal
@@ -981,6 +975,36 @@ mod tests {
             Release::SelectedMany(vec![3, -1]).selected(),
             Some(&[3, -1][..])
         );
+    }
+
+    /// The mask is what keeps a scheduler state bit out of a join counter,
+    /// and this is the case that fails *fast* without it: a node carrying one
+    /// bit must re-arm from its count alone. Unmasked, each of these would
+    /// read as hundreds of millions of dependencies, the node would never
+    /// become ready again, and the run would hang with no assertion to point
+    /// at it.
+    #[test]
+    fn a_state_bit_is_not_counted_as_a_strong_dependency() {
+        let mut graph = Graph::new();
+        let task = graph.add_node(Handle::Placeholder);
+        let node = graph.node(task);
+
+        for count in [0_u32, 1, 2, Node::STRONG_DEPENDENCIES_MASK] {
+            for state in [
+                0,
+                Node::PREEMPTED,
+                Node::RETAIN_SUBFLOW,
+                Node::JOINED_SUBFLOW,
+                Node::PREEMPTED | Node::RETAIN_SUBFLOW | Node::JOINED_SUBFLOW,
+            ] {
+                node.nstate().store(count | state, Ordering::Relaxed);
+                assert_eq!(
+                    strong_dependencies(node),
+                    usize::try_from(count).expect("a u32 fits in a usize"),
+                    "count {count:#x} with state {state:#x}"
+                );
+            }
+        }
     }
 
     /// Two threads must not share a stream, or two workers would walk the same

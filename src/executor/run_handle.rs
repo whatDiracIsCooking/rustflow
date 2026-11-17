@@ -84,12 +84,14 @@ use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError, Weak};
 use std::task::{Context, Poll};
 
-use crate::executor::topology::{Cancellable, Job, Topology};
+use crate::executor::topology::{Cancellable, Finished, Job, Parent, Topology, set_up_graph};
 use crate::executor::worker::WorkerThread;
 use crate::executor::{Executor, Shared};
+use crate::graph::Node;
 use crate::taskflow::{Flow, Taskflow};
 
 /// Why a run did not finish cleanly.
@@ -724,41 +726,75 @@ fn repeat(times: usize) -> impl FnMut() -> bool + Send + 'static {
 }
 
 impl Shared {
-    /// Arms `topology` over `flow`'s graph and queues its source tasks.
+    /// Arms every node of `flow`'s graph for `topology`, counts its source
+    /// tasks against `parent` and queues them.
     ///
-    /// Upstream's `_set_up_topology(Worker*, Topology*)`, whose `Worker*` is
-    /// this `worker`: a thread that is one of this executor's workers pushes
-    /// the sources onto its own queue, and any other thread goes through the
-    /// shared buffers. `run` is the second case, and the tear-down -- which
-    /// both re-runs a topology and starts the next one of a taskflow's queue
-    /// -- is the first.
+    /// Upstream's `_schedule_graph(Worker&, Graph&, Topology*, NodeBase*)`,
+    /// which is the one scheduling primitive in the executor: a run's own
+    /// graph goes through it with [`Parent::Run`], and so does every nested
+    /// graph with the node or the anchor it hangs off. Three steps, in
+    /// upstream's order, and the order is the whole of it -- the parent is
+    /// told about the sources *before* any of them is queued, because a source
+    /// can run and finish, and decrement that counter, before this call has
+    /// returned.
     ///
-    /// Scheduling a run does not touch the topology count: a run is counted
+    /// Upstream takes a `Graph&`, where this takes the share that owns it: a
+    /// job owns what it names, so the jobs this queues each need a handle on
+    /// the graph rather than a reference into it. That is #40's shape, and
+    /// `executor::topology` has the argument.
+    ///
+    /// The `worker` is upstream's: a thread that is one of this executor's
+    /// workers pushes the sources onto its own queue, and any other thread
+    /// goes through the shared buffers. `run` is the second case; the
+    /// tear-down -- which both re-runs a topology and starts the next one of a
+    /// taskflow's queue -- is the first.
+    ///
+    /// Scheduling a graph does not touch the topology count: a run is counted
     /// once, when its handle is created, however many times its graph goes
-    /// round.
-    pub(crate) fn set_up_topology(
+    /// round and however many graphs nest inside it.
+    pub(crate) fn schedule_graph(
         &self,
         worker: Option<&WorkerThread>,
         flow: &Arc<Flow>,
         topology: &Arc<Topology>,
+        parent: &Parent,
     ) {
-        let num_sources = topology.set_up(flow);
-        debug_assert!(
-            num_sources > 0,
-            "a run is only ever created for a graph with a source task"
-        );
+        let num_sources = set_up_graph(flow.graph());
+        parent.count_queued(topology, num_sources);
 
         match worker {
             // Upstream's `_bulk_schedule(Worker&, ...)`, which is
             // `WorkerThread::schedule` per job here: the deque behind a
             // worker's queue grows, so there is no bulk push to make.
             Some(worker) => {
-                for job in Job::sources(flow, topology) {
+                for job in Job::sources(flow, topology, parent) {
                     worker.schedule(job);
                 }
             }
-            None => self.bulk_schedule(Job::sources(flow, topology)),
+            None => self.bulk_schedule(Job::sources(flow, topology, parent)),
         }
+    }
+
+    /// Arms `topology` over `flow`'s graph and queues its source tasks.
+    ///
+    /// Upstream's `_set_up_topology(Worker*, Topology*)`, which is
+    /// [`Shared::schedule_graph`] with the topology as its own parent --
+    /// upstream's `_set_up_graph(g, tpg, tpg)`. Upstream *stores* the source
+    /// count on the topology where `schedule_graph` adds it, which is the same
+    /// write: a topology reaches this with nothing outstanding, whether
+    /// because it has never run or because the run that just ended drove the
+    /// counter to zero.
+    pub(crate) fn set_up_topology(
+        &self,
+        worker: Option<&WorkerThread>,
+        flow: &Arc<Flow>,
+        topology: &Arc<Topology>,
+    ) {
+        debug_assert!(
+            flow.has_source_task(),
+            "a run is only ever created for a graph with a source task"
+        );
+        self.schedule_graph(worker, flow, topology, &Parent::Run);
     }
 
     /// Ends a run whose last job has just finished, or sends its graph round
@@ -770,7 +806,7 @@ impl Shared {
     /// The graph is not an argument, where every other method of this family
     /// takes it: the job that got here has already given its share of the
     /// taskflow's storage up, which is what keeps a taskflow editable the
-    /// instant its run is over -- see `Job::into_run`. So the share this needs
+    /// instant its run is over -- see `Job::finish`. So the share this needs
     /// is the run's own, taken back out of the topology below.
     pub(crate) fn tear_down_topology(
         &self,
@@ -783,7 +819,7 @@ impl Shared {
 
         // Upstream's case 1: the predicate says run the graph again. Same
         // topology, so it is neither counted again nor finished -- and
-        // `Topology::set_up` re-arms every join counter the run just spent.
+        // `set_up_graph` re-arms every join counter the run just spent.
         // The run keeps its share of the storage, since it is about to need it
         // again.
         if topology.run_again() {
@@ -855,23 +891,58 @@ impl WorkerThread {
         self.shared.tear_down_topology(Some(self), topology);
     }
 
-    /// Accounts for one job of `topology` having finished, ending the run if it
-    /// was the last.
+    /// Accounts for one finished job against the parent its graph was
+    /// scheduled under, ending the run or resuming that parent if it was the
+    /// last.
     ///
-    /// Upstream's `_tear_down_nonasync` for a top-level node. It is the tail of
-    /// `WorkerThread::invoke` and the whole of what a job skipped by the
+    /// Upstream's `_tear_down_nonasync`, both of its branches. It is the tail
+    /// of `WorkerThread::invoke` and the whole of what a job skipped by the
     /// cancelled early-out at the top of that method still owes: the join
-    /// counters have to reach zero for the run to finish at all, which is why
+    /// counters have to reach zero for anything to finish at all, which is why
     /// upstream's cancelled branch goes to `_tear_down_invoke` rather than
     /// simply returning.
     ///
     /// **The last thing the caller may do with the run**, for the reason
     /// [`Shared::tear_down_topology`] gives -- and the caller must already
     /// have given up its share of the taskflow's storage, which is why the
-    /// only way to reach this is through `Job::into_run`.
-    pub(crate) fn finish_job(&self, topology: &Arc<Topology>) {
-        if topology.job_finished() {
-            self.tear_down_topology(topology);
+    /// only way to reach this is through [`Job::finish`].
+    pub(crate) fn finish_job(&self, finished: Finished) {
+        let (parent, topology) = finished.into_parts();
+
+        match parent {
+            // Upstream's `parent == node->_topology` branch: the last job of
+            // the run's own graph ends the run.
+            Parent::Run => {
+                if topology.job_finished() {
+                    self.tear_down_topology(&topology);
+                }
+            }
+            // Upstream's `else`: the parent is a node whose graph this job
+            // belonged to, or a corun's anchor.
+            Parent::Nested(nested) => {
+                // Read before the decrement, as upstream reads it and for a
+                // reason that survives translation: the instant that counter
+                // reaches zero the parent may be resumed on another worker,
+                // and a resumed parent clears its own `PREEMPTED` bit. A read
+                // after the decrement could therefore miss the bit that is
+                // asking for the resumption. (Upstream's own comment is about
+                // the node being *deleted* by then, which an arena and a share
+                // rule out.)
+                let base = nested.base();
+                let preempted = base.nstate().load(Ordering::Relaxed) & Node::PREEMPTED != 0;
+
+                if base.join_counter().fetch_sub(1, Ordering::AcqRel) == 1 && preempted {
+                    // Upstream's `_update_cache(worker, cache, parent)`, which
+                    // is not ported: the parent goes back on a queue like any
+                    // other job rather than being run immediately on this
+                    // worker. A corun's anchor is never preempted and has no
+                    // job to resume -- the frame waiting on it is watching the
+                    // counter this decrement just drove to zero.
+                    if let Some(job) = nested.resume() {
+                        self.schedule(job.clone());
+                    }
+                }
+            }
         }
     }
 }
@@ -1029,10 +1100,24 @@ mod tests {
             canceller
         };
 
+        // A finished run reports `false` whether or not its topology is still
+        // there, which is the half of this that holds the moment `wait`
+        // returns: `Topology::finish` marks the run finished before it
+        // releases the waiting thread.
         assert!(!canceller.cancel(), "the run is gone");
-        assert_eq!(format!("{canceller:?}"), "Canceller { live: false }");
-        // Still `false` for a clone made after the run went away.
         assert!(!canceller.clone().cancel());
+
+        // That the topology has actually been *freed* is a question about who
+        // else holds a share of it, and the answer the instant a `wait`
+        // returns is "possibly a worker": the thread that ends a run holds its
+        // share across the `finish` that releases the waiter, and drops it a
+        // few instructions later. So the pool is shut down -- which joins
+        // every worker -- before the token is asked, and then nothing but the
+        // token can name the run. Asserting it any earlier is a race, and was
+        // one: this case failed about one run in ten on two cores.
+        drop(executor);
+        assert_eq!(format!("{canceller:?}"), "Canceller { live: false }");
+        assert!(!canceller.cancel());
     }
 
     /// The repeat predicate is the whole of `run_n`, so its shape is worth

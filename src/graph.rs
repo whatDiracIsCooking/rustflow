@@ -4,10 +4,16 @@
 //! C++ a `tf::Task` wraps a raw `Node*` into a graph the caller keeps mutating,
 //! which does not survive translation to Rust's aliasing rules; here [`Graph`]
 //! owns its nodes by value in a `Vec` and a [`Task`] is an index into it.
-//! Upstream's object pool (`TF_ENABLE_TASK_POOL`) is therefore not ported, and
-//! neither is the `NodeBase`/`Node` split: the base class exists upstream so
-//! that `Topology` can share the three state words, which nothing in this port
-//! needs yet, so the words keep their upstream names in a single struct.
+//! Upstream's object pool (`TF_ENABLE_TASK_POOL`) is therefore not ported.
+//! Upstream's `NodeBase`/`Node` split is, as of #47: the base holds the
+//! state words a run writes, so that everything which can be the *parent* of
+//! a graph is one kind of thing to the scheduler -- a node whose nested graph
+//! is running, or the anchor a `corun` waits on. Two of upstream's fields are
+//! deliberately not in it. `_exception_ptr` belongs to the run here, which
+//! owns the one payload slot a failure is reported through, and `_parent`
+//! travels with the *job* that names a node rather than being stored on the
+//! node: `executor::topology` has that argument, and it is what keeps the
+//! scheduler free of raw pointers.
 //!
 //! That choice decides what erasing a node has to do. Upstream's `Graph::_erase`
 //! compacts its `_nodes` vector, which it can afford because a `tf::Task` holds
@@ -357,12 +363,66 @@ impl Handle {
     }
 }
 
+/// The state a run writes on something it can schedule a graph under:
+/// upstream's `NodeBase`.
+///
+/// A [`Node`] embeds one, and so does the anchor a
+/// [`corun`](crate::Executor::corun) waits on, because the scheduler counts
+/// both down the same way: the jobs of a graph decrement the join counter of
+/// whatever they were scheduled under, and the last of them to reach zero is
+/// what ends that nested run. Upstream says the same thing by inheritance,
+/// and reaches either through a `NodeBase*`.
+///
+/// The words are atomic even where upstream's are plain -- `_nstate` is a
+/// bare `int` there -- so that a run can hold a `&Graph` across worker
+/// threads instead of handing out `&mut` to nodes it does not exclusively
+/// own. Upstream's two remaining members are not here, and the module docs
+/// say why: `_parent` travels with the job, and a panic payload belongs to
+/// the run.
+#[derive(Debug, Default)]
+pub(crate) struct NodeBase {
+    /// Upstream's `_nstate`: the strong-dependency count in the low 28 bits
+    /// -- [`Node::STRONG_DEPENDENCIES_MASK`] -- and the scheduler's state
+    /// bits above it.
+    nstate: AtomicU32,
+    /// Upstream's `_estate`: the cancellation and exception bits, which for a
+    /// parent are what makes the whole chain under it cancelled.
+    estate: AtomicU32,
+    /// Upstream's `_join_counter`: what is still outstanding, be that this
+    /// node's own strong dependencies or the jobs of the graph it is the
+    /// parent of.
+    join_counter: AtomicUsize,
+}
+
+impl NodeBase {
+    /// A base with every word clear: no dependencies, no state, nothing
+    /// outstanding.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// The scheduler state word, upstream's `_nstate`.
+    pub(crate) fn nstate(&self) -> &AtomicU32 {
+        &self.nstate
+    }
+
+    /// The exception state word, upstream's `_estate`.
+    pub(crate) fn estate(&self) -> &AtomicU32 {
+        &self.estate
+    }
+
+    /// The join counter, upstream's `_join_counter`.
+    pub(crate) fn join_counter(&self) -> &AtomicUsize {
+        &self.join_counter
+    }
+}
+
 /// A single task of a [`Graph`]: its name, its work, its edges and the state
 /// words a run mutates.
 ///
-/// The state words are atomic even where upstream's are plain (`_nstate` is a
-/// bare `int` there) so that a run can hold a `&Graph` across worker threads
-/// instead of handing out `&mut` to nodes it does not exclusively own.
+/// The state words are a `NodeBase` -- crate-private, so it is named rather
+/// than linked here -- which is upstream's arrangement and the reason a parent
+/// can be a node or an anchor indifferently.
 #[derive(Debug)]
 pub struct Node {
     name: String,
@@ -373,9 +433,8 @@ pub struct Node {
     /// allocation, and keeps the order of each half observable to tests.
     num_successors: usize,
     edges: Vec<Task>,
-    nstate: AtomicU32,
-    estate: AtomicU32,
-    join_counter: AtomicUsize,
+    /// The state words a run writes, upstream's `NodeBase` subobject.
+    base: NodeBase,
 }
 
 impl Node {
@@ -387,9 +446,7 @@ impl Node {
             handle,
             num_successors: 0,
             edges: Vec::new(),
-            nstate: AtomicU32::new(0),
-            estate: AtomicU32::new(0),
-            join_counter: AtomicUsize::new(0),
+            base: NodeBase::new(),
         }
     }
 
@@ -455,35 +512,65 @@ impl Node {
     /// answer `false`.
     pub const JOINED_SUBFLOW: u32 = 0x8000_0000;
 
+    /// Upstream's `NSTATE::PREEMPTED`: set on a node whose nested graph is
+    /// running, and cleared when the scheduler comes back to it.
+    ///
+    /// A node carrying this bit has been *entered* and not finished: the
+    /// executor scheduled the graph the node is the parent of and left the
+    /// node itself to be resumed by the last of that graph's jobs to finish.
+    /// See the [`executor`](crate::executor) module docs for the protocol.
+    pub const PREEMPTED: u32 = 0x2000_0000;
+
+    /// Upstream's `NSTATE::STRONG_DEPENDENCIES_MASK`: which bits of the
+    /// `nstate` word hold the strong-dependency count rather than scheduler
+    /// state.
+    ///
+    /// The count lives in the low 28 bits and the state bits above it are the
+    /// three constants above, so every read of the count masks and every
+    /// write of it is checked against this. Without the mask a node carrying
+    /// one state bit would re-arm its join counter with that bit's value --
+    /// hundreds of millions -- and never become ready again, which is a hang
+    /// rather than a wrong answer.
+    pub const STRONG_DEPENDENCIES_MASK: u32 = 0x0FFF_FFFF;
+
+    /// The state words a run writes on this node, upstream's `NodeBase`
+    /// subobject.
+    ///
+    /// This is what the scheduler holds when it does not care whether the
+    /// thing it is counting down is a node or the anchor of a nested run.
+    pub(crate) fn base(&self) -> &NodeBase {
+        &self.base
+    }
+
     /// Returns the scheduler state word, upstream's `_nstate`.
     ///
-    /// The two constants above are the only bits of upstream's `NSTATE`
-    /// vocabulary this port has; `IMPLICITLY_ANCHORED`, `PREEMPTED` and the
-    /// `STRONG_DEPENDENCIES_MASK` arrive with the executor half of dynamic
-    /// tasking. The mask is the one that matters for the pair above: upstream
-    /// keeps the strong-dependency count in the low 28 bits and masks it out
-    /// of the word on every read, where this port's run stores and re-arms
-    /// from the whole 32 bits. Nothing can set these two bits on a node a run
-    /// will reach yet -- only [`crate::subflow`] writes them, from a path the
-    /// executor still refuses -- but the mask has to come back in that same
-    /// change, or a node carrying one of them would re-arm its join counter
-    /// with the bit's value.
+    /// The four constants above are the bits of upstream's `NSTATE`
+    /// vocabulary this port has; `IMPLICITLY_ANCHORED` arrives with the
+    /// anchor bits in issue #48. The word is the strong-dependency count with
+    /// the state bits above it, so the count is read through
+    /// [`Node::STRONG_DEPENDENCIES_MASK`] and nothing else.
     #[must_use]
     pub fn nstate(&self) -> &AtomicU32 {
-        &self.nstate
+        self.base.nstate()
     }
 
     /// Returns the exception state word, upstream's `_estate`.
     #[must_use]
     pub fn estate(&self) -> &AtomicU32 {
-        &self.estate
+        self.base.estate()
     }
 
     /// Returns the join counter a run decrements to decide when this node is
     /// ready, upstream's `_join_counter`.
+    ///
+    /// It counts two things, as upstream's does: the strong dependencies this
+    /// node is still waiting for, and -- while the node is the parent of a
+    /// running graph -- the jobs of that graph which have not finished. The
+    /// two never overlap, because a node whose nested graph is running has
+    /// already had its own dependencies spent.
     #[must_use]
     pub fn join_counter(&self) -> &AtomicUsize {
-        &self.join_counter
+        self.base.join_counter()
     }
 
     /// Appends `to` to the successor half, upstream's `Node::_precede` minus
@@ -787,6 +874,7 @@ const _: () = {
     assert_send_sync::<SubflowWork>();
     assert_send_sync::<RuntimeWork>();
     assert_send_sync::<Handle>();
+    assert_send_sync::<NodeBase>();
     assert_send_sync::<Node>();
     assert_send_sync::<Graph>();
 };
@@ -1259,10 +1347,10 @@ mod tests {
         assert_eq!(owned.node(Task::new(0)).name(), "inner");
     }
 
-    /// The two `nstate` bits are upstream's, which means two distinct top
-    /// bits: a value that is both of them is neither of anything else, and
-    /// neither can be confused with the strong-dependency count the port
-    /// keeps in the same word.
+    /// The `nstate` bits are upstream's, which means distinct top bits: a
+    /// value that is one of them is none of the others, and none of them can
+    /// be confused with the strong-dependency count the port keeps in the
+    /// same word.
     #[test]
     fn the_subflow_state_bits_are_upstreams_two_top_bits() {
         assert_eq!(Node::RETAIN_SUBFLOW, 0x4000_0000);
@@ -1285,6 +1373,63 @@ mod tests {
             node.nstate().load(Ordering::Relaxed) & Node::JOINED_SUBFLOW,
             0
         );
+    }
+
+    /// `PREEMPTED` and the mask are the other half of upstream's `NSTATE`,
+    /// and the one property that matters is that the state bits and the
+    /// count cannot reach into each other: the count is masked out of the
+    /// word on every read, so a bit set on a node must not be able to look
+    /// like 536,870,912 dependencies, and a count must not be able to look
+    /// like a state bit.
+    #[test]
+    fn the_state_bits_and_the_dependency_count_do_not_overlap() {
+        assert_eq!(Node::PREEMPTED, 0x2000_0000);
+        assert_eq!(Node::STRONG_DEPENDENCIES_MASK, 0x0FFF_FFFF);
+        assert_eq!(Node::PREEMPTED.count_ones(), 1);
+
+        let state = Node::PREEMPTED | Node::RETAIN_SUBFLOW | Node::JOINED_SUBFLOW;
+        assert_eq!(state & Node::STRONG_DEPENDENCIES_MASK, 0);
+        assert_eq!(state.count_ones(), 3);
+
+        // The mask is contiguous from bit zero, so masking a word is the
+        // count and nothing else. The bit just above it is upstream's
+        // `IMPLICITLY_ANCHORED`, which is issue #48's and is why the count
+        // field stops one bit short of `PREEMPTED` rather than at it.
+        assert_eq!(Node::STRONG_DEPENDENCIES_MASK.count_ones(), 28);
+        assert_eq!(Node::STRONG_DEPENDENCIES_MASK.trailing_ones(), 28);
+        const { assert!(Node::STRONG_DEPENDENCIES_MASK < Node::PREEMPTED) };
+        let (graph, t) = graph_of(1);
+        let node = graph.node(t[0]);
+        node.nstate()
+            .store(Node::STRONG_DEPENDENCIES_MASK | state, Ordering::Relaxed);
+        assert_eq!(
+            node.nstate().load(Ordering::Relaxed) & Node::STRONG_DEPENDENCIES_MASK,
+            Node::STRONG_DEPENDENCIES_MASK
+        );
+    }
+
+    /// A node's state words are its [`NodeBase`], which is the type the
+    /// scheduler holds when it does not care whether what it is counting
+    /// down is a node or an anchor.
+    #[test]
+    fn a_nodes_state_words_are_its_base() {
+        let (graph, t) = graph_of(1);
+        let node = graph.node(t[0]);
+        let base = node.base();
+
+        base.nstate().store(2, Ordering::Relaxed);
+        base.estate().store(4, Ordering::Relaxed);
+        base.join_counter().store(6, Ordering::Relaxed);
+        assert_eq!(node.nstate().load(Ordering::Relaxed), 2);
+        assert_eq!(node.estate().load(Ordering::Relaxed), 4);
+        assert_eq!(node.join_counter().load(Ordering::Relaxed), 6);
+
+        // And a base of its own starts clear, which is what an anchor needs:
+        // nothing outstanding until a graph is scheduled under it.
+        let anchor = NodeBase::new();
+        assert_eq!(anchor.nstate().load(Ordering::Relaxed), 0);
+        assert_eq!(anchor.estate().load(Ordering::Relaxed), 0);
+        assert_eq!(anchor.join_counter().load(Ordering::Relaxed), 0);
     }
 
     #[test]

@@ -215,7 +215,7 @@ impl Flow {
     /// -- before a run is ever queued -- is what keeps the tear-down from
     /// having to deal with a queued run that would schedule nothing.
     ///
-    /// It walks the graph, which [`Topology::set_up`] then walks again. That is
+    /// It walks the graph, which `set_up_graph` then walks again. That is
     /// the same trade the port already makes for the sources, and the same
     /// answer: a walk is cheaper than an allocation, and it buys a scheduling
     /// path with no empty case in it.
