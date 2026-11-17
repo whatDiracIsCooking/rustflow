@@ -14,10 +14,12 @@ asymmetry the first four have to warn about is absent from their tables, and
 they were measured in a separate run with a load of their own. Their section
 records both. The third run is #119's: it is the A/B of one change on the
 scheduling path across all six shapes, and it supersedes the
-`rustflow-runtime` column of the `fibonacci` table. The last section is a
-fourth run, #102's, on the same quiet box: an A/B of the *spill-buffer count*
-across all six shapes, which changed no shipped code and is the reason the
-count is still `bit_width(num_workers)`.
+`rustflow-runtime` column of the `fibonacci` table. The fourth run is #102's, on the same quiet box: an A/B of the *spill-buffer
+count* across all six shapes, which changed no shipped code and is the reason
+the count is still `bit_width(num_workers)`. The last section is a fifth run,
+#125's, which changed no shipped code either: it takes the per-task cost of
+the `async_task` shape's external submission apart with counters and
+ablations, and records what it is.
 
 ```sh
 devtools/devcontainer.sh bench                        # the whole suite
@@ -1297,3 +1299,249 @@ this file want opposite ends of that trade. What the one shape that benefits
 would need is not more buffers: it is not to materialise 65536 jobs and hand
 each one across a core boundary, which the end of the "#60 finding" section
 argues is a milestone rather than a patch.
+
+## The #125 attribution: an external async task is ~440 ns, and 87% of it is the node it allocates
+
+`async_task`'s `rustflow` id is the external submission path with no graph in
+it, and the table above left its per-task cost unexplained: ~440 ns at one
+worker, against the ~100 ns the "#60 finding" section measured for a job of an
+externally submitted *graph* on the same path. #125 is where that was taken
+apart, against the four candidates
+its text listed. The answer is the first of them -- **the allocation** -- but
+not for the reason "one allocation per task" suggests: a free async task costs
+**three** heap blocks and 848 bytes, the producer allocates them and a *worker*
+frees them, and two thirds of what they cost is that split rather than the
+allocating.
+
+**No shipped code changed**, and the decision at the end of this section says
+why. Everything below was measured with temporary counters and ablation
+harnesses inside `src/executor/async.rs`, `src/executor/mod.rs` and
+`src/executor/notifier.rs`; none of that instrumentation is in the shipped
+code, and the counter runs and the timing runs are separate builds -- a build
+carrying an atomic per notifier call is not a build to time. Because nothing
+shipped changed, the six shapes' tables above are untouched and were not
+re-run; the two `async_task` ids below were re-measured because the figure
+this section attributes had to be the one `main` reads today.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id |
+| Date | 2026-11-17 |
+| **Load average** | **1.2 to 7.5, and all of it this run's own** |
+
+The box was quiet, as it was for #119 and #102: no other agent was building or
+testing on it, and the figure above is the decay of this run's own 24-worker
+ids. The criterion ids below ran at a load of 2.1 to 2.4.
+
+### The number, re-measured on today's `main`
+
+Not taken from #96: `main` has had #119 (a runtime body's own queue) and #138
+and #141 (`wait_for_all` woken by the last share of the storage hold, and the
+debug assertion of that rule) since that table was written, and the second of
+those reworked the very machinery candidate 2 names. Each id in its own
+criterion process, the two ids back to back, the order reversed in round 2:
+
+| id | round 1 | round 2 | per task |
+|---|---|---|---|
+| `async_task/rustflow/1w/65536` | 28.730 ms | 31.311 ms | **438 / 478 ns** |
+| `async_task/rustflow-group/1w/65536` | 17.954 ms | 18.301 ms | 274 / 279 ns |
+
+So the figure to attribute is unchanged, and **#138's rework did not move it**
+-- which the counters below explain rather than leave to inference: the mutex
+that rework is about is taken **once per run**, not once per task.
+
+### Where the time is: the producer, not the worker and not the wait
+
+The shape is `N` submissions and one `wait_for_all`, so the first cut is to
+time the two apart. Eleven reps of the shipped path at one worker, medians,
+two rounds:
+
+| | round 1 | round 2 | share |
+|---|---|---|---|
+| submission loop | 427.3 ns/task | 418.1 ns/task | **95%** |
+| `wait_for_all` | 19.6 ns/task | 21.5 ns/task | 5% |
+| whole shape | 450.0 ns/task | 439.2 ns/task | |
+
+That answers candidate 4 on its own -- **the wait is 5% of the shape** -- and
+it says where the other 95% has to be looked for: the submitting thread's own
+loop, with one worker draining behind it. The same producer loop with *nothing
+consuming at all* -- the shipped build of it, pushing into a buffer nobody
+steals from -- costs **140 to 153 ns a task**, so roughly two thirds of what
+the producer pays it pays for having a consumer.
+
+### The counters: the mutex and the notifier are not it
+
+One instrumented run per worker count, 65536 external async tasks, counts and
+emphatically not timings:
+
+| counter | 1 worker | 24 workers |
+|---|---|---|
+| allocations / task | **3.016** | 3.016 |
+| bytes allocated / task | **848** | 848 |
+| `num_asyncs` reached zero | **1** per run | 2720 per run |
+| `num_topologies` reached zero | **1** per run | 6853 per run |
+| notifier poked | 65536 | 65536 |
+| ... and found nobody waiting | **65535** | 60375 |
+| ... and popped a parked waiter | 1 | 4803 |
+| `commit_wait` (a worker parks) | **1** per run | 5026 per run |
+| `thread::park()` actually called | **0** | 0 |
+
+- **Candidate 2's mutex is taken once per 65536 tasks at one worker.** Both
+  counters fall to zero exactly once -- at the end of the run -- because the
+  producer is ahead of the worker the whole way. What a submission pays per
+  task is four atomics and nothing else.
+- **Candidate 3's notifier poke finds nobody 65535 times out of 65536.** The
+  worker parks once, at the start, and then never again: it is never starved,
+  so `bulk_schedule`'s `notify_n(1)` is a `SeqCst` fence and a load that
+  returns. And `thread::park()` is never reached even at 24 workers, where
+  4803 pops signal 4827 waiters between them: every one of those waiters is
+  signalled between its own compare-exchange and its first load of the state
+  word, so no worker on this shape ever reaches the blocking call -- and
+  neither, therefore, does the notifier's `unpark`.
+- **Three allocations per task, not one.** #86's cost model says "one
+  allocation per async task, beyond its body", and the three are the
+  `Arc<AsyncNode>` (88 B), the arena's `Vec<Option<Node>>` (**704 B**: one
+  176-byte node in a `Vec` that grew to capacity 4) and the boxed body
+  (56 B).
+
+### The ablations: what each candidate costs
+
+Each variant is the shipped submission path with one thing taken out of it, in
+the shipped executor and against the real worker, timing the producer loop.
+Eleven reps per variant per round, medians, and the **order of the variants is
+rotated every rep** so none of them is always first; two rounds. Where a
+variant takes the counters out, the batch holds one topology instead and
+completion is noticed by the task body's own counter.
+
+| variant | 1 worker, r1 / r2 | 24 workers, r1 / r2 |
+|---|---|---|
+| **A** the shipped path | 444.6 / 434.9 ns | 1132.3 / 1140.9 ns |
+| **B** every node and job built before the timer | **52.5 / 51.4** | **224.5 / 226.2** |
+| **C** no `increment_async`/`finish_async` | 436.4 / 417.6 | 1123.8 / 1177.5 |
+| **D** notifier poked every 256 tasks | 441.5 / 424.6 | 1044.1 / 1060.9 |
+| **E** B and C together | 42.2 / 41.7 | 201.0 / 198.8 |
+| **F** the build recycled on the producer itself | 171.9 / 169.4 | 543.0 / 543.2 |
+| **G** A plus one more 64-byte allocation | 519.6 / 503.9 | 1823.0 / 1878.3 |
+| **H** A plus one more 704-byte allocation | 669.9 / 659.1 | 2053.8 / 2151.1 |
+
+Read as differences, at one worker:
+
+- **A − B = 384 to 392 ns: the node and the job.** Building them is 87% of the
+  submission loop. Nothing else in the path is within an order of magnitude of
+  it, and every other candidate has to be read against B's 52 ns.
+- **A − C = 8 to 17 ns: the two counters.** At or below the 2 to 5% a side's
+  own rounds disagree by, which is this file's test for a result. Candidate 2
+  is four atomics and one mutex per run.
+- **A − D = 3 to 10 ns: the notifier.** Likewise inside the spread at one
+  worker, and the counter table says why. At 24 workers it is 80 to 88 ns
+  (7%), which is the one place candidate 3 shows up at all.
+- **E = 42 ns: the handoff.** A push into a spill buffer, the notifier poke,
+  the worker stealing it back out and freeing the node. The same harness's
+  bare handoff -- plain `usize`s pushed to one thief, no job and no node -- is
+  34 to 35 ns, which is #60's experiment at one consumer rather than 24, so
+  the executor adds almost nothing to the cost of moving an item across a core
+  boundary.
+- **F − E = 128 to 130 ns: the build when the producer frees its own
+  memory**, against 384 to 392 when the worker does. **A − F = 266 to 273 ns
+  is therefore the cost of the split**, not of the work: in F the producer
+  allocates, runs and frees each node itself and pushes a prebuilt job
+  instead, so the worker's half of the regime is held exactly the same and
+  only the allocator's is different. Build it all on one thread with the
+  memory recycled straight back and the whole task -- node, job, body and
+  retirement -- costs **62 to 65 ns**.
+- **G − A = 69 to 75 ns per extra allocation.** One more 64-byte block,
+  allocated by the producer and freed by the worker, costs that much on its
+  own; three of them is the 266 to 273 ns above, which is the attribution
+  closing on itself from the other side. At 24 workers that single block costs
+  **691 to 737 ns** and the whole build goes from 388 ns to 911, which is
+  three quarters of why this shape is 2.6x worse at 24 workers than at one:
+  #96's "more workers make every variant worse" is, on this shape, the
+  allocator and not the scheduler.
+- **H − A = 224 to 225 ns** for a 704-byte block against G's 69 to 75 for a
+  64-byte one -- but H's box is zero-initialised, so what the difference buys
+  is 11 cache lines written and not a larger chunk. The A/B below is what
+  separates those two.
+
+### Sizing the arena to its one node is worth 3%, and it is not this issue's change
+
+The 704-byte allocation is the arena of a one-node graph: `Vec`'s first push
+takes capacity 4, so three quarters of the largest of the three blocks is
+never used. Measured as a two-build A/B -- a temporary `Graph` constructor
+sized to exactly one node, the two binaries run **A B B A** so neither side is
+systematically warmer:
+
+| | round 1 | round 2 | spread within one side |
+|---|---|---|---|
+| shipped (capacity 4) | 427.6 ns/task | 435.7 ns/task | 1.9% |
+| sized to one node | **412.3 ns/task** | **421.2 ns/task** | 2.2% |
+
+**−3.3 to −3.6%**, which is just outside either side's own spread and therefore a
+result -- and a small one, because the bytes it saves were never touched. It
+is the *count* of blocks that costs, not their size: that is what G against H
+looked like it contradicted and what this A/B settles. The change lives in
+`src/graph.rs` and `src/executor/async_node.rs`, is out of #125's scope, and
+is left for an issue of its own rather than smuggled in here.
+
+### A method note: a stand-in consumer is not a worker
+
+The first version of this harness replaced the executor with one producer
+thread and one thief spinning on the spill buffer, and staged the path up from
+a bare handoff. It had to be abandoned: with the real build in front of it the
+same producer loop read **545 to 832 ns** a task against the shipped path's
+445, and the two rounds of a stage disagreed by up to 2x. A thief that polls
+an empty deque in a tight loop keeps the deque's control words in its own
+cache, so every push the producer makes pays a coherence miss -- where a real
+worker, which runs a task body between steals and parks exactly once per run,
+costs the producer about half that. Every ablation above is therefore measured
+in the shipped executor against the real worker, with only the submission path
+varied. The one figure of that harness quoted above is its bare handoff of
+plain `usize`s (34 to 35 ns a task), which has no build in front of it and so
+never starves its thief; the stages that did are not reported, because what
+they measure is the stand-in.
+
+### The decision: declined, and this is the cost of the design
+
+**Nothing in this path is worth changing**, and the three candidates that
+could be changed from `executor::async` are each inside the noise:
+
+- The two counters are 2 to 4% of the shape at one worker and nothing at 24.
+  Folding them into one word would buy half of that, and would entangle the
+  two waiters that `executor::async` keeps apart on purpose and that #138 and
+  #141 have just finished hardening. Declined: a 1% win is not worth a
+  correctness surface that has already produced four race fixes (#109, #112,
+  #136, #138).
+- The notifier poke is 1 to 2% at one worker and 7% at 24, and it cannot be
+  skipped when no worker is waiting: the `is_empty` check that would skip it
+  has to follow the `SeqCst` fence, which is the expensive half, or the Dekker
+  pair that makes a wake-up unlosable is broken. #60 declined to wake workers
+  *earlier* on this path and this declines to wake them less often, for the
+  same reason in reverse.
+- The wait is 5%, and `wait_for_all` is already a condvar woken once.
+
+What is left is **the three heap blocks a free async task is**, 87% of the
+submission loop, and they are a property of how a node that belongs to no
+taskflow is represented here: `executor::async_node` gives such a task its own
+one-node `Graph` inside an `Arc`, so that every piece of the scheduler which
+resolves a node by index into a graph resolves this one too, and the body is
+boxed because it is type-erased. That decision is #86's and its module docs
+argue it; what this run adds is its price, which that module could not have
+known: **one allocation per task costs 69 to 75 ns at one worker and 691 to
+737 ns at 24 when the producer allocates and a worker frees**, so three of them
+is the shape.
+
+Upstream pays this differently rather than not paying it. Its async node is
+one `Node` out of `animate` -- a plain `new Node` in a default build, so the
+same producer-allocates/worker-frees regime over **one** block instead of
+three -- and `TF_ENABLE_TASK_POOL` replaces that with a sharded
+`ObjectPool<Node>` whose hot path is a lock-free stack of recycled blocks, so
+a freed node goes back to a shard instead of to the allocator -- which is
+exactly the defence against the regime measured above. Neither of those is
+reachable without changing what a free node *is* in this port, so the
+reducible shape here is "fewer blocks per async task", which is a design
+change to #86 and a milestone rather than a patch -- the same place the end of
+the "#60 finding" section arrived at for the flat graph, and for the same kind
+of reason. **That is the recorded cost of the architecture, with the ablations
+above as the evidence.**

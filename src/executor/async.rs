@@ -99,6 +99,36 @@
 //! buffers, and the submitting worker's own sweep reaches them before it
 //! sleeps.
 //!
+//! # What a submission costs, and which part of it is the node
+//!
+//! ~440 ns a task at one worker, for 65536 `silent_async`s submitted from a
+//! thread that is not a worker, where a job of an externally submitted
+//! *graph* costs ~100 ns on the same path. #125 is where that was taken apart
+//! and `BENCHMARKS.md` has the ablations; what belongs here is which line of
+//! the submission they point at, because three of the four suspects turned
+//! out to be nothing:
+//!
+//! - **The node is 87% of it.** A free async task is three heap blocks and
+//!   848 bytes -- the `Arc<AsyncNode>`, the one-node arena inside it and the
+//!   boxed body -- and the submitting thread allocates them where a *worker*
+//!   frees them. One allocation per task in that regime costs 69 to 75 ns at
+//!   one worker and 691 to 737 ns at 24, so the split is two thirds of the
+//!   price: the same construction with the memory recycled on one thread is
+//!   62 to 65 ns for the whole task.
+//! - **The two counters below are 2 to 4%** of it, four atomics a task. The
+//!   mutex each last decrement takes to meet a waiter is taken *once per run*
+//!   at one worker, not once per task.
+//! - **The notifier poke is 1 to 2%**: `bulk_schedule` is called with one job
+//!   per submission, but the worker is never starved on this shape, so 65535
+//!   of 65536 pokes find nobody waiting and no `thread::park` is ever reached.
+//! - **The wait is 5%.** [`Executor::wait_for_all`] is a condvar woken once.
+//!
+//! So what this path costs is what a free node *is*, which is
+//! `executor::async_node`'s decision (#86) rather than this module's, and
+//! nothing reachable from here is worth trading for it -- the counters least
+//! of all, whose separation is the subject of the section below and of four
+//! race fixes.
+//!
 //! # What the executor counts, and what its `Drop` waits for
 //!
 //! Every async task increments `num_topologies` on creation and decrements it
