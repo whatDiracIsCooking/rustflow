@@ -1191,12 +1191,23 @@ mod tests {
             .expect("no task panicked");
 
         assert_eq!(counted.load(Ordering::Relaxed), 8);
-        assert_eq!(executor.num_topologies(), 0);
 
         // The counter `Executor::drop` blocks on is balanced, which is what
         // this case is really about: `wait_for_all` returning is the same
         // claim as the drop below not hanging.
         executor.wait_for_all();
+
+        // Read here and not straight after the `wait` above, because the
+        // `wait` does not order the test thread against the tear-down that
+        // spends this counter: the body's outcome is delivered into the
+        // handle's slot *inside* the wrapper `AsyncHandle::for_body` builds,
+        // so it is part of the body, and the dispatch arm calls
+        // `Shared::finish_async` -- which decrements `num_topologies` and
+        // `num_asyncs` -- only once that body returns. The window between
+        // the two is by construction, so an early read of 1 is correct
+        // behaviour rather than a flake (#136); `wait_for_all` is the call
+        // that actually guarantees the zero.
+        assert_eq!(executor.num_topologies(), 0);
     }
 
     /// The anchor is an implicit anchor for its whole life, so a child that
