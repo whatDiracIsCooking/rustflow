@@ -40,10 +40,12 @@
 pub mod dump;
 pub mod flow_builder;
 pub mod graph;
+pub mod task;
 pub mod taskflow;
 
 pub use crate::flow_builder::{Callables, FlowBuilder};
 pub use crate::graph::{Graph, Handle, Node, Task, Work};
+pub use crate::task::{TaskMut, TaskRef, TaskType};
 pub use crate::taskflow::Taskflow;
 
 /// The names you need in scope to build a graph.
