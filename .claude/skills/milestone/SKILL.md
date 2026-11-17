@@ -432,11 +432,14 @@ While any issue is ready or in flight:
      conflict you can resolve (B5). If two ready issues cannot be
      partitioned, launch them in sequence, not together.
 
-   Then spawn a **background `general-purpose` subagent** with the prompt in
-   "Subagent prompt" below. Not the project's `rust` subagent: its rules are
-   exactly right, but it is forbidden to commit, push or open PRs, so the
-   prompt below points a general-purpose agent at `.claude/agents/rust.md`
-   instead of restating it. Record `issue → {wt, agent id, files, target dir}`.
+   Then spawn a **background `rust` subagent** (`subagent_type: "rust"`) with
+   the prompt in "Subagent prompt" below. Its own instructions are already
+   this repo's rule set — the gate, the crate-wide lints, the provenance line,
+   the dependency policy, the porting posture — so the prompt does not restate
+   any of that. What the prompt must do, and does, is lift `rust.md`'s "Stay
+   in your lane" ban on committing, pushing and opening PRs, which that file
+   waives only for a caller that says so explicitly. Record
+   `issue → {wt, agent id, files, target dir}`.
 
 2. **Wait for notifications**; never poll on a short timer, and never give an
    agent a wait loop of its own (see the prompt's rules). When an agent
@@ -580,14 +583,17 @@ spec. Your worktree already exists at /workspace/.claude/worktrees/<wt>, on
 branch <wt>, forked from origin/main — EnterWorktree {"path":
 ".claude/worktrees/<wt>"} into it and do not create another.
 
-Read .claude/agents/rust.md before writing any Rust: it is this repo's rule
-set (the gate, the crate-wide lints you may not #[allow] away, the `//!`
-provenance line a translated module must carry and an invented one must not,
-the no-new-dependencies posture, the porting posture on `tf::Task` handles).
-Also read README.md's "Provenance and attribution" section, and the upstream
-file your issue names.
+Your own instructions are this repo's rule set — the gate, the crate-wide
+lints you may not #[allow] away, the `//!` provenance line a translated module
+must carry and an invented one must not, the dependency policy, the porting
+posture on `tf::Task` handles. Follow them as written, with the one exception
+below. Also read README.md's "Provenance and attribution" section, and the
+upstream file your issue names.
 
 Rules:
+- **Exception to "Stay in your lane":** on this run you DO commit, push and
+  open the PR yourself — this is the explicit grant that section defers to,
+  and the mechanics are spelled out below.
 - Do NOT merge, do NOT add the `automerge` label, and do NOT tear down the
   worktree. Your job ends at an open PR with your own gate run reported in it.
   Then reply exactly: "PR #<M> ready" + one line with the gate result and the

@@ -5,8 +5,9 @@ description: >-
   module (graph, executor, control flow), translating a piece of upstream
   Taskflow into Rust, or chasing a clippy/fmt/test failure in the gate. Hands
   back a summary plus the gate's own output; it does not commit, push or open
-  PRs -- the `pr` skill does that.
-tools: Read, Write, Edit, Grep, Glob, Bash
+  PRs unless the caller explicitly tells it to (as `milestone run` does) --
+  otherwise the `pr` skill does that.
+tools: Read, Write, Edit, Grep, Glob, Bash, EnterWorktree
 model: inherit
 ---
 
@@ -110,6 +111,13 @@ Rough order of the work overall: static graph -> executor -> control flow
 
 ## Stay in your lane
 
-Do not commit, push, create or merge PRs, and do not tear down worktrees --
-report what you changed and what the gate said, and let the caller ship it
-with the `pr` skill.
+By default, do not commit, push, create or merge PRs, and do not tear down
+worktrees -- report what you changed and what the gate said, and let the
+caller ship it with the `pr` skill.
+
+The exception is a caller whose prompt explicitly tells you to commit, push
+and open the PR yourself. The `milestone` skill's `run` mode does exactly
+that, because its orchestrator merges PRs it did not open and needs one per
+issue to review. Take the grant only when the prompt states it, and only as
+far as it goes: merging, the `automerge` label and worktree teardown stay the
+caller's in every case.
