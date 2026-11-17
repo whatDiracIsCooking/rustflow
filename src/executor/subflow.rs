@@ -66,6 +66,19 @@
 //!   -- the `Drop` applies the policy early instead and the body finds an
 //!   empty graph; [`Subflow::set_retain`] says what that means for a caller.
 //!
+//! Which leaves the question that reading the two paths side by side raises:
+//! an **implicit** join recovers the lease through the `Drop` alone, because
+//! there is no frame left to recover it with -- the arm set `PREEMPTED` and
+//! returned long before the subgraph finished -- where an explicit join also
+//! has `take_lease`. That does not make the implicit join the riskier of the
+//! two, and it is worth saying which way round it is, because the
+//! `take_lease` on the explicit path is not there for retention at all: it is
+//! there so the *body* can go on reading the graph it built. Both paths pass
+//! through exactly one [`return_subgraph`] per entry, and therefore one
+//! `try_lock` that a retained graph can lose -- the `Drop`'s, around the
+//! moment the node is resumed, for the implicit join, and [`invoke`]'s tail,
+//! the instant the body returns, for the explicit one.
+//!
 //! # Only the spawning worker may join
 //!
 //! Upstream states the rule and leaves it at that. Here it is a type: a

@@ -53,7 +53,9 @@
 //! goes home when the lease is released, and whoever releases it reads this
 //! bit then -- which is after the body in every case the lease comes back the
 //! usual way, and inside the `join` call in the one case it does not.
-//! [`Subflow::set_retain`] has the exact condition.
+//! Retention is also best-effort, because putting the graph back must not
+//! park a worker on the node's lock. [`Subflow::set_retain`] has both
+//! conditions exactly.
 //!
 //! # Why there is no `executor()` accessor
 //!
@@ -218,7 +220,13 @@ impl<'a> Subflow<'a> {
     /// Default is `false`: the runtime clears a subflow's graph once it has
     /// been joined, so that a recursive subflow does not accumulate every
     /// generation of children it ever spawned. Set it to keep the graph for
-    /// something that wants to look at it afterwards, a DOT dump above all.
+    /// something that wants to look at it afterwards, a DOT dump above all --
+    /// bearing in mind that keeping it is best-effort, which
+    /// [`Subflow::set_retain`] says in full.
+    ///
+    /// This is what the *node* currently says, not a promise about what will
+    /// be in it: a `true` here means the graph is to be kept if it can be,
+    /// and a dump is still the only way to find out whether it was.
     #[must_use]
     pub fn retain(&self) -> bool {
         self.node.nstate().load(Ordering::Relaxed) & Node::RETAIN_SUBFLOW != 0
@@ -245,6 +253,23 @@ impl<'a> Subflow<'a> {
     /// `set_retain(true)` after the join is therefore honoured almost always
     /// and not reliably; before the join it always is. `executor::subflow` has
     /// the full argument.
+    ///
+    /// **Keeping the graph is best-effort.** Putting it back takes the node's
+    /// own lock, and the code that does it uses [`Mutex::try_lock`] rather
+    /// than waiting, for the reason [`crate::Taskflow::dump`] gives for its
+    /// own `try_lock`-and-skip read from the other side: the thread releasing
+    /// a lease is a worker, and a worker parked on a lock is a worker the rest
+    /// of the run cannot use. So a lock held at exactly that moment -- a
+    /// concurrent `dump` reading the cluster being the realistic case -- costs
+    /// the graph, which is dropped as an unretained one would be, and the dump
+    /// can come back without the cluster it asked for. There is one such
+    /// attempt per entry either way the subflow was joined: when the last job
+    /// of the subgraph is accounted for, for the implicit join, and when the
+    /// body returns, for [`Subflow::join`]. Nothing reports the loss, so a
+    /// dump that has to see the subgraph is a dump taken when the taskflow is
+    /// idle -- which is the advice upstream's own `dump` documentation gives
+    /// for a subflow anyway. The module docs' lease section is the argument
+    /// behind all of it.
     pub fn set_retain(&mut self, retain: bool) {
         if retain {
             self.node
