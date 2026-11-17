@@ -39,18 +39,21 @@
 //! and [`Executor::wait_for_all`] blocks until the executor is carrying no
 //! run at all.
 //!
-//! Interfering with a run already under way is where the port is still
-//! part-built. Cancelling one works: [`RunHandle::cancel`], or a
-//! [`Canceller`] -- the lifetime-free token the handle hands out, which is
+//! Interfering with a run already under way happens two ways, and both go
+//! through one word of state. Cancelling one works: [`RunHandle::cancel`], or
+//! a [`Canceller`] -- the lifetime-free token the handle hands out, which is
 //! what lets a task of another taskflow cancel this run -- stops the executor
 //! scheduling that run onwards. It is not preemptive, so a task already
 //! running is left to finish, and the run then *completes* rather than
 //! failing: `wait` hands back `Ok(())` as upstream's `get()` does not throw,
 //! the callback still fires, and a cancelled `run_n` does not go round again.
-//! A panic still interferes with nothing: a panicking task is caught where
-//! upstream catches an exception and reported through the handle, while the
-//! rest of that run executes to the end, so a failure is something a caller
-//! is told about afterwards rather than something that stops the graph.
+//! A panicking task cancels the rest of its own run on exactly those terms,
+//! through the other bit of that word: it is caught where upstream catches an
+//! exception, so no worker dies of it, and what it adds to a cancellation is
+//! the payload, which `wait` hands back as [`RunError::Panicked`]. Only the
+//! first panicking task of a run is reported, and a later run of the same
+//! taskflow starts clean. What a failure cannot yet do is propagate out of a
+//! subflow or a runtime task, neither of which this port runs at all.
 //! The README's "Order of work" section is the sequence the whole port
 //! follows, and reading what is next there beats a list here that would go
 //! stale the week after it was written.

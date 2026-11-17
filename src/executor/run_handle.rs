@@ -75,10 +75,15 @@ pub enum RunError {
     /// the failure continuing to propagate on *this* thread -- can hand it to
     /// [`std::panic::resume_unwind`].
     ///
-    /// Only the first panicking task of a run is reported, and the rest of the
-    /// run still runs: a panic that cancels the remainder of its own run is
-    /// issue #32, which sets the `EXCEPTION` bit of the run's estate word that
-    /// [`RunHandle::cancel`] sets `CANCELLED` in.
+    /// Only the first panicking task of a run is reported, and the panic
+    /// cancels the rest of that run: it sets the `EXCEPTION` bit of the same
+    /// estate word [`RunHandle::cancel`] sets `CANCELLED` in, so the executor
+    /// stops scheduling that run onwards on exactly the terms
+    /// [`RunHandle::cancel`] describes. Tasks already running finish, tasks
+    /// not yet scheduled do not run at all, and a `run_n` or `run_until` run
+    /// does not go round again. The *next* run of the same taskflow starts
+    /// clean: each run has its own topology, and every node's state is re-armed
+    /// before a run's sources are queued.
     Panicked(Box<dyn Any + Send>),
 }
 

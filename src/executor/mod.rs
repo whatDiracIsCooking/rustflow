@@ -53,6 +53,17 @@
 //! the pool had not got to yet. How much that is depends on the race between
 //! the call and the pool, which is why upstream's own documentation says "we
 //! may still see some tasks complete their executions or none".
+//!
+//! A panicking task is the second way a run gets cancelled, and it reuses all
+//! three pieces: upstream's `_process_exception` sets `ESTATE::EXCEPTION`
+//! rather than `CANCELLED`, and the early-out and the re-run decision both
+//! read the two bits as one. So a panic cancels the rest of its own run on
+//! exactly the terms above -- tasks already running finish, tasks not yet
+//! scheduled do not run -- and the one thing it adds is the payload, which
+//! [`wait`](crate::RunHandle::wait) hands back as
+//! [`RunError::Panicked`](crate::RunError::Panicked) where a cancelled run
+//! gets `Ok(())`. Only the first panicking task of a run is reported;
+//! `ESTATE::CAUGHT`, set by the same atomic, is what drops the rest.
 
 pub mod corun;
 pub mod notifier;
