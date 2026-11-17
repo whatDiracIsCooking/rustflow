@@ -104,23 +104,27 @@
 //! A `spawn` body cannot fail as far as the executor is concerned -- the
 //! wrapper catches it -- so the only failure this module records is a
 //! `silent_async`'s, and for a task submitted to the executor there is
-//! nowhere to deliver it: no future, no frame waiting, no run that anybody
-//! holds. Upstream parks the payload on the node, where its `_tear_down_async`
-//! then recycles the node and nothing can ever read it; here it is
-//! **dropped**, which is the same observable with the payload's destructor
-//! run promptly instead of at the next node reuse.
+//! nowhere to *deliver* it: no future, no frame waiting, no run that anybody
+//! holds. It goes through [`Job::record_panic`] like any other task's, and
+//! what that walk does with a chain this short is park the payload on the
+//! node the task is -- which is where upstream parks it too, and where
+//! [`AsyncTask::take_panic`](crate::AsyncTask::take_panic) reads it back for
+//! the kinds of free node that hand out a handle. For a `silent_async` there
+//! is no handle, so the payload dies with the node, one share later.
 //!
-//! What it must *not* do is go through [`Job::record_panic`], and that is
-//! worth stating because it is the obvious thing to call. The walk that
-//! function performs stops at the first anchor above the failing node, and
-//! the root of a parentless free node's chain is [`Parent::Run`] over the
-//! *sentinel* run -- the one `Topology::free_standing` hands to every async
-//! task in the process. Claiming the sentinel's payload slot would set
-//! `EXCEPTION` in the estate word of a run that every later free node reads
+//! That the walk is safe to call at all is issue #105's, and it is worth
+//! stating here because this module is where it was not. A parentless free
+//! node's chain roots at [`Parent::Run`] over the *sentinel* run -- the one
+//! `Topology::free_standing` hands to every async task in the process -- and
+//! the walk used to treat every root as an anchor and claim it. That set
+//! `EXCEPTION` in the estate word of a run which every later free node reads
 //! through `Job::is_parent_cancelled`, so one `silent_async` that panicked
-//! would cancel every async task submitted after it, for the life of the
-//! process. [`record_failure`] is therefore a choice between the walk and the
-//! floor, and `Parent::Run` means the floor.
+//! skipped every async task submitted after it for the life of the process,
+//! and a skipped async job never reaches the counters below -- so the next
+//! `wait_for_all` never returned either. #88 dropped the payload on the floor
+//! rather than walk into that; the walk now ends at the sentinel instead of
+//! anchoring there, which is `executor::topology`'s half of the fix and the
+//! reason this module no longer needs a case of its own.
 //!
 //! # An async handle inside a graph is still refused
 //!
@@ -138,7 +142,6 @@
 //! and the submitting calls above are how it is said.
 
 use core::fmt;
-use std::any::Any;
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
@@ -648,7 +651,7 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &AsyncWork) -> 
     // message back. A bare `panic!` would be worse rather than louder -- it
     // would unwind with this job never counted as finished, so the run's join
     // counter would never reach zero and a `wait` would block for ever.
-    if !is_free_standing(job) {
+    if !job.topology().is_free_standing() {
         job.topology().record_panic(Box::new(
             "an async node cannot be run as part of a taskflow: \
              an async task is submitted to the executor, not built into a graph",
@@ -672,7 +675,18 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &AsyncWork) -> 
             if let Some(body) = body.take()
                 && let Err(payload) = panic::catch_unwind(AssertUnwindSafe(body))
             {
-                record_failure(job, payload);
+                // Upstream's `TF_EXECUTOR_EXCEPTION_HANDLER` calling
+                // `_process_exception`, which is the walk and nothing special
+                // for an async node: a `silent_async` of the executor's own
+                // has nothing above it, so the walk ends at the sentinel and
+                // parks the payload on this node -- where upstream parks it
+                // too, and where `AsyncTask::take_panic` reads it for the
+                // kinds of free node that hand out a handle. A free node
+                // *under* a parent (#90's runtime child, #93's task-group
+                // member) has an anchor on its chain, and the same call
+                // delivers it there. The module docs have why this used to
+                // drop the payload instead and what changed (#105).
+                job.record_panic(payload);
             }
             Some(Release::Strong)
         }
@@ -705,47 +719,6 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &AsyncWork) -> 
     }
 
     release
-}
-
-/// Whether `job` is a job of a free-standing async node rather than of a
-/// handle somebody put in a taskflow's graph.
-///
-/// The run is the discriminator because it is the one field only a free node
-/// can have: `Job::free` is the only way to get the sentinel
-/// `Topology::free_standing` onto a job, and every other constructor carries
-/// the topology of a real run. `executor::topology` has why a free node
-/// claims to be part of a run at all.
-fn is_free_standing(job: &Job) -> bool {
-    std::ptr::eq(job.topology(), &**Topology::free_standing())
-}
-
-/// Delivers `payload` -- what a free node's body panicked with -- to whatever
-/// is waiting above that node, or drops it if nothing is.
-///
-/// Upstream's `_process_exception`, with the parentless case answered
-/// differently and on purpose; the module docs have the argument in full. The
-/// short of it is that a parentless free node's chain roots at the sentinel
-/// run, so walking it would record the failure of one `silent_async` against
-/// a run that every later async task of the process reads as its own.
-///
-/// A free node *under* a parent is a different question and gets the walk:
-/// its chain is a chain of jobs the failing job owns, and the anchor at the
-/// end of it -- a runtime node that preempted itself, a task group's anchor,
-/// or the run a parented chain reaches -- is something that can be waited on
-/// and therefore something a failure is worth marking. #90 and #94 are where
-/// such a node first becomes creatable, and where the one chain this walk
-/// still cannot help with lands: a free node under a *free* parent that is
-/// itself parentless roots at the sentinel again, which is why upstream
-/// anchors the parent of such a chain explicitly.
-fn record_failure(job: &Job, payload: Box<dyn Any + Send>) {
-    match job.parent() {
-        // Upstream's `nullptr | nullptr` row: `exe.silent_async()`, with no
-        // future, no frame and no run above it. There is nowhere to deliver,
-        // so the payload is dropped here rather than parked where nothing can
-        // read it.
-        Parent::Run => drop(payload),
-        Parent::Nested(_) => job.record_panic(payload),
-    }
 }
 
 #[cfg(test)]
@@ -802,18 +775,32 @@ mod tests {
         );
     }
 
-    /// A `silent_async` that panics has nowhere to report, and the thing that
-    /// matters is what it must *not* reach: the sentinel run every free node
-    /// shares. A failure recorded there would set the `EXCEPTION` bit that
-    /// `Job::is_parent_cancelled` reads, and every async task submitted after
-    /// it -- for the life of the process -- would be skipped unrun.
+    /// A `silent_async` that panics has nowhere to report its failure to, and
+    /// the thing that matters is what it must *not* reach: the sentinel run
+    /// every free node shares. A failure recorded there would set the
+    /// `EXCEPTION` bit that `Job::is_parent_cancelled` reads, and every async
+    /// task submitted after it -- for the life of the process -- would be
+    /// skipped unrun.
+    ///
+    /// #88's case, re-expressed for the truth #105 moved it to: the payload
+    /// is no longer dropped on the floor by this module but walked by
+    /// `Job::record_panic` like any other task's, which parks it on the node
+    /// the task is -- gone with the node's last share, since a `silent_async`
+    /// hands out no handle to read it from. What the sentinel holds
+    /// afterwards is the half the walk had to get right, so it is asserted
+    /// here rather than inferred from the tasks that follow.
     #[test]
     fn a_silent_async_that_panics_leaves_the_executor_usable() {
         let executor = Executor::new(2);
         let counter = Arc::new(AtomicUsize::new(0));
 
-        executor.silent_async(|| panic!("dropped on the floor"));
+        executor.silent_async(|| panic!("parked on the node"));
         executor.wait_for_all();
+
+        assert!(
+            !Topology::free_standing().cancelled(),
+            "the run every free node shares took no part in that failure"
+        );
 
         executor.silent_async({
             let counter = Arc::clone(&counter);
@@ -948,6 +935,48 @@ mod tests {
             error.to_string(),
             "a task panicked: an async node cannot be run as part of a taskflow: \
              an async task is submitted to the executor, not built into a graph"
+        );
+    }
+
+    /// Issue #105's regression, at the level a caller meets it: one failure
+    /// *recorded* on a parentless free node, and then an ordinary
+    /// `silent_async` that has to run to completion.
+    ///
+    /// The failure goes through [`Job::record_panic`] rather than through a
+    /// panicking body, because that is the walk the bug was in and because
+    /// #90, #91 and #93 all reach it with a node this test can hold. A
+    /// payload claimed on the sentinel run would set `EXCEPTION` on the one
+    /// topology every free node of the process shares, and the second task
+    /// below would be torn down unrun by the early-out at the top of
+    /// `WorkerThread::invoke` -- which never reaches
+    /// [`Shared::finish_async`], so `num_asyncs` would never fall to zero
+    /// and neither the `wait_for_all` below nor [`Executor`]'s own `Drop`
+    /// would ever return. That is why the slot is asserted on first and the
+    /// spin has a deadline: everything downstream of a poisoned sentinel
+    /// hangs rather than fails.
+    #[test]
+    fn a_recorded_failure_on_a_free_node_leaves_later_async_tasks_runnable() {
+        let executor = Executor::new(2);
+        let failed = AsyncNode::new("failed", Handle::Async(AsyncWork::plain(|| {})));
+
+        Job::free(&failed, &Parent::Run).record_panic(Box::new("boom"));
+        assert!(
+            failed.take_panic().is_some(),
+            "the payload belongs to the node that failed"
+        );
+
+        let ran = Arc::new(AtomicBool::new(false));
+        executor.silent_async({
+            let ran = Arc::clone(&ran);
+            move || ran.store(true, Ordering::Release)
+        });
+
+        spin_until("the async task submitted after a free node's failure", &ran);
+        executor.wait_for_all();
+        assert_eq!(
+            executor.num_topologies(),
+            0,
+            "and the task that ran was accounted for"
         );
     }
 }

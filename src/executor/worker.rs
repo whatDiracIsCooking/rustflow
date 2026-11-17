@@ -670,7 +670,7 @@ impl WorkerThread {
             // is free-standing and is dispatched through a job of its own
             // arena, so what gets here is a handle somebody put in a
             // taskflow. Both refuse, each in its own file for the reason the
-            // four above have theirs -- `r#async` is #88's and
+            // four above have theirs -- `r#async` landed with #88 and
             // `dependent_async` is #91's -- and those docs say why running a
             // `FnOnce` body as part of a graph is refused rather than
             // supported.

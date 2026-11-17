@@ -137,7 +137,7 @@
 //! expressible, since a run nothing can wait for and nothing can cancel is
 //! exactly what a free node wants to be part of.
 //!
-//! [`Topology::free_standing`] is that run, and three properties make it
+//! [`Topology::free_standing`] is that run, and four properties make it
 //! sound rather than merely convenient:
 //!
 //! - **It never finishes.** Its join counter is born at one, for a job that
@@ -150,13 +150,22 @@
 //!   unreachable. That is what "never finishes" has to mean here, and it is
 //!   why the sentinel is not simply a `Topology::nothing_to_run`, which is
 //!   finished before it is handed out.
+//! - **It is never an anchor.** An anchor is a thing a failure can be
+//!   *delivered* to, which is to say a thing somebody is waiting on, and
+//!   this is the one run nobody can wait on. So [`Job::record_panic`] ends a
+//!   chain that roots here instead of claiming it -- upstream's null
+//!   `_topology`, which its `_process_exception` reaches by the same route --
+//!   and the payload stays on the failing node, where
+//!   [`AsyncTask::take_panic`](crate::AsyncTask::take_panic) reads it. Issue
+//!   #105 is where this was a claim the walk did not keep: the sentinel took
+//!   the payload of the first free node to fail, and the bullet below was
+//!   false from that moment on.
 //! - **It is never cancelled.** Nothing hands out a
-//!   [`Canceller`](crate::Canceller) for it and nothing records a failure on
-//!   it -- a failure on a free node goes to the node's own slot, which is
-//!   [`Job::record_panic`]'s last case -- so [`Job::is_parent_cancelled`]
-//!   reads `false` for a free node with no parent, and reads the chain above
-//!   it when there is one. A task group cancels its children through exactly
-//!   that chain.
+//!   [`Canceller`](crate::Canceller) for it, and nothing records a failure on
+//!   it either -- which is the bullet above, and is why that one comes first.
+//!   So [`Job::is_parent_cancelled`] reads `false` for a free node with no
+//!   parent, and reads the chain above it when there is one. A task group
+//!   cancels its children through exactly that chain.
 //! - **It holds no taskflow.** Its `flow` slot is `None`, so sharing it
 //!   keeps nothing alive but itself: one allocation for the whole process,
 //!   which is what keeps an async task at upstream's one allocation per task
@@ -398,6 +407,14 @@ pub(crate) enum Parent {
     /// The run itself, which is every top-level node's parent: upstream's
     /// `parent == node->_topology`. The topology is the one the job already
     /// holds, so the variant carries nothing.
+    ///
+    /// It is also what a free node with nothing above it carries, where the
+    /// run it names is the sentinel [`Topology::free_standing`] -- upstream's
+    /// *null* `_parent` over its null `_topology`. The two are told apart by
+    /// the run rather than by a variant of their own, which is
+    /// [`Topology::is_free_standing`], and the one place the difference is
+    /// load-bearing is [`Job::record_panic`]: a chain rooted at a real run
+    /// ends at an anchor, a chain rooted at the sentinel ends at nothing.
     Run,
     /// A graph nested inside the run: a node whose own graph is running, or
     /// the anchor a [`corun`](crate::Executor::corun) waits on.
@@ -715,12 +732,17 @@ impl Job {
     /// Upstream's `_schedule(Worker&, Node*)` over an async node, where the
     /// node it is handed carries `_topology == nullptr` and the parent it was
     /// given at construction. Here both travel with the job, as they do for
-    /// every other node: the parent is whatever scheduled this task -- the
-    /// run itself, standing in for upstream's null, or a
-    /// [`Parent::Nested`] for a task spawned by a runtime body or owned by a
-    /// task group -- and the run is the sentinel
-    /// [`Topology::free_standing`], which the module docs argue for at
-    /// length.
+    /// every other node: the parent is whatever scheduled this task --
+    /// [`Parent::Run`] over the sentinel for a task submitted to the
+    /// executor, which is upstream's null parent, or a [`Parent::Nested`] for
+    /// a task spawned by a runtime body or owned by a task group -- and the
+    /// run is the sentinel [`Topology::free_standing`], which the module docs
+    /// argue for at length.
+    ///
+    /// The parentless pair is upstream's `nullptr | nullptr` row of
+    /// `_tear_down_async`'s table, and it is a pair rather than one fact in
+    /// two places: the walk in [`Job::record_panic`] ends at the sentinel,
+    /// because a chain that gets there has nothing above it either.
     ///
     /// The share of the node is what keeps it alive while the job is queued,
     /// which is upstream's reference count on the same node for the same
@@ -832,20 +854,40 @@ impl Job {
     /// will re-raise the payload itself. Failing that, the innermost base
     /// seen carrying `IMPLICITLY_ANCHORED` gets it -- a node that preempted
     /// itself and means to look. Failing *that* -- no anchor anywhere on the
-    /// chain, which takes a chain rooted at neither a run nor a frame that is
-    /// waiting -- the payload stays on the failing node, where upstream also
-    /// leaves it: an execution with nothing above it to report to.
+    /// chain, which takes a chain rooted at neither a run somebody started
+    /// nor a frame that is waiting -- the payload stays on the failing node,
+    /// where upstream also leaves it: an execution with nothing above it to
+    /// report to.
     ///
-    /// The run is the chain's root and is always anchored, which upstream
-    /// says by constructing its topology `EXPLICITLY_ANCHORED` and this port
-    /// says by [`Parent::Run`] being an anchor by definition. So a plain
-    /// static graph behaves exactly as it did before anchors existed: the
-    /// failing node is marked, the walk reaches the run, and the run's own
-    /// claim keeps the first payload -- the same pair of steps
-    /// [`Topology::record_panic`] takes for a failure that has no chain to
-    /// walk at all. That is also why the implicit and node-local cases below
-    /// are unreachable from a top-level task and are ported all the same: a
-    /// corun's anchor is a chain root that can in principle be un-anchored.
+    /// A chain rooted at a run **somebody started** ends at an anchor, which
+    /// upstream says by constructing its topology `EXPLICITLY_ANCHORED` and
+    /// this port says by [`Parent::Run`] over such a run being an anchor by
+    /// definition. So a plain static graph behaves exactly as it did before
+    /// anchors existed: the failing node is marked, the walk reaches the run,
+    /// and the run's own claim keeps the first payload -- the same pair of
+    /// steps [`Topology::record_panic`] takes for a failure that has no chain
+    /// to walk at all.
+    ///
+    /// The sentinel [`Topology::free_standing`] is the one root that is
+    /// **not** an anchor, and that is issue #105's: it is upstream's null
+    /// `_topology` on a free node, a run nothing can wait for, nothing can
+    /// cancel and nobody can read a payload back out of. Claiming it would
+    /// mean claiming the one topology every free node in the process shares
+    /// -- setting the `EXCEPTION` that [`Job::is_parent_cancelled`] reads, so
+    /// that one failed async task skipped every async task submitted after it
+    /// for the life of the process. A chain whose root is the sentinel
+    /// therefore ends like upstream's null parent: with no anchor at all, so
+    /// that the payload lands on the failing node and
+    /// [`AsyncTask::take_panic`](crate::AsyncTask::take_panic) can read it.
+    /// A free node *with* a parent is not that chain -- it walks its
+    /// [`Parent::Nested`] links first, and only a root reached through them
+    /// decides the case.
+    ///
+    /// Which run that root is, is the job's at the *root* rather than this
+    /// job's own, which is why the walk carries one along. The two differ for
+    /// exactly one shape: a free node spawned under a node of a real run
+    /// (#92's runtime child) holds the sentinel on its own job while the
+    /// chain above it roots at the run that is actually waiting.
     ///
     /// Whichever anchor is chosen, the `fetch_or` of `EXCEPTION | CAUGHT` on
     /// it decides whether this payload is the first one and therefore the one
@@ -866,6 +908,11 @@ impl Job {
         let node = self.node().base();
         let mut base = node;
         let mut parent = Some(&self.parent);
+        // The run of the job whose parent `parent` is, which is the run a
+        // `Parent::Run` at the end of the walk names. It travels with the
+        // chain rather than being read off `self` because the two are not
+        // always the same run -- see the docs above.
+        let mut topology: &Topology = &self.topology;
         let mut implicit: Option<Anchor<'_>> = None;
 
         // Upstream's `while(ea && !(ea->_estate & EXPLICITLY_ANCHORED))`, with
@@ -886,14 +933,25 @@ impl Job {
 
             match parent {
                 // Upstream's `ea == nullptr`: the chain is over, with no
-                // frame on it waiting. Only a corun anchor whose guard is not
-                // held can end a chain this way.
+                // frame on it waiting. A corun anchor whose guard is not held
+                // ends a chain this way.
                 None => break None,
-                // The root, which is anchored for the length of the run.
-                Some(Parent::Run) => break Some(Anchor::Run(&self.topology)),
+                // Upstream's other null, `_topology == nullptr` on a free
+                // node: the sentinel is a run nothing can wait for, so a
+                // chain rooted at it ends with no anchor rather than with
+                // one nobody can read (#105).
+                Some(Parent::Run) if topology.is_free_standing() => break None,
+                // The root, anchored for the length of the run.
+                Some(Parent::Run) => break Some(Anchor::Run(topology)),
                 Some(Parent::Nested(nested)) => {
                     base = nested.base();
-                    parent = nested.resume().map(Job::parent);
+                    match nested.resume() {
+                        Some(job) => {
+                            parent = Some(job.parent());
+                            topology = job.topology();
+                        }
+                        None => parent = None,
+                    }
                 }
             }
         };
@@ -907,13 +965,13 @@ impl Job {
             // Upstream's last line, and the case the failing node's own slot
             // exists for: no anchor anywhere on the chain, so there is
             // nothing waiting -- an execution with no external control over
-            // it, which is upstream's own description of it. Unreachable from
-            // anything the executor runs today, since every chain roots
-            // either at a run or at an anchor somebody is blocked on, and
-            // ported because a *silent* async task is where a chain can root
-            // at neither: its node's own slot is what
-            // `AsyncTask::take_panic` reads, which is #86's half of upstream's
-            // `exception_ptr()`.
+            // it, which is upstream's own description of it. A *silent* async
+            // task submitted to the executor is exactly that and is what
+            // reaches this: its chain is one link long and roots at the
+            // sentinel, which the walk ends on rather than anchors at, so the
+            // payload stays where `AsyncTask::take_panic` reads it -- #86's
+            // half of upstream's `exception_ptr()`. A corun anchor whose
+            // guard is not held is the other way in.
             (None, None) => Anchor::Base(node),
         };
 
@@ -956,10 +1014,12 @@ impl Job {
     /// the second, even though the run as a whole is still going.
     ///
     /// A free async node answers through the same two terms and needs no case
-    /// of its own: the first reads the sentinel run, which is never
-    /// cancelled, so a task with no parent is never skipped, and the second
-    /// walks whatever chain is above it -- which is how a task group cancels
-    /// the children it owns. The module docs have the sentinel's side of it.
+    /// of its own: the first reads the sentinel run, which is never cancelled
+    /// because nothing ever records anything on it -- [`Job::record_panic`]
+    /// is what has to keep that true -- so a task with no parent is never
+    /// skipped, and the second walks whatever chain is above it, which is how
+    /// a task group cancels the children it owns. The module docs have the
+    /// sentinel's side of it.
     pub(crate) fn is_parent_cancelled(&self) -> bool {
         self.topology.cancelled() || self.parent.ancestor_cancelled()
     }
@@ -1062,7 +1122,9 @@ impl Job {
 /// own. That is the whole of the difference, so this names the two cases and
 /// gives them the one pair of operations the walk needs.
 enum Anchor<'a> {
-    /// The run, which is every chain's root and is anchored by definition.
+    /// A run somebody started, which is anchored by definition for as long
+    /// as it is running. Never the sentinel: nobody is waiting on that one,
+    /// so [`Job::record_panic`] ends such a chain rather than building this.
     Run(&'a Topology),
     /// A node waiting for its own nested graph, or the anchor a `corun` keeps
     /// on its frame.
@@ -1166,8 +1228,9 @@ impl std::hash::Hash for Job {
 /// why [`Cancellable::cancelled`] is a mask over those two, as upstream's
 /// `Topology::cancelled` is; `CAUGHT` is not part of that mask and says only
 /// that the payload slot is taken. The fourth, `EXPLICITLY_ANCHORED`, is
-/// never set on a run -- a run is the chain's root and is anchored by
-/// definition, which [`Job::record_panic`] spells out.
+/// never set on a run -- a run somebody started is anchored by definition
+/// and the sentinel is not an anchor at all, which [`Job::record_panic`]
+/// spells out.
 pub(crate) struct Cancellable {
     /// Upstream's `_estate`, holding the three bits a topology uses.
     estate: AtomicU32,
@@ -1389,14 +1452,14 @@ impl Topology {
         Self::over(predicate, on_finish, Some(flow))
     }
 
-    /// The one run every free-standing async node claims to be part of:
-    /// a sentinel that is never cancelled, never finished and holds no
-    /// taskflow.
+    /// The one run every free-standing async node claims to be part of: a
+    /// sentinel that is never cancelled, never finished, never an anchor and
+    /// holds no taskflow.
     ///
     /// Upstream needs nothing here -- its async node's `_topology` is null,
     /// and the tear-down written for such a node never reads it. The module
     /// docs have why this port answers with a sentinel instead of an
-    /// `Option<Arc<Topology>>` on every job in the crate, and what the three
+    /// `Option<Arc<Topology>>` on every job in the crate, and what the four
     /// properties above rest on.
     ///
     /// One per process rather than one per [`Executor`](crate::Executor),
@@ -1425,6 +1488,24 @@ impl Topology {
             topology.join_counter.store(1, Ordering::Relaxed);
             Arc::new(topology)
         })
+    }
+
+    /// Whether this run is the sentinel [`Topology::free_standing`] rather
+    /// than a run somebody started.
+    ///
+    /// Upstream's `node->_topology == nullptr`, which is a test it makes in
+    /// two places: `_tear_down_async`, over the node, and
+    /// `_process_exception`, over the anchor it would otherwise claim. The
+    /// identity of the one allocation is what stands in for the null here,
+    /// and [`Job::free`] is the only way onto a job, so this answers "is
+    /// this a free node's job" as exactly as upstream's test does.
+    ///
+    /// The two callers that matter are [`Job::record_panic`], which ends a
+    /// chain rooted here rather than anchoring it, and `executor::async`,
+    /// which tells a free node's job from a [`Handle::Async`](crate::Handle)
+    /// somebody built into a graph.
+    pub(crate) fn is_free_standing(&self) -> bool {
+        std::ptr::eq(self, &**Self::free_standing())
     }
 
     /// A run that is over before it begins and has no graph at all: what
@@ -2963,6 +3044,20 @@ mod tests {
         assert_eq!(size_of::<Job>(), 40);
     }
 
+    /// The sentinel run's whole estate word, which every case that records a
+    /// failure on a free node has to leave at zero.
+    ///
+    /// The word rather than [`Topology::cancelled`], because `CAUGHT` is not
+    /// in that mask and a claim nobody can read back would be as wrong as a
+    /// cancellation: this run is one allocation for the process, and the
+    /// correct number of bits ever set on it is none.
+    fn sentinel_estate() -> u32 {
+        Topology::free_standing()
+            .estate
+            .estate
+            .load(Ordering::Relaxed)
+    }
+
     /// The free-standing node of a silent async task, which is the fifth
     /// kind of graph a job can walk.
     fn free_node() -> Arc<AsyncNode> {
@@ -3043,5 +3138,94 @@ mod tests {
             "the phantom job is what the counter can never get past"
         );
         assert!(!topology.cancelled(), "and nothing can cancel the sentinel");
+    }
+
+    /// A failure on a parentless free node stays on that node's own slot --
+    /// [`Job::record_panic`]'s last case, which a free node is the first
+    /// thing in the crate to reach -- and leaves the sentinel run exactly as
+    /// it was found.
+    ///
+    /// Both halves matter and the second is issue #105's. The sentinel is one
+    /// allocation for the whole process, read by every free node through
+    /// [`Job::is_parent_cancelled`], so an `EXCEPTION` bit recorded on it
+    /// would skip every async task submitted after the first failure for the
+    /// life of that process -- and, since a skipped async job never reaches
+    /// the counters its tear-down owes, hang the next `wait_for_all` as well.
+    /// The first half is what [`AsyncTask::take_panic`](crate::AsyncTask)
+    /// reads.
+    #[test]
+    fn a_parentless_free_nodes_failure_stays_on_its_own_node() {
+        let node = free_node();
+        Job::free(&node, &Parent::Run).record_panic(Box::new("boom"));
+
+        let payload = node.take_panic().expect("the node's own slot has it");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
+        assert!(node.take_panic().is_none(), "a payload is taken once");
+
+        assert_eq!(
+            sentinel_estate(),
+            0,
+            "the sentinel took no bit of the failure"
+        );
+        assert!(!Topology::free_standing().cancelled());
+        assert!(
+            !Job::free(&free_node(), &Parent::Run).is_parent_cancelled(),
+            "so the next free node of the process still runs"
+        );
+    }
+
+    /// A free node *with* a parent above it walks that chain exactly as
+    /// before: the anchor somebody is blocked on takes the payload, and
+    /// neither the failing node nor the sentinel holds anything. Only a chain
+    /// that roots at the sentinel ends with nobody.
+    ///
+    /// The anchor here is a [`Nested`] with nothing above it and its
+    /// explicit-anchor bit held, which is the shape #93's task group gives
+    /// the children it owns and the shape a `corun` frame already has.
+    #[test]
+    fn a_failure_on_a_free_node_under_an_anchor_is_delivered_to_it() {
+        let parent = Nested::new(None);
+        let _anchor = parent.base().anchor_explicitly();
+
+        let node = free_node();
+        Job::free(&node, &parent.as_parent()).record_panic(Box::new("boom"));
+
+        let payload = parent.base().take_panic().expect("the anchor has it");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
+        assert!(
+            node.take_panic().is_none(),
+            "the failing node kept nothing: the anchor is what is waiting"
+        );
+        assert_eq!(
+            sentinel_estate(),
+            0,
+            "and the run the chain never reached is untouched"
+        );
+    }
+
+    /// #90's shape, and the one the sentinel used to swallow outright: a free
+    /// node that preempted itself to run a nested graph is an *implicit*
+    /// anchor, and a failure under it is delivered there.
+    ///
+    /// The walk records such an anchor and keeps going, so what it does at
+    /// the chain's root decides the case: a root that claimed to be an
+    /// anchor would outrank the implicit one and take the payload itself.
+    #[test]
+    fn a_failure_under_an_implicitly_anchored_free_node_is_delivered_to_it() {
+        let above = free_node();
+        above
+            .node()
+            .base()
+            .nstate()
+            .fetch_or(Node::IMPLICITLY_ANCHORED, Ordering::Relaxed);
+        let parent = Nested::new(Some(Job::free(&above, &Parent::Run)));
+
+        let node = free_node();
+        Job::free(&node, &parent.as_parent()).record_panic(Box::new("boom"));
+
+        let payload = above.take_panic().expect("the implicit anchor has it");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
+        assert!(node.take_panic().is_none(), "the failing node kept nothing");
+        assert_eq!(sentinel_estate(), 0, "and the sentinel did not outrank it");
     }
 }
