@@ -233,11 +233,18 @@ impl Parent {
     /// The ancestor half of upstream's `Node::_is_parent_cancelled`, over the
     /// whole chain where upstream reads the immediate parent only. Upstream
     /// can stop at one level because its `_process_exception` walks the chain
-    /// *upwards* marking every ancestor as it records a failure; that walk is
-    /// issue #48's, so until it lands the check is the one that walks. Reading
-    /// every level is correct either way -- a marked ancestor is marked for
-    /// the chain below it -- and it costs one relaxed load per level of
-    /// nesting, which is as deep as the caller's graphs are.
+    /// *upwards* marking every ancestor as it records a failure, which
+    /// [`Job::record_panic`] now does too -- so one level would be enough
+    /// here as well, and reading every level is kept because it answers
+    /// strictly more of the question for one relaxed load per level of
+    /// nesting.
+    ///
+    /// What the extra levels catch is a failure in a *sibling* subtree. A
+    /// walk marks the chain from the failing node up to its anchor, so a job
+    /// whose own parent is unmarked may still have a marked grandparent --
+    /// the anchor that failed -- and every job under that anchor is doomed
+    /// whichever branch it is on. Upstream runs those jobs; skipping them is
+    /// the same answer sooner.
     fn ancestor_cancelled(&self) -> bool {
         let mut parent = self;
         loop {
@@ -366,9 +373,131 @@ impl Job {
         &self.parent
     }
 
-    /// The run this job is part of, which is what a failure is reported to.
+    /// The run this job is part of.
     pub(crate) fn topology(&self) -> &Topology {
         &self.topology
+    }
+
+    /// This job's *share* of the run, which is what scheduling a graph needs:
+    /// every job of a nested graph holds one of its own, so
+    /// [`Shared::schedule_graph`](crate::executor::Shared) takes the share
+    /// rather than a reference.
+    ///
+    /// The three dispatch arms that run a nested graph reach the run through
+    /// here -- they have a `&Job` and nothing else -- which is why this sits
+    /// beside [`Job::topology`] rather than being folded into it.
+    pub(crate) fn topology_share(&self) -> &Arc<Topology> {
+        &self.topology
+    }
+
+    /// Records that the work of this job's node failed with `payload`,
+    /// delivering it to whatever is waiting for the graph that node is part
+    /// of: upstream's `Executor::_process_exception`.
+    ///
+    /// Three kinds of thing can be waiting, and the walk is how the right one
+    /// is found. From the failing node upwards, every base on the parent
+    /// chain is marked `EXCEPTION` -- which is what cancels the rest of each
+    /// nested graph the failure is inside of, since that bit is half of what
+    /// the early-out at the top of `WorkerThread::invoke` reads -- and the
+    /// walk stops at the first base that is **explicitly anchored**: a frame
+    /// in a `corun` or a `join`, which is waiting for exactly this graph and
+    /// will re-raise the payload itself. Failing that, the innermost base
+    /// seen carrying `IMPLICITLY_ANCHORED` gets it -- a node that preempted
+    /// itself and means to look. Failing *that*, the payload stays on the
+    /// failing node, where upstream also leaves it: an execution with nothing
+    /// above it to report to.
+    ///
+    /// The run is the chain's root and is always anchored, which upstream
+    /// says by constructing its topology `EXPLICITLY_ANCHORED` and this port
+    /// says by [`Parent::Run`] being an anchor by definition. So a plain
+    /// static graph behaves exactly as it did before anchors existed: the
+    /// failing node is marked, the walk reaches the run, and
+    /// [`Topology::record_panic`] keeps the first payload -- which is why the
+    /// implicit and node-local cases below are unreachable from a top-level
+    /// task and are nevertheless ported, since a corun's anchor is a chain
+    /// root that can in principle be un-anchored.
+    ///
+    /// Whichever anchor is chosen, the `fetch_or` of `EXCEPTION | CAUGHT` on
+    /// it decides whether this payload is the first one and therefore the one
+    /// kept, which is #32's rule moved from the run to the anchor. A payload
+    /// that loses that race is dropped, and that is the one deliberate
+    /// departure from upstream here -- the comment on the delivery below says
+    /// why.
+    ///
+    /// Nothing here can dangle and nothing here is a pointer walk. The chain
+    /// is held by this job -- a [`Parent::Nested`] owns the job of the parent
+    /// node, which owns its own parent, up to the root -- so every base the
+    /// walk touches is alive because the walk's own job is alive. That the
+    /// bases are alive is a stronger statement than it looks: a job of a
+    /// nested graph has not yet decremented its parent's join counter, so no
+    /// ancestor can be *finished* either, and no frame can have stopped
+    /// waiting for one.
+    pub(crate) fn record_panic(&self, payload: Box<dyn Any + Send>) {
+        let node = self.node().base();
+        let mut base = node;
+        let mut parent = Some(&self.parent);
+        let mut implicit: Option<Anchor<'_>> = None;
+
+        // Upstream's `while(ea && !(ea->_estate & EXPLICITLY_ANCHORED))`, with
+        // its `ea = ea->_parent` spelled as a step along this job's chain and
+        // its null pointer as the `None` two of the arms below produce.
+        let explicit = loop {
+            if base.is_explicitly_anchored() {
+                break Some(Anchor::Base(base));
+            }
+
+            base.estate()
+                .fetch_or(Cancellable::EXCEPTION, Ordering::Relaxed);
+            // Only the innermost one, as upstream's comment says: the first
+            // implicit anchor the walk meets is the closest to the failure.
+            if implicit.is_none() && base.is_implicitly_anchored() {
+                implicit = Some(Anchor::Base(base));
+            }
+
+            match parent {
+                // Upstream's `ea == nullptr`: the chain is over, with no
+                // frame on it waiting. Only a corun anchor whose guard is not
+                // held can end a chain this way.
+                None => break None,
+                // The root, which is anchored for the length of the run.
+                Some(Parent::Run) => break Some(Anchor::Run(&self.topology)),
+                Some(Parent::Nested(nested)) => {
+                    base = nested.base();
+                    parent = nested.resume().map(Job::parent);
+                }
+            }
+        };
+
+        // Upstream's `if(ea) ... else if(ia)`, as one choice rather than two
+        // tests: an explicit anchor that has *already* caught a payload does
+        // not hand this one on to an implicit anchor, which two `if let`s in
+        // a row would lose.
+        let anchor = match (explicit, implicit) {
+            (Some(anchor), _) | (None, Some(anchor)) => anchor,
+            // Upstream's last line, and the case the failing node's own slot
+            // exists for: no anchor anywhere on the chain, so there is
+            // nothing waiting -- an execution with no external control over
+            // it, which is upstream's own description of it. Unreachable from
+            // anything the executor runs today, since every chain roots
+            // either at a run or at an anchor somebody is blocked on, and
+            // ported because #51's async tasks are where a chain can root at
+            // neither.
+            (None, None) => Anchor::Base(node),
+        };
+
+        // The first failure under this anchor is the one it reports, which is
+        // #32's rule applied where the failure is delivered rather than only
+        // at the run. A later one is dropped, and that is the one place this
+        // walk does not follow upstream: upstream parks the loser on the
+        // failing node, where `tf::Task::exception_ptr()` -- an accessor this
+        // port does not have -- can read it back. With nothing able to read
+        // it, parking it would hold a caller's payload, destructor and all,
+        // until the next set-up of that graph, where #32's thread-safety case
+        // pins the opposite: of a thousand simultaneous failures exactly one
+        // payload survives and the rest are dropped by the run.
+        if anchor.claim_panic() {
+            anchor.keep_panic(payload);
+        }
     }
 
     /// Resolves this job into the node to run, the graph holding it and the
@@ -404,7 +533,7 @@ impl Job {
     /// of its own graph, so every handle is cloned from the ones already in
     /// hand rather than looked up again.
     pub(crate) fn successor(&self, task: Task) -> Self {
-        Self::new(task, &self.flow, &self.topology, &self.parent)
+        Self::new(task, &self.flow, self.topology_share(), &self.parent)
     }
 
     /// Spends this job, handing back what the worker still owes: the parent to
@@ -431,6 +560,42 @@ impl Job {
         // method exists rather than letting the job fall out of scope.
         drop(flow);
         Finished { parent, topology }
+    }
+}
+
+/// Where a failure found by [`Job::record_panic`] is delivered.
+///
+/// Upstream needs no such type: every link of its parent chain is a
+/// `NodeBase*`, its topology included, so the anchor it stops at is one
+/// pointer whatever kind of thing it turned out to be. Here the chain's root
+/// is a run rather than a base -- [`Parent::Run`] -- and a run keeps its
+/// payload in the completion slot a `wait` reads rather than in a slot of its
+/// own. That is the whole of the difference, so this names the two cases and
+/// gives them the one pair of operations the walk needs.
+enum Anchor<'a> {
+    /// The run, which is every chain's root and is anchored by definition.
+    Run(&'a Topology),
+    /// A node waiting for its own nested graph, or the anchor a `corun` keeps
+    /// on its frame.
+    Base(&'a NodeBase),
+}
+
+impl Anchor<'_> {
+    /// Claims this anchor's one payload slot, reporting whether this caller
+    /// was the first to do so.
+    fn claim_panic(&self) -> bool {
+        match self {
+            Self::Run(topology) => topology.claim_panic(),
+            Self::Base(base) => base.claim_panic(),
+        }
+    }
+
+    /// Puts `payload` in the slot this caller has just claimed.
+    fn keep_panic(&self, payload: Box<dyn Any + Send>) {
+        match self {
+            Self::Run(topology) => topology.keep_panic(payload),
+            Self::Base(base) => base.keep_panic(payload),
+        }
     }
 }
 
@@ -538,6 +703,17 @@ impl Cancellable {
     /// read on its own, which is how upstream decides that a panic is the
     /// first one -- see [`Topology::record_panic`].
     pub(crate) const CAUGHT: u32 = 0x2000_0000;
+    /// Upstream's `ESTATE::EXPLICITLY_ANCHORED`: somebody is waiting for the
+    /// graph scheduled under this base, so a failure inside that graph is
+    /// theirs to deal with and the panic walk stops here.
+    ///
+    /// It is in the estate vocabulary with the other three because that is
+    /// the word it lives in, and it is the one of the four that is never set
+    /// on a *run*: a topology is the chain's root and is treated as anchored
+    /// by [`Job::record_panic`] without a bit of its own. What carries it is
+    /// a `NodeBase`, through
+    /// `NodeBase::anchor_explicitly`.
+    pub(crate) const EXPLICITLY_ANCHORED: u32 = 0x8000_0000;
 
     /// A run that is neither cancelled nor finished.
     fn new() -> Self {
@@ -561,6 +737,21 @@ impl Cancellable {
         // *results* between threads is the join counter and the completion
         // lock, not this.
         self.estate.fetch_or(bits, Ordering::Relaxed) & bits == 0
+    }
+
+    /// Claims the one payload slot of this run, reporting whether this caller
+    /// was the first to do so.
+    ///
+    /// The run's half of `NodeBase::claim_panic`, and the same atomic:
+    /// `EXCEPTION` beside `CAUGHT` so that claiming the slot is also what
+    /// cancels the rest of the run, and `CAUGHT` masked on its own because
+    /// that is the bit which says the slot is taken. On a run the two
+    /// maskings happen to agree -- nothing sets `EXCEPTION` on a topology
+    /// without claiming the slot in the same call -- and they are written the
+    /// same way so that a reader has one rule to learn rather than two.
+    pub(crate) fn claim_panic(&self) -> bool {
+        let flag = Self::EXCEPTION | Self::CAUGHT;
+        self.estate.fetch_or(flag, Ordering::Relaxed) & Self::CAUGHT == 0
     }
 
     /// Whether this run is cancelled: upstream's `Topology::cancelled`, which
@@ -875,15 +1066,16 @@ impl Topology {
         }
     }
 
-    /// Records that a task of this run panicked, keeping the first payload and
-    /// cancelling whatever the run had not started.
+    /// Records that this run failed, keeping the first payload and cancelling
+    /// whatever the run had not started.
     ///
-    /// Upstream's `_process_exception`, restricted to the one anchor this port
-    /// has: upstream walks the node's parent chain to find the enclosing
-    /// anchor and ends at the topology, which is constructed
-    /// `EXPLICITLY_ANCHORED` for exactly that reason, so for a top-level task
-    /// the whole of the walk is this one `fetch_or`. The subflow and runtime
-    /// anchors it also finds are M4's.
+    /// The delivery half of upstream's `_process_exception` with the run as
+    /// the anchor, which is where a failing *task* of a top-level graph ends
+    /// up: [`Job::record_panic`] is the walk that decides that, and this is
+    /// what it calls when the walk reaches the chain's root. The two other
+    /// callers have no node and no chain to walk -- a run policy's predicate
+    /// and its on-finish callback -- so they report their failure straight to
+    /// the run that asked them.
     ///
     /// Two things come out of the one atomic. `EXCEPTION` is half of
     /// [`Topology::cancelled`], so setting it is the whole of "the rest of the
@@ -896,22 +1088,32 @@ impl Topology {
     /// about should be the one that failed first, not the one that happened to
     /// finish unwinding last.
     ///
-    /// Upstream masks `CAUGHT` alone where this masks both bits, which is the
-    /// same test while the only thing that sets `EXCEPTION` on a topology is
-    /// this method, setting the pair together. A second anchor kind would
-    /// break that equivalence, which is why the pair is set in one call rather
-    /// than in two.
+    /// A payload that arrives when the slot is already taken is dropped here
+    /// rather than reported, which is the one difference from a `NodeBase`
+    /// anchor: a node hands the loser's payload to the failing node's own
+    /// slot, because a node's slot is read by code that knows to look. A run
+    /// has nowhere further to put it.
     pub(crate) fn record_panic(&self, payload: Box<dyn Any + Send>) {
-        // Upstream's `constexpr static auto flag = EXCEPTION | CAUGHT`, and
-        // its one `fetch_or` over the pair. That atomic is the arbiter rather
-        // than the lock, so a later panic of a run that already has one is
-        // dropped on the way out of here without ever touching the completion
-        // slot -- which is what keeps a thousand simultaneously failing tasks
-        // off it.
-        let flag = Cancellable::EXCEPTION | Cancellable::CAUGHT;
-        if self.estate.set(flag) {
-            self.lock().panic = Some(payload);
+        if self.claim_panic() {
+            self.keep_panic(payload);
         }
+    }
+
+    /// Claims this run's one payload slot, reporting whether this caller was
+    /// the first: the run's half of `NodeBase::claim_panic`.
+    ///
+    /// The atomic is the arbiter rather than the lock, so a later panic of a
+    /// run that already has one is turned away without ever touching the
+    /// completion slot -- which is what keeps a thousand simultaneously
+    /// failing tasks off it.
+    pub(crate) fn claim_panic(&self) -> bool {
+        self.estate.claim_panic()
+    }
+
+    /// Puts `payload` in the slot this caller has just claimed, where a
+    /// `wait` will find it.
+    pub(crate) fn keep_panic(&self, payload: Box<dyn Any + Send>) {
+        self.lock().panic = Some(payload);
     }
 
     /// Marks this run finished and releases whoever is waiting for it.
@@ -1035,6 +1237,10 @@ impl Topology {
 ///   [`Task`] at another node. So the sources are found twice instead, here
 ///   and in [`Job::sources`], which costs a second walk over the graph and
 ///   saves the allocation that collecting them would need.
+/// - **The payload slot is emptied as well as the state words.** Upstream's
+///   `node->_exception_ptr = nullptr` is in the same loop and is here for the
+///   same reason the state bits are cleared: the slot is where an anchor's
+///   failure waits, and a run must not report one left by the last.
 /// - **The state word is written through the mask.** Upstream assigns
 ///   `NSTATE::NONE` and then accumulates the count into the word with `+=`,
 ///   masking it back out when it arms the join counter. Here the count is
@@ -1067,8 +1273,17 @@ pub(crate) fn set_up_graph(graph: &Graph) -> usize {
             .expect("a task has fewer strong dependencies than the state word can count");
 
         node.nstate().store(counted, Ordering::Relaxed);
-        node.estate().store(0, Ordering::Relaxed);
         node.join_counter().store(strong, Ordering::Relaxed);
+
+        // Upstream's `node->_exception_ptr = nullptr`: a payload left on a
+        // node by a failure nobody came to collect must not be reported by
+        // the next run of the same graph. The `swap` is what keeps a mutex
+        // off this path for the runs that did not fail -- a payload is only
+        // ever put in a slot by a claimant that set `CAUGHT` in the same
+        // word, so a word without that bit cannot have one under it.
+        if node.estate().swap(0, Ordering::Relaxed) & Cancellable::CAUGHT != 0 {
+            node.base().clear_panic();
+        }
 
         // A source is a node with no predecessors, which is not the same test
         // as "no strong dependencies" and is upstream's. The two part company
@@ -1762,6 +1977,189 @@ mod tests {
             "a skipped job still owes its parent the decrement"
         );
         assert!(!topology.cancelled(), "the run itself is fine");
+    }
+
+    /// The parent chain the anchor cases walk: a root, a `root` node under
+    /// it, a `middle` node under that, and the jobs of a nested graph under
+    /// `middle`.
+    ///
+    /// Built by hand rather than by running anything, because what these
+    /// cases are about is the walk: the two [`Nested`] parents are exactly
+    /// what a dispatch arm would have built, and the jobs are exactly what
+    /// `schedule_graph` would have queued.
+    struct Chain {
+        /// The storage holding `root` and `middle`.
+        flow: Arc<Flow>,
+        /// The run at the chain's root, which the walk must leave alone
+        /// whenever an anchor below it takes the payload.
+        topology: Arc<Topology>,
+        /// The outer parent node, two levels above a failing job.
+        root: Task,
+        /// The inner parent node, one level above it.
+        middle: Task,
+        /// The jobs of the nested graph, each of a node of its own.
+        jobs: Vec<Job>,
+    }
+
+    impl Chain {
+        /// A chain whose nested graph has `jobs` jobs.
+        ///
+        /// `root_parent` is what the `root` node's own job hangs off: the run
+        /// for an ordinary nesting, or a [`Nested`] with nothing above it --
+        /// the shape a corun anchor has -- for a chain that ends without
+        /// reaching a run.
+        fn new(jobs: usize, root_parent: &Parent) -> Self {
+            let mut outer = Taskflow::new();
+            let (root, middle) = outer.emplace_n((|| {}, || {}));
+            let flow = Arc::clone(outer.flow());
+            let topology = run_of(&flow);
+            set_up_graph(flow.graph());
+
+            let above = Nested::new(Some(Job::new(root, &flow, &topology, root_parent)));
+            let parent = Nested::new(Some(Job::new(middle, &flow, &topology, &above.as_parent())));
+
+            let inner = fan(jobs, &Arc::new(AtomicUsize::new(0)));
+            set_up_graph(inner.flow().graph());
+            let jobs =
+                Job::sources(inner.flow(), &topology, &parent.as_parent()).collect::<Vec<_>>();
+            assert!(!jobs.is_empty(), "a chain needs a job to fail");
+
+            // Everything the jobs need is owned by the jobs: the inner
+            // taskflow's storage, the chain of parents above them and the
+            // run. So the taskflow handles can go here.
+            Self {
+                flow,
+                topology,
+                root,
+                middle,
+                jobs,
+            }
+        }
+
+        /// The state words of one of the two parent nodes.
+        fn base(&self, task: Task) -> &NodeBase {
+            self.flow.graph().node(task).base()
+        }
+
+        /// Whether `task`'s base was marked by the walk, without claiming
+        /// anything.
+        fn marked(&self, task: Task) -> bool {
+            self.base(task).estate().load(Ordering::Relaxed) & Cancellable::EXCEPTION != 0
+        }
+
+        /// Whether `task`'s base holds the payload, which is the bit that
+        /// says the walk stopped there rather than passing through.
+        fn caught(&self, task: Task) -> bool {
+            self.base(task).estate().load(Ordering::Relaxed) & Cancellable::CAUGHT != 0
+        }
+    }
+
+    /// The first of the three anchor cases: a failure under an explicit
+    /// anchor two levels up is delivered to *that* anchor, every base between
+    /// is marked so the rest of each nested graph stops, and the run is left
+    /// alone.
+    #[test]
+    fn a_failure_under_an_explicit_anchor_is_delivered_to_it() {
+        let chain = Chain::new(1, &Parent::Run);
+        let _anchor = chain.base(chain.root).anchor_explicitly();
+
+        chain.jobs[0].record_panic(Box::new("boom"));
+
+        // The anchor caught it, and the base between did not: it carries the
+        // mark that cancels the rest of its own graph and nothing else.
+        assert!(chain.caught(chain.root), "the anchor did not catch it");
+        assert!(chain.marked(chain.root));
+        assert!(
+            chain.marked(chain.middle),
+            "the intermediate node is marked"
+        );
+        assert!(!chain.caught(chain.middle), "it is not an anchor");
+        assert!(
+            chain.jobs[0].node().estate().load(Ordering::Relaxed) & Cancellable::EXCEPTION != 0,
+            "the failing node is marked too"
+        );
+
+        let payload = chain
+            .base(chain.root)
+            .take_panic()
+            .expect("the anchor has the payload");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
+
+        // The run is untouched: it is not cancelled, so the jobs of the
+        // *outer* graph still run, and a `wait` on it reports nothing. That
+        // is the whole point of an anchor -- the failure belongs to whoever
+        // is waiting for the nested graph.
+        assert!(!chain.topology.cancelled(), "the run was cancelled");
+        chain.topology.finish();
+        assert!(chain.topology.join().is_none(), "the run has a payload");
+
+        // And nothing was left on the failing node, which is where a payload
+        // with nowhere to go would have ended up.
+        assert!(chain.jobs[0].node().base().take_panic().is_none());
+    }
+
+    /// The second: with no explicit anchor anywhere on the chain, the
+    /// innermost `IMPLICITLY_ANCHORED` base gets the payload -- the one
+    /// closest to the failure, not the outermost.
+    ///
+    /// The chain has to end without a run for this case to be reachable at
+    /// all, because a run is an anchor by definition; a parent with nothing
+    /// above it is a corun anchor's shape, which is what this builds.
+    #[test]
+    fn a_failure_with_no_explicit_anchor_goes_to_the_innermost_implicit_one() {
+        let unanchored = Nested::new(None);
+        let chain = Chain::new(1, &unanchored.as_parent());
+
+        // Both parents volunteer; the inner one wins.
+        for task in [chain.root, chain.middle] {
+            chain
+                .base(task)
+                .nstate()
+                .fetch_or(Node::IMPLICITLY_ANCHORED, Ordering::Relaxed);
+        }
+
+        chain.jobs[0].record_panic(Box::new("boom"));
+
+        assert!(chain.caught(chain.middle), "the inner anchor did not catch");
+        assert!(!chain.caught(chain.root), "the outer anchor caught it");
+        assert!(chain.marked(chain.root), "the walk passed through it");
+        let payload = chain
+            .base(chain.middle)
+            .take_panic()
+            .expect("the inner anchor has the payload");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
+        assert!(chain.base(chain.root).take_panic().is_none());
+        assert!(!chain.topology.cancelled());
+    }
+
+    /// The third: two failures under one anchor keep the first, which is the
+    /// rule a run has always applied, now applied at the anchor. The loser is
+    /// left on the node that raised it -- upstream's fall-through -- rather
+    /// than dropped.
+    #[test]
+    fn two_failures_under_one_anchor_keep_the_first() {
+        let chain = Chain::new(2, &Parent::Run);
+        let _anchor = chain.base(chain.root).anchor_explicitly();
+
+        chain.jobs[0].record_panic(Box::new("first"));
+        chain.jobs[1].record_panic(Box::new("second"));
+
+        let payload = chain
+            .base(chain.root)
+            .take_panic()
+            .expect("the anchor has a payload");
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"first"),
+            "the anchor kept the later failure"
+        );
+
+        // And the loser is gone rather than parked on the node that raised
+        // it, which is where upstream leaves it: see `Job::record_panic` for
+        // why this port drops it instead. Neither failing node holds
+        // anything.
+        assert!(chain.jobs[0].node().base().take_panic().is_none());
+        assert!(chain.jobs[1].node().base().take_panic().is_none());
     }
 
     /// A waiter that arrives before the run finishes has to be released by

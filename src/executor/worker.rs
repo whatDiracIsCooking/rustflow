@@ -513,12 +513,14 @@ impl WorkerThread {
         let release = match node.handle() {
             // Upstream's `_invoke_static_task`, whose
             // `TF_EXECUTOR_EXCEPTION_HANDLER` is this `catch_unwind` and whose
-            // `_process_exception` is `Topology::record_panic`: the failure is
-            // stored on the topology, cancels whatever the run had not
-            // started, and is reported from `wait`, never raised on a worker
-            // thread. `AssertUnwindSafe` is the honest annotation -- the state
-            // a panicking body can leave half-written is the user's own,
-            // reachable only through what the closure captured.
+            // `_process_exception` is `Job::record_panic`: the failure is
+            // delivered to whatever is waiting for the graph this node is
+            // part of -- the run, for a top-level task -- cancels the rest of
+            // that graph, and is reported from `wait` or from the frame that
+            // was waiting, never raised on a worker thread. `AssertUnwindSafe`
+            // is the honest annotation -- the state a panicking body can leave
+            // half-written is the user's own, reachable only through what the
+            // closure captured.
             //
             // The successors below are still released, as upstream's are: its
             // exception handler is the body of the first switch and does not
@@ -526,7 +528,7 @@ impl WorkerThread {
             // the worker that dequeues one finds the run cancelled.
             Handle::Static(work) => {
                 if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| work.invoke())) {
-                    topology.record_panic(payload);
+                    job.record_panic(payload);
                 }
                 Some(Release::Strong)
             }
@@ -541,14 +543,14 @@ impl WorkerThread {
             // is empty, which selects no successor and ends the branch.
             Handle::Condition(work) => Some(Release::Selected(
                 panic::catch_unwind(AssertUnwindSafe(|| work.invoke()))
-                    .map_err(|payload| topology.record_panic(payload))
+                    .map_err(|payload| job.record_panic(payload))
                     .ok(),
             )),
             // Upstream's `_invoke_multi_condition_task`, the same again over
             // however many indices the body returns.
             Handle::MultiCondition(work) => Some(Release::SelectedMany(
                 panic::catch_unwind(AssertUnwindSafe(|| work.invoke()))
-                    .map_err(|payload| topology.record_panic(payload))
+                    .map_err(|payload| job.record_panic(payload))
                     .unwrap_or_default(),
             )),
             // The four dynamic-tasking handles, each upstream's

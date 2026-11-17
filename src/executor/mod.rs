@@ -75,6 +75,46 @@
 //! gets `Ok(())`. Only the first panicking task of a run is reported;
 //! `ESTATE::CAUGHT`, set by the same atomic, is what drops the rest.
 //!
+//! # Anchors: who a failure is reported to
+//!
+//! "A panic cancels the rest of its own run" is the claim above that a
+//! nested graph makes more precise, because a failure inside one is not the
+//! whole run's business: somebody may be waiting for exactly that graph, and
+//! if so the failure is *theirs*. The thing that is waiting is an **anchor**,
+//! and `Job::record_panic` in `topology` is upstream's `_process_exception`:
+//! a walk from the failing node up the parent chain, marking `EXCEPTION` on
+//! every base it passes so that each nested graph the failure is inside of
+//! stops starting work, and stopping at the first anchor it finds. There are
+//! three kinds, and they are tried in this order:
+//!
+//! 1. an **explicit** anchor -- upstream's `ESTATE::EXPLICITLY_ANCHORED` --
+//!    is a frame that is blocked on this graph right now: an
+//!    [`Executor::corun`], or the `join` of a subflow. It is a bit held by a
+//!    guard for exactly as long as that frame waits, so a walk that reaches
+//!    it hands the payload to a thread that is about to look. Whoever takes
+//!    it decides what to do: `corun` re-raises it on its own worker,
+//!    [`Executor::try_corun`] returns it;
+//! 2. an **implicit** anchor -- upstream's `NSTATE::IMPLICITLY_ANCHORED` --
+//!    is a node that preempted itself and means to look at its payload slot
+//!    when it is resumed, which is #51's runtime tasks. The *innermost* one
+//!    the walk saw gets the payload, because that is the one closest to the
+//!    failure;
+//! 3. the **run**, which is every chain's root and is anchored by definition
+//!    -- upstream constructs its topology `EXPLICITLY_ANCHORED` to say so.
+//!    Its payload slot is the completion slot, so this is the case where a
+//!    `wait` reports the failure, and it is the only case a static graph has.
+//!
+//! A node whose nested graph merely *preempted* it is no anchor at all: a
+//! subflow's or a module's children report straight past it to the run, which
+//! is why a failure in one of those surfaces from `wait` like any other. What
+//! the walk still does for such a node is mark it, so the siblings of the
+//! failing job are skipped.
+//!
+//! Whichever anchor is found, one `fetch_or` of `EXCEPTION | CAUGHT` on it
+//! decides whether this payload is the first and therefore the one kept --
+//! the same rule a run has always applied, now applied wherever the failure
+//! is delivered.
+//!
 //! # Parents, and what a nested graph counts down
 //!
 //! Every graph the executor schedules is scheduled *under* something, and
@@ -151,9 +191,12 @@
 //!
 //! Upstream reads only the immediate parent, because its `_process_exception`
 //! walks the chain *upwards* and marks every ancestor as it records the
-//! failure. That walk, and the anchor bits that tell it where to stop, are
-//! issue #48; until they land the check is the half that walks, which answers
-//! the same question at the cost of one relaxed load per level of nesting.
+//! failure -- which the walk above now does too, so one level would be enough
+//! here as well. Reading every level is kept because it costs one relaxed
+//! load per level of nesting and answers strictly more: a job whose own
+//! parent is unmarked can still have a marked *grandparent*, when the failure
+//! was in a sibling subtree under the same anchor, and every job under a
+//! failed anchor is one whose result nobody will collect.
 
 pub mod corun;
 pub(crate) mod module;

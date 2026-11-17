@@ -8,12 +8,14 @@
 //! Upstream's `NodeBase`/`Node` split is, as of #47: the base holds the
 //! state words a run writes, so that everything which can be the *parent* of
 //! a graph is one kind of thing to the scheduler -- a node whose nested graph
-//! is running, or the anchor a `corun` waits on. Two of upstream's fields are
-//! deliberately not in it. `_exception_ptr` belongs to the run here, which
-//! owns the one payload slot a failure is reported through, and `_parent`
-//! travels with the *job* that names a node rather than being stored on the
-//! node: `executor::topology` has that argument, and it is what keeps the
-//! scheduler free of raw pointers.
+//! is running, or the anchor a `corun` waits on. One of upstream's fields is
+//! deliberately not in it: `_parent` travels with the *job* that names a node
+//! rather than being stored on the node -- `executor::topology` has that
+//! argument, and it is what keeps the scheduler free of raw pointers.
+//! `_exception_ptr` *is* in it, as of #48, because an anchor is where a
+//! failure inside a nested graph is delivered and an anchor is a `NodeBase`
+//! -- crate-private, so it is named rather than linked here, and its own doc
+//! comment says why the slot cannot live anywhere cheaper.
 //!
 //! That choice decides what erasing a node has to do. Upstream's `Graph::_erase`
 //! compacts its `_nodes` vector, which it can afford because a `tf::Task` holds
@@ -29,9 +31,11 @@
 
 use core::fmt;
 use core::num::TryFromIntError;
-use std::sync::atomic::{AtomicU32, AtomicUsize};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::any::Any;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
+use crate::executor::topology::Cancellable;
 use crate::runtime::Runtime;
 use crate::subflow::Subflow;
 use crate::taskflow::Taskflow;
@@ -376,27 +380,66 @@ impl Handle {
 /// The words are atomic even where upstream's are plain -- `_nstate` is a
 /// bare `int` there -- so that a run can hold a `&Graph` across worker
 /// threads instead of handing out `&mut` to nodes it does not exclusively
-/// own. Upstream's two remaining members are not here, and the module docs
-/// say why: `_parent` travels with the job, and a panic payload belongs to
-/// the run.
-#[derive(Debug, Default)]
+/// own. Upstream's one remaining member is not here, and the module docs say
+/// why: `_parent` travels with the job.
+///
+/// # Why the payload slot is here and not on the parent
+///
+/// `panic` is upstream's `_exception_ptr`, and the question #48 had to settle
+/// is whose field it is. A chain of parents in this port is a chain of
+/// `Nested` allocations in `executor::topology` -- not of nodes -- so storing
+/// a nested failure *there* looks cheaper: one slot per nested run instead of
+/// one per node. It does not work, and the case that breaks it is the one the
+/// slot exists for.
+///
+/// A parent whose nested graph is running is **preempted**: the last job of
+/// that graph re-queues the parent's own job and then lets the `Nested` go,
+/// so by the time the parent is entered a second time -- possibly on another
+/// worker -- the allocation that was its children's parent has been dropped.
+/// A payload stored on it would be gone exactly when the resumed node needs
+/// to look at it. Upstream reads `rt._node->_exception_ptr` on precisely that
+/// second entry (`_async` in `taskflow/core/async.hpp`), which is the same
+/// statement from the other side: the node outlives its nested run, and the
+/// `Nested` does not.
+///
+/// So the slot is on the node, as upstream has it -- and the anchor a `corun`
+/// waits on gets one for free, because that anchor *is* a `NodeBase`. The one
+/// anchor with no `NodeBase` is the run itself, whose payload slot is the
+/// completion slot a `wait` already reads.
+///
+/// The cost is a `Mutex` per node where upstream has a pointer. It is never
+/// contended: which thread may write the slot is settled by an atomic
+/// `fetch_or` of `CAUGHT` on the estate word before the lock is taken, so at
+/// most one writer ever arrives, and the reader is the frame or the entry
+/// that waited for the nested graph. What the lock buys over a raw pointer is
+/// that it is safe code, and it carries the payload's own happens-before: a
+/// taker sees the write because it took the same lock, not because it read
+/// some counter in the right order.
+#[derive(Default)]
 pub(crate) struct NodeBase {
     /// Upstream's `_nstate`: the strong-dependency count in the low 28 bits
     /// -- [`Node::STRONG_DEPENDENCIES_MASK`] -- and the scheduler's state
     /// bits above it.
     nstate: AtomicU32,
     /// Upstream's `_estate`: the cancellation and exception bits, which for a
-    /// parent are what makes the whole chain under it cancelled.
+    /// parent are what makes the whole chain under it cancelled, plus the
+    /// explicit-anchor bit an [`ExplicitAnchor`] guard sets.
     estate: AtomicU32,
     /// Upstream's `_join_counter`: what is still outstanding, be that this
     /// node's own strong dependencies or the jobs of the graph it is the
     /// parent of.
     join_counter: AtomicUsize,
+    /// Upstream's `_exception_ptr`: what the first task to fail under this
+    /// anchor panicked with, until whoever waited for that graph takes it.
+    ///
+    /// Empty on every node that is not an anchor, which is most of them; the
+    /// type doc says why it is nevertheless here rather than on the parent.
+    panic: Mutex<Option<Box<dyn Any + Send>>>,
 }
 
 impl NodeBase {
     /// A base with every word clear: no dependencies, no state, nothing
-    /// outstanding.
+    /// outstanding and no payload.
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -414,6 +457,143 @@ impl NodeBase {
     /// The join counter, upstream's `_join_counter`.
     pub(crate) fn join_counter(&self) -> &AtomicUsize {
         &self.join_counter
+    }
+
+    /// Marks this base as the blocking point of a nested graph until the
+    /// guard is dropped: upstream's `ExplicitAnchorGuard`.
+    ///
+    /// Taken by whoever is about to wait for a graph scheduled under this
+    /// base -- `_corun_graph`, in `executor::corun` -- and taken *before* the
+    /// graph is scheduled, because a source of that graph can fail before the
+    /// call that scheduled it has returned and a failure that arrives while
+    /// the bit is clear walks straight past the frame that is waiting for it.
+    pub(crate) fn anchor_explicitly(&self) -> ExplicitAnchor<'_> {
+        self.estate
+            .fetch_or(Cancellable::EXPLICITLY_ANCHORED, Ordering::Relaxed);
+        ExplicitAnchor(self)
+    }
+
+    /// Whether some frame is waiting for a graph scheduled under this base,
+    /// which is where the panic walk stops.
+    pub(crate) fn is_explicitly_anchored(&self) -> bool {
+        self.estate.load(Ordering::Relaxed) & Cancellable::EXPLICITLY_ANCHORED != 0
+    }
+
+    /// Whether this base is an anchor of last resort: upstream's
+    /// `NSTATE::IMPLICITLY_ANCHORED`, set on a node that preempted itself and
+    /// will look at the slot when it is resumed.
+    pub(crate) fn is_implicitly_anchored(&self) -> bool {
+        self.nstate.load(Ordering::Relaxed) & Node::IMPLICITLY_ANCHORED != 0
+    }
+
+    /// Claims the one payload slot of this base, reporting whether this
+    /// caller was the first to do so.
+    ///
+    /// Upstream's `(_estate.fetch_or(EXCEPTION | CAUGHT) & CAUGHT) == 0`: the
+    /// atomic is the arbiter, so a later failure under the same anchor is
+    /// turned away here rather than at the lock. `EXCEPTION` comes with it
+    /// because an anchor that has a failure to report is an anchor whose
+    /// remaining children are to be skipped, which is the same bit
+    /// cancellation reads.
+    ///
+    /// Masking `CAUGHT` alone rather than the pair is upstream's and is
+    /// load-bearing on a node: the panic walk sets `EXCEPTION` on every base
+    /// it passes, so a base can arrive here already carrying it and still be
+    /// owed the payload.
+    pub(crate) fn claim_panic(&self) -> bool {
+        let flag = Cancellable::EXCEPTION | Cancellable::CAUGHT;
+        self.estate.fetch_or(flag, Ordering::Relaxed) & Cancellable::CAUGHT == 0
+    }
+
+    /// Puts `payload` in the slot this caller has just claimed.
+    ///
+    /// **Call it only after [`NodeBase::claim_panic`] has answered `true`**,
+    /// which is what makes the write unopposed -- and is load-bearing beyond
+    /// that: `set_up_graph` in `executor::topology` reads `CAUGHT` to decide
+    /// whether a node's slot is worth locking at all, so a payload put here
+    /// without claiming the slot first would be invisible to the clearing a
+    /// re-run does and would surface as the *next* run's failure.
+    pub(crate) fn keep_panic(&self, payload: Box<dyn Any + Send>) {
+        debug_assert!(
+            self.estate.load(Ordering::Relaxed) & Cancellable::CAUGHT != 0,
+            "a payload was kept in a slot nobody claimed"
+        );
+        *self.lock_panic() = Some(payload);
+    }
+
+    /// Takes the payload out of the slot and un-claims it: upstream's
+    /// `NodeBase::_rethrow_exception`, minus the rethrow.
+    ///
+    /// Upstream raises the exception again on the spot; here the payload is
+    /// handed back so that the caller decides, which is what gives
+    /// [`Executor::corun`](crate::Executor::corun) and its `try_` form one
+    /// primitive instead of two. Clearing `EXCEPTION | CAUGHT` is upstream's
+    /// too and only happens when there was something to take: the anchor has
+    /// no failure to report any more, so a graph scheduled under it next is
+    /// not born cancelled.
+    pub(crate) fn take_panic(&self) -> Option<Box<dyn Any + Send>> {
+        let payload = self.lock_panic().take();
+        if payload.is_some() {
+            let flag = Cancellable::EXCEPTION | Cancellable::CAUGHT;
+            self.estate.fetch_and(!flag, Ordering::Relaxed);
+        }
+        payload
+    }
+
+    /// Empties the slot, as `_set_up_graph` does to every node of a graph it
+    /// is arming: a payload nobody came for must not be reported by the next
+    /// run of the same graph.
+    pub(crate) fn clear_panic(&self) {
+        drop(self.lock_panic().take());
+    }
+
+    /// The payload slot. Poisoning is taken rather than propagated, as the
+    /// executor's locks are: nothing under this lock does more than move a
+    /// box, so a poisoned slot means a panic *elsewhere* and refusing to hand
+    /// it back would turn a reported failure into a stuck wait.
+    fn lock_panic(&self) -> MutexGuard<'_, Option<Box<dyn Any + Send>>> {
+        self.panic.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl fmt::Debug for NodeBase {
+    /// Hand-written because the payload is a `Box<dyn Any + Send>`, which has
+    /// no [`Debug`](fmt::Debug) -- whether there *is* one is the part worth
+    /// printing, as it is for a run's completion slot.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NodeBase")
+            .field("nstate", &self.nstate)
+            .field("estate", &self.estate)
+            .field("join_counter", &self.join_counter)
+            .field(
+                "panicked",
+                &self.panic.try_lock().is_ok_and(|payload| payload.is_some()),
+            )
+            .finish()
+    }
+}
+
+/// Holds a `NodeBase` explicitly anchored for as long as it lives:
+/// upstream's `ExplicitAnchorGuard`.
+///
+/// Taken by [`NodeBase::anchor_explicitly`] and released on drop, including
+/// on an unwind through the frame that is waiting -- which is the whole
+/// reason it is a guard rather than two calls, exactly as upstream's is.
+///
+/// Upstream's comment on why the bit sits in `_estate` rather than beside the
+/// other scheduler bits in `_nstate` is about a C++ data race it would
+/// otherwise have: its `_nstate` is a plain `int`, written by the thread
+/// taking the guard and read by another thread tearing a child down. Both
+/// words are atomic here, so the port keeps the bit where upstream put it for
+/// the ordinary reason -- it is the word the panic walk reads -- rather than
+/// for that one.
+pub(crate) struct ExplicitAnchor<'a>(&'a NodeBase);
+
+impl Drop for ExplicitAnchor<'_> {
+    fn drop(&mut self) {
+        self.0
+            .estate
+            .fetch_and(!Cancellable::EXPLICITLY_ANCHORED, Ordering::Relaxed);
     }
 }
 
@@ -521,6 +701,17 @@ impl Node {
     /// See the [`executor`](crate::executor) module docs for the protocol.
     pub const PREEMPTED: u32 = 0x2000_0000;
 
+    /// Upstream's `NSTATE::IMPLICITLY_ANCHORED`: set on a node that preempted
+    /// itself and means to look at its own payload slot when it is resumed.
+    ///
+    /// It is the anchor of *lowest* priority: a failure under this node is
+    /// delivered here only if no frame between the failure and the run is
+    /// explicitly waiting for a graph -- see the
+    /// [`executor`](crate::executor) module docs for the three kinds and the
+    /// order they are tried in. Upstream sets it on a runtime task's node for
+    /// as long as that body's own children are running, which is #51.
+    pub const IMPLICITLY_ANCHORED: u32 = 0x1000_0000;
+
     /// Upstream's `NSTATE::STRONG_DEPENDENCIES_MASK`: which bits of the
     /// `nstate` word hold the strong-dependency count rather than scheduler
     /// state.
@@ -544,10 +735,9 @@ impl Node {
 
     /// Returns the scheduler state word, upstream's `_nstate`.
     ///
-    /// The four constants above are the bits of upstream's `NSTATE`
-    /// vocabulary this port has; `IMPLICITLY_ANCHORED` arrives with the
-    /// anchor bits in issue #48. The word is the strong-dependency count with
-    /// the state bits above it, so the count is read through
+    /// The four state bits above are the whole of upstream's `NSTATE`
+    /// vocabulary. The word is the strong-dependency count with those bits
+    /// above it, so the count is read through
     /// [`Node::STRONG_DEPENDENCIES_MASK`] and nothing else.
     #[must_use]
     pub fn nstate(&self) -> &AtomicU32 {
@@ -1387,17 +1577,25 @@ mod tests {
         assert_eq!(Node::STRONG_DEPENDENCIES_MASK, 0x0FFF_FFFF);
         assert_eq!(Node::PREEMPTED.count_ones(), 1);
 
-        let state = Node::PREEMPTED | Node::RETAIN_SUBFLOW | Node::JOINED_SUBFLOW;
+        // All four state bits, which is the whole of upstream's vocabulary:
+        // disjoint from each other and from the count field.
+        assert_eq!(Node::IMPLICITLY_ANCHORED, 0x1000_0000);
+        assert_eq!(Node::IMPLICITLY_ANCHORED.count_ones(), 1);
+        let state = Node::PREEMPTED
+            | Node::RETAIN_SUBFLOW
+            | Node::JOINED_SUBFLOW
+            | Node::IMPLICITLY_ANCHORED;
         assert_eq!(state & Node::STRONG_DEPENDENCIES_MASK, 0);
-        assert_eq!(state.count_ones(), 3);
+        assert_eq!(state.count_ones(), 4);
 
         // The mask is contiguous from bit zero, so masking a word is the
-        // count and nothing else. The bit just above it is upstream's
-        // `IMPLICITLY_ANCHORED`, which is issue #48's and is why the count
-        // field stops one bit short of `PREEMPTED` rather than at it.
+        // count and nothing else, and it stops just below the lowest state
+        // bit -- `IMPLICITLY_ANCHORED`, which is why the count field stops
+        // one bit short of `PREEMPTED` rather than at it.
         assert_eq!(Node::STRONG_DEPENDENCIES_MASK.count_ones(), 28);
         assert_eq!(Node::STRONG_DEPENDENCIES_MASK.trailing_ones(), 28);
-        const { assert!(Node::STRONG_DEPENDENCIES_MASK < Node::PREEMPTED) };
+        const { assert!(Node::STRONG_DEPENDENCIES_MASK < Node::IMPLICITLY_ANCHORED) };
+        const { assert!(Node::IMPLICITLY_ANCHORED < Node::PREEMPTED) };
         let (graph, t) = graph_of(1);
         let node = graph.node(t[0]);
         node.nstate()
@@ -1430,6 +1628,87 @@ mod tests {
         assert_eq!(anchor.nstate().load(Ordering::Relaxed), 0);
         assert_eq!(anchor.estate().load(Ordering::Relaxed), 0);
         assert_eq!(anchor.join_counter().load(Ordering::Relaxed), 0);
+    }
+
+    /// The explicit-anchor bit is upstream's `ExplicitAnchorGuard`, so what
+    /// has to hold is that it is set for exactly as long as the guard lives
+    /// -- an unwind through the waiting frame included -- and that it does
+    /// not disturb the other estate bits.
+    #[test]
+    fn an_explicit_anchor_is_set_while_its_guard_lives() {
+        let anchor = NodeBase::new();
+        assert!(!anchor.is_explicitly_anchored());
+
+        anchor
+            .estate()
+            .store(Cancellable::CANCELLED, Ordering::Relaxed);
+        {
+            let _guard = anchor.anchor_explicitly();
+            assert!(anchor.is_explicitly_anchored());
+            // Set beside whatever the word already held rather than over it,
+            // which is why both the guard's halves are read-modify-write.
+            assert_eq!(
+                anchor.estate().load(Ordering::Relaxed),
+                Cancellable::CANCELLED | Cancellable::EXPLICITLY_ANCHORED
+            );
+        }
+
+        assert!(!anchor.is_explicitly_anchored());
+        assert_eq!(
+            anchor.estate().load(Ordering::Relaxed),
+            Cancellable::CANCELLED,
+            "the guard cleared a bit that was not its own"
+        );
+
+        // And on an unwind, which is the case the guard exists for: a frame
+        // waiting for a nested graph must not leave the anchor set behind.
+        let anchor = NodeBase::new();
+        let unwound = std::panic::catch_unwind(|| {
+            let _guard = anchor.anchor_explicitly();
+            panic!("the waiting frame failed");
+        });
+        assert!(unwound.is_err());
+        assert!(!anchor.is_explicitly_anchored());
+    }
+
+    /// The payload slot, which is upstream's `_exception_ptr` plus the
+    /// `CAUGHT` arbiter that says who may write it: the first claimant keeps
+    /// its payload, a later one is turned away, and taking the payload leaves
+    /// the base ready to anchor another graph.
+    #[test]
+    fn the_payload_slot_keeps_the_first_claimant_and_is_taken_once() {
+        let base = NodeBase::new();
+        assert!(base.take_panic().is_none());
+
+        // The walk marks every base it passes with `EXCEPTION`, so a base can
+        // arrive at the claim already carrying it and must still be owed the
+        // payload: the test is `CAUGHT` alone.
+        base.estate()
+            .fetch_or(Cancellable::EXCEPTION, Ordering::Relaxed);
+        assert!(base.claim_panic(), "the first claimant");
+        base.keep_panic(Box::new("first"));
+        assert!(!base.claim_panic(), "the second claimant");
+
+        assert_eq!(
+            base.estate().load(Ordering::Relaxed),
+            Cancellable::EXCEPTION | Cancellable::CAUGHT
+        );
+
+        let payload = base.take_panic().expect("a payload was kept");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"first"));
+        // Taken, not cloned, and the base is no longer a failed one: both
+        // bits are gone, so a graph scheduled under it next is not born
+        // cancelled.
+        assert!(base.take_panic().is_none());
+        assert_eq!(base.estate().load(Ordering::Relaxed), 0);
+
+        // Clearing is what a set-up does to a node: whatever was there goes,
+        // and a slot that was empty stays empty.
+        assert!(base.claim_panic());
+        base.keep_panic(Box::new("dropped by the next set-up"));
+        base.clear_panic();
+        assert!(base.take_panic().is_none());
+        base.clear_panic();
     }
 
     #[test]

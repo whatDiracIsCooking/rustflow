@@ -59,17 +59,53 @@
 //! upstream's local `NodeBase anchor` in `corun`: the jobs of the graph count
 //! it down rather than counting down the topology, and the corunning frame
 //! waits for it to reach zero. The topology is still there and still the run
-//! -- it is what a failing task reports to and what `join` waits on -- but
+//! -- it is what `join` waits on and what a run policy reports to -- but
 //! nothing drives *its* counter to zero, so this frame is its own tear-down.
 //! Scheduling under an anchor rather than under the topology is what the
-//! parent machinery of #47 is for, and what #48's explicit-anchor guard will
-//! hang the exception half of upstream's `_corun_graph` on.
+//! parent machinery of #47 is for.
 //!
 //! That makes a corun the closure-shaped version of the promise
 //! [`Executor::run`] makes with a lifetime: the borrow of `taskflow` ends when
 //! this function returns, and it cannot return until the run is over.
+//!
+//! # Why a failure comes back here rather than from `wait`
+//!
+//! A task of the inner graph that panics does not report to the inner run.
+//! It reports to the **anchor**, because the anchor is what this frame is
+//! waiting on and this frame is therefore what can do something about it --
+//! that is the whole of what upstream's `ESTATE::EXPLICITLY_ANCHORED` is for,
+//! and `corun_graph` below -- crate-private, so it is named rather than
+//! linked -- is where the bit is set. So the payload comes out of the corun
+//! call, on the worker that made it, and not out of a `wait` somewhere else:
+//! there is no handle to wait on, and the task body that called `corun` is
+//! the only code that knows what the inner graph was for.
+//!
+//! Which leaves the question of what to *do* with it, and both answers are
+//! wanted often enough that this module offers each by name:
+//!
+//! - [`Executor::corun`] re-raises it, with
+//!   [`resume_unwind`](std::panic::resume_unwind). That is upstream's
+//!   `_rethrow_exception` exactly, and it is the shape that composes: a
+//!   caller who wrapped the call in nothing has the failure propagate out of
+//!   its own task body, where the executor catches it as that task's failure
+//!   and the *outer* run reports it. The payload keeps its identity all the
+//!   way, so a handler two levels up still downcasts it to what the inner
+//!   task panicked with.
+//! - [`Executor::try_corun`] hands it back as a [`CorunError::Run`]. That is
+//!   the shape for a caller who means to inspect or ignore the failure, and
+//!   it is what upstream's callers write a `try`/`catch` around.
+//!
+//! Both leave the rest of the inner graph cancelled, on the terms the
+//! [`executor`](crate::executor) module docs set out for any failure:
+//! claiming the anchor's payload slot sets the same `EXCEPTION` bit that
+//! stops jobs being started, so the siblings of the failing task that had not
+//! begun do not run. The outer run is untouched by either shape -- the walk
+//! stopped at the anchor -- unless the body lets the panic through, which is
+//! precisely how `corun` propagates.
 
+use std::any::Any;
 use std::fmt;
+use std::panic;
 use std::sync::Arc;
 
 use crate::executor::Executor;
@@ -77,6 +113,65 @@ use crate::executor::run_handle::RunError;
 use crate::executor::topology::{Nested, Topology};
 use crate::executor::worker::WorkerThread;
 use crate::taskflow::{Flow, Taskflow};
+
+/// Runs `flow`'s graph under `parent` and waits for it on the calling worker,
+/// handing back what the first task of it to fail panicked with.
+///
+/// Upstream's `Executor::_corun_graph`, and the one primitive every blocking
+/// wait on a nested graph is built from: [`Executor::corun`] here, and
+/// `Subflow::join` (#50) and `Runtime::corun` (#51) when they land. Four
+/// steps, in upstream's order, and the order is the whole of it:
+///
+/// 1. a graph with nothing to run is nothing to wait for, so this returns at
+///    once -- upstream's `if(g.empty()) return`;
+/// 2. `parent` is anchored **before** the graph is scheduled, because a
+///    source of it can fail before this call has returned and a failure that
+///    arrives while the bit is clear walks past the frame that is waiting;
+/// 3. the graph goes under `parent`, so its jobs count that parent down
+///    rather than the run, and the calling worker stays in the work-stealing
+///    loop until they have all finished -- which is what keeps a nested wait
+///    from costing the pool a thread;
+/// 4. the guard is dropped and the payload taken, which is upstream's
+///    `p->_rethrow_exception()` with the decision of what to do about it left
+///    to the caller. That is what gives the two shapes
+///    [`Executor::corun`] and [`Executor::try_corun`] one implementation.
+///
+/// The graph arrives as the share that owns it rather than as a `&Graph`,
+/// which is what [`Shared::schedule_graph`](crate::executor::Shared) takes
+/// and therefore what survives the widening that a subflow's subgraph and an
+/// adopted module's graph will need: a job of this graph has to own the
+/// storage its node indices resolve in, and a reference cannot be owned.
+///
+/// `worker` is upstream's `Worker&`: the real one when the caller is a
+/// dispatch arm inside `WorkerThread::invoke`, and a
+/// [`corun_view`](WorkerThread::corun_view) of it when the caller is a task
+/// *body*, which cannot name the frame running it. Either way the loop is the
+/// same one.
+pub(crate) fn corun_graph(
+    worker: &mut WorkerThread,
+    flow: &Arc<Flow>,
+    topology: &Arc<Topology>,
+    parent: &Arc<Nested>,
+) -> Option<Box<dyn Any + Send>> {
+    // Upstream's `g.empty()`, widened to the graph that *has* nothing to run
+    // -- an empty one, or one whose every node is in a cycle. Scheduling one
+    // would queue no job, so nothing would ever drive the parent's counter
+    // off zero and the wait below would be over before it began; returning
+    // here says the same thing without taking a guard for it.
+    if !flow.has_source_task() {
+        return None;
+    }
+
+    {
+        let _anchor = parent.base().anchor_explicitly();
+        worker
+            .shared
+            .schedule_graph(Some(worker), flow, topology, &parent.as_parent());
+        worker.corun_until(|| parent.outstanding() == 0);
+    }
+
+    parent.base().take_panic()
+}
 
 /// Why a [`Executor::corun`] or [`Executor::corun_until`] call did not do what
 /// it was asked.
@@ -195,16 +290,6 @@ impl InnerRun {
         &self.anchor
     }
 
-    /// Whether every job of the inner graph has finished.
-    ///
-    /// Upstream's `_corun_graph` predicate exactly:
-    /// `p->_join_counter.load(acquire) == 0` over the anchor it scheduled the
-    /// graph under. [`InnerRun::end`] is what then makes the run safe to
-    /// leave behind.
-    fn finished(&self) -> bool {
-        self.anchor.outstanding() == 0
-    }
-
     /// Ends the run: the last touch of the graph, and then the completion
     /// slot.
     ///
@@ -313,32 +398,119 @@ impl Executor {
     /// assert!(executor.corun(&inner).is_err());
     /// ```
     ///
+    /// # Panics
+    ///
+    /// Panics with the payload of the first task of `taskflow` to panic,
+    /// which is upstream's rethrow: `corun` propagates a failure of the inner
+    /// graph on the calling worker, where the task body that called it can
+    /// catch it as its own -- or not, in which case the executor catches it
+    /// where it catches any other failing task and the *outer* run reports
+    /// it. The payload keeps its identity, because it is handed to
+    /// [`std::panic::resume_unwind`] rather than re-panicked: a caller that
+    /// catches it downcasts to exactly what the inner task panicked with, and
+    /// the panic hook does not print it a second time.
+    ///
+    /// [`Executor::try_corun`] is the same call with that failure as an
+    /// `Err` instead. The module docs say which to reach for.
+    ///
+    /// # Errors
+    ///
+    /// [`CorunError::NotAWorker`] if the calling thread is not a worker of
+    /// this executor, which is the only error this shape returns -- a failing
+    /// task is the panic above, not an error.
+    pub fn corun(&self, taskflow: &Taskflow) -> Result<(), CorunError> {
+        match self.corun_payload(taskflow)? {
+            // Upstream's `p->_rethrow_exception()`, and the reason this is the
+            // last line of the call rather than something done with the inner
+            // run still on the frame: the unwind starts here, so everything
+            // that run owed has already been paid.
+            Some(payload) => panic::resume_unwind(payload),
+            None => Ok(()),
+        }
+    }
+
+    /// Runs `taskflow` from inside one of this executor's own workers,
+    /// reporting a failing task as an error rather than propagating it.
+    ///
+    /// [`Executor::corun`] with the one difference the name says: a task of
+    /// `taskflow` that panics comes back as
+    /// [`CorunError::Run`]`(`[`RunError::Panicked`]`)` carrying the payload,
+    /// in the shape [`RunHandle::wait`](crate::RunHandle::wait) reports a
+    /// failing run in, instead of being raised on this thread. Everything
+    /// else -- the anchor, the loop, the borrow of `taskflow`, what happens
+    /// to the rest of the inner graph -- is that method's, and its docs are
+    /// where the explanation lives.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use rustflow::prelude::*;
+    /// use rustflow::{Executor, RunError};
+    ///
+    /// let executor = Arc::new(Executor::new(2));
+    /// let inner = Arc::new({
+    ///     let mut inner = Taskflow::new();
+    ///     inner.emplace(|| panic!("x"));
+    ///     inner
+    /// });
+    ///
+    /// let mut outer = Taskflow::new();
+    /// outer.emplace({
+    ///     let executor = Arc::clone(&executor);
+    ///     let inner = Arc::clone(&inner);
+    ///     move || {
+    ///         // The failure is the caller's to deal with, so the task that
+    ///         // coruns survives it and the outer run completes.
+    ///         let error = executor.try_corun(&inner).expect_err("`x` panicked");
+    ///         assert_eq!(error.to_string(), "a task panicked: x");
+    ///     }
+    /// });
+    ///
+    /// executor.run(&outer).wait().expect("the outer task caught it");
+    /// ```
+    ///
     /// # Errors
     ///
     /// [`CorunError::NotAWorker`] if the calling thread is not a worker of
     /// this executor, and [`CorunError::Run`] if a task of `taskflow`
     /// panicked. Only the first panicking task is reported, as with
-    /// [`Executor::run`]; the rest of the graph still runs.
-    pub fn corun(&self, taskflow: &Taskflow) -> Result<(), CorunError> {
+    /// [`Executor::run`]; what the rest of the inner graph does is
+    /// [`Executor::corun`]'s answer.
+    pub fn try_corun(&self, taskflow: &Taskflow) -> Result<(), CorunError> {
+        match self.corun_payload(taskflow)? {
+            Some(payload) => Err(CorunError::Run(RunError::Panicked(payload))),
+            None => Ok(()),
+        }
+    }
+
+    /// Both shapes of corun, up to what is done with the payload.
+    ///
+    /// The whole of upstream's `corun` template: a stack anchor, the graph
+    /// scheduled under it, and the calling worker kept in the loop until that
+    /// anchor's counter reaches zero. What this adds is the topology, which
+    /// upstream passes as `nullptr` here and this port cannot: a queued job
+    /// owns a share of its run, and the run is what the policy callbacks
+    /// report to.
+    fn corun_payload(
+        &self,
+        taskflow: &Taskflow,
+    ) -> Result<Option<Box<dyn Any + Send>>, CorunError> {
         let id = self.this_worker_id().ok_or(CorunError::NotAWorker)?;
 
         let run = InnerRun::new(taskflow.flow());
+        let mut payload = None;
         if taskflow.flow().has_source_task() {
             // Counted as the `run` family counts its own, and for the reason
             // that family's `start` gives: a worker skips the steal loop while
             // `num_topologies` is zero, so this run has to be visible there
             // before its sources are.
             self.shared.increment_topology();
-            self.shared.schedule_graph(
-                None,
-                taskflow.flow(),
-                run.topology(),
-                &run.anchor().as_parent(),
-            );
 
-            // Upstream's `_corun_graph`: work until the anchor's counter says
-            // every job of the inner graph has finished.
-            WorkerThread::corun_view(Arc::clone(&self.shared), id).corun_until(|| run.finished());
+            // The corun view is this frame's stand-in for the `Worker&`
+            // upstream hands `_corun_graph`; `WorkerThread::corun_view` says
+            // why the real one cannot be reached from a task body.
+            let mut worker = WorkerThread::corun_view(Arc::clone(&self.shared), id);
+            payload = corun_graph(&mut worker, taskflow.flow(), run.topology(), run.anchor());
 
             // The decrement every run gets, which for a corun is this frame's
             // rather than a tear-down's -- see `InnerRun::end`, which is the
@@ -351,10 +523,13 @@ impl Executor {
         // counted, so there is nothing to decrement for it.
         run.end();
 
-        match run.join() {
-            Some(payload) => Err(CorunError::Run(RunError::Panicked(payload))),
-            None => Ok(()),
-        }
+        // The anchor is where a failing task of the inner graph reports, so
+        // the payload above is almost always the whole answer. The run's own
+        // slot is still read, as the backstop it is: a failure with no node
+        // to walk up from -- a run policy's callback -- lands there instead,
+        // and so does one recorded against the topology directly by a node
+        // kind the executor does not run yet.
+        Ok(payload.or_else(|| run.join()))
     }
 
     /// Keeps the calling worker in the work-stealing loop until `predicate`
@@ -423,6 +598,7 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::AssertUnwindSafe;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -559,7 +735,9 @@ mod tests {
     }
 
     /// A panic in a corun task is reported to the corunning worker, in the
-    /// same shape `wait` reports it, and does not escape onto the worker.
+    /// same shape `wait` reports it, and does not escape onto the worker:
+    /// `try_corun` is the shape for a caller that means to look at it, so the
+    /// task that called it survives and the outer run completes.
     #[test]
     fn a_panicking_corun_task_is_reported_as_an_error() {
         let executor = Arc::new(Executor::new(2));
@@ -576,7 +754,7 @@ mod tests {
             let inner = Arc::clone(&inner);
             let message = Arc::clone(&message);
             move || {
-                let error = executor.corun(&inner).expect_err("the task panicked");
+                let error = executor.try_corun(&inner).expect_err("the task panicked");
                 *message.lock().expect("the slot is not poisoned") = error.to_string();
             }
         });
@@ -589,6 +767,74 @@ mod tests {
             *message.lock().expect("the slot is not poisoned"),
             "a task panicked: boom"
         );
+    }
+
+    /// The other shape: `corun` re-raises the payload on the corunning
+    /// worker, so a task body that does not catch it fails with it and the
+    /// outer run reports that -- with the payload still the one the *inner*
+    /// task panicked with, which is what `resume_unwind` buys over a fresh
+    /// panic.
+    #[test]
+    fn a_panicking_corun_task_propagates_through_the_calling_task() {
+        let executor = Arc::new(Executor::new(2));
+        let inner = Arc::new({
+            let mut inner = Taskflow::new();
+            inner.emplace(|| panic!("boom"));
+            inner
+        });
+
+        let mut outer = Taskflow::new();
+        outer.emplace({
+            let executor = Arc::clone(&executor);
+            let inner = Arc::clone(&inner);
+            move || executor.corun(&inner).expect("a worker may corun")
+        });
+
+        let error = executor
+            .run(&outer)
+            .wait()
+            .expect_err("the corun panic became the outer task's failure");
+        // One variant, so this is a plain destructuring from inside the
+        // crate; `tests/exceptions.rs` is where it has to be a `match`.
+        let RunError::Panicked(payload) = &error;
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
+    }
+
+    /// And the same payload can be caught by the *task* that called `corun`,
+    /// which is upstream's
+    /// `REQUIRE_THROWS_WITH_AS(executor.corun(tf), "x", ..)` inside a task
+    /// body: `catch_unwind` around `corun` is what a C++ `try`/`catch`
+    /// around it is.
+    #[test]
+    fn a_calling_task_can_catch_what_corun_re_raises() {
+        let executor = Arc::new(Executor::new(2));
+        let inner = Arc::new({
+            let mut inner = Taskflow::new();
+            inner.emplace(|| panic!("boom"));
+            inner
+        });
+
+        let caught = Arc::new(AtomicUsize::new(0));
+        let mut outer = Taskflow::new();
+        outer.emplace({
+            let executor = Arc::clone(&executor);
+            let inner = Arc::clone(&inner);
+            let caught = Arc::clone(&caught);
+            move || {
+                let payload = panic::catch_unwind(AssertUnwindSafe(|| {
+                    executor.corun(&inner).expect("a worker may corun");
+                }))
+                .expect_err("the corun re-raised the inner panic");
+                assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
+                caught.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        executor
+            .run(&outer)
+            .wait()
+            .expect("the outer task caught it");
+        assert_eq!(caught.load(Ordering::Relaxed), 1);
     }
 
     #[test]
