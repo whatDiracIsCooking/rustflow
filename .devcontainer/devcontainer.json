@@ -11,10 +11,18 @@
   },
   "workspaceFolder": "/workspace",
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+  "//mounts": "Mounted by the same names docker/compose.yaml declares, so both front ends warm one cargo registry, one /target and one Claude Code login rather than a cold copy each. rustflow-claude-config is CLAUDE_CONFIG_DIR in the Dockerfile; it is what makes an in-container `claude /login` outlast a container recreate.",
   "mounts": [
     "source=rustflow-cargo-registry,target=/usr/local/cargo/registry,type=volume",
-    "source=rustflow-target,target=/target,type=volume"
+    "source=rustflow-target,target=/target,type=volume",
+    "source=rustflow-claude-config,target=/claude-config,type=volume"
   ],
+  "//containerEnv": "All three are optional and forwarded from the host, matching the `environment:` list in docker/compose.yaml. ${localEnv:VAR} expands to the empty string when the host has no such variable; an empty value is not a configured credential, so a machine that sets neither of Claude Code's two still gets the interactive /login path.",
+  "containerEnv": {
+    "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
+    "CLAUDE_CODE_OAUTH_TOKEN": "${localEnv:CLAUDE_CODE_OAUTH_TOKEN}",
+    "GH_TOKEN": "${localEnv:GH_TOKEN}"
+  },
   "remoteUser": "dev",
   "customizations": {
     "vscode": {

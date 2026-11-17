@@ -41,6 +41,26 @@ x-rust: &rust
     # artifacts in ./target.
     - cargo-registry:/usr/local/cargo/registry
     - target:/target
+    # Claude Code's credentials and project state (CLAUDE_CONFIG_DIR in the
+    # Dockerfile). A volume for the same reason as the two above, plus one more:
+    # it survives `down` and `rebuild`, so an interactive `claude /login` inside
+    # the container is done ONCE rather than on every recreate. `nuke`
+    # (down -v) drops it and the login with it.
+    - claude-config:/claude-config
+  # Bare names, no `${...:-}` defaults, and that distinction matters: this form
+  # forwards each variable only when the host actually has it set, and omits it
+  # from the container entirely when it does not. Spelling them `${VAR:-}`
+  # instead would inject an EMPTY value, and an empty ANTHROPIC_API_KEY reads
+  # as "a key was configured" to the thing that finds it.
+  #
+  # None is required. Claude Code with none of its two set falls back to an
+  # interactive `/login`, whose result persists in the claude-config volume --
+  # which is the better path for a personal machine. These exist for the
+  # headless case, and GH_TOKEN so in-container `gh` is authenticated as you.
+  environment:
+    - ANTHROPIC_API_KEY
+    - CLAUDE_CODE_OAUTH_TOKEN
+    - GH_TOKEN
   working_dir: /workspace
   user: "${HOST_UID:?Set HOST_UID via id -u}:${HOST_GID:?Set HOST_GID via id -g}"
 
@@ -59,8 +79,9 @@ services:
         cargo clippy --all-targets --all-features -- -D warnings
         cargo test --all-features ${CARGO_TEST_ARGS:-}
 
-  # The long-lived interactive container devtools/devcontainer.sh execs into.
-  # It holds no state of its own -- the volumes do -- so `down` is cheap.
+  # The long-lived interactive container devtools/devcontainer.sh execs into,
+  # and the one an in-container `claude` runs in. It holds no state of its own
+  # -- the volumes do -- so `down` is cheap.
   dev:
     <<: *rust
     command: ["sleep", "infinity"]
@@ -82,3 +103,5 @@ volumes:
     name: rustflow-cargo-registry
   target:
     name: rustflow-target
+  claude-config:
+    name: rustflow-claude-config

@@ -27,7 +27,9 @@ jobs:
     steps:
       # Before checkout, deliberately: the slim image has no git, and
       # actions/checkout silently falls back to a REST tarball without it,
-      # leaving no .git directory. Same package list as the Dockerfile.
+      # leaving no .git directory. This is the Dockerfile's FIRST apt list
+      # ("what the Rust build needs") verbatim; its second one installs agent
+      # tooling -- claude, gh, python3 -- which this job has no use for.
       - name: Install container prerequisites
         run: |
           apt-get update

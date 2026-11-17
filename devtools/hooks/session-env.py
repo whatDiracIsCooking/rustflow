@@ -11,9 +11,10 @@ which is worth knowing up front rather than discovering through a
     `devtools/devcontainer.sh <cmd>` and `docker compose -f
     docker/compose.yaml run --rm check`, both of which drive the container.
   * INSIDE the container, `cargo` is on PATH and builds land in /target (a
-    named volume), not ./target. `docker` is NOT available there, so the
-    wrapper and compose cannot be invoked from inside -- run them from the
-    host.
+    named volume), not ./target. So are `claude` and `gh`, which is what makes
+    an in-container agent session possible at all. `docker` is NOT available
+    there, so the wrapper and compose cannot be invoked from inside -- run
+    them from the host.
 
 Detection: the standard Docker marker file `/.dockerenv`. The result is emitted
 as SessionStart `additionalContext`, so it lands in the session's context
@@ -35,9 +36,12 @@ def main() -> None:
             "Environment: inside the devcontainer (the container half of this "
             "repo's split host/container setup). `cargo` is on PATH here and "
             "CARGO_TARGET_DIR=/target, a named volume -- so build output does "
-            "NOT appear in ./target in the checkout. `docker` is not "
-            "available here: devtools/devcontainer.sh and docker/compose.yaml "
-            "are host-only, so do not try to run them from in here. The gate "
+            "NOT appear in ./target in the checkout. `claude` and `gh` are on "
+            "PATH too; `gh` is authenticated only if the host forwarded "
+            "GH_TOKEN, so check `gh auth status` before relying on it. "
+            "`docker` is not available here: devtools/devcontainer.sh and "
+            "docker/compose.yaml are host-only, so do not try to run them "
+            "from in here. The gate "
             "is `cargo fmt --all --check && cargo clippy --all-targets "
             "--all-features -- -D warnings && cargo test --all-features`."
         )
