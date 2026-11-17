@@ -13,11 +13,15 @@
 //! - [`worker`] a worker and the scheduling loop it runs;
 //! - `topology` one run of one taskflow, the job a queue carries, and the
 //!   run's cancellation bits -- the one module here that is crate-private,
-//!   since a caller has no business with a run's internals;
+//!   since a caller has no business with a run's internals. It is also where
+//!   the ownership argument lives: a job owns a share of its run and of the
+//!   taskflow's storage, which is what keeps a queue of jobs from being a
+//!   queue of raw pointers;
 //! - [`run_handle`] the `run` family itself -- `run`, `run_n`, `run_until` and
 //!   the owning half of each -- the tear-down that decides whether a finished
 //!   run goes round again, the handle whose borrow is this port's answer to
-//!   upstream's "do not mutate a running taskflow", and the
+//!   upstream's "do not mutate a running taskflow", what that answer does and
+//!   does not promise if the handle is leaked, and the
 //!   [`Canceller`](crate::Canceller) that cancels a run from outside it.
 //!
 //! What is left here is what the *executor* owns: the worker array, the

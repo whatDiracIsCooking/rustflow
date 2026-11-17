@@ -219,8 +219,31 @@ the same split:
   nodes and a `Task` is a `Copy` index. Dependency edits go through the
   taskflow via a short-lived fluent borrow, so the graph is plain `Send + Sync`
   with no `unsafe`, and a run can hold `&Taskflow` across worker threads.
-  Upstream's rule "do not mutate a taskflow while it runs" becomes a lifetime on
-  the run handle.
+  Upstream's rule "do not mutate a taskflow while it runs" becomes a lifetime
+  on the run handle — which makes the ordinary case a compile error, and is
+  not on its own enough; see the next entry.
+- **A run owns the graph it walks** (issue #40). A lifetime on the run handle
+  is only as good as the handle: `mem::forget` on one ends the borrow under
+  NLL with the run still in flight, and a blocking `Drop` cannot help, because
+  `Drop` is not guaranteed to run. That was a use-after-free reachable from
+  safe code. So a taskflow is now a name plus an `Arc` of its *storage* — the
+  graph and the queue of runs — and every queued job holds a share of that
+  storage and of the run it belongs to. Upstream is less careful here than
+  this, not more: its nodes hold a raw `Topology*`, its topologies a
+  `Taskflow&`, and its `tf::Future` only a `weak_ptr`, so nothing owns a
+  taskflow on its behalf at all.
+
+  The consequences are the point. A leaked handle leaks rather than dangling;
+  an edit of a running taskflow panics (`Arc::get_mut` finds the run's shares)
+  rather than reallocating a vector workers are walking; and the executor's
+  one `unsafe` boundary is gone, leaving the notifier's as the only one in the
+  crate. The cost is four atomic refcount operations per task and one
+  `Arc::get_mut` per graph edit, measured in `BENCHMARKS.md`: +35 to +41 ns a
+  task at 24 workers on `linear_chain` (+19%, the shape that measures nothing
+  but scheduler overhead), +4 ns on `embarrassing_parallelism` at the same
+  width (+2.4%), +1 to +4 ns at one worker, and +2 ns per `emplace`. A real
+  regression, and the right one to accept: the alternative was a safe API with
+  a reachable use-after-free.
 - **Task bodies are `FnMut() + Send + 'static`.** Condition tasks create
   cycles, so a body runs many times per run and upstream invokes it mutably;
   the scheduler's one-worker-per-node guarantee is the safety argument.

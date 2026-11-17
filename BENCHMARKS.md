@@ -96,6 +96,11 @@ worker that has something to do 40% more time per task, because every completed
 task is handed to whichever worker wakes up first rather than staying on the
 queue it was pushed to.
 
+**These four rows predate #40**, which made a queued job own a share of its run
+and of the taskflow's storage and cost this shape about 19% at 24 workers --
+see "The #40 decision" below for the measurement. The rows are left as measured
+rather than scaled.
+
 ## binary_tree
 
 A complete binary tree of `N` slots, node `i` preceding `2i` and `2i + 1`: one
@@ -168,6 +173,90 @@ the calling thread into the shared overflow buffers rather than onto a worker's
 own queue, so all 65536 of them are distributed by stealing; that is the first
 thing to look at, and it is a scheduling question rather than a `Work` one.
 
+These rows predate #40 too, which cost this shape 2.4% at 65536 tasks and 24
+workers and 7% at 4096 -- an order of magnitude less than the chain, because
+here there is a task body for the scheduler's overhead to hide behind.
+
+## The #40 decision: a job owns what it names, at 4 atomics a task
+
+Issue #40 found a use-after-free reachable from safe code: `mem::forget` on a
+`RunHandle` ends the borrow the scheduler's raw pointers leaned on, and the
+taskflow could then be freed under the workers. The fix that was taken -- the
+issue's option 1 -- gives every queued `Job` an `Arc<Topology>` and an
+`Arc<Flow>` instead of two `NonNull`s, so a job's targets are alive *because
+the job holds them*. That is four atomic read-modify-writes per task that the
+pointers did not pay: two clones when the job is built, two drops when it is
+spent. `Taskflow::graph_mut` also became an `Arc::get_mut`, which is one more
+on the graph-building path.
+
+Measured the same way the `Work` question above was, and for the same reason --
+cross-run criterion comparison on this box measures the other agents' builds,
+not the patch. Three interleaved rounds, both variants of each round within a
+minute of each other, `-- rustflow` so the rayon ids are not even built; load
+average 2.0 to 5.8 throughout. Point estimates of the mean, in the order the
+rounds ran, with the per-task figure taken from the mean delta:
+
+| id | before (`NonNull`) | after (`Arc`) | per task |
+|---|---|---|---|
+| `linear_chain/1w/16384` | 1.706, 1.611, *4.636* ms | 1.765, 1.626, 1.791 ms | +1 to +4 ns |
+| `linear_chain/24w/1024` | 221.4, 227.8, 224.7 µs | 264.4, 268.7, 266.2 µs | **+41 ns** |
+| `linear_chain/24w/16384` | 3.115, 3.159, 3.098 ms | 3.696, 3.684, 3.735 ms | **+35 ns** |
+| `embarrassing/24w/4096` | 784.5, 777.4, 755.3 µs | 828.0, 835.0, 820.3 µs | +13 ns |
+| `embarrassing/24w/65536` | 11.93, 11.84, 11.65 ms | 12.11, 12.06, 12.09 ms | +4 ns |
+| `embarrassing/rustflow-build/65536` | 2.215, 2.067, 2.070 ms | 2.273, 2.215, 2.256 ms | +2 ns |
+
+Two ids are left out of the table because this box cannot resolve them:
+`linear_chain/1w/1024` reported a 95% interval wider than ±15% in four of its
+six measurements, and `embarrassing/1w/65536` -- whose task body is ~543 ns --
+swung between 43.2 and 48.0 ms *before* the change and 41.7 to 53.4 ms after
+it, which is ±10% against an effect of under 1%. The italicised 4.636 ms is an
+outlier of the same kind, 2.8x its own neighbours, and is excluded from the
+`1w/16384` delta.
+
+What the usable rows say:
+
+- **At 24 workers the cost is 35 to 41 ns per task**, and the three rounds of
+  each row agree on it to within 10% (+43.0/+40.9/+41.5 µs over 1024 tasks;
+  +581/+524/+637 µs over 16384). That is about 9 ns per refcount operation,
+  which is what a contended cache line costs: the whole pool shares two of
+  them, one per allocation, and a chain hands every task to whichever worker
+  wakes first, so both lines bounce from core to core for the length of the
+  run.
+- **At one worker it is 1 to 4 ns per task**, i.e. the four uncontended
+  RMWs and nothing else. The lines stay in one core's cache, and this is the
+  figure the design would cost on a pool that kept work where it was pushed.
+- **It is a fraction of a shape with a real task body**: +4 ns against 543 ns
+  of work is 2.4% at 65536 tasks, and +13 ns at 4096 is 7% -- that id is
+  fixed-cost heavy, 190 ns a task against the same 543 ns of work.
+- **Building a graph costs +2 ns per `emplace`**, which is the `Arc::get_mut`
+  uniqueness check behind `graph_mut`. It buys the other half of the issue: an
+  edit of a running taskflow panics instead of reallocating a vector the
+  workers are walking.
+
+So the worst case is +19% on the one shape built to measure nothing but
+scheduler overhead, and ~2% on the shape with work in it. **That is accepted,
+and it is the whole point of the issue**: the alternative is a safe API with a
+reachable use-after-free, which is not a thing to trade nanoseconds against.
+
+Two things would get most of it back, and neither is this PR:
+
+- **Upstream's `_update_cache`/`TF_INVOKE_CONTINUATION`**, which `worker.rs`
+  already records as unported: it keeps one ready successor out of the queue
+  and jumps back to the top of `_invoke` with it. Under the old pointers that
+  saved a queue push; under these shares it also saves a clone *and* a drop,
+  which is exactly the 4 atomics -- on a chain, all of them. The shape it helps
+  most is the shape that regressed most.
+- **One allocation instead of two**, putting the `Topology` and the share of
+  the storage in the same `Arc` so a job clones one refcount rather than two.
+  It was not taken here because the storage share has to be *released* at a
+  particular instant -- before the join counter can end the run -- and a share
+  inside the run's own allocation cannot be, which would make
+  `taskflow.emplace()` panic at random for a few instructions after a `wait`
+  returned. `tests/basics.rs`'s
+  `a_taskflow_is_editable_the_instant_its_run_reports_done` is the case that
+  would fail. Half the atomics for a racy panic is the wrong trade; the
+  continuation optimisation is the one to do first.
+
 ## The `Work` decision: `Mutex::try_lock` stays
 
 `Work` holds its callable in a `Mutex` and `invoke` takes it with `try_lock`,
@@ -211,10 +300,14 @@ What that says:
   nothing measurable on a shape with a real task body, and the box cannot
   resolve either claim to better than the effect itself.
 
-Against that, the cost is concrete rather than stylistic. The crate has exactly
-one sanctioned `unsafe` boundary today (`Job`, in `src/executor/topology.rs`);
-this would be the second, and it needs two -- the `unsafe` deref in `invoke` and
-an `unsafe impl Sync for Work<R>`, since `UnsafeCell` is not `Sync` on its own.
+Against that, the cost is concrete rather than stylistic. When this was
+measured the crate had exactly one sanctioned `unsafe` boundary in the
+scheduler (`Job`, in `src/executor/topology.rs`) and this would have been the
+second; #40 has since removed that one, so the only `unsafe` left anywhere in
+the crate is the notifier's `ThreadSlot`, and an `UnsafeCell` in `Work` would
+now be *reintroducing* a boundary rather than adding to one. It needs two of
+them, besides -- the `unsafe` deref in `invoke` and an
+`unsafe impl Sync for Work<R>`, since `UnsafeCell` is not `Sync` on its own.
 It would also delete the assertion that pays for the `Mutex`: `try_lock` turns a
 broken one-worker-per-node invariant into an immediate panic naming it, and the
 `UnsafeCell` turns the same bug into a data race on a `dyn FnMut`, which is
