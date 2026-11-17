@@ -24,7 +24,10 @@
 //! finding" section took apart -- the crate's one measurement of this path --
 //! and this benchmark is the whole of that path with no task body in front of
 //! it, so the per-task figures below are the ones to read against it rather
-//! than to re-derive.
+//! than to re-derive. What the `rustflow` id's own ~440 ns a task goes on is
+//! the "#125 attribution" section of that file: 87% of it is the three heap
+//! blocks a free async task is, allocated by this thread and freed by a
+//! worker, and the counters and the notifier together are under 5%.
 //!
 //! rayon's scope does *not* measure that: `ThreadPool::install` makes the
 //! calling thread a worker of the pool for the length of the closure, so its
