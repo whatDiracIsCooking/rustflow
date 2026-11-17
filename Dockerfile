@@ -80,14 +80,25 @@ RUN set -eu \
 # Bump CLAUDE_CODE_VERSION and rebuild instead.
 ENV DISABLE_AUTOUPDATER=1
 
-# Where Claude Code keeps credentials, history and project state. It defaults
-# to $HOME/.claude, which lives in the container's writable layer and would be
-# thrown away by every `down`/`rebuild` -- i.e. you would log in again on every
-# recreate. Pointing it at a fixed path lets docker/compose.yaml and
-# devcontainer.json back it with a named volume, exactly as they do for the
-# cargo registry: container-side state, deliberately NOT in the bind mount
-# (where it would collide with the host's own .claude/ and land in git status).
-ENV CLAUDE_CONFIG_DIR=/claude-config
+# Pin HOME rather than inherit whatever /etc/passwd says for the runtime uid.
+# Two reasons, and the second is the load-bearing one:
+#
+#   * The runtime user is a build ARG. `useradd` below only runs when that uid
+#     is not already taken, so on a host uid that collides with a Debian system
+#     user (anything under 1000) HOME would be that account's home instead.
+#   * docker/compose.yaml and devcontainer.json have to NAME this path to mount
+#     Claude Code's config dir at it, and neither can ask the image what the
+#     uid's home turned out to be. Pinned here, $HOME/.claude is knowable.
+#
+# Deliberately NOT CLAUDE_CONFIG_DIR=/claude-config, which an earlier revision
+# of this file had. Claude Code keeps .claude.json BESIDE its config directory,
+# not in it -- and that separation is exactly what makes the config dir safe to
+# share with the host: ~/.claude is mounted from the host (so the container is
+# logged in because you are) while ~/.claude.json stays container-private (it
+# is one monolithic JSON rewritten whole, so sharing it is last-writer-wins).
+# Setting CLAUDE_CONFIG_DIR collapses the two back into one directory and the
+# container's copy then lands in the host's config dir.
+ENV HOME=/home/dev
 
 # Run as the host user so files written into the bind mount are owned by you
 # and not by root. A default of 1000 is only a default: pass the real values
@@ -104,8 +115,12 @@ RUN if ! getent group ${HOST_GID} >/dev/null; then groupadd -g ${HOST_GID} dev; 
 # to /target instead of /workspace/target so a container build and a host build
 # can never poison each other's artifacts through the bind mount.
 ENV CARGO_TARGET_DIR=/target
-RUN mkdir -p /target /usr/local/cargo/registry ${CLAUDE_CONFIG_DIR} \
- && chown -R ${HOST_UID}:${HOST_GID} /target /usr/local/cargo ${CLAUDE_CONFIG_DIR}
+# $HOME/.claude is created so that an unmounted container still has a writable
+# config dir (Claude Code then behaves like a fresh install and asks you to log
+# in) rather than failing on a missing path. Both front ends mount the host's
+# over it.
+RUN mkdir -p /target /usr/local/cargo/registry ${HOME}/.claude \
+ && chown -R ${HOST_UID}:${HOST_GID} /target /usr/local/cargo ${HOME}
 
 USER ${HOST_UID}:${HOST_GID}
 WORKDIR /workspace

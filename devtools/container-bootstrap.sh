@@ -20,8 +20,13 @@ set -uo pipefail
 # path, two delivery mechanisms, so this script does not care which front end
 # started the container.
 SEED="${1:-/tmp/claude-seed.json}"
-CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-DST="$CONFIG_DIR/.claude.json"
+# Beside the config directory, not inside it. $HOME/.claude is bind-mounted
+# from the host (that is what keeps the container logged in), and this file
+# must NOT be: it is one monolithic JSON holding every project's state,
+# rewritten whole on each change, so a shared one is last-writer-wins between
+# the host and here. $HOME/.claude.json is in the container's own filesystem,
+# which is why this runs per created container.
+DST="$HOME/.claude.json"
 
 # --- git: make `git push` possible ------------------------------------------
 # The image has no ssh client and the container has no keys, so an SSH remote
@@ -58,16 +63,16 @@ else
          "(export it on the host; read-only git still works)"
 fi
 
-# --- Claude Code: seed the config so there is no login prompt ----------------
-# ~/.claude.json is NOT part of the config directory -- it sits beside it -- so
-# the /claude-config volume does not carry it and a fresh container looks like
-# a fresh install. Seeding it from the host's copy is what keeps the login.
+# --- Claude Code: seed ~/.claude.json ---------------------------------------
+# Credentials come from the mounted config dir, so this is not about logging
+# in; it is about onboarding state and -- the part nothing else can supply --
+# the workspace trust entry. See the transform below.
 #
-# A COPY, never a shared mount: that file is one monolithic JSON holding every
-# project's state, rewritten whole on each change, so host and container
-# sharing it read-write is last-writer-wins. The seed mount is read-only and
-# this writes only to the volume.
-if [ -e "$DST" ]; then
+# `-f`, not `-e`: -f follows symlinks, so a DANGLING one reads as absent and
+# gets replaced. That is a real case rather than a hypothetical -- a host may
+# keep ~/.claude/.claude.json as a symlink to ~/.claude.json, and under the
+# mount that link's target does not exist in here.
+if [ -f "$DST" ]; then
     exit 0
 fi
 if [ ! -r "$SEED" ]; then
@@ -80,7 +85,9 @@ fi
 # jq for one transform.
 python3 - "$SEED" "$DST" <<'PY' || exit 0
 import json
+import os
 import sys
+import tempfile
 
 seed, dst = sys.argv[1], sys.argv[2]
 
@@ -123,8 +130,21 @@ cfg.setdefault("projects", {}).setdefault("/workspace", {})[
     "hasTrustDialogAccepted"
 ] = True
 
-with open(dst, "w") as fh:
-    json.dump(cfg, fh, indent=2)
+# Write-then-rename, so an existing DANGLING SYMLINK at dst is REPLACED rather
+# than followed. `open(dst, "w")` follows it and dies on the target's missing
+# parent directory:
+#     FileNotFoundError: [Errno 2] ... '/claude-config/.claude.json'
+# Atomic too, which is worth having for a file read on every start. The temp
+# file goes in dst's own directory so the rename stays within one filesystem.
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dst) or ".")
+try:
+    with os.fdopen(fd, "w") as fh:
+        json.dump(cfg, fh, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, dst)
+except BaseException:
+    os.unlink(tmp)
+    raise
 PY
 
 echo "bootstrap: seeded $DST from $SEED"

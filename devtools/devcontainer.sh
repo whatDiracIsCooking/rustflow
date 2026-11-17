@@ -14,8 +14,7 @@
 #   devtools/devcontainer.sh test [ARGS]   cargo test
 #   devtools/devcontainer.sh rebuild       rebuild the image after a Dockerfile edit
 #   devtools/devcontainer.sh down          stop it (volumes survive)
-#   devtools/devcontainer.sh nuke          stop it AND drop every volume, the
-#                                          Claude Code login included
+#   devtools/devcontainer.sh nuke          stop it AND drop every volume
 #   devtools/devcontainer.sh status        what is running
 #
 # VS Code / IDE users can instead open .devcontainer/devcontainer.json; it
@@ -31,6 +30,15 @@ export HOST_UID="${HOST_UID:-$(id -u)}"
 export HOST_GID="${HOST_GID:-$(id -g)}"
 
 dc() { docker compose -f "$COMPOSE_FILE" "$@"; }
+
+# compose binds ~/.claude into the dev container as Claude Code's config dir.
+# docker does NOT refuse a missing bind source -- it creates it owned by ROOT,
+# and the failure then surfaces later as a permission error that names no
+# mount. So make it here, as the user, where it is cheap and obvious.
+ensure_claude_config_dir() {
+    local src="${CLAUDE_CONFIG_SRC:-$HOME/.claude}"
+    [ -d "$src" ] || mkdir -p "$src"
+}
 
 # Hand the host's ~/.claude.json to the container, then run the in-container
 # bootstrap (git push credentials + the Claude Code config seed; see that
@@ -59,6 +67,7 @@ bootstrap() {
 # idempotent anyway.
 ensure_up() {
     if [ -z "$(dc ps -q dev 2>/dev/null)" ]; then
+        ensure_claude_config_dir
         dc up -d dev
         bootstrap
     fi
@@ -72,7 +81,7 @@ cmd="${1:-shell}"
 shift || true
 
 case "$cmd" in
-    up)      dc up -d dev; bootstrap ;;
+    up)      ensure_claude_config_dir; dc up -d dev; bootstrap ;;
     shell)
         ensure_up
         if [ "${1:-}" = "-c" ]; then
@@ -104,8 +113,13 @@ case "$cmd" in
         ;;
     test)    in_dev "cargo test --all-features $*" ;;
     fmt)     in_dev 'cargo fmt --all' ;;
-    rebuild) dc build --no-cache dev && dc up -d --force-recreate dev && bootstrap ;;
+    rebuild) ensure_claude_config_dir \
+                 && dc build --no-cache dev \
+                 && dc up -d --force-recreate dev && bootstrap ;;
     down)    dc down ;;
+    # Drops the build caches and the two shadow volumes. NOT your Claude Code
+    # login: that lives in the host's ~/.claude, which is a bind, and `down -v`
+    # does not touch binds.
     nuke)    dc down -v ;;
     status)  dc ps ;;
     *)

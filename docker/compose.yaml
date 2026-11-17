@@ -41,22 +41,19 @@ x-rust: &rust
     # artifacts in ./target.
     - cargo-registry:/usr/local/cargo/registry
     - target:/target
-    # Claude Code's credentials and project state (CLAUDE_CONFIG_DIR in the
-    # Dockerfile). A volume for the same reason as the two above, plus one more:
-    # it survives `down` and `rebuild`, so an interactive `claude /login` inside
-    # the container is done ONCE rather than on every recreate. `nuke`
-    # (down -v) drops it and the login with it.
-    - claude-config:/claude-config
   # Bare names, no `${...:-}` defaults, and that distinction matters: this form
   # forwards each variable only when the host actually has it set, and omits it
   # from the container entirely when it does not. Spelling them `${VAR:-}`
   # instead would inject an EMPTY value, and an empty ANTHROPIC_API_KEY reads
   # as "a key was configured" to the thing that finds it.
   #
-  # None is required. Claude Code with none of its two set falls back to an
-  # interactive `/login`, whose result persists in the claude-config volume --
-  # which is the better path for a personal machine. These exist for the
-  # headless case, and GH_TOKEN so in-container `gh` is authenticated as you.
+  # None is required, and Claude Code's two are usually not wanted: the
+  # ~/.claude bind above already logs the container in as you. They are here
+  # for the headless case -- a CI runner or a host with no ~/.claude -- where
+  # CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) authenticates with no
+  # config at all. GH_TOKEN is different: it is the ONLY way in-container `gh`
+  # is authenticated, and the only way `git push` works, since the image has no
+  # ssh client for this repo's git@github.com: remote.
   environment:
     - ANTHROPIC_API_KEY
     - CLAUDE_CODE_OAUTH_TOKEN
@@ -81,11 +78,56 @@ services:
 
   # The long-lived interactive container devtools/devcontainer.sh execs into,
   # and the one an in-container `claude` runs in. It holds no state of its own
-  # -- the volumes do -- so `down` is cheap.
+  # -- the volumes and the bind below do -- so `down` is cheap.
   dev:
     <<: *rust
     command: ["sleep", "infinity"]
     init: true
+    # The anchor's three mounts repeated, because a YAML merge key cannot
+    # EXTEND a sequence -- `volumes:` here replaces the anchor's list outright,
+    # so every entry has to be present. Worth that duplication to keep the
+    # Claude Code mounts off `check`, `test` and `build`: those run cargo and
+    # have no use for them, and the bind source below is a real host directory
+    # that docker CREATES (owned by root) when it is missing -- so a batch
+    # `docker compose run --rm check` on a machine that has never run Claude
+    # Code would quietly leave a root-owned ~/.claude behind.
+    volumes:
+      - ..:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - target:/target
+      # Claude Code's config dir -- $HOME/.claude, with HOME pinned in the
+      # Dockerfile so this path is nameable here at all. The one
+      # BIND here rather than a volume, and deliberately read-write: it is the
+      # host's own ~/.claude, so the container is logged in because you are, with
+      # no token to mint and no /login to answer.
+      #
+      # A directory, not just the credentials file inside it. A single-file bind
+      # mount cannot be REPLACED, only written through -- an atomic
+      # write-temp-then-rename, which is how a careful writer updates a
+      # credential, fails on one with
+      #     OSError: [Errno 16] Device or resource busy
+      # (measured). Mounting the directory leaves the rename inside the mount,
+      # where it works.
+      #
+      # Shared live rather than copied, for the same reason: the file holds a
+      # refreshToken that is rewritten when the access token refreshes. One copy
+      # cannot go stale against the other, and a container refresh cannot
+      # invalidate the host's login.
+      #
+      # ~/.claude.json is NOT in here -- Claude Code keeps it BESIDE the config
+      # directory, so it stays in the container's own filesystem -- and
+      # that is load-bearing, not an oversight. It is one monolithic JSON holding
+      # every project's state, rewritten whole on each change, so sharing it
+      # would be last-writer-wins between the host and this container.
+      # devtools/container-bootstrap.sh gives the container its own copy instead.
+      - ${CLAUDE_CONFIG_SRC:-${HOME}/.claude}:/home/dev/.claude
+      # Two subtrees shadowed back out of that bind, so the container cannot
+      # write them: a plugin install rewrites state every other session on the
+      # host shares, and can be environment-specific besides. Empty volumes mean
+      # the container simply has no plugins, which for a build container is the
+      # right amount.
+      - claude-plugins:/home/dev/.claude/plugins
+      - claude-backups:/home/dev/.claude/backups
 
   build:
     <<: *rust
@@ -103,5 +145,9 @@ volumes:
     name: rustflow-cargo-registry
   target:
     name: rustflow-target
-  claude-config:
-    name: rustflow-claude-config
+  # Both exist only to shadow a subtree of the ~/.claude bind, so they are
+  # expected to stay empty and are safe for `nuke` to drop.
+  claude-plugins:
+    name: rustflow-claude-plugins
+  claude-backups:
+    name: rustflow-claude-backups
