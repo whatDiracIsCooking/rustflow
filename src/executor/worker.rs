@@ -1,11 +1,12 @@
 //! Translated from `taskflow/core/worker.hpp` (Taskflow v4.1.0).
 //!
 //! The scheduling loop itself -- upstream's `Executor::_spawn`,
-//! `_exploit_task`, `_explore_task` and `_wait_for_task`, from
-//! `taskflow/core/executor.hpp` of the same version -- is translated here too,
-//! rather than into the parent module, because every line of it reads or writes
-//! one worker's own state. The parent module keeps what the *executor* owns:
-//! the worker array, the buffers, the notifier and the thread-id map.
+//! `_exploit_task`, `_explore_task`, `_wait_for_task`, `_schedule`, `_invoke`
+//! and `_tear_down_topology`, from `taskflow/core/executor.hpp` of the same
+//! version -- is translated here too, rather than into the parent module,
+//! because every line of it either reads or writes one worker's own state or
+//! runs on that worker's thread. The parent module keeps what the *executor*
+//! owns: the worker array, the buffers, the notifier and the thread-id map.
 //!
 //! # Why a worker is two types here and one type upstream
 //!
@@ -41,10 +42,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use super::{Job, Shared};
+use super::Shared;
 use crate::executor::notifier::Notifier;
 use crate::executor::queue::{Thief, WorkerQueue};
 use crate::executor::rng::Xorshift32;
+use crate::executor::topology::{Job, Topology};
+use crate::graph::Handle;
+use crate::taskflow::Taskflow;
 
 /// A worker of an [`Executor`](crate::Executor), as every thread but its own
 /// sees it.
@@ -198,7 +202,11 @@ impl WorkerThread {
         // `AssertUnwindSafe` is the honest annotation: the state a panicking
         // task could leave half-written is this worker's own, and this worker
         // is about to stop touching it.
-        let panicked = panic::catch_unwind(AssertUnwindSafe(|| self.schedule())).err();
+        //
+        // The stop condition never fires: this worker leaves the loop the way
+        // upstream's does, through `_wait_for_task` reporting that the `done`
+        // flag is set. `run_until`'s docs name who passes one that does fire.
+        let panicked = panic::catch_unwind(AssertUnwindSafe(|| self.run_until(|| false))).err();
 
         if let Some(interface) = interface {
             interface.scheduler_epilogue(self.worker(), panicked);
@@ -210,42 +218,177 @@ impl WorkerThread {
     }
 
     /// The work-stealing loop: drain the local queue, then steal or sleep until
-    /// there is something to drain again. Upstream's `while(1)` over
-    /// `_exploit_task` and `_wait_for_task`, which breaks when the second one
-    /// says the worker is done.
-    fn schedule(&mut self) {
+    /// there is something to drain again, and stop when `stop` says so or when
+    /// the executor shuts this worker down.
+    ///
+    /// Upstream's `while(1)` over `_exploit_task` and `_wait_for_task`, which
+    /// breaks when the second one says the worker is done.
+    ///
+    /// The stop condition is a parameter rather than the `done` flag because
+    /// `corun`/`corun_until` -- a later issue -- enter this same loop from
+    /// *inside* a task body and have to leave it again when the graph they are
+    /// waiting on is finished, not when the pool shuts down. Note what such a
+    /// caller must not reuse: [`WorkerThread::wait_for_task`] parks the worker,
+    /// which is a deadlock for a worker that is itself the thing an inner run
+    /// is waiting for, so a corunning loop steals with
+    /// [`WorkerThread::explore_task`] and never sleeps.
+    pub(crate) fn run_until(&mut self, mut stop: impl FnMut() -> bool) {
         let mut job = None;
         loop {
-            self.exploit_task(job.take());
+            self.exploit_task(job.take(), &mut stop);
+            if stop() {
+                return;
+            }
             match self.wait_for_task() {
                 Some(next) => job = Some(next),
-                None => break,
+                None => return,
             }
         }
     }
 
-    /// Runs `job`, then drains this worker's own queue.
+    /// Runs `job`, then drains this worker's own queue, stopping early if
+    /// `stop` says to.
     ///
     /// Upstream's `_exploit_task`. Local work comes first and in LIFO order:
     /// the job pushed most recently is the one most likely to still be in
     /// cache, and taking it keeps the queue's older, coarser work available for
-    /// thieves.
-    fn exploit_task(&mut self, first: Option<Job>) {
+    /// thieves. Jobs left in the queue by an early stop are not lost -- they
+    /// are picked up by the next drain, or stolen.
+    fn exploit_task(&mut self, first: Option<Job>, stop: &mut impl FnMut() -> bool) {
         let mut job = first;
         while let Some(next) = job {
             self.invoke(next);
+            if stop() {
+                return;
+            }
             job = self.queue.pop();
         }
     }
 
-    /// Runs one job.
+    /// Queues `job` on this worker's own queue. Upstream's
+    /// `_schedule(Worker&, Node*)`.
     ///
-    /// Upstream's `_invoke` runs the node's work and schedules its successors.
-    /// Nothing can enqueue a [`Job`] yet -- there is no `run` and no graph
-    /// behind it until the topology lands -- so the body of this is the one
-    /// part of the scheduling loop that is still a stub rather than a
-    /// translation.
-    fn invoke(&mut self, _job: Job) {}
+    /// Upstream can fail this push -- its per-worker queue is bounded -- and
+    /// spills into the shared buffers when it does. The deque behind
+    /// [`WorkerQueue`] grows instead, so the spill path has no equivalent
+    /// here; see that module for the trade.
+    pub(crate) fn schedule(&self, job: Job) {
+        self.queue.push(job);
+        self.shared.notifier.notify_one();
+    }
+
+    /// Runs one job: the task's work, then the bookkeeping that decides what
+    /// becomes runnable next.
+    ///
+    /// Upstream's `_invoke`, restricted to the two node kinds that exist --
+    /// static and placeholder. Upstream's eight other kinds, its semaphores,
+    /// its observers and its cancellation check are each a later milestone,
+    /// and none of them is silently absent: the `match` below names the two it
+    /// handles and [`Handle`] is `#[non_exhaustive]`, so a new kind arrives as
+    /// a compile error here rather than as a task that mysteriously does
+    /// nothing.
+    ///
+    /// Upstream's `_update_cache`/`TF_INVOKE_CONTINUATION` is not ported
+    /// either: it keeps one ready successor out of the queue and jumps
+    /// straight back to the top of `_invoke` with it. That is a worthwhile
+    /// optimisation and a measurable one, so it belongs with the benchmarks
+    /// rather than with the first correct version.
+    pub(crate) fn invoke(&mut self, job: Job) {
+        // SAFETY: a job reaches a worker only through a queue, and the only
+        // thing that puts one there is a run whose `RunHandle` is alive: the
+        // handle's `Drop` blocks until the topology's join counter reaches
+        // zero, and the worker that drives it to zero does nothing with the
+        // topology, the taskflow or the node afterwards except
+        // `Topology::finish`, which is the release of that very handle. So
+        // every job that can be dequeued names a live node of a borrowed graph
+        // and a live topology. See `executor::topology` for the full argument.
+        let (node, taskflow, topology) = unsafe { job.parts() };
+        let graph = taskflow.graph();
+
+        match node.handle() {
+            // Upstream's `_invoke_static_task`, whose
+            // `TF_EXECUTOR_EXCEPTION_HANDLER` is this `catch_unwind`: the
+            // failure is stored on the topology and reported from `wait`,
+            // never raised on a worker thread. `AssertUnwindSafe` is the
+            // honest annotation -- the state a panicking body can leave
+            // half-written is the user's own, reachable only through what the
+            // closure captured.
+            Handle::Static(work) => {
+                if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| work.invoke())) {
+                    topology.record_panic(payload);
+                }
+            }
+            // Upstream's `std::monostate` case: a placeholder has no work, and
+            // it still has successors to release.
+            Handle::Placeholder => {}
+        }
+
+        // Upstream's comment, which is the whole reason this is a `fetch_add`
+        // of the strong-dependency count rather than a `store`: the counter
+        // has to be re-armed before any successor is scheduled, so that a
+        // cycle -- which only a conditioner can create -- finds this node
+        // ready again, and it has to be an add because the body just run may
+        // itself have scheduled this node.
+        node.join_counter().fetch_add(
+            usize::try_from(node.nstate().load(Ordering::Relaxed))
+                .expect("a u32 always fits in a usize on a 32-bit target or wider"),
+            Ordering::Relaxed,
+        );
+
+        for &successor in node.successors() {
+            let next = graph.node(successor);
+            if next.join_counter().fetch_sub(1, Ordering::AcqRel) == 1 {
+                // Counted on the topology before it is queued, or the run
+                // could look finished with a job still in flight.
+                topology.job_queued();
+                self.schedule(Job::new(successor, taskflow, topology));
+            }
+        }
+
+        // Upstream's `_tear_down_nonasync`. Nothing below may touch `node`,
+        // `graph`, `taskflow` or `topology`: the tear-down releases the thread
+        // that owns all four.
+        if topology.job_finished() {
+            self.tear_down_topology(taskflow, topology);
+        }
+    }
+
+    /// Ends a run whose last job has just finished. Upstream's
+    /// `_tear_down_topology`.
+    ///
+    /// Only the final-run half of upstream's is here, because only a topology
+    /// that runs once can exist yet. The rest of it hooks in at the top of
+    /// this method, before either line below, and in this order: evaluate the
+    /// run predicate and, if it says run again, re-arm the graph with
+    /// [`Topology::set_up`](crate::executor::topology::Topology::set_up) and
+    /// queue its sources through [`WorkerThread::schedule`] -- a re-run is the
+    /// same topology, so it must neither be counted again nor finish -- and
+    /// otherwise call the per-run callback and start the next topology of the
+    /// taskflow's queue. `taskflow` is a parameter for exactly that: re-arming
+    /// the graph needs it, and the topology deliberately holds no reference to
+    /// it.
+    pub(crate) fn tear_down_topology(&mut self, _taskflow: &Taskflow, topology: &Topology) {
+        // The accounting first and the completion slot last. This is
+        // deliberately *not* upstream's order -- its `_tear_down_topology`
+        // calls `_carry_out_promise()` and only then `_decrement_topology()`,
+        // so a caller whose `tf::Future` has just come back can still see
+        // `num_topologies()` counting the run it has already been handed the
+        // result of. The window is small, real and free to close, and worth
+        // closing because that count is what `wait_for_all` blocks on and what
+        // the worker loop's fast path reads: here, once a `wait` returns, the
+        // run is fully accounted for. The release in `decrement_topology`'s
+        // `fetch_sub` and the lock `finish` takes are what carry that to the
+        // waiting thread, whose own read of the count is relaxed.
+        //
+        // The order is also the only one the port's lifetimes allow, which is
+        // what makes it free: `finish` releases the thread that owns the
+        // topology *and* the taskflow's borrow, so it has to be this worker's
+        // last touch of either, while `decrement_topology` reads only the
+        // executor's shared state -- which every worker holds a share of, and
+        // which therefore outlives all of them.
+        self.shared.decrement_topology();
+        topology.finish();
+    }
 
     /// Steals until something turns up, the worker is told to stop, or the
     /// attempts run out. Upstream's `_explore_task`.
@@ -333,15 +476,14 @@ impl WorkerThread {
             // first because a job in a buffer was pushed by a thread that has
             // no queue of its own, and nobody else is going to come looking.
             //
-            // Upstream walks the buffers one at a time and points the sticky
-            // victim at the one it found. `Buffers` answers emptiness over all
-            // of them at once and does not hand out the individual queues, so
-            // the sticky victim goes to the first buffer and the draw in
-            // `explore_task` finds the rest: a steal attempt wasted on the cold
-            // path, against a per-buffer accessor that nothing else wants yet.
-            if !self.shared.buffers.is_empty() {
+            // The sticky victim goes to the buffer that answered, not to the
+            // first one, which is upstream's behaviour as it walks the buffers
+            // one at a time: the next thing this worker does is steal from its
+            // sticky victim, so pointing it anywhere else spends an attempt on
+            // a queue already known to be empty.
+            if let Some(buffer) = self.shared.buffers.first_nonempty() {
                 self.shared.notifier.cancel_wait(self.id);
-                self.sticky_victim = self.shared.workers.len();
+                self.sticky_victim = self.shared.workers.len() + buffer;
                 continue;
             }
 

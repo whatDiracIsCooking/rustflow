@@ -10,7 +10,12 @@
 //! - [`notifier`] the sleep/wake protocol that idles a worker which finds no
 //!   work;
 //! - [`rng`] the one random number the steal loop needs;
-//! - [`worker`] a worker and the scheduling loop it runs.
+//! - [`worker`] a worker and the scheduling loop it runs;
+//! - `topology` one run of one taskflow, and the job a queue carries -- the
+//!   one module here that is crate-private, since a caller has no business
+//!   with a run's internals;
+//! - [`run_handle`] `run` itself, and the handle whose borrow is this port's
+//!   answer to upstream's "do not mutate a running taskflow".
 //!
 //! What is left here is what the *executor* owns: the worker array, the
 //! buffers, the notifier, the thread-id map, and the lifecycle -- spawn the
@@ -20,6 +25,8 @@
 pub mod notifier;
 pub mod queue;
 pub mod rng;
+pub mod run_handle;
+pub(crate) mod topology;
 pub mod worker;
 
 use std::collections::HashMap;
@@ -32,18 +39,8 @@ use crossbeam_utils::CachePadded;
 
 use crate::executor::notifier::{DefaultNotifier, Notifier};
 use crate::executor::queue::{Buffers, WorkerQueue};
+use crate::executor::topology::Job;
 use crate::executor::worker::{Worker, WorkerInterface, WorkerThread};
-
-/// One unit of work in a worker's queue: upstream's `Node*`.
-///
-/// A placeholder, and deliberately an empty one. The executor cannot schedule
-/// anything until a topology exists to schedule, so there is nothing yet for a
-/// job to *be*, and guessing now would mean guessing the shape of the thing
-/// `run` hands to a worker. The scheduling loop is written in terms of this
-/// type and nothing else, so filling it in is a change to this declaration and
-/// to `WorkerThread::invoke`.
-#[derive(Debug, Hash)]
-pub(crate) struct Job;
 
 /// A work-stealing executor: a fixed pool of worker threads over a shared set
 /// of queues.
@@ -62,9 +59,9 @@ pub(crate) struct Job;
 /// assert_eq!(executor.this_worker_id(), None);
 /// ```
 ///
-/// Dropping the executor shuts the pool down and joins every thread, which is
-/// upstream's destructor. There is nothing to run on it yet: `run` and the
-/// topology behind it are the next step.
+/// [`Executor::run`] is what puts a taskflow on it; dropping the executor
+/// shuts the pool down and joins every thread, which is upstream's
+/// destructor.
 pub struct Executor {
     /// Everything the executor shares with its workers.
     ///
@@ -96,11 +93,22 @@ pub(crate) struct Shared {
     pub(crate) notifier: CachePadded<DefaultNotifier>,
     /// How many topologies are running, i.e. upstream's `_num_topologies`.
     ///
-    /// Zero until `run` exists, which is why the whole steal loop still folds
-    /// away through its fast path today. Padded separately from the notifier
-    /// because upstream pads it separately, with a comment that says the false
+    /// Read on the hot path: a worker with nothing to steal checks it before
+    /// it sweeps the queues, because zero means every queue is empty by the
+    /// executor's own invariant. Padded separately from the notifier because
+    /// upstream pads it separately, with a comment that says the false
     /// sharing between the two "can cause serious performance drop".
     pub(crate) num_topologies: CachePadded<AtomicUsize>,
+    /// The lock [`Executor::wait_for_all`] reads `num_topologies` under.
+    ///
+    /// Upstream waits on the atomic itself, which C++20 can do and Rust
+    /// cannot; a mutex and a condvar are the equivalent, and the lock is what
+    /// closes the window between a waiter reading a non-zero count and
+    /// actually sleeping. Nothing on the scheduling path touches it -- only a
+    /// run that has just finished and a thread that asked to wait.
+    pub(crate) topologies: Mutex<()>,
+    /// Signalled when `num_topologies` falls to zero.
+    pub(crate) no_topologies: Condvar,
     /// Which worker a thread is, by thread id.
     ///
     /// Upstream keeps the same map for the reason its comment gives: a
@@ -126,6 +134,51 @@ impl Shared {
     /// two-phase guard before it sleeps.
     pub(crate) fn num_topologies(&self) -> usize {
         self.num_topologies.load(Ordering::Relaxed)
+    }
+
+    /// Counts one more run as in flight. Upstream's `_increment_topology`.
+    pub(crate) fn increment_topology(&self) {
+        self.num_topologies.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one run as finished, waking [`Executor::wait_for_all`] if that
+    /// was the last. Upstream's `_decrement_topology`.
+    pub(crate) fn decrement_topology(&self) {
+        if self.num_topologies.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Under the lock: a waiter that has read a non-zero count but not
+            // yet reached `wait` still holds it, so taking it here is what
+            // stops this notification from arriving before the waiter is
+            // listening and being lost.
+            let _idle = self
+                .topologies
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.no_topologies.notify_all();
+        }
+    }
+
+    /// Queues `jobs` from a thread that has no queue of its own.
+    ///
+    /// Upstream's `_bulk_schedule(I first, size_t)`: everything goes to the
+    /// shared buffers, and the notifier is told how many workers are worth
+    /// waking. A worker scheduling its own successors uses
+    /// [`WorkerThread::schedule`](crate::executor::worker::WorkerThread) and
+    /// its own queue instead.
+    pub(crate) fn bulk_schedule(&self, jobs: impl IntoIterator<Item = Job>) {
+        let mut num_jobs = 0;
+        for job in jobs {
+            self.buffers.push(job);
+            num_jobs += 1;
+        }
+
+        // Notified after the pushes, as upstream notifies: a worker woken
+        // before its work is visible would sweep the queues, find nothing and
+        // go back to sleep. Upstream's commented-out experiment in
+        // `_bulk_schedule` is exactly this trade, and it records that waking
+        // first bought nothing.
+        if num_jobs > 0 {
+            self.notifier.notify_n(num_jobs);
+        }
     }
 }
 
@@ -219,9 +272,12 @@ impl Executor {
 
     /// How many workers the notifier is accounting for right now.
     ///
-    /// Upstream's `num_waiters`, and worth what the notifier says it is worth:
-    /// a worker counts from the moment it opens a wait, not from the moment it
-    /// actually sleeps.
+    /// Upstream's `num_waiters`, and worth exactly what
+    /// [`Notifier::num_waiters`] says it is worth: which workers a notifier
+    /// counts is the notifier's own business, and the two in this crate count
+    /// different things, as upstream's two do. So this is a diagnostic, never
+    /// a predicate -- "the pool is idle" is [`Executor::num_topologies`], and
+    /// deciding whether to sleep is the notifier's two-phase guard.
     #[must_use]
     pub fn num_waiters(&self) -> usize {
         self.shared.notifier.num_waiters()
@@ -229,7 +285,8 @@ impl Executor {
 
     /// How many topologies are running. Upstream's `num_topologies`.
     ///
-    /// Zero until there is something to run.
+    /// One per [`RunHandle`](crate::RunHandle) whose run has not finished,
+    /// and the count [`Executor::wait_for_all`] blocks on reaching zero.
     #[must_use]
     pub fn num_topologies(&self) -> usize {
         self.shared.num_topologies()
@@ -286,6 +343,8 @@ impl Executor {
                 buffers: Buffers::new(num_workers),
                 notifier: CachePadded::new(DefaultNotifier::new(num_workers)),
                 num_topologies: CachePadded::new(AtomicUsize::new(0)),
+                topologies: Mutex::new(()),
+                no_topologies: Condvar::new(),
                 thread_ids: OnceLock::new(),
                 start: StartGate::new(),
             }),
@@ -337,9 +396,13 @@ impl Drop for Executor {
     /// Upstream's `_shutdown`: tell every worker to stop, wake the ones that
     /// are asleep, and join them all.
     ///
-    /// Upstream first calls `wait_for_all` so that a topology still running
-    /// finishes before the pool goes away. There is no topology to wait for
-    /// yet; when there is, this is where that wait belongs.
+    /// Upstream first calls `wait_for_all`, so that a topology still running
+    /// finishes before the pool goes away. There is deliberately no such call
+    /// here: a [`RunHandle`](crate::RunHandle) borrows the executor and blocks
+    /// when it is dropped, so a run in flight already keeps the executor
+    /// alive, and this method cannot be reached with a topology outstanding.
+    /// Not waiting here is also what keeps a worker that died of a bug from
+    /// turning shutdown into a hang -- the pool still comes down.
     fn drop(&mut self) {
         for worker in &self.shared.workers {
             // Relaxed, as upstream's `test_and_set` is: `notify_all` below
