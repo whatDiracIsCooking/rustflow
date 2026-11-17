@@ -401,6 +401,19 @@ impl<R> AsyncHandle<R> {
     /// calling worker in the work-stealing loop until a predicate says to
     /// stop -- and [`AsyncHandle::is_done`] is the predicate to give it.
     ///
+    /// What a returned `wait` does and does not order (#136): the outcome is
+    /// in the slot, and everything the body wrote before it returned is
+    /// visible to the caller. The executor's accounting is **not** settled
+    /// yet. The outcome is delivered by the wrapper around the body, and the
+    /// counters [`Executor::wait_for_all`] and [`Executor`]'s drop sleep on
+    /// are decremented by the tear-down a few instructions later, so
+    /// [`Executor::num_topologies`] may still count this task for a moment
+    /// after `wait` returns. Nothing a caller can edit sits behind that count
+    /// for an async task, which is why the order is documented rather than
+    /// changed; `wait_for_all` is the call that promises zero, and upstream's
+    /// `std::future::get` has the identical window. The ordering section of
+    /// `executor::topology` has the inventory of waits this is one of.
+    ///
     /// # Panics
     ///
     /// Panics if this handle's outcome has already been taken, which takes

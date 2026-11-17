@@ -129,6 +129,32 @@
 //! wide as it was: one job, from the moment it is counted to the moment it
 //! is spent.
 //!
+//! The rule, then, in the form a new wait can be checked against: **a thread
+//! is woken only by the drop of the last hold on whatever it will touch
+//! next.** Three races of one shape -- #109, #112 and the one below -- were
+//! each a wake performed by some other event, with the order between the two
+//! living in a comment. The inventory of waits is short enough to keep here
+//! (#138), and the way to add one is to add it to this list and to the model
+//! in `tests/loom_storage.rs`:
+//!
+//! - `RunHandle::wait`, its `Future` and its `Drop` sleep in the run's
+//!   completion slot, and are woken by [`Drop for Storage`](Storage).
+//! - `Executor::wait_for_all` and `Executor::drop` sleep on the executor's
+//!   run count, and the decrement that wakes them is the same `Drop`'s. It
+//!   used to be the tear-down's, one line before it dropped its own share,
+//!   so a `wait_for_all` could wake to a storage still held -- #109's window
+//!   at #109's own other waiter, reachable in safe code only through a
+//!   leaked `RunHandle`, which is why it was the fourth to be found and not
+//!   the first.
+//! - A `corun` frame sleeps nowhere: it owns the hold and polls it for
+//!   uniqueness, which is the rule asked as a question (#112).
+//! - A `Subflow::join` waits on an anchor and takes its lease back through
+//!   `Drop for Inside`, tolerating a straggler (#50).
+//! - `AsyncHandle::wait` is woken by the body's wrapper delivering the
+//!   outcome, *before* the tear-down decrements the executor's counters.
+//!   Nothing with a uniqueness requirement sits behind that wake, so the
+//!   order is documented on `wait` rather than changed (#136).
+//!
 //! A job addresses its node by [`Task`] index rather than by pointer, which is
 //! what keeps the node itself out of the question: it comes out of the graph
 //! through safe code, and a graph nobody can edit while a job names it cannot
@@ -337,6 +363,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::task::{Poll, Waker};
 
+use crate::executor::Shared;
 use crate::executor::async_node::AsyncNode;
 use crate::executor::subflow;
 use crate::graph::{Graph, Handle, Node, NodeBase, Task};
@@ -482,6 +509,19 @@ pub(crate) struct Storage {
     /// released holds one too: the upgrade can only fail for a run nobody can
     /// still be waiting on.
     run: Weak<Topology>,
+    /// The executor whose run count this run is counted in, so that the last
+    /// share can take it back out; `None` for a hold whose run was never
+    /// counted, or accounts for itself.
+    ///
+    /// Here rather than in the tear-down for the reason the waiter is: that
+    /// count is what [`Executor::wait_for_all`](crate::Executor::wait_for_all)
+    /// sleeps on, and a decrement performed before the last share went woke
+    /// that thread to a storage still held (#138). A share rather than a
+    /// `Weak` because nothing about the executor's lifetime turns on it --
+    /// every worker holds one -- and the one caller this decrement releases
+    /// that could then let the executor go, its `Drop`, joins every worker
+    /// before it does.
+    executor: Option<Arc<Shared>>,
 }
 
 /// A graph owned by one node of another graph, named by that node.
@@ -808,12 +848,14 @@ impl GraphOwner {
 }
 
 impl Storage {
-    /// A hold on `flow` whose last share releases `run`'s waiter: what
-    /// [`Topology::for_run`] gives a run somebody is waiting on.
-    fn gating(flow: Arc<Flow>, run: &Weak<Topology>) -> Arc<Self> {
+    /// A hold on `flow` whose last share takes `run` out of `executor`'s count
+    /// and then releases `run`'s waiter: what [`Topology::for_run`] gives a
+    /// run somebody may be waiting on, through either of the two waits.
+    fn gating(flow: Arc<Flow>, run: &Weak<Topology>, executor: Arc<Shared>) -> Arc<Self> {
         Arc::new(Self {
             flow: Some(flow),
             run: run.clone(),
+            executor: Some(executor),
         })
     }
 
@@ -840,10 +882,16 @@ impl Storage {
     /// including why a frame may ask a question the last share cannot answer
     /// for it. Both kinds end through [`Topology::release_flow`], which
     /// releases the waiter itself for a hold that cannot.
+    ///
+    /// Nor does this hold account for its run. A corun's frame counts its
+    /// run in and out itself -- out *after* the hold has become unique, which
+    /// is the order [`Drop for Storage`](Storage) keeps for a gating hold --
+    /// and a hand-built topology is never counted at all.
     fn ungated(flow: Arc<Flow>) -> Arc<Self> {
         Arc::new(Self {
             flow: Some(flow),
             run: Weak::new(),
+            executor: None,
         })
     }
 
@@ -878,9 +926,10 @@ impl Storage {
 }
 
 impl Drop for Storage {
-    /// Releases the storage and then the thread waiting on the run, in that
-    /// order, which is the whole of the guarantee
-    /// [`Taskflow::graph_mut`](crate::Taskflow::graph_mut) makes.
+    /// Releases the storage, then the run's place in the executor's count,
+    /// then the thread waiting on the run, in that order -- which is the
+    /// whole of the guarantee [`Taskflow::graph_mut`](crate::Taskflow::graph_mut)
+    /// makes, to both of the threads that can be waiting.
     ///
     /// This runs when the last share of the hold goes, and which thread that
     /// is depends on how the run ended: the tear-down's own
@@ -891,11 +940,26 @@ impl Drop for Storage {
     /// on its taskflow's storage uncontested. The module docs' ordering
     /// section has why those copies cannot be ordered instead.
     ///
+    /// The decrement is here for the same reason and since #138: a thread in
+    /// [`Executor::wait_for_all`](crate::Executor::wait_for_all) is woken by
+    /// the count rather than by the completion slot, so a decrement performed
+    /// anywhere but after the last share -- the tear-down's own, one line
+    /// before it dropped its share, as it was -- woke that thread to a
+    /// storage still held. Between the storage and the waiter rather than
+    /// after both, so that the other half of the tear-down's old promise
+    /// stands too: once either wait returns, the run is accounted for.
+    ///
     /// `Drop for Inside` is the same shape one level in -- the last share of a
     /// subflow's lease is what sends the subgraph home -- and rests on the
     /// same observation: no holder of a share can prove it is the last.
     fn drop(&mut self) {
         drop(self.flow.take());
+
+        // `None` for a run that accounts for itself or was never counted: see
+        // the field.
+        if let Some(executor) = self.executor.take() {
+            executor.decrement_topology();
+        }
 
         // `None` only for a run nobody can be waiting on: see the field.
         if let Some(run) = self.run.upgrade() {
@@ -1765,12 +1829,27 @@ impl Topology {
     /// run's own `Weak` in it rather than installed afterwards. The ordering
     /// section of the module docs says what it buys; [`Storage::ungated`] says
     /// which runs do without it and why that is not a trap.
-    pub(crate) fn for_run<P, C>(predicate: P, on_finish: C, flow: Arc<Flow>) -> Arc<Self>
+    ///
+    /// `executor` is whose run count the caller is about to count this run
+    /// in -- [`Shared::increment_topology`] is the caller's, the matching
+    /// decrement is the hold's last share's (#138).
+    pub(crate) fn for_run<P, C>(
+        predicate: P,
+        on_finish: C,
+        flow: Arc<Flow>,
+        executor: Arc<Shared>,
+    ) -> Arc<Self>
     where
         P: FnMut() -> bool + Send + 'static,
         C: FnOnce() + Send + 'static,
     {
-        Arc::new_cyclic(|run| Self::over(predicate, on_finish, Some(Storage::gating(flow, run))))
+        Arc::new_cyclic(|run| {
+            Self::over(
+                predicate,
+                on_finish,
+                Some(Storage::gating(flow, run, executor)),
+            )
+        })
     }
 
     /// The one run every free-standing async node claims to be part of: a
@@ -2803,10 +2882,22 @@ mod tests {
         let woken = Arc::new(AtomicUsize::new(0));
         let waker = Waker::from(Arc::new(CountingWaker(Arc::clone(&woken))));
 
+        // The executor whose count the run is in. Declared first so that an
+        // assertion failing below still drops the straggler -- and with it
+        // the count -- before `Executor::drop` waits for that count.
+        let executor = crate::Executor::new(1);
+        let shared = Arc::clone(&executor.shared);
+        shared.increment_topology();
+
         let mut taskflow = Taskflow::new();
         taskflow.emplace(|| {});
         let taskflow = taskflow;
-        let topology = Topology::for_run(|| true, || {}, Arc::clone(taskflow.flow()));
+        let topology = Topology::for_run(
+            || true,
+            || {},
+            Arc::clone(taskflow.flow()),
+            Arc::clone(&shared),
+        );
         let straggler = topology
             .storage()
             .expect("a run that has not been torn down holds its own share");
@@ -2814,14 +2905,19 @@ mod tests {
         assert!(topology.poll_join(&waker).is_pending());
 
         // The whole of the tear-down's last act, with the straggler still
-        // holding a share: nothing is released, because the storage is not
-        // free yet.
+        // holding a share: nothing is released and nothing is decremented,
+        // because the storage is not free yet.
         topology.release_flow();
         assert!(
             topology.poll_join(&waker).is_pending(),
             "a run whose storage is still held is not over"
         );
         assert_eq!(woken.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            shared.num_topologies(),
+            1,
+            "a run whose storage is still held is still counted (#138)"
+        );
 
         drop(straggler);
         assert!(
@@ -2829,6 +2925,11 @@ mod tests {
             "the last share of the hold releases the waiter"
         );
         assert_eq!(woken.load(Ordering::Relaxed), 1, "the waker was not woken");
+        assert_eq!(
+            shared.num_topologies(),
+            0,
+            "the last share of the hold takes the run out of the count (#138)"
+        );
         assert_eq!(
             Arc::strong_count(taskflow.flow()),
             1,

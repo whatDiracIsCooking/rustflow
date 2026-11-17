@@ -563,7 +563,12 @@ impl Executor {
             return RunHandle::finished(None);
         }
 
-        let topology = Topology::for_run(predicate, on_finish, Arc::clone(taskflow.flow()));
+        let topology = Topology::for_run(
+            predicate,
+            on_finish,
+            Arc::clone(taskflow.flow()),
+            Arc::clone(&self.shared),
+        );
         self.start(taskflow.flow(), &topology);
 
         RunHandle {
@@ -658,7 +663,12 @@ impl Executor {
             return RunHandle::finished(Some(taskflow));
         }
 
-        let topology = Topology::for_run(predicate, on_finish, Arc::clone(taskflow.flow()));
+        let topology = Topology::for_run(
+            predicate,
+            on_finish,
+            Arc::clone(taskflow.flow()),
+            Arc::clone(&self.shared),
+        );
         self.start(taskflow.flow(), &topology);
 
         RunHandle {
@@ -693,6 +703,14 @@ impl Executor {
     /// a run whose handle is alive and whose borrow keeps the executor around.
     /// What it answers is the question upstream's `num_topologies` answers:
     /// is the executor idle.
+    ///
+    /// Once it returns, every taskflow whose runs it waited for is editable,
+    /// as it is after a `wait`: the decrement that wakes this is performed by
+    /// the last share of each run's hold on its storage, after that share has
+    /// released the storage (#138). Only a leaked [`RunHandle`] can edit after
+    /// this rather than after `wait` in safe code, but the promise is the
+    /// same either way, and the ordering section of `executor::topology` has
+    /// the inventory of waits it is one of.
     pub fn wait_for_all(&self) {
         let mut idle = self
             .shared
@@ -850,33 +868,29 @@ impl Shared {
             self.set_up_topology(worker, &next);
         }
 
-        // The accounting, and only then the release below. This is
-        // deliberately *not* upstream's order -- its `_tear_down_topology`
-        // calls `_carry_out_promise()` and only then `_decrement_topology()`,
-        // so a caller whose `tf::Future` has just come back can still see
-        // `num_topologies()` counting the run it has already been handed the
-        // result of. The window is small, real and free to close, and worth
-        // closing because that count is what `wait_for_all` blocks on and what
-        // the worker loop's fast path reads: here, once a `wait` returns, the
-        // run is fully accounted for. The release in `decrement_topology`'s
-        // `fetch_sub` and the lock `finish` takes are what carry that to the
-        // waiting thread, whose own read of the count is relaxed.
-        //
-        // `decrement_topology` reads only the executor's shared state, which
-        // every worker holds a share of and which therefore outlives all of
-        // them, so it is free to come after the last touch of the graph and
-        // before the waiter is released.
-        self.decrement_topology();
-
         // The last two acts, in this order: this thread's own share of the
         // run's hold on the storage, and then the run's. What releases the
-        // waiting thread is the drop of the *last* share of that hold,
-        // wherever it is -- `Drop for Storage` -- so the two lines below are
-        // not merely before the release but are what performs it, on this
-        // thread when nothing else is still holding a copy of a preempted
-        // node's job and on the worker dropping that copy when something is.
-        // Issue #109 is why it is the share rather than this function that
-        // releases the waiter; `executor::topology` has the argument.
+        // waiting thread -- either waiting thread -- is the drop of the *last*
+        // share of that hold, wherever it is: `Drop for Storage` takes the run
+        // out of the executor's count and then wakes the completion slot, so
+        // the two lines below are not merely before the release but are what
+        // performs it, on this thread when nothing else is still holding a
+        // copy of a preempted node's job and on the worker dropping that copy
+        // when something is.
+        //
+        // Nothing is decremented here, and that is #138. Upstream's
+        // `_tear_down_topology` calls `_carry_out_promise()` and only then
+        // `_decrement_topology()`, so a caller whose `tf::Future` has come
+        // back can still see the run counted; this function used to close
+        // that window by decrementing *first* -- and `wait_for_all`, which
+        // sleeps on that very count, could then wake before the share below
+        // was dropped and find the storage held. Decrementing in the `Drop`,
+        // after the storage and before the completion slot, keeps the first
+        // property and gains the second: once either wait returns, the run is
+        // accounted for and its storage is free. Issue #109 is why it is the
+        // share rather than this function that releases the waiter;
+        // `executor::topology`'s ordering section has the argument and the
+        // inventory of waits.
         drop(storage);
         topology.release_flow();
     }
@@ -1247,8 +1261,10 @@ mod tests {
     /// #76: the graph is two atomic operations, so the version of this case
     /// that read the count straight after handing out the two handles was
     /// asserting a state the pool was free to have left already -- and `0` is
-    /// then the right answer, since the tear-down decrements before it
-    /// releases a waiter. CI's two cores found that; this box's twenty-four
+    /// then the right answer, since the last share of a run's hold on its
+    /// storage decrements the count before it releases a waiter (#138; the
+    /// tear-down did, when this was written). CI's two cores found that; this
+    /// box's twenty-four
     /// hid it. So the source task of the first run signals that it is in and
     /// waits, which makes "both runs outstanding" a fact about the program
     /// rather than about the machine: the first cannot finish while its own
