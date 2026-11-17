@@ -264,7 +264,8 @@ impl Executor {
 
     /// Creates the free-standing node `work` is the body of and queues it:
     /// upstream's `_schedule_async_task` plus the `_increment_topology` its
-    /// two public callers make first.
+    /// two public callers make first -- which, as there, is taken only for a
+    /// parentless submission.
     ///
     /// `parent` is upstream's `NodeBase* parent`, which is null for a
     /// submission to the executor and a node or an anchor for one from a
@@ -290,7 +291,18 @@ impl Executor {
     /// queueing a graph's sources. Only then is the job pushed, after which it
     /// may already be running.
     pub(crate) fn schedule_async_task(&self, work: AsyncWork, parent: &Parent, estate: u32) {
-        self.shared.increment_async();
+        // Only a parentless submission, which is upstream's split exactly:
+        // `_increment_topology` is a line of the public `async` and
+        // `silent_async` -- the two that pass a null parent -- and not of the
+        // `_async(..., tpg, parent)` a runtime body or a task group calls.
+        // A parented child's completion is accounted for by its parent's join
+        // counter, which is what the parent is waiting on, and counting it
+        // here as well would leave `num_asyncs` and `num_topologies` carrying
+        // a job the tear-down below never spends: issue #115, which is why
+        // this condition is the tear-down's own.
+        if matches!(parent, Parent::Run) {
+            self.shared.increment_async();
+        }
 
         let node = AsyncNode::new("", Handle::Async(work));
         node.node()
@@ -766,9 +778,13 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &AsyncWork) -> 
     // `if(node->_parent == nullptr) _decrement_topology();`, where this
     // port's null parent is `Parent::Run` on a free node. A parented one --
     // #92's runtime child, #94's task-group member -- is not counted here
-    // because it was not counted on submission either: only the executor's
-    // own `spawn` and `silent_async` increment, as only upstream's `async`
-    // and `silent_async` do.
+    // because `Executor::schedule_async_task` does not count it on
+    // submission either: only a parentless submission increments, as only
+    // upstream's public `async` and `silent_async` do, and what accounts for
+    // a parented child instead is the join counter of the parent that is
+    // waiting on it. The two conditions are one claim, and #115 is what it
+    // cost when they disagreed -- a child that was counted here and never
+    // un-counted left `wait_for_all` and `Executor::drop` waiting for ever.
     //
     // The job itself is spent by `WorkerThread::invoke` immediately after
     // this returns, which is what drops the node and the body with it --
@@ -791,6 +807,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::executor::queue::WorkerQueue;
+    use crate::executor::topology::Nested;
     use crate::prelude::*;
 
     /// How long a handshake waits for the other side before it gives up.
@@ -808,6 +826,51 @@ mod tests {
             assert!(Instant::now() < deadline, "gave up waiting for {what}");
             thread::yield_now();
         }
+    }
+
+    /// The two counters a free async task's submission and tear-down have to
+    /// balance: `(num_asyncs, num_topologies)`.
+    fn counters(executor: &Executor) -> (usize, usize) {
+        (
+            executor.shared.num_asyncs.load(Ordering::Acquire),
+            executor.num_topologies(),
+        )
+    }
+
+    /// Spends whatever the counters are still carrying, so that a case which
+    /// found them unbalanced fails instead of hanging.
+    ///
+    /// [`Executor`]'s own `Drop` waits for `num_asyncs` to reach zero, so a
+    /// leaked submission would park the test thread for ever -- in the
+    /// unwinding of the very assertion that caught it. One
+    /// [`Shared::finish_async`] spends one of each counter, which is what one
+    /// leaked submission costs, so the loop is over `num_asyncs`.
+    fn drain_counters(executor: &Executor) {
+        for _ in 0..executor.shared.num_asyncs.load(Ordering::Acquire) {
+            executor.shared.finish_async();
+        }
+    }
+
+    /// Takes the one job a submission pushed back out of the shared buffers,
+    /// for a case that runs it by hand.
+    ///
+    /// The pool cannot run a *parented* submission: a worker skips the steal
+    /// loop entirely while `num_topologies` is zero, which is what a parented
+    /// submission correctly leaves it at. A real parented child is submitted
+    /// from inside a running task, whose own run is counted -- #92 is where
+    /// that caller arrives -- so driving the job from the test thread is what
+    /// stands in for it here.
+    fn take_submitted_job(executor: &Executor) -> Job {
+        let buffer = executor
+            .shared
+            .buffers
+            .first_nonempty()
+            .expect("the submission pushed a job");
+        executor
+            .shared
+            .buffers
+            .steal_from(buffer)
+            .expect("the job the submission pushed")
     }
 
     /// A `spawn` body that panics is the handle's failure and nobody else's:
@@ -1040,6 +1103,69 @@ mod tests {
             executor.num_topologies(),
             0,
             "and the task that ran was accounted for"
+        );
+    }
+
+    /// A free node submitted **under a parent** is accounted for by that
+    /// parent and by nothing else: the executor's two counters are untouched
+    /// by the submission and still zero after the tear-down, which is what
+    /// lets [`Executor::wait_for_all`] and [`Executor`]'s own `Drop` return
+    /// at all.
+    ///
+    /// Issue #115's first half. The submission used to increment both
+    /// counters whatever the parent was, while the tear-down decrements them
+    /// only for a [`Parent::Run`], so one parented child leaked one of each
+    /// -- upstream increments in its public `async`/`silent_async` and not in
+    /// the `_async(..., tpg, parent)` its runtime and task-group forms call,
+    /// which is exactly this condition.
+    ///
+    /// **How a regression surfaces.** As a failed assertion rather than a
+    /// hang, which takes some care: a leak is a `Drop` that never returns, so
+    /// the counters are read into locals and then *spent* before anything is
+    /// asserted. Reading them rather than calling `wait_for_all` is the same
+    /// precaution one line earlier.
+    #[test]
+    fn a_parented_async_task_is_counted_by_its_parent_and_not_by_the_executor() {
+        let executor = Executor::new(1);
+        let mut worker = WorkerThread::new(Arc::clone(&executor.shared), 0, WorkerQueue::new());
+
+        // An anchor with no node to resume -- a corun's shape, and a task
+        // group's -- which is the parent a child is counted against.
+        let parent = Nested::new(None);
+        let ran = Arc::new(AtomicBool::new(false));
+
+        executor.schedule_async_task(
+            AsyncWork::plain({
+                let ran = Arc::clone(&ran);
+                move || ran.store(true, Ordering::Release)
+            }),
+            &parent.as_parent(),
+            ESTATE_NONE,
+        );
+        let submitted = counters(&executor);
+        assert_eq!(
+            parent.outstanding(),
+            1,
+            "the child is outstanding against its parent"
+        );
+
+        worker.invoke(take_submitted_job(&executor));
+        let torn_down = counters(&executor);
+
+        drain_counters(&executor);
+
+        assert_eq!(
+            submitted,
+            (0, 0),
+            "a parented submission counts nothing in the executor's own counters"
+        );
+        assert_eq!(torn_down, (0, 0), "and its tear-down spends nothing");
+        assert!(ran.load(Ordering::Acquire), "the body ran");
+        assert_eq!(
+            parent.outstanding(),
+            0,
+            "the parent's counter is where the child was counted, and the \
+             tear-down is what spent it"
         );
     }
 }

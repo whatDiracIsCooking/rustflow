@@ -552,7 +552,19 @@ impl Parent {
         }
     }
 
-    /// Whether any parent above this one has been cancelled or has failed.
+    /// Whether any parent above this one has been cancelled or has failed, or
+    /// the run the chain roots at has.
+    ///
+    /// `topology` is the run of the job whose parent this is, which is the
+    /// run a [`Parent::Run`] at the end of the walk names. It travels with
+    /// the chain for [`Job::record_panic`]'s reason and over exactly the same
+    /// shape: a free node spawned under a node of a real run (#92's runtime
+    /// child) holds the sentinel on its own job while the chain above it
+    /// roots at the run that is actually waiting, so the root's run is the
+    /// only place that cancellation can be read. Issue #115 is where this
+    /// walk stopped at `Parent::Run` without reading it, and a child of a
+    /// cancelled run was therefore not skipped. The sentinel needs no case of
+    /// its own: nothing ever cancels it, so the same load answers both roots.
     ///
     /// The ancestor half of upstream's `Node::_is_parent_cancelled`, over the
     /// whole chain where upstream reads the immediate parent only. Upstream
@@ -569,11 +581,17 @@ impl Parent {
     /// the anchor that failed -- and every job under that anchor is doomed
     /// whichever branch it is on. Upstream runs those jobs; skipping them is
     /// the same answer sooner.
-    fn ancestor_cancelled(&self) -> bool {
+    fn ancestor_cancelled(&self, topology: &Topology) -> bool {
         let mut parent = self;
+        // Re-borrowed rather than taken by `mut` reference, which is what
+        // lets the walk step onto a run held by a job further up the chain:
+        // the two borrows have nothing to do with each other's lifetimes.
+        let mut topology: &Topology = topology;
         loop {
             let Self::Nested(nested) = parent else {
-                return false;
+                // The root: the run somebody started, or the sentinel, which
+                // is never cancelled.
+                return topology.cancelled();
             };
 
             // Upstream's `ESTATE::CANCELLED | ESTATE::EXCEPTION` on a
@@ -585,7 +603,12 @@ impl Parent {
             }
 
             match nested.resume() {
-                Some(job) => parent = job.parent(),
+                Some(job) => {
+                    parent = job.parent();
+                    topology = job.topology();
+                }
+                // A corun anchor, whose chain names no run at all: the frame
+                // that is waiting holds the only state above this.
                 None => return false,
             }
         }
@@ -1225,8 +1248,15 @@ impl Job {
     /// skipped, and the second walks whatever chain is above it, which is how
     /// a task group cancels the children it owns. The module docs have the
     /// sentinel's side of it.
+    ///
+    /// The second term is handed this job's own run because the walk carries
+    /// one to the chain's root, which is #115 and which is what makes a
+    /// parented free node answer for the run that is waiting on it rather
+    /// than for the sentinel it holds itself. The first term is still a term:
+    /// a chain that ends at a corun anchor names no run, so this job's own is
+    /// read nowhere else.
     pub(crate) fn is_parent_cancelled(&self) -> bool {
-        self.topology.cancelled() || self.parent.ancestor_cancelled()
+        self.topology.cancelled() || self.parent.ancestor_cancelled(&self.topology)
     }
 
     /// Whether `graph` is a graph this job is already running inside of: the
@@ -3454,6 +3484,51 @@ mod tests {
         assert!(
             under_parent.is_parent_cancelled(),
             "a cancelled parent skips the free nodes under it"
+        );
+    }
+
+    /// A free node whose chain roots at a **cancelled run** is skipped, and
+    /// one whose chain roots at a live run is not. #92's runtime child is
+    /// that shape: a free node spawned from the body of a node of a real
+    /// run, hanging off that node.
+    ///
+    /// Issue #115's second half, and [`Job::record_panic`]'s fix one function
+    /// along. The child's own job holds the sentinel -- never cancelled, by
+    /// design -- so the run that is actually waiting can only be read off the
+    /// job at the chain's *root*, which is why the walk carries one along.
+    ///
+    /// **How a regression surfaces**: as a `false` from the second assertion,
+    /// which is a child of a cancelled run doing work the run has already
+    /// given up on -- and, for a run cancelled because a task of it failed,
+    /// work whose own failure has nowhere left to go.
+    #[test]
+    fn a_free_node_under_a_cancelled_run_is_cancelled_through_its_chain() {
+        let mut taskflow = Taskflow::new();
+        let spawner = taskflow.emplace(|| {});
+        let flow = Arc::clone(taskflow.flow());
+        let topology = run_of(&flow);
+        let owner = GraphOwner::flow(&flow);
+        set_up_graph(flow.graph());
+
+        let parent = Nested::new(Some(Job::new(spawner, &owner, &topology, &Parent::Run)));
+        let child = Job::free(&free_node(), &parent.as_parent());
+
+        assert!(
+            !child.is_parent_cancelled(),
+            "a live run runs the free nodes spawned under it"
+        );
+
+        assert!(
+            topology.cancel(),
+            "the run is in flight, so it can be cancelled"
+        );
+        assert!(
+            child.is_parent_cancelled(),
+            "a child of a cancelled run is skipped, though its own job holds the sentinel"
+        );
+        assert!(
+            !Topology::free_standing().cancelled(),
+            "and the sentinel took no part in it"
         );
     }
 
