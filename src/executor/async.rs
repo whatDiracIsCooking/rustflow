@@ -60,21 +60,39 @@
 //! > then immediately enter corun, it becomes very difficult to get the task
 //! > out of its cache correctly.
 //!
-//! The two branches collapse into one here, and what collapses them is where
-//! the owning end of a worker's queue lives. A submission from a worker of
-//! this executor is a submission from inside a task *body*, which is called
-//! by the `WorkerThread` frame that holds that end -- and a frame cannot be
-//! named from the code it called. `LocalQueue` in `executor::worker` has that
-//! argument in full, for the corun loop that met it first; the consequence
-//! here is that a free async job goes to the shared buffers whichever thread
-//! submitted it, exactly as a corun loop's newly ready jobs do.
+//! Both branches are here, and which one a submission takes is **not**
+//! decided by looking the caller up: it is the `worker` argument, which only
+//! a caller that was *handed* its worker can fill in. That is upstream's test
+//! `this_worker()` with the lookup replaced by the thing the lookup was for,
+//! and the reason is where the owning end of a worker's queue lives. A
+//! submission from a worker of this executor is a submission from inside a
+//! task *body*, which is called by the `WorkerThread` frame that holds that
+//! end -- and a frame cannot be named from the code it called. `LocalQueue`
+//! in `executor::worker` has that argument in full, for the corun loop that
+//! met it first.
 //!
-//! What that costs is locality: the job is taken out of a buffer by whichever
-//! worker sweeps it up rather than by the submitting worker's next pop. What
-//! it does not cost is progress -- every worker steals from the buffers, and
-//! a worker with one job in its own queue and one in a buffer finds both --
-//! and it does not cost correctness at a single worker either: the submitting
-//! worker's own sweep reaches the buffers before it sleeps.
+//! So the two public forms on [`Executor`] pass `None` and their jobs go to
+//! the shared buffers, whichever thread called them, exactly as a corun
+//! loop's newly ready jobs do: `Executor::spawn` called from inside a body
+//! cannot name the frame that called it. A [`Runtime`](crate::Runtime) body
+//! can, because a runtime task is *given* the scheduler -- the handle holds
+//! that frame -- so the four `Runtime` forms in `executor::runtime_async`
+//! (#92) pass `Some`, and their children go onto the queue of the worker
+//! running the body.
+//!
+//! That difference is not a micro-optimisation, and #92 is where it stopped
+//! being one: a worker's own queue is LIFO, so a body that spawns a child and
+//! then coruns gets *that child* back first, where the buffers would have
+//! handed it the oldest job in the pool. Recursive spawning is the shape that
+//! cares -- each nested corun that picks up somebody else's work instead of
+//! its own adds a frame without retiring one -- and `Runtime.Fibonacci` in
+//! `tests/runtimes.rs` overflowed a worker's stack in under a second when
+//! every child went to the buffers. What the buffers cost a *parentless*
+//! submission is only locality, which is why that branch is unchanged: the
+//! job is taken out by whichever worker sweeps it up rather than by the
+//! submitting worker's next pop, nothing is waiting on it in a frame below,
+//! and progress is unaffected -- every worker steals from the buffers, and
+//! the submitting worker's own sweep reaches them before it sleeps.
 //!
 //! # What the executor counts, and what its `Drop` waits for
 //!
@@ -262,61 +280,21 @@ impl Executor {
         self.schedule_async_task(AsyncWork::plain(body), &Parent::Run, ESTATE_NONE);
     }
 
-    /// Creates the free-standing node `work` is the body of and queues it:
-    /// upstream's `_schedule_async_task` plus the `_increment_topology` its
-    /// two public callers make first -- which, as there, is taken only for a
-    /// parentless submission.
+    /// Creates the free-standing node `work` is the body of and queues it,
+    /// through the state the submission actually needs:
+    /// [`Shared::schedule_async_task`], which is where every line of it is
+    /// argued.
     ///
-    /// `parent` is upstream's `NodeBase* parent`, which is null for a
-    /// submission to the executor and a node or an anchor for one from a
-    /// runtime body (#92) or a task group (#94). [`Parent::Run`] stands in
-    /// for the null, as it does for every free node: `executor::topology` has
-    /// why the sentinel run is a better answer there than an `Option`.
-    ///
-    /// `estate` is upstream's second argument, the `ESTATE` word it
-    /// constructs the node with: [`ESTATE_NONE`] for everything submitted
-    /// here, and `Cancellable::EXPLICITLY_ANCHORED` for the handle-returning
-    /// runtime-shaped form in `executor::runtime` -- which is what makes a
-    /// failure under such a node land on the node's own slot, where its
-    /// second entry reads it. It is set before the job is queued, because a
-    /// node that is to be an anchor has to be one before anything under it
-    /// can fail.
-    ///
-    /// The order is upstream's and all three steps are load-bearing. The
-    /// counters go up before anything is queued, because a worker skips the
-    /// steal loop entirely while `num_topologies` is zero and because a job
-    /// that ran and tore down before this call returned would otherwise
-    /// decrement a count it was never in. The parent is told about the job
-    /// next, for the same reason `Shared::schedule_graph` tells it before
-    /// queueing a graph's sources. Only then is the job pushed, after which it
-    /// may already be running.
+    /// Kept as the [`Executor`]'s own call because that is the receiver its
+    /// two public forms above have, and because moving the body changed
+    /// nothing about them. What the move bought is the caller that has no
+    /// `Executor` at all: a [`Runtime`](crate::Runtime) body holds the
+    /// worker's share of [`Shared`] and nothing more -- `src/runtime.rs` has
+    /// why there is no `executor()` to reach back through -- so the eight
+    /// `Runtime` forms in `executor::runtime_async` (#92) submit their
+    /// children through the method below.
     pub(crate) fn schedule_async_task(&self, work: AsyncWork, parent: &Parent, estate: u32) {
-        // Only a parentless submission, which is upstream's split exactly:
-        // `_increment_topology` is a line of the public `async` and
-        // `silent_async` -- the two that pass a null parent -- and not of the
-        // `_async(..., tpg, parent)` a runtime body or a task group calls.
-        // A parented child's completion is accounted for by its parent's join
-        // counter, which is what the parent is waiting on, and counting it
-        // here as well would leave `num_asyncs` and `num_topologies` carrying
-        // a job the tear-down below never spends: issue #115, which is why
-        // this condition is the tear-down's own.
-        if matches!(parent, Parent::Run) {
-            self.shared.increment_async();
-        }
-
-        let node = AsyncNode::new("", Handle::Async(work));
-        node.node()
-            .base()
-            .estate()
-            .fetch_or(estate, Ordering::Relaxed);
-        let job = Job::free(&node, parent);
-        parent.count_queued(Topology::free_standing(), 1);
-
-        // Upstream's two branches, collapsed for the reason the module docs
-        // give: the owning end of the submitting worker's queue belongs to
-        // the frame below this call, so there is one destination and it is
-        // the one every thread outside the pool uses.
-        self.shared.bulk_schedule([job]);
+        self.shared.schedule_async_task(work, parent, estate);
     }
 }
 
@@ -632,6 +610,77 @@ impl<R> Delivery<R> {
 const OUTCOME_TAKEN_TWICE: &str = "the outcome of an async task is handed over exactly once";
 
 impl Shared {
+    /// Creates the free-standing node `work` is the body of and queues it:
+    /// upstream's `_schedule_async_task` plus the `_increment_topology` its
+    /// two public callers make first -- which, as there, is taken only for a
+    /// parentless submission.
+    ///
+    /// `parent` is upstream's `NodeBase* parent`, which is null for a
+    /// submission to the executor and a node or an anchor for one from a
+    /// runtime body (#92) or a task group (#94). [`Parent::Run`] stands in
+    /// for the null, as it does for every free node: `executor::topology` has
+    /// why the sentinel run is a better answer there than an `Option`.
+    ///
+    /// `estate` is upstream's second argument, the `ESTATE` word it
+    /// constructs the node with: [`ESTATE_NONE`] for everything submitted
+    /// here, and `Cancellable::EXPLICITLY_ANCHORED` for the handle-returning
+    /// runtime-shaped form in `executor::runtime` -- which is what makes a
+    /// failure under such a node land on the node's own slot, where its
+    /// second entry reads it. It is set before the job is queued, because a
+    /// node that is to be an anchor has to be one before anything under it
+    /// can fail.
+    ///
+    /// The order is upstream's and all three steps are load-bearing. The
+    /// counters go up before anything is queued, because a worker skips the
+    /// steal loop entirely while `num_topologies` is zero and because a job
+    /// that ran and tore down before this call returned would otherwise
+    /// decrement a count it was never in. The parent is told about the job
+    /// next, for the same reason `Shared::schedule_graph` tells it before
+    /// queueing a graph's sources. Only then is the job pushed, after which it
+    /// may already be running.
+    ///
+    /// # Why the receiver is [`Shared`] and not [`Executor`]
+    ///
+    /// Because `Shared` is what a worker holds. Every line above reads the
+    /// shared state and nothing else, and the caller that cannot be served
+    /// any other way is a [`Runtime`](crate::Runtime) body spawning a child
+    /// of its own (#92): the handle it is given holds the worker's share of
+    /// this, and there is no `Executor` anywhere on that path -- not by
+    /// omission but by design, which `src/runtime.rs`'s "Why there is no
+    /// `executor()`" sets out. [`Executor::schedule_async_task`] stays as the
+    /// one-line call the two public forms make, so nothing about them moved.
+    pub(crate) fn schedule_async_task(&self, work: AsyncWork, parent: &Parent, estate: u32) {
+        // Only a parentless submission, which is upstream's split exactly:
+        // `_increment_topology` is a line of the public `async` and
+        // `silent_async` -- the two that pass a null parent -- and not of the
+        // `_async(..., tpg, parent)` a runtime body or a task group calls.
+        // A parented child's completion is accounted for by its parent's join
+        // counter, which is what the parent is waiting on, and counting it
+        // here as well would leave `num_asyncs` and `num_topologies` carrying
+        // a job the tear-down below never spends: issue #115, which is why
+        // this condition is the tear-down's own.
+        if matches!(parent, Parent::Run) {
+            self.increment_async();
+        }
+
+        let node = AsyncNode::new("", Handle::Async(work));
+        node.node()
+            .base()
+            .estate()
+            .fetch_or(estate, Ordering::Relaxed);
+        let job = Job::free(&node, parent);
+        parent.count_queued(Topology::free_standing(), 1);
+
+        // Upstream's two branches, collapsed for the reason the module docs
+        // give: the owning end of the submitting worker's queue belongs to
+        // the frame below this call, so there is one destination and it is
+        // the one every thread outside the pool uses. Issue #119 is what
+        // that costs a recursive body, and the module docs name the one
+        // caller -- a runtime body (#92) -- that could take upstream's other
+        // branch if it were given the choice.
+        self.bulk_schedule([job]);
+    }
+
     /// Counts one more free async task, before it is queued.
     ///
     /// Upstream's `_increment_topology`, called by `async` and `silent_async`

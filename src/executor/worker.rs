@@ -587,6 +587,19 @@ impl WorkerThread {
             // for the run to finish at all. The tail of this method says what
             // spending the job here does; it is the same line.
             if job.is_parent_cancelled() {
+                // Upstream's cancelled branch goes to `_tear_down_invoke`,
+                // which dispatches on the handle: a skipped *dependent-async*
+                // node still owes `FINISHED` and the list of tasks waiting
+                // for it, because nothing else will ever queue them and each
+                // was counted against this job's parent when it was
+                // submitted. Every other kind owes only the parent branch,
+                // which is `finish_job` below, and `release_skipped` answers
+                // for all of them -- it asks both questions itself. #92 is
+                // what made this reachable at all: a free node under a real
+                // run is the first one this early-out can skip, and
+                // `executor::dependent_async`'s hanging section has what
+                // stranding its successors would cost.
+                dependent_async::release_skipped(self, &job);
                 self.finish_job(job.finish());
                 // Upstream's `_tear_down_invoke` can leave a cache here -- the
                 // preempted parent this job was the last child of -- and

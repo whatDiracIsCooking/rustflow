@@ -1,6 +1,6 @@
 //! Translated from `unittests/test_asyncs.cpp` (Taskflow v4.1.0).
 //!
-//! Three of upstream's groups are here. `Async` is a hundred thousand
+//! Five of upstream's groups are here. `Async` is a hundred thousand
 //! value-returning submissions whose handles are collected and then read, and
 //! `NestedAsync` is the same hundred thousand with a chain of three more
 //! submitted from inside each body; both run at one, two, four, eight and
@@ -27,27 +27,39 @@
 //! that would are a later step -- so the port has one unnamed submitting call
 //! and the three branches collapse onto it.
 //!
-//! Upstream's remaining groups are named rather than half-ported, each with
-//! what it waits on:
+//! **`AsyncRuntime`** and **`RecursiveAsyncRuntime`** are the fourth and
+//! fifth, and are #92's: both need a runtime body able to spawn work *under
+//! its own node*, which is
+//! [`Runtime::spawn`](rustflow::Runtime::spawn) and
+//! [`Runtime::silent_async`](rustflow::Runtime::silent_async). The bodies
+//! themselves arrived with #90 -- `MixedAsync.<N>Executors` submits them --
+//! but a body that cannot spawn a child cannot be recursive, and
+//! `Runtime::corun` had nothing to wait for until then. Both keep upstream's
+//! own figures and worker counts: a thousand children per body at one through
+//! eight workers, and a hundred-by-ten tree at one through four.
 //!
-//! - **`AsyncRuntime`** and **`RecursiveAsyncRuntime`** need a runtime body
-//!   to be able to spawn work *under its own node*: `Runtime::spawn` and
-//!   `Runtime::silent_async`, which are #92. The bodies themselves arrived
-//!   with #90 -- `MixedAsync.<N>Executors` below submits them -- but a body
-//!   that cannot spawn a child cannot be recursive, and
-//!   `Runtime::corun` has nothing to wait for until then.
+//! Neither is affected by the stack-depth cliff `tests/runtimes.rs` measures
+//! and issue #119 owns, and the reason is worth knowing before adding a case
+//! here: nesting needs a *corun* to hold a frame open while its worker runs
+//! other people's work, and the deepest thing in this file is one corun over
+//! children that spawn nothing. `RecursiveAsyncRuntime` recurses two levels
+//! and coruns nowhere, so its 1101 tasks cost one frame each.
+//!
+//! One of upstream's groups is still named rather than ported:
+//!
 //! - **`MixedAsync.<N>threads`** (upstream's `mixed_async`) submits plain
 //!   bodies from the tasks of a *running* graph. It needs nothing this crate
 //!   lacks -- #88's `spawn` and `silent_async` are the whole of it -- and is
-//!   a follow-up rather than part of #90, which is about the runtime-shaped
-//!   bodies the group above submits.
+//!   a follow-up rather than part of #90 or #92, both of which are about the
+//!   runtime-shaped bodies the groups above submit.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustflow::{AsyncHandle, Executor, Runtime};
+use rustflow::prelude::*;
+use rustflow::{AsyncHandle, Executor};
 
 /// Upstream's `int N = 100000`, in both of its helpers.
 ///
@@ -441,4 +453,227 @@ fn mixed_async_7_executors() {
 #[test]
 fn mixed_async_8_executors() {
     mixed_executor_async(8);
+}
+
+/// Upstream's `async_runtime(size_t W)`: four runtime tasks of one graph,
+/// spawning four thousand children between them, two of which corun and two
+/// of which leave their children to the implicit join.
+///
+/// The `4005` is the whole assertion and it is arithmetic over work the run
+/// cannot have finished without doing -- three plain tasks, two thousand
+/// children under the two bodies that corun, and two thousand and two under
+/// the two that do not. What the two halves pin is the pair the join is made
+/// of: a corun returns only when this node's children are done, and a body
+/// that returns without coruning keeps its node preempted until they are.
+///
+/// Upstream's `sf.async` is [`Runtime::spawn`] here and its discarded
+/// `std::future` a dropped [`AsyncHandle`], which detaches the result and not
+/// the task.
+fn runtime_spawned_tasks(workers: usize) {
+    /// Upstream's `for(int i=0; i<1000; i++)`, four times over.
+    const CHILDREN: usize = 1000;
+    /// Upstream's `REQUIRE(counter == 4005)`.
+    const TOTAL: usize = 3 + 2 * CHILDREN + 2 * (CHILDREN + 1);
+
+    let executor = Executor::new(workers);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let bump = |counter: &Arc<AtomicUsize>| {
+        let counter = Arc::clone(counter);
+        move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    };
+
+    let mut taskflow = Taskflow::new();
+    let a = taskflow.emplace(bump(&counter));
+    let b = taskflow.emplace(bump(&counter));
+    taskflow.emplace(bump(&counter));
+
+    // Upstream's `S1`: a thousand silent children, waited for explicitly.
+    let s1 = taskflow.emplace_runtime({
+        let counter = Arc::clone(&counter);
+        move |runtime: &mut Runtime<'_>| {
+            for _ in 0..CHILDREN {
+                runtime.silent_async(bump(&counter));
+            }
+            runtime.corun();
+        }
+    });
+
+    // Upstream's `S2`: one more than a thousand, left to the implicit join.
+    let s2 = taskflow.emplace_runtime({
+        let counter = Arc::clone(&counter);
+        move |runtime: &mut Runtime<'_>| {
+            runtime.silent_async(bump(&counter));
+            for _ in 0..CHILDREN {
+                runtime.silent_async(bump(&counter));
+            }
+        }
+    });
+
+    // Upstream's third: a thousand *handle-returning* children and a corun,
+    // which is what pins that a dropped handle changes nothing about the
+    // join.
+    taskflow.emplace_runtime({
+        let counter = Arc::clone(&counter);
+        move |runtime: &mut Runtime<'_>| {
+            runtime.silent_async(bump(&counter));
+            for _ in 0..CHILDREN {
+                drop(runtime.spawn(bump(&counter)));
+            }
+            runtime.corun();
+        }
+    });
+
+    // Upstream's fourth: handle-returning children and no corun at all.
+    taskflow.emplace_runtime({
+        let counter = Arc::clone(&counter);
+        move |runtime: &mut Runtime<'_>| {
+            for _ in 0..CHILDREN {
+                drop(runtime.spawn(bump(&counter)));
+            }
+        }
+    });
+
+    taskflow.task(a).precede([s1, s2]);
+    taskflow.task(s1).precede([b]);
+    taskflow.task(s2).precede([b]);
+
+    executor.run(&taskflow).wait().expect("no task panicked");
+
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        TOTAL,
+        "{workers} workers: every child of every runtime task ran"
+    );
+}
+
+/// Upstream's `recursive_async_runtime(size_t num_threads)`: a free
+/// runtime-shaped task spawning a hundred runtime-shaped children, each
+/// spawning ten of its own, with **no corun anywhere** -- once through
+/// [`Executor::spawn_runtime`] and once through
+/// [`Executor::dependent_async_runtime`].
+///
+/// What it adds to `Runtime.RecursiveImplicitJoin` in `tests/runtimes.rs`,
+/// which is the same shape under a *graph's* runtime task, is the root: the
+/// node every one of those 1101 tasks is ultimately counted against is a
+/// **free** node rather than a task of a run, so the thing that waits is an
+/// [`AsyncHandle`] rather than a `wait` on a run. The second half is the one
+/// case in the suite that reaches the runtime-shaped *dependent*-async form
+/// on the executor, whose node is entered twice like any other reentrant one.
+fn recursive_runtime_spawned_tasks(workers: usize) {
+    /// Upstream's `N1`.
+    const CHILDREN: usize = 100;
+    /// Upstream's `N2`.
+    const GRANDCHILDREN: usize = 10;
+    /// Upstream's `REQUIRE(counter == N2*N1 + N1 + 1)`.
+    const TOTAL: usize = GRANDCHILDREN * CHILDREN + CHILDREN + 1;
+
+    /// The body both halves submit: count, spawn `CHILDREN` children, and
+    /// return without waiting for any of them.
+    fn spawn_tree(
+        counter: Arc<AtomicUsize>,
+    ) -> impl for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static {
+        move |runtime: &mut Runtime<'_>| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            for _ in 0..CHILDREN {
+                let counter = Arc::clone(&counter);
+                runtime.silent_async_runtime(move |child: &mut Runtime<'_>| {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    for _ in 0..GRANDCHILDREN {
+                        let counter = Arc::clone(&counter);
+                        // Upstream's innermost body takes a `tf::Runtime&` it
+                        // never uses, which is worth keeping: it is a
+                        // runtime-shaped *leaf*, so its node is entered once
+                        // and finishes on that entry.
+                        child.silent_async_runtime(move |_: &mut Runtime<'_>| {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        });
+                    }
+                });
+            }
+        }
+    }
+
+    let executor = Executor::new(workers);
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    executor
+        .spawn_runtime(spawn_tree(Arc::clone(&counter)))
+        .wait()
+        .expect("nothing under the tree panicked");
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        TOTAL,
+        "{workers} workers: the handle waited for the whole tree"
+    );
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let (_task, done) = executor.dependent_async_runtime(spawn_tree(Arc::clone(&counter)), []);
+    done.wait().expect("nothing under the tree panicked");
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        TOTAL,
+        "{workers} workers: the same tree under a dependent-async root"
+    );
+}
+
+#[test]
+fn async_runtime_1_thread() {
+    runtime_spawned_tasks(1);
+}
+
+#[test]
+fn async_runtime_2_threads() {
+    runtime_spawned_tasks(2);
+}
+
+#[test]
+fn async_runtime_3_threads() {
+    runtime_spawned_tasks(3);
+}
+
+#[test]
+fn async_runtime_4_threads() {
+    runtime_spawned_tasks(4);
+}
+
+#[test]
+fn async_runtime_5_threads() {
+    runtime_spawned_tasks(5);
+}
+
+#[test]
+fn async_runtime_6_threads() {
+    runtime_spawned_tasks(6);
+}
+
+#[test]
+fn async_runtime_7_threads() {
+    runtime_spawned_tasks(7);
+}
+
+#[test]
+fn async_runtime_8_threads() {
+    runtime_spawned_tasks(8);
+}
+
+#[test]
+fn recursive_async_runtime_1_thread() {
+    recursive_runtime_spawned_tasks(1);
+}
+
+#[test]
+fn recursive_async_runtime_2_threads() {
+    recursive_runtime_spawned_tasks(2);
+}
+
+#[test]
+fn recursive_async_runtime_3_threads() {
+    recursive_runtime_spawned_tasks(3);
+}
+
+#[test]
+fn recursive_async_runtime_4_threads() {
+    recursive_runtime_spawned_tasks(4);
 }
