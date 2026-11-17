@@ -29,6 +29,15 @@
 //!   owner pushes or pops" rule that upstream writes in a comment is here a
 //!   property of where the value lives.
 //!
+//! That split is also why a [`WorkerThread`] does not always hold the owning
+//! end of its queue. A corun loop -- [`WorkerThread::corun_until`], the loop
+//! `Executor::corun` runs -- starts from *inside* a task body, which is inside
+//! the [`WorkerThread`] frame already running that worker's loop, and a frame
+//! cannot be named from the code it called. So a corun loop gets a second
+//! [`WorkerThread`] over the same worker, built by
+//! [`WorkerThread::corun_view`], and reaches the queue the only way a value
+//! without the owning end can: see [`LocalQueue`].
+//!
 //! The one upstream field with no equivalent is `_thread`: a `JoinHandle` is
 //! owned by whoever will join it, so the executor keeps the handles and the
 //! worker does not. That costs the port upstream's `WorkerInterface` trick of
@@ -141,9 +150,9 @@ pub(crate) struct WorkerThread {
     /// This worker's id, the same as `self.worker().id`, kept here so that the
     /// hot path indexes the worker array instead of chasing it.
     pub(crate) id: usize,
-    /// The owning end of this worker's queue: push and pop happen here, and
-    /// nowhere else.
-    pub(crate) queue: WorkerQueue<Job>,
+    /// Where this loop takes its local work from, and where it puts the work
+    /// it makes ready. See [`LocalQueue`].
+    pub(crate) queue: LocalQueue,
     /// The queue this worker tries to steal from first.
     ///
     /// Upstream's `_sticky_victim`, and the reason the steal loop is not purely
@@ -153,6 +162,36 @@ pub(crate) struct WorkerThread {
     /// This worker's victim-picking generator. Per-worker, because a shared one
     /// would be a contended cache line on the hottest path there is.
     pub(crate) rng: Xorshift32,
+}
+
+/// Which end of a worker's queue a scheduling loop holds.
+///
+/// Upstream needs no equivalent: its `_corun_until` takes the `Worker&` the
+/// executor hands out and pops that worker's queue through it. Here the owning
+/// end of a queue is a `!Sync` value that lives in the [`WorkerThread`] on the
+/// worker's own stack frame, and a task body -- which is what calls
+/// `Executor::corun` -- is called *by* that frame and cannot name it.
+///
+/// A corun loop therefore runs on a [`WorkerThread::corun_view`] of the same
+/// worker, which has no owning end, and the two accesses it needs are both
+/// reachable from the state every thread shares:
+///
+/// - taking local work becomes a steal from the worker's own [`Thief`] -- the
+///   same queue, from the first-in end rather than the last-in one;
+/// - publishing newly ready work goes to the shared buffers instead of the
+///   queue.
+///
+/// Both are a little slower than the owned end -- a steal is the contended
+/// side of the deque, and a buffer costs the pusher a hash and the taker a
+/// sweep -- and neither changes which jobs run or in what order they become
+/// ready. The whole trade is locality, and what it buys is that no part of
+/// this port needs a raw pointer to another thread's stack frame.
+pub(crate) enum LocalQueue {
+    /// The owning end, held by the thread running this worker's own scheduling
+    /// loop: pops are LIFO and uncontended, and nothing else may touch it.
+    Owned(WorkerQueue<Job>),
+    /// No owning end, because another [`WorkerThread`] on this thread has it.
+    Corun,
 }
 
 /// What one round of stealing came back with.
@@ -177,12 +216,50 @@ impl WorkerThread {
         Self {
             shared,
             id,
-            queue,
+            queue: LocalQueue::Owned(queue),
             // Upstream starts every worker on its own queue. It is empty at
             // that point, so the first steal is wasted; what it buys is that a
             // worker which is handed work directly finds it without a draw.
             sticky_victim: id,
             rng: Xorshift32::new(seed_from_current_thread()),
+        }
+    }
+
+    /// A second view of worker `id`, for a corun loop that starts inside one
+    /// of that worker's task bodies.
+    ///
+    /// Call it only from worker `id`'s own thread -- `Executor::corun` checks
+    /// that before it gets here. The two views share the worker's queue, but
+    /// not the sticky victim and not the generator: those are a `&mut` each,
+    /// and the owned one is borrowed by the frame below. Sharing them would
+    /// buy a warm first steal and cost the only thing that keeps the two views
+    /// apart, which is that only one of them is ever running.
+    pub(crate) fn corun_view(shared: Arc<Shared>, id: usize) -> Self {
+        // Where `new` starts a worker on its own queue, a corun view starts on
+        // the first shared buffer: [`WorkerThread::pop`] has already looked at
+        // this worker's own queue by the time a steal is drawn, and the inner
+        // run this loop is waiting for was queued through the buffers.
+        let sticky_victim = shared.workers.len();
+        Self {
+            shared,
+            id,
+            queue: LocalQueue::Corun,
+            sticky_victim,
+            rng: Xorshift32::new(seed_from_current_thread()),
+        }
+    }
+
+    /// Takes the next job from this worker's own queue, or `None` if it held
+    /// none. Upstream's `w._wsq.pop()`.
+    fn pop(&self) -> Option<Job> {
+        match &self.queue {
+            LocalQueue::Owned(queue) => queue.pop(),
+            // The same queue through the other end, which is what a view
+            // without the owning end can reach. It matters that this covers
+            // the worker's own queue at all: with one worker, a job left there
+            // by the frame below has nobody else to run it, and a corun loop
+            // that could not take it would wait for a job it is sitting on.
+            LocalQueue::Corun => self.worker().thief.steal(),
         }
     }
 
@@ -225,13 +302,16 @@ impl WorkerThread {
     /// breaks when the second one says the worker is done.
     ///
     /// The stop condition is a parameter rather than the `done` flag because
-    /// `corun`/`corun_until` -- a later issue -- enter this same loop from
-    /// *inside* a task body and have to leave it again when the graph they are
-    /// waiting on is finished, not when the pool shuts down. Note what such a
-    /// caller must not reuse: [`WorkerThread::wait_for_task`] parks the worker,
-    /// which is a deadlock for a worker that is itself the thing an inner run
-    /// is waiting for, so a corunning loop steals with
-    /// [`WorkerThread::explore_task`] and never sleeps.
+    /// this loop was factored out for `corun`. It turned out not to be the
+    /// loop `corun` can use, and the reason is the one sentence worth keeping
+    /// from that attempt: [`WorkerThread::wait_for_task`] parks the worker,
+    /// and nothing wakes the notifier when a *topology* finishes -- only a
+    /// push does -- so a corun loop that reached the sleep path would wait for
+    /// a notification that is never sent, having parked the very thread the
+    /// run it is waiting for may need. [`WorkerThread::corun_until`] is
+    /// therefore its own loop, over [`WorkerThread::explore_task`], and this
+    /// one keeps the parameter for the only caller it has: `|| false`, the
+    /// worker loop that leaves only on the `done` flag.
     pub(crate) fn run_until(&mut self, mut stop: impl FnMut() -> bool) {
         let mut job = None;
         loop {
@@ -242,6 +322,43 @@ impl WorkerThread {
             match self.wait_for_task() {
                 Some(next) => job = Some(next),
                 None => return,
+            }
+        }
+    }
+
+    /// The corun loop: keep running jobs -- this worker's own first, then
+    /// anybody's -- until `stop` says that whatever this thread is waiting for
+    /// has happened.
+    ///
+    /// Upstream's `_corun_until`, which is `goto exploit`/`goto explore` over
+    /// the same two moves this makes. Three things differ from
+    /// [`WorkerThread::run_until`], and all three are upstream's too:
+    ///
+    /// - one local job per round, not a drain: a job run here may itself
+    ///   corun, so each one costs stack, and upstream's comment says why it
+    ///   takes a single task -- draining "can potentially enter a very deep
+    ///   recursive corun, causing stack overflow".
+    /// - never sleeps. A worker that parks here is a worker the run it is
+    ///   waiting for cannot use, and nothing would wake it: see
+    ///   [`WorkerThread::run_until`]. So an empty sweep yields the core
+    ///   instead, as upstream's does.
+    /// - ignores the `done` flag, as upstream's loop does by never reading it.
+    ///   A corun is always nested inside a task body, so the run that task
+    ///   belongs to is in flight, so its handle is alive, so the executor
+    ///   cannot be dropped and no worker's flag can be set. Treating a
+    ///   shutdown as "found nothing" is therefore unreachable rather than
+    ///   wrong -- and leaving the loop on it would be wrong: the jobs of the
+    ///   inner run name a topology the corunning frame owns.
+    pub(crate) fn corun_until(&mut self, mut stop: impl FnMut() -> bool) {
+        while !stop() {
+            if let Some(job) = self.pop() {
+                self.invoke(job);
+                continue;
+            }
+
+            match self.explore_task() {
+                Stolen::Job(job) => self.invoke(job),
+                Stolen::Nothing | Stolen::Shutdown => thread::yield_now(),
             }
         }
     }
@@ -261,7 +378,7 @@ impl WorkerThread {
             if stop() {
                 return;
             }
-            job = self.queue.pop();
+            job = self.pop();
         }
     }
 
@@ -271,9 +388,14 @@ impl WorkerThread {
     /// Upstream can fail this push -- its per-worker queue is bounded -- and
     /// spills into the shared buffers when it does. The deque behind
     /// [`WorkerQueue`] grows instead, so the spill path has no equivalent
-    /// here; see that module for the trade.
+    /// here; see that module for the trade. A corun view has no queue of its
+    /// own and goes to the buffers for a different reason, which is
+    /// [`LocalQueue`]'s.
     pub(crate) fn schedule(&self, job: Job) {
-        self.queue.push(job);
+        match &self.queue {
+            LocalQueue::Owned(queue) => queue.push(job),
+            LocalQueue::Corun => self.shared.buffers.push(job),
+        }
         self.shared.notifier.notify_one();
     }
 
@@ -297,13 +419,15 @@ impl WorkerThread {
     /// rather than with the first correct version.
     pub(crate) fn invoke(&mut self, job: Job) {
         // SAFETY: a job reaches a worker only through a queue, and the only
-        // thing that puts one there is a run whose `RunHandle` is alive: the
-        // handle's `Drop` blocks until the topology's join counter reaches
-        // zero, and the worker that drives it to zero does nothing with the
-        // topology, the taskflow or the node afterwards except
-        // `Topology::finish`, which is the release of that very handle. So
-        // every job that can be dequeued names a live node of a borrowed graph
-        // and a live topology. See `executor::topology` for the full argument.
+        // things that put one there are a run whose `RunHandle` is alive and a
+        // corun whose frame has not returned. Both own the topology and both
+        // block until its join counter reaches zero, and the worker that
+        // drives it to zero does nothing with the topology, the taskflow or
+        // the node afterwards except `Topology::finish`, which is the release
+        // of that very owner. So every job that can be dequeued names a live
+        // node of a borrowed graph and a live topology. See
+        // `executor::topology` for the full argument and `executor::corun` for
+        // the corun half of it.
         let (node, taskflow, topology) = unsafe { job.parts() };
         let graph = taskflow.graph();
 

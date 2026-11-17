@@ -260,6 +260,19 @@ impl Topology {
         self.join_counter.fetch_sub(1, Ordering::AcqRel) == 1
     }
 
+    /// How many jobs of this run are still outstanding, read without blocking.
+    ///
+    /// Zero means the run's last job has finished. This is the counter
+    /// upstream's `corun` waits on -- `p->_join_counter.load(acquire) == 0` --
+    /// and [`Executor::corun`](crate::Executor::corun) is the one caller:
+    /// every other waiter has [`Topology::join`] and wants to be asleep, while
+    /// a corunning worker must not sleep at all. Acquire for upstream's
+    /// ordering; what makes it safe to *drop* a topology afterwards is
+    /// [`Topology::join`], not this read.
+    pub(crate) fn outstanding(&self) -> usize {
+        self.join_counter.load(Ordering::Acquire)
+    }
+
     /// Stores what a panicking task panicked with, keeping the first.
     ///
     /// Upstream keeps the first exception too, and for the same reason: with

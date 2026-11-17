@@ -52,6 +52,7 @@ pub mod task;
 pub mod taskflow;
 
 pub use crate::executor::Executor;
+pub use crate::executor::corun::CorunError;
 pub use crate::executor::queue::{Buffers, Thief, WorkerQueue};
 pub use crate::executor::rng::{Xorshift32, Xorshift64};
 pub use crate::executor::run_handle::{RunError, RunHandle};
