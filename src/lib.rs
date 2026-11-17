@@ -7,6 +7,9 @@
 //! slice is the static task graph (`Taskflow`/`Task`) and the work-stealing
 //! `Executor` that runs it.
 //!
+//! The port follows **Taskflow v4.1.0** (commit `45366fe5`, 2026-06-19). See
+//! the README's "Upstream pin" section before translating anything.
+//!
 //! # Relationship to upstream
 //!
 //! Taskflow is MIT licensed, as is this crate. This is a reimplementation in
@@ -23,7 +26,7 @@
 //! first line of its own `//!` doc comment:
 //!
 //! ```text
-//! //! Translated from `taskflow/core/executor.hpp`.
+//! //! Translated from `taskflow/core/executor.hpp` (Taskflow v4.1.0).
 //! ```
 //!
 //! Silence therefore means "this module is our own design". Keeping that
