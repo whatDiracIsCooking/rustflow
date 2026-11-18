@@ -6,36 +6,41 @@
 //! Upstream builds each stage from a free function --
 //! `tf::make_for_each_task`, `tf::make_transform_task`,
 //! `tf::make_reduce_task` -- that hands back a plain callable, which
-//! `executor.silent_dependent_async` then submits directly. This crate has
-//! no such free functions: [`Runtime::for_each`], [`Runtime::transform`] and
-//! [`Runtime::reduce`] are methods on a live `&mut Runtime`, not callables a
-//! factory can hand back cold, because the chunk loop underneath every one
-//! of them is built on [`Runtime::scope`] (`src/algorithm/for_each.rs`'s own
-//! `# Design` section says why). So each stage here is
-//! [`Executor::silent_dependent_async_runtime`] wrapping a closure that
-//! locks its own `Arc<Mutex<_>>` state and calls the matching `Runtime::`
-//! method -- see this example's PR for why that shape, not a free function,
-//! is what the port actually has, and what it costs: three explicit locks
-//! where upstream's iterators alias the same `std::vector` across all three
-//! stages with none at all, trusted only by the dependency edges named
-//! below. None of the owned-data wrappers on [`AlgorithmBuilder`] -- the
-//! owned-data `FlowBuilder` wrappers every other example in this milestone
-//! uses -- apply here at all: all three build a task by calling
-//! [`FlowBuilder::emplace_runtime`](rustflow::FlowBuilder::emplace_runtime),
-//! and a dependent-async task is not queued into any `Taskflow` for that to
-//! call.
+//! `executor.silent_dependent_async` then submits directly. This crate's
+//! `make_for_each_task`, `make_transform_task` and `make_reduce_task` are
+//! that same family, so each stage below is a single
+//! [`Executor::silent_dependent_async_runtime`] call over a factory's
+//! product, with no closure written at the call site: the product is handed
+//! its `&mut Runtime` when it *runs*, and never needed one to be built. The
+//! owned-data `FlowBuilder` wrappers on `AlgorithmBuilder` -- what every
+//! other algorithm example in this milestone calls -- do not reach here at
+//! all, since each of them builds its task through
+//! `FlowBuilder::emplace_runtime` and a dependent-async task is not queued
+//! into any `Taskflow` for that to call. The factory is the layer the two
+//! forms share.
+//!
+//! The `Arc<Mutex<_>>` the three stages pass between them is a real
+//! divergence from upstream, whose three factories alias one `std::vector`
+//! across all three stages with no lock at all. The factories do not remove
+//! the lock -- a writing factory is handed a locked vector and the family's
+//! read side accepts one, which is what lets stage B and stage C read what
+//! stage A wrote -- they remove the hand-rolling of it; `DESIGN.md`'s
+//! decisions on the factory family say why the port accepts the lock rather
+//! than an aliasing stand-in that would need `unsafe`. The two dependency
+//! edges named below are what make the sharing sound, and are required:
+//! `src/algorithm/mod.rs`'s `SliceSource` docs state that two stages sharing
+//! one lock must be joined by an edge even when both only read.
 //!
 //! Upstream's program only *prints* its result. This milestone's examples
 //! print *and* **assert**: the same check upstream throws on is also
 //! checked with `assert_eq!`, so a non-zero exit from the binary is itself
 //! the test. See the README's "Examples" section.
-//!
-//! [`AlgorithmBuilder`]: rustflow::algorithm::AlgorithmBuilder
 
 use std::sync::{Arc, Mutex};
 
+use rustflow::Executor;
 use rustflow::algorithm::partitioner::DefaultPartitioner;
-use rustflow::{Executor, Runtime};
+use rustflow::algorithm::{make_for_each_task, make_reduce_task, make_transform_task};
 
 /// Upstream's `N = 65536`, kept here too: every element is touched by three
 /// cheap passes with no allocation per element, so the whole chain stays
@@ -51,79 +56,52 @@ fn main() {
 
     // for-each: upstream's `tf::make_for_each_task(data.begin(), data.end(),
     // [](int& i){ i = 1; })`.
-    let stage_a = {
-        let data = Arc::clone(&data);
-        executor.silent_dependent_async_runtime(
-            move |runtime: &mut Runtime<'_>| {
-                let mut guard = data
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                runtime.for_each(
-                    &mut guard,
-                    |i: &mut i32| *i = 1,
-                    DefaultPartitioner::default(),
-                );
-            },
-            [],
-        )
-    };
+    let stage_a = executor.silent_dependent_async_runtime(
+        make_for_each_task(
+            Arc::clone(&data),
+            |i: &mut i32| *i = 1,
+            DefaultPartitioner::default(),
+        ),
+        [],
+    );
 
     // transform: upstream's `tf::make_transform_task(data.begin(),
     // data.end(), data.begin(), [](int& i){ return i*2; })`. Upstream
     // transforms in place; this port's `Runtime::transform` always writes
-    // into a second slice (that module's own `# Design` section says why
-    // one `&mut [T]` cannot stand in for both), so the doubled values land
-    // in their own `Vec` instead.
-    let stage_b = {
-        let data = Arc::clone(&data);
-        let doubled = Arc::clone(&doubled);
-        executor.silent_dependent_async_runtime(
-            move |runtime: &mut Runtime<'_>| {
-                let data_guard = data
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let mut doubled_guard = doubled
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                runtime.transform(
-                    &data_guard,
-                    &mut doubled_guard,
-                    |i: &i32| i * 2,
-                    DefaultPartitioner::default(),
-                );
-            },
-            [&stage_a],
-        )
-    };
+    // into a second slice (that module's own `# Design` section says why one
+    // `&mut [T]` cannot stand in for both), so the doubled values land in
+    // their own `Vec` -- which is also what keeps this one call's read
+    // source and write target two distinct locks, as the factory family
+    // requires.
+    let stage_b = executor.silent_dependent_async_runtime(
+        make_transform_task(
+            Arc::clone(&data),
+            Arc::clone(&doubled),
+            |i: &i32| i * 2,
+            DefaultPartitioner::default(),
+        ),
+        [&stage_a],
+    );
 
     // reduce: upstream's `tf::make_reduce_task(data.begin(), data.end(),
-    // sum, std::plus<int>{})`.
-    let _stage_c = {
-        let doubled = Arc::clone(&doubled);
-        let sum = Arc::clone(&sum);
-        executor.silent_dependent_async_runtime(
-            move |runtime: &mut Runtime<'_>| {
-                let doubled_guard = doubled
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let mut sum_guard = sum
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                runtime.reduce(
-                    &doubled_guard,
-                    &mut sum_guard,
-                    |a: &i32, b: &i32| a + b,
-                    DefaultPartitioner::default(),
-                );
-            },
-            [&stage_b],
-        )
-    };
+    // sum, std::plus<int>{})` -- over `doubled` here, where upstream's
+    // in-place transform left the doubled values in `data` itself.
+    let _stage_c = executor.silent_dependent_async_runtime(
+        make_reduce_task(
+            Arc::clone(&doubled),
+            Arc::clone(&sum),
+            |a: &i32, b: &i32| a + b,
+            DefaultPartitioner::default(),
+        ),
+        [&stage_b],
+    );
 
     // wait for all async tasks to complete
     executor.wait_for_all();
 
-    // verify the result
+    // verify the result. `make_reduce_task` folds into an `Arc<Mutex<T>>`, so
+    // reading its answer back out is the one lock this program still takes:
+    // none of the three stages takes one of its own.
     let total = *sum.lock().expect("uncontended");
     let expected = i32::try_from(N).expect("N fits in i32") * 2 + 1;
     assert_eq!(total, expected, "INCORRECT RESULT");
