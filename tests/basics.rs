@@ -20,8 +20,8 @@
 //!   an index-handle visitor cannot do while the walk borrows the graph; the
 //!   walk collects the indices and the renaming follows it.
 //!
-//! One further section, between `Task.RemoveDependencies` and `Iterators`, is
-//! not upstream's either: its own header says why.
+//! Two further sections, between `Task.RemoveDependencies` and `Iterators`,
+//! are not upstream's either: each one's own header says why.
 //!
 //! The last two sections are not upstream's at all. Upstream has no
 //! `RunHandle` and therefore no case for leaking one, while this port's
@@ -42,7 +42,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustflow::prelude::*;
-use rustflow::{Executor, Node, RunError, RunHandle, TaskType};
+use rustflow::{AsyncWork, Executor, Node, RunError, RunHandle, TaskType};
 
 // The topics this file calls every item of: the matrix macro, the counting
 // body its `emplace` calls attach, and the spin its two leaked-handle cases
@@ -581,6 +581,122 @@ fn task_data_survives_a_run() {
     run(&taskflow);
     assert_eq!(counter.load(Ordering::Relaxed), 2);
     assert_eq!(taskflow.task_ref(a).data::<i32>(), Some(&7));
+}
+
+/// The slot is editable in place and can be taken back out again: the other
+/// two halves of the attachment the case above only reads. A taken slot leaves
+/// the task with no data rather than a stale copy of it, and a take that names
+/// the wrong type hands the box back to the task instead of losing it.
+#[test]
+fn task_data_is_editable_in_place_and_can_be_taken_back() {
+    let mut taskflow = Taskflow::new();
+    let a = emplace(&mut taskflow, || {});
+
+    taskflow.task(a).set_data(7i32);
+    *taskflow
+        .task(a)
+        .data_mut::<i32>()
+        .expect("the slot holds the i32 just attached") += 35;
+    assert_eq!(taskflow.task_ref(a).data::<i32>(), Some(&42));
+
+    assert_eq!(taskflow.task(a).take_data::<u8>(), None);
+    assert_eq!(
+        taskflow.task_ref(a).data::<i32>(),
+        Some(&42),
+        "a take of the wrong type leaves the slot as it was"
+    );
+
+    assert_eq!(taskflow.task(a).take_data::<i32>(), Some(42));
+    assert_eq!(taskflow.task_ref(a).data::<i32>(), None);
+}
+
+// --------------------------------------------------------
+// Testcase: the arena under the task handles (not upstream's)
+//
+// Upstream has no case for these because it has no arena: a `tf::Task` is a
+// `Node*` and `tf::Graph` is the vector it was allocated out of, so walking
+// the graph mutably and reading a node's work back are things its tests do
+// through the task handles above. Here `Graph` is public, a `Task` indexes it
+// and `DESIGN.md`'s "Graph as an arena" is the decision -- so the arena's own
+// surface is this port's to pin.
+// --------------------------------------------------------
+
+/// `Graph::iter_mut` reaches every live node and no tombstone: the mutable
+/// half of the walk `Graph::iter` and `Graph::tasks` make, and the one way a
+/// caller holding the graph edits the nodes in it.
+#[test]
+fn iter_mut_reaches_every_live_node() {
+    let mut graph = Graph::new();
+    let a = graph.add_named_node("a", Handle::Placeholder);
+    let b = graph.add_named_node("b", Handle::Placeholder);
+    let c = graph.add_named_node("c", Handle::Placeholder);
+    assert!(graph.erase(b));
+
+    let mut walked = Vec::new();
+    for (task, node) in graph.iter_mut() {
+        walked.push(task);
+        node.set_name(format!("{}!", node.name()));
+    }
+    assert_eq!(walked, vec![a, c], "the erased slot is not walked");
+
+    let named: Vec<&str> = graph.iter().map(|(_, node)| node.name()).collect();
+    assert_eq!(named, vec!["a!", "c!"], "the walk's edits landed");
+}
+
+/// `Node::handle_mut` hands back *this* node's handle, so work replaced
+/// through it is the work the node holds afterwards -- `TaskMut::work`'s claim
+/// one level up, for a graph a caller owns outright rather than one a
+/// `Taskflow` does.
+#[test]
+fn handle_mut_replaces_the_work_the_node_holds() {
+    let mut graph = Graph::new();
+    let task = graph.add_node(Handle::Placeholder);
+    assert!(graph.node(task).handle().is_placeholder());
+
+    *graph.node_mut(task).handle_mut() = Handle::Static(Work::new(|| {}));
+    assert!(graph.node(task).handle().is_static());
+}
+
+/// A node's `Debug` names the work it holds and the state words a run writes.
+///
+/// Every one of those is a hand-written impl, and for one reason: a closure, a
+/// `Box<dyn Any>` and a payload slot behind a `Mutex` have no `Debug` to
+/// derive, so each prints what it *is* instead of what it holds. A node that
+/// printed nothing would be the one thing they are all there to avoid.
+#[test]
+fn a_nodes_debug_names_the_work_it_holds() {
+    let mut taskflow = Taskflow::new();
+    let static_task = taskflow.emplace(|| {});
+    let condition = taskflow.emplace_condition(|| 0);
+    let subflow = taskflow.emplace_subflow(|_| {});
+    let runtime = taskflow.emplace_runtime(|_| {});
+    let nonpreemptive = taskflow.emplace_nonpreemptive_runtime(|_| {});
+    taskflow.task(static_task).name("printed");
+
+    let graph = taskflow.graph();
+    let printed = |task| format!("{:?}", graph.node(task));
+
+    let text = printed(static_task);
+    assert!(text.contains("Work(..)"), "{text}");
+    assert!(text.contains("name: \"printed\""), "{text}");
+    assert!(text.contains("NodeBase"), "{text}");
+    assert!(text.contains("DispatchClaim"), "{text}");
+
+    assert!(printed(condition).contains("Work(..)"));
+    assert!(printed(subflow).contains("SubflowWork(..)"));
+    assert!(printed(runtime).contains("RuntimeWork(..)"));
+    assert!(
+        printed(nonpreemptive).contains("NonpreemptiveRuntimeWork(..)"),
+        "{}",
+        printed(nonpreemptive)
+    );
+
+    // An async node's body is a slot the one worker that runs it takes the
+    // call out of, so whether it is still there is what its `Debug` prints.
+    let mut graph = Graph::new();
+    let spawned = graph.add_node(Handle::Async(AsyncWork::plain(|| {})));
+    let text = format!("{:?}", graph.node(spawned));
+    assert!(text.contains("OnceWork(\"pending\")"), "{text}");
 }
 
 // --------------------------------------------------------
