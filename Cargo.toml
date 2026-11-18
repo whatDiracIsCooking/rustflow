@@ -120,3 +120,15 @@ harness = false
 [[bench]]
 name = "black_scholes"
 harness = false
+
+[[bench]]
+name = "for_each"
+harness = false
+
+[[bench]]
+name = "reduce_sum"
+harness = false
+
+[[bench]]
+name = "scan"
+harness = false

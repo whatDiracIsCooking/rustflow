@@ -2093,3 +2093,136 @@ any number taken here would record the load and not the shape. What is
 verified here is that the benchmark runs and that its answer is right:
 `cargo bench --all-features --bench black_scholes -- --test` drives all eight
 ids and the untimed check behind them.
+
+## for_each
+
+`N` `f64`s, each replaced by its own tangent: upstream's `for_each_taskflow`
+builds a fresh `tf::Taskflow`, calls
+`for_each_by_index(IndexRange(0, vec.size(), 1), ..)` over a body that walks
+one sub-range, and runs it, timing both -- "ours includes building the graph"
+from this file's own header applies here too, though what is built is one
+runtime task rather than `N` of them. `par_iter_mut().for_each` is the
+baseline, in the role TBB's `parallel_for` plays upstream. Sizes are two
+points off upstream's `N = 10..=1e8` sweep: `1000`, where the fixed cost of
+building and running a one-task taskflow still shows, and `1000000`, where
+the per-element `tan` dominates it. Worker counts are this file's usual pair,
+`1` and `available_parallelism`, from `benches/common/`.
+
+**This is the first shape in the suite where the baseline is the same program
+rather than a different schedule for the same work.** The four flat-graph
+shapes compare a graph of `N` nodes against a parallel iterator that has no
+graph, which is the asymmetry `embarrassing_parallelism`'s own
+declaration-only id exists to quantify. Here both columns take one index
+range and split it into chunks at run time -- `for_each_by_index`'s
+partitioner against rayon's own range split -- so the construction term is
+one node on our side and nothing on rayon's, and what is left is the
+partitioners and the per-chunk dispatch. That makes the pair of numbers to
+read not within this table but across two: **`for_each` against
+`embarrassing_parallelism` at the same worker count** is the difference
+between splitting a range and enqueuing one task per element, which is the
+measured question this section is the input to.
+
+Two departures from upstream are recorded in `benches/for_each.rs`'s own
+module docs and matter to the comparison. The `rustflow` column's vector is a
+slice of `AtomicU64` holding `f64` bit patterns, because the ported body is
+one `Fn(IndexRange<usize>)` shared by every chunk and so cannot hold a
+`&mut [f64]`; the baseline keeps a plain `Vec<f64>`, since `par_iter_mut`
+hands each element a real `&mut f64`. And each sample runs on a freshly
+generated vector through `iter_batched`, as `sort`'s does, because this shape
+mutates its input in place and upstream regenerates `vec` once per round.
+
+Both columns are checked before either is timed: `benches/for_each.rs`'s
+`verify` runs each variant once per size and worker count, outside any
+measured region, and compares every element against a sequential `f64::tan`
+reference. The comparison is exact, not a tolerance -- each output depends on
+exactly one input element and both columns call the same `f64::tan` on it --
+so a chunk the partitioner never handed out fails the run instead of
+producing a figure.
+
+**Figures: measured by #352, which takes every M11 section's table in one
+quiet-box pass.** This section lands with its shape, its ids, its sizes and
+its baseline fixed and no numbers, deliberately: three agents were building
+on this box while it was written, and a figure taken then would record the
+load rather than the shape.
+
+## reduce_sum
+
+`N` `f64`s summed once: upstream's `reduce_sum_taskflow` builds a fresh
+`tf::Taskflow`, calls `reduce_by_index(IndexRange(0, vec.size(), 1), result,
+lop, std::plus<double>())` -- `lop` folding one sub-range into the running
+total it is handed, `gop` folding each worker's local into the shared result
+-- and runs it, timing both. `par_iter().sum::<f64>()` is the baseline, in
+the role TBB's `parallel_reduce` plays upstream. Sizes are two points off
+upstream's `N = 10..=1e9` sweep: `1000`, where the fixed cost of the run
+dominates the additions, and `1000000`, where the additions dominate it.
+Worker counts are the usual pair from `benches/common/`.
+
+The shape is `for_each`'s with the writes replaced by a fold, so the two
+sections are worth reading together: the same range, the same partitioner and
+the same one-node graph, with a per-worker local and one `gop` merge each in
+place of a store per element. What a row says that `for_each`'s does not is
+what the merge costs, since an `f64` addition is cheap enough that the fold
+itself is close to memory-bound at the larger size.
+
+**The check on this shape is a tolerance, not an equality, and that is the
+shape rather than a weakened assertion.** Floating-point addition is not
+associative, so this crate's per-worker locals folded by `gop`, rayon's own
+tree of partial sums and a sequential `Iterator::sum` add the same `N` values
+in three different orders and land on three slightly different `f64`s.
+`benches/reduce_sum.rs` therefore asserts a relative distance of `1e-6` from
+a sequential sum, before any id is timed, for both columns -- five orders of
+magnitude tighter than mis-chunking would be, since dropping or repeating one
+chunk of a million-element sum moves the answer by a fraction of a percent.
+The module docs say so next to the constant. One departure from upstream
+feeds that check: upstream's `main.cpp` only `resize`s its `vec` and never
+writes it, so every round there sums zeroes -- an answer a run that skipped
+half the range would also reach -- while the port fills the vector from the
+same generator `sort`'s does.
+
+**Figures: measured by #352**, for the reason the `for_each` section above
+states.
+
+## scan
+
+An inclusive scan of `N` `i32`s under multiplication: upstream's
+`scan_taskflow` builds a fresh `tf::Taskflow`, calls
+`inclusive_scan(input.begin(), input.end(), output.begin(),
+std::multiplies<int>{})` and runs it, timing both. Sizes are two points off
+upstream's `N = 10..=1e8` sweep, `1000` and `1000000`; worker counts are the
+usual pair. The output buffer is allocated by the harness and reused across
+samples, as upstream's `output.resize(N)` in `main.cpp` is -- every slot is
+overwritten by every run, and the allocation is not part of what upstream
+times.
+
+**The baseline column is a sequential `Iterator::scan`, not a parallel one,
+because rayon has no parallel scan.** Its parallel iterators express map,
+filter, reduce and sort; a prefix scan, whose every output depends on every
+earlier input, is not among them, and a `fold` plus a `collect` would be a
+different algorithm wearing the name. So this column is labelled `sequential`
+rather than `rayon`, the way `linear_chain`'s section records that *its*
+rayon column is empty instead of putting a loop in it and calling that a
+parallel baseline. The difference from `linear_chain` is that here the
+sequential program is the one a caller would actually write, so it is a real
+baseline and not a stand-in: what a row asks is whether two passes over the
+data across several workers beat one pass on one. It has no worker axis --
+a sequential scan has no count to be held to -- so it is measured once per
+size and the same figure is read against both of that size's rows, exactly as
+the `pipeline` section's `mpsc` chain is.
+
+Two notes on the arithmetic, both upstream's behaviour made explicit.
+Products of `int`s overflow within a handful of elements at every size here,
+which upstream's `std::multiplies<int>` leaves to undefined behaviour and
+both columns spell `i32::wrapping_mul`: the point of the shape is the scan's
+dependency structure, not the value it ends on. And the generated inputs are
+odd where upstream's are `::rand()`, because a single zero anywhere in the
+input makes every later output zero and would blind the check below to
+anything that went wrong past that point.
+
+That check is `benches/scan.rs`'s `verify`, run before any id of a size is
+timed: the `rustflow` variant runs once per size and worker count outside any
+measured region and its whole output buffer is compared, slot by slot,
+against the sequential baseline's, so a block whose carry-in was never
+applied fails the run rather than producing a figure.
+
+**Figures: measured by #352**, for the reason the `for_each` section above
+states.
