@@ -37,6 +37,13 @@
 //! of a caller error rather than `executor::module`'s `CYCLE` refusal, which
 //! is specific to a node reachable by walking `Handle::Module`'s own parent
 //! chain -- a chain a free-standing runtime task is not on.
+//!
+//! The body is `FnMut` rather than `FnOnce` because the node it becomes may
+//! run more than once: a taskflow submitted with
+//! [`Executor::run_n`](crate::Executor::run_n) enters every node of it once
+//! per run, so a one-shot body would have nothing left to call on the
+//! second. [`merge`](super::merge)'s factories are `FnMut` for the same
+//! reason and name this one for it.
 
 use std::sync::Arc;
 
@@ -47,24 +54,13 @@ use crate::taskflow::Taskflow;
 /// Builds a runtime-shaped body that runs the whole of `target`'s graph:
 /// upstream's `make_module_task` and `Algorithm::make_module_task`.
 ///
-/// The body schedules `target`'s graph under the node and the run of
-/// whichever [`Runtime`] it is handed -- a node of a taskflow's own graph via
-/// [`FlowBuilder::emplace_runtime`](crate::FlowBuilder::emplace_runtime), or a
-/// free-standing node via
-/// [`Executor::spawn_runtime`](crate::Executor::spawn_runtime),
-/// [`Executor::silent_async_runtime`](crate::Executor::silent_async_runtime),
-/// [`Executor::dependent_async_runtime`](crate::Executor::dependent_async_runtime)
-/// or a [`TaskGroup`](crate::TaskGroup)'s own async family -- so its
-/// successors or its handle wait for the whole composition, the same promise
-/// [`FlowBuilder::composed_of`](crate::FlowBuilder::composed_of) makes for a
-/// node built into a graph. An empty or sourceless `target` is a no-op,
-/// upstream's `graph.empty()` early return.
+/// The body schedules `target`'s graph under the node and the run of the
+/// [`Runtime`] it is handed, so that node's successors or handle wait for
+/// the whole composition. An empty or sourceless `target` is a no-op.
 ///
-/// `FnMut` rather than `FnOnce`, because the body may run more than once --
-/// a node of a taskflow run with [`Executor::run_n`](crate::Executor::run_n),
-/// not merely submitted once. Calling this on a `target` that is already
-/// running is a caller error with no refusal of its own, which the module
-/// docs' `# Design` section says more about.
+/// Calling this on a `target` that is already running is a caller error,
+/// which the module docs' `# Design` section says more about, as it does the
+/// `FnMut` bound.
 ///
 /// ```
 /// use std::sync::Arc;
