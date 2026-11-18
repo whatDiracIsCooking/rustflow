@@ -8,204 +8,63 @@
 //! `taskflow/core/executor.hpp` of the same release and land in [`invoke`].
 //!
 //! A dependent-async task is an async task with edges to other async tasks:
-//! the same free-standing node `executor::async_node` is, submitted the same
-//! way from any thread, counted in the same two counters, and -- for the
-//! handle-returning form -- delivering into the same [`AsyncHandle`]. The
-//! other half of the header is [`async`](crate::executor::r#async) and this
-//! module leans on it rather than repeating it. What is particular to this
-//! half is that the graph is built **one task at a time, while the tasks
-//! already submitted are running**, which no `Taskflow` can do and which is
-//! the whole of the protocol below.
+//! the same free-standing node, submitted the same way from any thread,
+//! counted in the same two counters and -- for a handle-returning form --
+//! delivering into the same [`AsyncHandle`]. What is particular to this half
+//! of the header is that the graph is built **one task at a time, while the
+//! tasks already submitted are running**, which no `Taskflow` can do.
 //!
-//! # One iterator where upstream has four overloads
+//! # Design
 //!
-//! Upstream names dependencies either variadically --
-//! `silent_dependent_async(f, t1, t2)`, which packs `&t1, &t2` into a
-//! `std::array` and forwards -- or as an iterator pair, `(first, last)` over
-//! anything dereferencing to an `AsyncTask`. Both collapse onto one
-//! `IntoIterator<Item = &AsyncTask>` parameter here, which is what makes
-//! `[&a, &b]`, `tasks.iter()`, `&tasks[k..k + 1]` and `[]` all read naturally
-//! at the call site, and which is also the one thing about the signature that
-//! is not upstream's: `std::distance` on a random-access pair is how upstream
-//! knows how many dependencies there are before it looks at any of them, and
-//! a Rust iterator may be single-pass. The guard below is what replaces it.
+//! [`async`](crate::executor::r#async) holds the submission core this module
+//! is the dependent half of; the body shapes and the receivers are its
+//! business rather than this one's. Two things are this one's.
 //!
-//! The `TaskParams` overloads collapse onto the unnamed forms for
-//! [`async`](crate::executor::r#async)'s reason: they differ only in the name
-//! given to the node, and nothing in this milestone reads one.
+//! The **protocol**, per dependency named: an *empty* handle is skipped,
+//! upstream's `task.empty()` branch of `_process_dependent_async`; a
+//! dependency that has already **finished** is counted off the new node's
+//! join counter at once, nothing ever draining its list again; and otherwise
+//! the new node's [`Job`] goes onto that dependency's list, whose tear-down
+//! counts it off. A node whose counter reaches zero is queued by whichever of
+//! the submitting thread and a predecessor's tear-down arrives last, which
+//! does not matter: every decrement is a `fetch_sub` of its own, so exactly
+//! one drives the counter to zero. `AsyncNode::push_successor` and
+//! `AsyncNode::finish` are the pair that makes naming a dependency and
+//! finishing one atomic against each other, where upstream uses its
+//! `ESTATE::LOCKED` spin bit and `ESTATE::FINISHED` in one word.
 //!
-//! # The protocol
+//! The **guard**, which replaces upstream's `std::distance`: a Rust
+//! `IntoIterator` may be single-pass, so the counter cannot start at the
+//! number of dependencies. It starts at [`SUBMITTING`] instead, and that one
+//! outstanding dependency is spent together with everything found already met
+//! in one final `fetch_sub`. Without it a task whose first dependency
+//! finished early could run and *finish* before its second was named, leaving
+//! a job on a list nothing drains again. `DESIGN.md` has that decision and
+//! with it why `Parent::count_queued` is taken at submission here, where a
+//! plain async task's is taken beside the push.
 //!
-//! Upstream guards a predecessor's `_edges` with the `ESTATE::LOCKED` spin
-//! bit and marks a finished task with `ESTATE::FINISHED` in the same word, so
-//! that its two operations cannot interleave: naming a dependency has to
-//! either find it unfinished and leave a successor behind, or find it
-//! finished and leave nothing, and finishing has to either see a successor
-//! and take it, or set the bit that sends the next namer down the other
-//! branch. Here the successor list is the `Mutex<Vec<Job>>` on `AsyncNode`
-//! and `FINISHED` is set *under that lock* -- `AsyncNode::push_successor` and
-//! `AsyncNode::finish` are the pair, and `executor::async_node` has why one
-//! lock over both is the same statement as upstream's one word.
+//! Nothing here can hang because every queued dependent-async job sets
+//! `FINISHED` and drains its list whatever happens to it -- a task left on a
+//! list nothing drains again is a count against its parent that is never
+//! spent. A parentless job cannot even be skipped, its run being the sentinel
+//! and its parent no chain; a job under a parent can, and
+//! [`release_skipped`] is what the early-out at the top of
+//! `WorkerThread::invoke_one` calls instead. That is upstream's arrangement
+//! exactly: its cancelled branch goes to `_tear_down_invoke`, which
+//! dispatches on the handle and so runs the *whole* of
+//! `_tear_down_dependent_async` where every other node kind owes only the
+//! parent branch.
 //!
-//! So a submission does this, per dependency named:
-//!
-//! - an **empty** handle is skipped, which is upstream's `task.empty()`
-//!   branch of `_process_dependent_async` and the case
-//!   `DependentAsync.NullDependency` is about: a default-constructed
-//!   [`AsyncTask`](crate::AsyncTask) names no task, so there is nothing to
-//!   wait for and nothing to push onto;
-//! - a dependency that has **already finished** is counted off the new node's
-//!   join counter at once, because nothing will ever drain its list again;
-//! - otherwise the new node's [`Job`] goes onto that dependency's list, and
-//!   the dependency's own tear-down is what counts it off.
-//!
-//! A node whose counter reaches zero is queued, by whichever of the two
-//! arrives last -- the submitting thread or a predecessor's tear-down. Which
-//! of them it is cannot be predicted and does not matter: exactly one
-//! decrement drives the counter to zero, because every one of them is a
-//! `fetch_sub` of its own.
-//!
-//! # The guard, where upstream has `std::distance`
-//!
-//! Upstream initialises the new node's `_join_counter` to the number of
-//! dependencies and then decrements it for each one already met, scheduling
-//! if the last decrement left zero. That needs the count *before* the first
-//! dependency is looked at, which a single-pass iterator cannot give.
-//!
-//! This port starts the counter at [`SUBMITTING`] -- one outstanding
-//! dependency, which is the submitting call itself -- raises it by one as each
-//! dependency is named, and spends the guard together with everything it
-//! found already met in one final `fetch_sub`. The guard is not a trick to
-//! avoid counting: it is load-bearing, and the thing it buys is that the
-//! counter **cannot reach zero while the submission is still in progress**.
-//! Without it a task whose first dependency finished early could be queued,
-//! run and *finish* before its second dependency had been named -- and naming
-//! a dependency of a node that has already finished would leave a job on a
-//! list that nothing drains again, which is a task that never runs, or push
-//! it onto a predecessor whose tear-down then schedules a node that has
-//! already run. Upstream is safe from both for the same reason by
-//! construction, since its counter starts at the full count.
-//!
-//! # A submission of its own, not `schedule_async_task`
-//!
-//! `Executor::schedule_async_task` in [`async`](crate::executor::r#async) is
-//! the submission for the other half of the header and cannot serve this one,
-//! which is upstream's split exactly -- `_schedule_dependent_async_task` is a
-//! function of its own there too. Two things differ and both are structural:
-//! the node carries a [`Handle::DependentAsync`](crate::Handle), so that the
-//! dispatch reaches the arm that releases successors, and the job must
-//! **not** be queued until every dependency has been named, which is the
-//! guard's whole point. What is shared is shared rather than copied:
-//! `Shared::increment_async`, `Parent::count_queued` and
-//! `Shared::bulk_schedule` are the same three calls in the same order, and
-//! `Shared::finish_async` is the same tear-down counter.
-//!
-//! One of those three lands at a different *point*, which is the only other
-//! thing this submission does differently. `Parent::count_queued` is "tell
-//! the parent before you queue the job", and for a plain async task the
-//! submission and the queueing are one instant, so counting beside the push
-//! is counting at submission. Here they are not: the job may be queued by a
-//! predecessor's tear-down, on another thread, at any time after the first
-//! dependency is named. So the count is taken once at submission, for the
-//! one job that will run the task, and neither the push below nor the
-//! tear-down takes it again. Upstream agrees and says so from the other
-//! side: its `Runtime::dependent_async` raises `_node->_join_counter` itself
-//! before calling `_dependent_async` at all.
-//!
-//! # Ownership is the `Arc`
-//!
-//! `async_task.hpp`'s argument for a reference-counted handle is the ABA
-//! problem: a task named as the dependency of a *later* submission has to
-//! still be there when that submission looks at it, and a count held by the
-//! caller is what guarantees it. Here the count is an `Arc<AsyncNode>`, held
-//! by every [`AsyncTask`](crate::AsyncTask) handle, by every [`Job`] of the
-//! node, and by every predecessor's successor list until that list is
-//! drained. Upstream's `_incref`/`_decref` pairs, its tear-down
-//! `fetch_sub(ESTATE::REFCOUNT_ONE)` and its `recycle(node)` therefore have
-//! no equivalent at all: the node goes when the last share goes, whether that
-//! is a handle's, a worker's or a list's.
-//!
-//! # Panics
-//!
-//! A [`dependent_async`](Executor::dependent_async) body's panic goes into
-//! its handle, because the body the node runs is the wrapper
-//! `AsyncHandle::for_body` built -- upstream's `std::packaged_task`, and the
-//! same wrapper [`Executor::spawn`] submits. The executor's own failure
-//! machinery never sees it.
-//!
-//! A [`silent_dependent_async`](Executor::silent_dependent_async) body's
-//! panic has no handle to go into, so it goes through `Job::record_panic`
-//! like any other task's -- and this is the one place in the crate where that
-//! walk's last case is both reached *and* readable. The chain is one link
-//! long and roots at the sentinel run every free node shares, which is not an
-//! anchor (#105), so the payload stays on the node the task is; and unlike a
-//! `silent_async`'s, that node is still named by a handle, so
-//! [`AsyncTask::take_panic`](crate::AsyncTask::take_panic) hands it back --
-//! upstream's `exception_ptr()` on the same node. The order the tear-down
-//! keeps is what makes it worth reading: the payload is parked *before*
-//! `FINISHED` is set, so a caller that sees
-//! [`is_done`](crate::AsyncTask::is_done) can take the payload.
-//!
-//! Neither kind of failure cancels anything. A free node has nothing above it
-//! to cancel, and the sentinel run is never marked -- which is what keeps a
-//! failed task from skipping every async task submitted after it.
-//!
-//! # Where a released successor is queued
-//!
-//! Upstream's tear-down releases through `_update_cache`, so the last
-//! successor it finds ready is run by this worker on the spot and the rest go
-//! on its queue. The cache cannot be reached from here -- it is a local of
-//! `WorkerThread::invoke_one`, filled from the *graph* successors a free node
-//! does not have, and [`invoke`] answers with a [`Release`] rather than a job
-//! -- so every released successor goes onto this worker's own queue instead.
-//! That is the same jobs in the same order: the queue is LIFO, so the last
-//! one pushed is the first one popped, and it is popped by this worker unless
-//! a thief gets there first. The cost is one push and one pop per chain link,
-//! which is what `BENCHMARKS.md` measures the continuation against for a
-//! graph's chain.
-//!
-//! # Why nothing here can hang
-//!
-//! Every queued dependent-async job sets `FINISHED` and drains its list,
-//! whatever happens to it, and that is what nothing here hanging rests on: a
-//! task left on a list nothing drains again is a task that never runs, and a
-//! task that never runs is a count against its parent that is never spent.
-//!
-//! A task submitted *to the executor* gets there the easy way -- it can never
-//! be skipped at all. The early-out at the top of `WorkerThread::invoke_one`
-//! skips a job whose run is cancelled or whose parent chain is marked, and a
-//! parentless free node has neither: its run is the sentinel, which nothing
-//! ever records anything on, and its parent is `Parent::Run` rather than a
-//! chain. A body that *panicked* is not an exception to it either, since the
-//! panic is caught rather than unwound through the tear-down.
-//!
-//! A task submitted from a runtime body (#92) is the case that needs the
-//! other half. It hangs off a node of a real run, so the early-out can skip
-//! one -- the run was cancelled, or a sibling failed and the walk marked the
-//! node they share -- and a skipped job never reaches the dispatch and so
-//! never reaches [`invoke`]. [`release_skipped`] is what the early-out calls
-//! instead, which is upstream's arrangement exactly: its cancelled branch
-//! goes to `_tear_down_invoke`, which dispatches on the handle and so runs
-//! the *whole* of `_tear_down_dependent_async` for such a node rather than
-//! only the parent branch every other kind owes.
-//!
-//! # A dependent-async handle inside a graph is still refused
-//!
-//! [`Graph::add_node`](crate::Graph::add_node) takes any
-//! [`Handle`](crate::Handle), so a caller can put a
-//! [`Handle::DependentAsync`](crate::Handle) into a taskflow's graph. It is
-//! refused for the reason [`async`](crate::executor::r#async) gives -- an
-//! async body is a `FnOnce` and a graph may be run any number of times -- and
-//! doubly so here: the dependencies of a dependent-async task are other free
-//! nodes rather than edges of any graph, so such a node could not have them
-//! honoured even in principle.
+//! A [`Handle::DependentAsync`] somebody built into a taskflow's graph is
+//! refused for the reason [`async`](crate::executor::r#async) gives, and
+//! doubly so here: the dependencies of such a task are other free nodes
+//! rather than edges of any graph.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::Ordering;
 
 use crate::async_task::AsyncTask;
-use crate::executor::r#async::{AsyncHandle, ESTATE_NONE};
-use crate::executor::async_node::AsyncNode;
+use crate::executor::r#async::{AsyncHandle, Spawn, Submission};
 use crate::executor::runtime;
 use crate::executor::topology::{Job, Parent, Topology};
 use crate::executor::worker::{Release, WorkerThread};
@@ -226,24 +85,20 @@ impl Executor {
     /// result.
     ///
     /// Upstream's `Executor::dependent_async`. The [`AsyncTask`] is what
-    /// names this task as a dependency of a later one; the [`AsyncHandle`] is
-    /// upstream's `std::future<R>` and behaves exactly as
+    /// names this task as a dependency of a later one; the [`AsyncHandle`]
+    /// is upstream's `std::future<R>` and behaves exactly as
     /// [`Executor::spawn`]'s does, including that dropping it detaches.
     ///
-    /// Dependencies are named by handle and may be named from any thread,
-    /// including from a task body already running on one of this executor's
-    /// workers -- which is how a graph of async tasks is built while it runs.
-    /// A task already finished is not waited for, and an **empty** handle is
-    /// skipped: it names no task.
+    /// Dependencies are named by handle and from any thread, including from
+    /// a task body already running on one of this executor's workers -- which
+    /// is how a graph of async tasks is built while it runs. A task already
+    /// finished is not waited for, and an **empty** handle is skipped: it
+    /// names no task.
     ///
-    /// A panic out of `body` is caught by the wrapper this call builds and
-    /// reported from [`AsyncHandle::wait`] as
-    /// [`RunError::Panicked`](crate::RunError::Panicked)`(payload)`. It does
-    /// **not** cancel the tasks that depend on this one -- upstream's
-    /// `std::future` makes the same promise, since the exception it stores
-    /// was never thrown as far as the executor is concerned -- so a successor
-    /// of a failed task runs, and a caller who wants otherwise reads the
-    /// handle and decides.
+    /// A panic out of `body` is reported from that handle as
+    /// [`RunError::Panicked`](crate::RunError::Panicked)`(payload)` and does
+    /// **not** cancel the tasks that depend on this one, as upstream's
+    /// `std::future` promises too.
     ///
     /// ```
     /// use rustflow::Executor;
@@ -269,23 +124,11 @@ impl Executor {
         R: Send + 'static,
         F: FnOnce() -> R + Send + 'static,
     {
-        // Upstream's `std::packaged_task<R()>` and the `get_future()` beside
-        // it, which is the one construction site for a handle in the crate:
-        // the node runs a plain body whatever `R` is, exactly as a `spawn`ed
-        // one does.
-        let (wrapper, handle) = AsyncHandle::for_body(body);
-        let task = self.schedule_dependent_async_task(
-            AsyncWork::plain(wrapper),
-            &Parent::Run,
-            // Upstream's `ESTATE::REFCOUNT_ONE` and nothing else: the
-            // reference count is the `Arc` here, and the anchor bit its
-            // runtime-shaped branch also sets is #92's, where there is a
-            // second entry that reads the node's payload slot. A plain
-            // body's failure is caught by the wrapper above instead.
-            ESTATE_NONE,
+        self.shared.schedule_dependent_async_task(
+            Spawn::handled(body),
+            &Submission::parentless(),
             dependencies,
-        );
-        (task, handle)
+        )
     }
 
     /// Runs `body` on this executor once every task in `dependencies` has
@@ -298,12 +141,10 @@ impl Executor {
     /// here too, and the [`AsyncTask`] it hands back is the same handle.
     ///
     /// A panic out of `body` is **kept on the task**, where
-    /// [`AsyncTask::take_panic`] hands it back to whoever still holds a
-    /// handle -- upstream's `exception_ptr()`, and the one place in this port
-    /// a free node's own payload slot is both written and readable. It
-    /// cancels nothing, here or in the tasks that depend on this one. The
-    /// default panic hook still prints it, so a silent task that fails is not
-    /// an invisible one.
+    /// [`AsyncTask::take_panic`] hands it back -- upstream's
+    /// `exception_ptr()`, and the one place in this port a free node's own
+    /// payload slot is both written and readable. It cancels nothing, and the
+    /// default panic hook still prints it.
     ///
     /// ```
     /// use std::sync::Arc;
@@ -337,102 +178,38 @@ impl Executor {
     where
         F: FnOnce() + Send + 'static,
     {
-        self.schedule_dependent_async_task(
-            AsyncWork::plain(body),
-            &Parent::Run,
-            ESTATE_NONE,
-            dependencies,
-        )
-    }
-
-    /// Creates the free-standing node `work` is the body of, counts the
-    /// dependencies named against it, and queues it if there are none left to
-    /// wait for, through the state the submission actually needs:
-    /// [`Shared::schedule_dependent_async_task`], which is where the protocol
-    /// is argued.
-    ///
-    /// Kept as the [`Executor`]'s own call for
-    /// [`Executor::schedule_async_task`]'s reason, and moved for its reason
-    /// too: a [`Runtime`](crate::Runtime) body naming the dependencies of a
-    /// child of its own (#92) has the worker's share of [`Shared`] and no
-    /// `Executor` at all.
-    ///
-    /// No `worker` argument, where the method below has one, for
-    /// [`Executor::schedule_async_task`]'s reason: a call on an `Executor`
-    /// cannot name the frame running it.
-    pub(crate) fn schedule_dependent_async_task<'a>(
-        &self,
-        work: AsyncWork,
-        parent: &Parent,
-        estate: u32,
-        dependencies: impl IntoIterator<Item = &'a AsyncTask>,
-    ) -> AsyncTask {
         self.shared
-            .schedule_dependent_async_task(work, parent, estate, dependencies, None)
+            .schedule_dependent_async_task(
+                Spawn::silent(body),
+                &Submission::parentless(),
+                dependencies,
+            )
+            .0
     }
 }
 
 impl Shared {
-    /// Creates the free-standing node `work` is the body of, counts the
+    /// Creates the free-standing node `spawn` is the body of, counts the
     /// dependencies named against it, and queues it if there are none left to
     /// wait for: upstream's `_schedule_dependent_async_task` plus the
-    /// `_process_dependent_async` it calls per dependency and the
-    /// `_increment_topology` its public callers make first, which as there is
-    /// taken only for a parentless submission.
+    /// `_process_dependent_async` it calls per dependency.
     ///
-    /// `parent` and `estate` are upstream's own two arguments and mean what
-    /// they mean in [`Shared::schedule_async_task`]: [`Parent::Run`] is its
-    /// null parent, and the estate word is the bits to start the node with.
-    /// Both are parameters rather than constants because the runtime-shaped
-    /// forms (#92) need the other value of each, as they do for the plain
-    /// async node.
-    ///
-    /// The order of the three steps that are not the dependency loop is
-    /// [`Shared::schedule_async_task`]'s, for its reasons: the counters go up
-    /// before anything can be queued, the parent is told about the job
-    /// before it is pushed, and the push is last because the job may
-    /// already be running when it returns. What this adds in the middle is
-    /// the guard, which the module docs argue for -- and note that the guard
-    /// is raised *before* `increment_async` could matter, since a node
-    /// nobody can reach yet cannot be scheduled by anybody.
-    ///
-    /// The receiver is [`Shared`] for [`Shared::schedule_async_task`]'s
-    /// reason, which is the same one here: `Shared` is what a worker holds,
-    /// and a [`Runtime`](crate::Runtime) body submitting a dependent child
-    /// (#92) has no `Executor` to call.
-    ///
-    /// `worker` is that method's own argument and means exactly what it means
-    /// there -- upstream's `this_worker()`, as a parameter rather than a
-    /// lookup -- with one thing particular to this node kind: it decides
-    /// where only the push *this* call may make goes, which is the one for a
-    /// task whose dependencies were all met already. A task released later by
-    /// a predecessor's tear-down is queued by whichever worker ran that
-    /// predecessor, through `WorkerThread::schedule`, and was never this
-    /// submission's to place. Upstream's branch sits inside its
-    /// `if(num_predecessors == 0)` for the same reason.
-    pub(crate) fn schedule_dependent_async_task<'a>(
+    /// The steps that are not the dependency loop are
+    /// [`Shared::schedule_async_task`]'s, in that order and for its reasons;
+    /// what this adds in the middle is the guard the module docs argue for.
+    /// The [`Submission`] places only the push *this* call may make, which is
+    /// the one for a task whose dependencies were all met already: a task
+    /// released later is queued by whichever worker ran its last predecessor
+    /// and was never this submission's to place, which is why upstream's own
+    /// branch sits inside its `if(num_predecessors == 0)`.
+    pub(crate) fn schedule_dependent_async_task<'a, H>(
         &self,
-        work: AsyncWork,
-        parent: &Parent,
-        estate: u32,
+        spawn: Spawn<H>,
+        to: &Submission<'_>,
         dependencies: impl IntoIterator<Item = &'a AsyncTask>,
-        worker: Option<&WorkerThread>,
-    ) -> AsyncTask {
-        // Parentless only, which is the condition the tear-down below
-        // decrements under and upstream's split between its public
-        // `dependent_async` and the `_dependent_async(..., tpg, parent)` its
-        // runtime and task-group forms call: `Executor::schedule_async_task`
-        // has the whole of the argument, and #115 is what the two conditions
-        // disagreeing cost.
-        if matches!(parent, Parent::Run) {
-            self.increment_async();
-        }
-
-        let node = AsyncNode::new("", Handle::DependentAsync(work));
-        node.node()
-            .base()
-            .estate()
-            .fetch_or(estate, Ordering::Relaxed);
+    ) -> (AsyncTask, H) {
+        let (work, estate, handle) = spawn.into_parts();
+        let node = self.new_free_node(Handle::DependentAsync(work), estate, to);
 
         // Upstream's `num_predecessors` as the counter's initial value, with
         // the guard standing in for a count it cannot take in advance.
@@ -442,34 +219,24 @@ impl Shared {
         outstanding.store(SUBMITTING, Ordering::Relaxed);
 
         // Upstream's `_node->_join_counter.fetch_add(1)`, which is a line of
-        // `Runtime::dependent_async` rather than of
+        // its `Runtime::dependent_async` rather than of
         // `_schedule_dependent_async_task` -- the parent is told by whoever
-        // submits. It is here instead, as `schedule_async_task` has it, and
-        // *this early* rather than beside the push below, which is the one
-        // ordering question this call raises for this node kind: a plain
-        // async task is queued by the thread that submits it, so the two
-        // points are the same instant, but a dependent-async task may be
-        // queued by a predecessor's tear-down on another thread the moment
-        // the first `push_successor` returns -- and may be queued however
-        // long after this call. One count per *task* and not per job: the
-        // several jobs the loop below may create are copies of the one job
-        // that will run it, the rest of which are dropped undequeued, and
-        // `WorkerThread::finish_job` spends this count once when that job
-        // finishes.
-        parent.count_queued(Topology::free_standing(), 1);
+        // submits. One count per *task* and not per job: the jobs the loop
+        // below may create are copies of the one job that will run it, the
+        // rest dropped undequeued, and `WorkerThread::finish_job` spends this
+        // count once when that job finishes.
+        to.parent().count_queued(Topology::free_standing(), 1);
 
         // Upstream's `_process_dependent_async` loop. `met` is the
         // dependencies that turned out to be over already -- its
         // `num_predecessors = node->_join_counter.fetch_sub(1) - 1` branch,
-        // deferred to one decrement below rather than taken per dependency,
-        // because under the guard there is nothing to be gained by taking it
-        // early and one less atomic to pay for.
+        // deferred to one decrement below because under the guard there is
+        // nothing to be gained by taking it early.
         let mut met = 0;
         for dependency in dependencies {
-            // Upstream's `if(task.empty())` branch: an empty handle names no
-            // task, so it is neither counted nor pushed onto. Skipping it
-            // outright is the same arithmetic as upstream's count-then-cancel
-            // and is `DependentAsync.NullDependency`.
+            // An empty handle names no task, so it is neither counted nor
+            // pushed onto. Skipping it outright is the same arithmetic as
+            // upstream's count-then-cancel.
             let Some(predecessor) = dependency.node() else {
                 continue;
             };
@@ -481,68 +248,50 @@ impl Shared {
             outstanding.fetch_add(1, Ordering::Relaxed);
 
             // Upstream's spin-locked `_edges.push_back(node)` against its
-            // `ESTATE::FINISHED` test, which `AsyncNode::push_successor`
-            // performs under one lock: `false` is the dependency that had
-            // already finished, whose list nothing will drain again, so this
-            // submission counts it off itself.
-            if !predecessor.push_successor(Job::free(&node, parent)) {
+            // `ESTATE::FINISHED` test, under one lock: `false` is the
+            // dependency that had already finished, whose list nothing will
+            // drain again, so this submission counts it off itself.
+            if !predecessor.push_successor(Job::free(&node, to.parent())) {
                 met += 1;
             }
         }
 
         // Upstream's `if(num_predecessors == 0) _schedule(...)`, which is
         // this decrement reaching zero. One `fetch_sub` for the guard and
-        // every met dependency together, so that the counter is driven to
-        // zero exactly once however many of each there were: every other
-        // decrement of it is a predecessor's tear-down spending one.
+        // every met dependency together, so the counter is driven to zero
+        // exactly once however many of each there were.
         //
-        // `AcqRel`, as upstream's is: the acquire half is what makes a
-        // predecessor's writes visible to whoever is released by this, and
-        // the release half publishes the pushes above to the tear-down that
-        // is released by the predecessor's own decrement instead.
+        // `AcqRel`, as upstream's is: the acquire half makes a predecessor's
+        // writes visible to whoever is released by this, and the release half
+        // publishes the pushes above to the tear-down released by the
+        // predecessor's own decrement instead.
         if outstanding.fetch_sub(met + SUBMITTING, Ordering::AcqRel) == met + SUBMITTING {
-            // Upstream's two branches of that `_schedule`, over the argument
-            // rather than over a thread-local lookup, as the plain
-            // submission's are.
-            let job = Job::free(&node, parent);
-            match worker {
-                Some(worker) => worker.schedule(job),
-                None => self.bulk_schedule([job]),
-            }
+            to.queue(self, Job::free(&node, to.parent()));
         }
 
         // Upstream's `AsyncTask task(animate(...))` is taken at the *top* of
         // its function, because the count it takes is what keeps the node
         // alive while the loop runs. Here the local `node` is that share and
-        // this is it being handed over -- the node has been shared from its
-        // constructor on, which `executor::async_node` says is why.
-        AsyncTask::new(node)
+        // this is it being handed over.
+        (AsyncTask::new(node), handle)
     }
 }
 
 /// Runs the dependent-async task `job` is for and releases whatever was
 /// waiting for it: upstream's `DEPENDENT_ASYNC` arm of `_invoke`, which is
-/// `_invoke_dependent_async_task` followed by
-/// `_tear_down_dependent_async`.
+/// `_invoke_dependent_async_task` followed by `_tear_down_dependent_async`.
 ///
-/// `Some(Release::Strong)` for a task that is over. A free node has no graph
-/// successors to release, so what that answer buys is the tear-down
-/// `WorkerThread::invoke_one` performs on the way out -- which for a job
-/// under a parent (#92's runtime child, #94's task-group member) counts that
-/// parent down, and for a parentless one reaches the sentinel run, whose
-/// counter can never hit zero, so it correctly does nothing.
-///
-/// `None` is upstream's `if(_invoke_dependent_async_task(...)) return;` -- a
-/// runtime-shaped body that preempted its own node -- and neither the
-/// successors nor the counters are touched then: the second entry is what
-/// finishes the task, and a task that has not finished must not release what
-/// is waiting for it.
+/// `Some(Release::Strong)` for a task that is over, which buys the tear-down
+/// `WorkerThread::invoke_one` performs on the way out, as the plain async arm
+/// does. `None` is upstream's `if(_invoke_dependent_async_task(...)) return;`
+/// -- a runtime-shaped body that preempted its own node -- and neither the
+/// successors nor the counters are touched then: a task that has not finished
+/// must not release what is waiting for it.
 pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &AsyncWork) -> Option<Release> {
-    // Upstream has no equivalent and needs none, for the reason
-    // `executor::async` gives: a handle somebody built into a graph is told
-    // apart from a free node's job by the identity of the run, and the
-    // refusal goes through the channel a panicking body uses so that the run
-    // is failed rather than hung.
+    // A handle somebody built into a graph, told apart from a free node's job
+    // by the identity of the run and refused through the channel a panicking
+    // body uses, so that the run is failed rather than hung: `executor::async`
+    // has the whole of that argument.
     if !job.topology().is_free_standing() {
         job.topology().record_panic(Box::new(
             "a dependent-async node cannot be run as part of a taskflow: \
@@ -555,34 +304,25 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &AsyncWork) -> 
     let release = match work {
         // Upstream's case 0, `void()`: a `silent_dependent_async` body or the
         // wrapper a `dependent_async` submits, under the `catch_unwind` that
-        // is its `TF_EXECUTOR_EXCEPTION_HANDLER`. Taken out of the slot
-        // rather than called through it, because an async body is a `FnOnce`;
-        // `None` would be a body already spent, which one submission and one
-        // queued job cannot reach, and doing nothing is the one answer to it
-        // that cannot run a body twice. `AssertUnwindSafe` is the honest
-        // annotation, for `Handle::Static`'s reason.
+        // is its `TF_EXECUTOR_EXCEPTION_HANDLER`, and taken out of the slot
+        // for the reason `executor::async`'s own arm gives.
         AsyncWork::Plain(body) => {
             if let Some(body) = body.take()
                 && let Err(payload) = panic::catch_unwind(AssertUnwindSafe(body))
             {
                 // Upstream's `_process_exception`, and for this node kind the
                 // walk's last case is the useful one: nothing is anchored
-                // above a task submitted here, so the payload stays on the
-                // node, where `AsyncTask::take_panic` reads it back. Before
-                // `finish` below, which is what lets a caller that has seen
-                // `is_done` take it.
+                // above a task submitted to the executor, so the payload
+                // stays on the node, where `AsyncTask::take_panic` reads it
+                // back -- before `finish` below, which is what lets a caller
+                // that has seen `is_done` take it.
                 job.record_panic(payload);
             }
             Some(Release::Strong)
         }
-        // Upstream's cases 1 and 2, which are its two
-        // `_invoke_runtime_task_impl` overloads and this port's
-        // `executor::runtime`. Nothing submits a runtime-shaped
-        // dependent-async body yet -- `Runtime::dependent_async` is #92's --
-        // so the only way to such a node today is to build one by hand
-        // inside the crate; the arm is here rather than `unreachable!`
-        // because the node kind is what decides the protocol, not the shape
-        // of the body, and #92 needs this line to say exactly this.
+        // Upstream's cases 1 and 2, its two `_invoke_runtime_task_impl`
+        // overloads and this port's `executor::runtime`: the node kind
+        // decides the protocol, not the shape of the body.
         AsyncWork::Runtime(_) | AsyncWork::Reentrant { .. } => {
             runtime::invoke_async(worker, job, work)
         }
@@ -594,15 +334,12 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &AsyncWork) -> 
 
     release_successors(worker, job);
 
-    // Upstream's parentless branch of `_tear_down_dependent_async`:
-    // `if(node->_parent == nullptr) _decrement_topology()`, where this port's
-    // null parent is `Parent::Run` on a free node. A parented one is not
-    // counted here because the submission does not count it either, and what
-    // accounts for it instead is its parent's join counter (#115). The
-    // counters go *after* the release above, as upstream orders them: a
-    // successor is already counted in them on its own behalf, so the order
-    // cannot let `wait_for_all` return early either way, and keeping
-    // upstream's is one less thing for a reader to check.
+    // Upstream's parentless branch of `_tear_down_dependent_async`, under the
+    // condition `Shared::new_free_node` increments under. The counters go
+    // *after* the release above, as upstream orders them: a successor is
+    // already counted in them on its own behalf, so the order cannot let
+    // `wait_for_all` return early either way, and keeping upstream's is one
+    // less thing for a reader to check.
     if matches!(job.parent(), Parent::Run) {
         worker.shared.finish_async();
     }
@@ -614,25 +351,14 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &AsyncWork) -> 
 /// dispatch **skipped**, and does nothing for a job of any other kind.
 ///
 /// The half of upstream's `_tear_down_invoke` that is not
-/// `WorkerThread::finish_job`: its cancelled early-out dispatches on the
-/// handle, so a `DEPENDENT_ASYNC` node reaches the whole of
-/// `_tear_down_dependent_async` -- `FINISHED` set, the successor list drained
-/// -- where every other kind owes only the parent branch.
-///
-/// Called by that early-out for every job it skips, which is why the two
-/// questions are asked here rather than there: the node kind, and whether
-/// this is a free node at all. A [`Handle::DependentAsync`] somebody built
-/// into a taskflow's graph is the second one -- [`invoke`] refuses such a
-/// node, and a cancelled run can skip one before it is ever refused -- and it
-/// has no successor list to drain, because the list is a *free* node's state.
-///
-/// Why it matters is the module docs' hanging section: the tasks waiting on a
-/// skipped one were counted against its parent when they were submitted, so
-/// leaving them on a list nothing drains again means the parent's join
-/// counter never reaches zero. For #92's children that parent is a preempted
-/// runtime node, which is then never resumed -- a run that never finishes and
-/// a `wait` that never returns, in place of a cancellation that was supposed
-/// to end the run promptly.
+/// `WorkerThread::finish_job`. Called by that early-out for every job it
+/// skips, which is why the two questions are asked here rather than there:
+/// the node kind, and whether this is a free node at all -- a
+/// [`Handle::DependentAsync`] built into a taskflow's graph has no successor
+/// list to drain, the list being a *free* node's state. Why it matters is the
+/// module docs' paragraph on hanging: the tasks waiting on a skipped one were
+/// counted against its parent when they were submitted, so leaving them there
+/// means a parent whose join counter never reaches zero.
 pub(crate) fn release_skipped(worker: &mut WorkerThread, job: &Job) {
     if job.async_node().is_some() && matches!(job.node().handle(), Handle::DependentAsync(_)) {
         release_successors(worker, job);
@@ -645,11 +371,17 @@ pub(crate) fn release_skipped(worker: &mut WorkerThread, job: &Job) {
 ///
 /// The two steps are `AsyncNode::finish`, which sets `FINISHED` under the
 /// successor lock and hands the list back, and then the release -- outside
-/// the lock, which is this port's one departure from upstream's shape here.
-/// Upstream releases under its spin bit because its scheduling path is
-/// lock-free; a job pushed to a queue may be stolen and run before this call
-/// returns, and whatever it does must not be able to wait on the lock it was
-/// released under. `executor::async_node` has that argument in full.
+/// the lock, which is this port's one departure from upstream's shape here:
+/// upstream releases under its spin bit because its scheduling path is
+/// lock-free, and a job pushed to a queue may be stolen and run before this
+/// call returns, so whatever it does must not be able to wait on the lock it
+/// was released under.
+///
+/// A released successor goes onto *this* worker's queue, where upstream's
+/// `_update_cache` would have kept one for the frame below: that cache is a
+/// local of `WorkerThread::invoke_one` filled from graph successors a free
+/// node does not have, so the difference is one push and one pop per chain
+/// link.
 pub(crate) fn release_successors(worker: &mut WorkerThread, job: &Job) {
     // Upstream's `std::get_if<Node::DependentAsync>(&node->_handle)`, which
     // cannot fail for the same reason: the dispatch arm this runs under is
@@ -665,12 +397,11 @@ pub(crate) fn release_successors(worker: &mut WorkerThread, job: &Job) {
         // node of the job that was parked here rather than over a node
         // pointer. It cannot wrap, which is why this is a plain `fetch_sub`
         // where the successor loops in `WorkerThread::invoke_one` floor at
-        // zero (#98): every decrement of this counter was paid for by an
-        // increment the submitting call made before pushing the job, and
-        // nothing can bypass a free node's dependencies -- there is no
-        // `Runtime::schedule` for a node that is not part of a graph. The
-        // assertion is in debug builds, where the crate's own tests run, so
-        // a protocol that broke that invariant would fail rather than hang.
+        // zero: every decrement of this counter was paid for by an increment
+        // the submitting call made before pushing the job, and nothing can
+        // bypass a free node's dependencies. The assertion is in debug
+        // builds, where the crate's own tests run, so a protocol that broke
+        // that invariant would fail rather than hang.
         let outstanding = successor
             .node()
             .join_counter()
@@ -683,16 +414,8 @@ pub(crate) fn release_successors(worker: &mut WorkerThread, job: &Job) {
         if outstanding == 1 {
             // Nothing is counted here, which is the one place this port's
             // "count a job before you queue it" rule is kept by somebody
-            // else: the submission that created this job counted it against
-            // its parent then, because it could not know which thread would
-            // queue it or when. Counting again here would leave the parent
-            // waiting for a job that no longer exists.
-            //
-            // This worker's own queue, where upstream's `_update_cache`
-            // would have kept one of them for the frame below this one. The
-            // module docs have why the cache cannot be reached from here and
-            // why the difference is one push and one pop rather than a
-            // change in which worker runs what.
+            // else: the submission counted it against its parent then,
+            // because it could not know which thread would queue it or when.
             worker.schedule(successor);
         }
     }
@@ -1033,10 +756,9 @@ mod tests {
         let parent = Nested::new(None);
         let (ran, set_ran) = flag();
 
-        let task = executor.schedule_dependent_async_task(
-            AsyncWork::plain(move || set_ran.store(true, Ordering::Release)),
-            &parent.as_parent(),
-            ESTATE_NONE,
+        let (task, ()) = executor.shared.schedule_dependent_async_task(
+            Spawn::silent(move || set_ran.store(true, Ordering::Release)),
+            &Submission::under_anchor(&parent),
             // No dependencies, so the submission queues the job itself: a
             // dependency would park it on a node this case would then have to
             // run as well, and the counters are the subject here.

@@ -4,217 +4,107 @@
 //! then wait for. There is no graph, no taskflow and no runtime task around
 //! it: a worker asks the executor for one, submits as many async tasks as it
 //! likes, and coruns until they are done -- which is what makes recursive
-//! parallelism (upstream's own example is Fibonacci) a plain recursive
-//! function rather than a graph somebody has to build.
+//! parallelism a plain recursive function rather than a graph somebody has to
+//! build. Only a worker can open one, because the only thing a group can do
+//! to *wait* is corun; [`Executor::task_group`] is the one constructor and
+//! [`CorunError::NotAWorker`] is its refusal.
 //!
-//! Only a worker of the executor can open one, because the only thing a group
-//! can do to *wait* is corun, and coruning means staying in the
-//! work-stealing loop. [`Executor::task_group`] is the one constructor and
-//! [`CorunError::NotAWorker`] is its refusal -- the same error
-//! [`Executor::corun`] returns for the same mistake, since it is the same
-//! mistake: code that thought it was on a worker and was not.
+//! # Design
 //!
-//! # The anchor
+//! The eight spawning forms are one delegation each onto the submission core
+//! in `executor::async`, which takes everything that varies between them.
+//! What a group adds is the `Submission` the children go under, and three
+//! things follow from it.
 //!
-//! Upstream's group holds `NodeBase _node_base {NSTATE::IMPLICITLY_ANCHORED,
-//! ESTATE::NONE, nullptr, 0}` -- a bare node base on the stack of the task
-//! that opened the group -- and hands `&_node_base` to the executor as the
-//! parent of every task it spawns. Here that is a `Parent::Nested` with no
-//! resume job, which is exactly the shape `Executor::corun`'s stack anchor
-//! already has: something a nested graph's jobs count down, with no node to
-//! re-queue when the count reaches zero, because a *frame* is waiting on the
-//! counter instead.
+//! The **anchor** is upstream's `NodeBase _node_base
+//! {NSTATE::IMPLICITLY_ANCHORED, ESTATE::NONE, nullptr, 0}` as a
+//! `Parent::Nested` with no resume job -- the shape `Executor::corun`'s stack
+//! anchor already has, something a nested graph's jobs count down with no node
+//! to re-queue when the count reaches zero, because a *frame* is waiting on
+//! the counter instead. Two things differ from that anchor and both are
+//! upstream's: it is `IMPLICITLY_ANCHORED` from the moment the group is opened
+//! rather than for the length of one wait, so a child that fails while nobody
+//! is coruning still lands its payload somewhere the next
+//! [`TaskGroup::corun`] will look; and it is an [`Arc`] rather than a value on
+//! the frame, every job of every child holding a share, which is what lets
+//! this port mirror upstream's missing destructor without upstream's undefined
+//! behaviour. `DESIGN.md` has that decision and the `Drop` this type does not
+//! have.
 //!
-//! Two things differ from the corun anchor, and both are upstream's.
+//! **Who counts a child** is the submission, through `Parent::count_queued`:
+//! upstream writes `_node_base._join_counter.fetch_add(1)` at the top of every
+//! spawning form and this port takes that count one call inwards, so the forms
+//! below add nothing of their own. That one count is also the *whole* of a
+//! child's accounting -- the executor's own two counters are for the tasks
+//! nothing else can wait for -- so [`Executor::wait_for_all`] does not wait
+//! for a group's children and `corun` is how a caller reads the anchor.
 //!
-//! The first is `IMPLICITLY_ANCHORED`, set once when the group is opened. A
-//! corun anchor is explicitly anchored for the length of the wait and is
-//! nothing at all outside it; a group's anchor is an anchor of last resort
-//! for its whole life, so a child that fails while nobody is coruning still
-//! lands its payload on the anchor rather than losing it with the node. The
-//! next [`TaskGroup::corun`] reports it. `Job::record_panic` in the
-//! crate-private `executor::topology` is the walk that reads both bits, and
-//! the "What a failure reaches" section below says which children reach the
-//! anchor at all.
-//!
-//! The second is that the anchor is an [`Arc`] rather than a value on the
-//! frame. Every job of a child holds a share of its parent, so the anchor
-//! outlives the group whenever a child does -- which is the whole of why
-//! this port can mirror upstream's missing destructor safely, and the Drop
-//! section says so.
-//!
-//! # Who counts a child
-//!
-//! Upstream writes `_node_base._join_counter.fetch_add(1)` at the top of
-//! every one of its spawning forms and then calls the executor's internal
-//! `_async` / `_silent_async` / `_dependent_async` with a null topology and
-//! `&_node_base` as the parent. In this port that `fetch_add` is
-//! `Parent::count_queued`, which the submission itself takes -- one count per
-//! child, before the job can be pushed anywhere -- so the forms below pass
-//! the anchor as the parent and add nothing of their own. Counting it twice
-//! would be a counter that never comes back to zero, which is to say a
-//! [`TaskGroup::corun`] that never returns.
-//!
-//! That one count is also the *whole* of a child's accounting. The
-//! executor's own `num_asyncs` and `num_topologies` are for the tasks
-//! nothing else can wait for -- an [`Executor::spawn`] or an
-//! [`Executor::silent_async`], whose parent is the run itself -- and a
-//! parented child is deliberately in neither, upstream's split exactly
-//! (issue #115). So [`Executor::wait_for_all`] does **not** wait for the
-//! children of a group: the anchor's join counter is what waits for them,
-//! and `corun` is how a caller reads it.
-//!
-//! # No implicit join in `Drop`
-//!
-//! Upstream's `TaskGroup` has no destructor. A group that goes out of scope
-//! with work outstanding therefore dangles the `NodeBase` its children are
-//! still counting down -- undefined behaviour, which upstream's own
-//! documentation says in as many words ("failing to do so results in
-//! undefined behavior").
-//!
-//! This port mirrors it: there is no `Drop` on [`TaskGroup`], and dropping
-//! one with children outstanding is **not** a join. What it is instead is
-//! merely *unjoined*, because the anchor is shared rather than borrowed: the
-//! children keep running, their counts land on an anchor that is still
-//! alive, and the last share of it goes with the last child -- taking with it
-//! a payload that nobody came for. Nothing dangles and nothing is undefined.
-//!
-//! No convenience join is added, and that is a decision rather than an
-//! omission. A `Drop` that corun was the alternative, and it would put a
-//! wait on the one path a caller cannot see, cannot opt out of and cannot
-//! handle a failure from -- including an unwind, where coruning inside a
-//! `Drop` risks a second panic and an abort. A caller who wants the join
-//! calls [`TaskGroup::corun`], which is where the failure is reportable.
+//! **Where a child is queued** is the shared buffers, where upstream pushes
+//! onto the submitting worker's own queue, and the group is the submitter
+//! `DESIGN.md` records as nearest to naming a worker and still unable to: it
+//! holds `worker: usize`, an id, because [`Executor::task_group`] is a call on
+//! the *executor* from inside a task body, and even with the frame it would
+//! gain nothing, since [`TaskGroup::corun`] runs on a
+//! `WorkerThread::corun_view` whose pops are steals from the first-in end
+//! where a push would be LIFO. What that leaves is a **stack-depth** ceiling
+//! and not a correctness one -- every child runs, at any worker count.
+//! Measured against a worker's default 2 MiB stack in the debug build
+//! `cargo test` uses: the recursive Fibonacci of `tests/task_group.rs` passes
+//! at `fib(15)` and overflows at `fib(16)`, and its two sorts pass at 2000
+//! elements and overflow at 3000, so that file ships inputs a factor of two
+//! inside the cliff. `BENCHMARKS.md` has the release-build figures.
 //!
 //! # What a failure reaches
 //!
 //! A child's panic is caught where every other task body's is, and where it
-//! goes afterwards depends on which form spawned it -- upstream's
-//! arrangement, through the estate word its internal forms construct the
-//! child's node with:
+//! goes afterwards is upstream's arrangement, through the estate word its
+//! internal forms construct the child's node with. The silent forms have no
+//! handle to report to, so the payload goes up the parent chain and lands on
+//! the **group's anchor**, where [`TaskGroup::corun`] re-raises it and
+//! [`TaskGroup::try_corun`] hands it back; only the first such failure is
+//! kept. The handle-returning plain forms deliver into their own
+//! [`AsyncHandle`] and the group stays quiet. The handle-returning
+//! runtime-shaped forms construct their node *explicitly anchored*, which
+//! stops the walk at the child itself, so what failed under that child is its
+//! handle's to report.
 //!
-//! - [`TaskGroup::silent_async`] and [`TaskGroup::silent_dependent_async`]
-//!   have no handle to report to, so the payload goes up the parent chain and
-//!   lands on the **group's anchor**. [`TaskGroup::corun`] re-raises it with
-//!   [`resume_unwind`](panic::resume_unwind), which is upstream's
-//!   `_rethrow_exception`, and [`TaskGroup::try_corun`] hands it back as
-//!   [`RunError::Panicked`]. Only the first such failure is kept, as
-//!   everywhere else in the crate; the rest are dropped.
-//! - [`TaskGroup::spawn`] and [`TaskGroup::dependent_async`] deliver into
-//!   their own [`AsyncHandle`], because the body the node runs is the
-//!   wrapper `AsyncHandle::for_body` built. The group never sees it, and
-//!   `corun` is quiet about it.
-//! - the two runtime-shaped handle-returning forms,
-//!   [`TaskGroup::spawn_runtime`] and
-//!   [`TaskGroup::dependent_async_runtime`], construct their node
-//!   *explicitly anchored*, which stops the walk at the child itself: the
-//!   child's own slot holds the payload and its finishing entry hands it to
-//!   the handle. That is upstream's `ESTATE::EXPLICITLY_ANCHORED` argument,
-//!   and it is what lets such a child report what failed under *it* rather
-//!   than only what its body did.
-//!
-//! A payload that reaches the anchor also marks it, and the mark is the bit
+//! A payload that reaches the anchor also marks it, and that mark is the bit
 //! the scheduler reads as cancellation -- so a failed silent child stops the
-//! children that had not started, exactly as [`TaskGroup::cancel`] would.
-//! Taking the payload clears it again, which is what makes a group usable
-//! after a `corun` has reported a failure.
+//! children that had not started, as [`TaskGroup::cancel`] would. Taking the
+//! payload clears it again, which is what makes a group usable after a
+//! `corun` has reported a failure.
 //!
 //! # Cancellation
 //!
-//! [`TaskGroup::cancel`] sets `CANCELLED` on the anchor and nothing else.
-//! Every child reads it on the way in -- `Job::is_parent_cancelled` walks the
-//! parent chain, and the anchor is the first link of every child's -- so a
-//! child that has not started does not run, while one already running runs
-//! to completion. It is cooperative, as upstream says: `cancel` is not a
-//! wait, and a caller still coruns afterwards to synchronise with what was
-//! already in flight.
+//! [`TaskGroup::cancel`] sets `CANCELLED` on the anchor and nothing else, and
+//! every child reads it on the way in -- `Job::is_parent_cancelled` walks the
+//! parent chain, whose first link is the anchor -- so a child that has not
+//! started does not run while one already running runs to completion. It is
+//! cooperative, as upstream says.
 //!
-//! One limit is worth naming, because it is this port's rather than
-//! upstream's. A cancelled child of the two *dependent* families is torn
-//! down by the skip at the top of `WorkerThread::invoke_one`, which counts
-//! the anchor down but does not drain the child's successor list the way the
-//! dependent-async arm does -- upstream's skip goes through
-//! `_tear_down_invoke` and therefore does drain it. So a chain of dependent
-//! children that is cancelled mid-flight leaves the jobs behind the cancelled
-//! link unqueued, their counts still on the anchor, and a `corun` after that
-//! does not return. Cancel a group whose outstanding children are
-//! dependent-async tasks only when they have no successors still to be
-//! released.
+//! One limit is this port's rather than upstream's. A cancelled child of the
+//! two *dependent* families is torn down by the skip at the top of
+//! `WorkerThread::invoke_one`, which counts the anchor down but does not
+//! drain the child's successor list the way the dependent-async arm does,
+//! where upstream's skip goes through `_tear_down_invoke` and therefore does.
+//! So a chain of dependent children cancelled mid-flight leaves the jobs
+//! behind the cancelled link unqueued, their counts still on the anchor, and a
+//! `corun` after that does not return: cancel a group whose outstanding
+//! children are dependent-async tasks only when they have no successors still
+//! to be released.
 //!
 //! # Eight spawning forms where upstream has four templates
 //!
-//! Upstream's four -- `async`, `silent_async`, `dependent_async`,
-//! `silent_dependent_async` -- each dispatch on the shape of the callable
-//! with `if constexpr(is_runtime_task_v<F>)`, so one name covers both a
-//! `void()` body and a `void(tf::Runtime&)` one. Rust has no overloading, so
-//! each splits into a pair and the runtime-shaped half takes the `_runtime`
-//! suffix `Executor::spawn_runtime` and `FlowBuilder::emplace_runtime`
-//! already use. `async` becomes `spawn` for the reason `executor::async`
-//! gives -- it is a reserved word -- and the other three names are
-//! upstream's verbatim.
-//!
-//! Upstream's `TaskParams` overloads collapse onto the unnamed forms, and
-//! its variadic-plus-iterator pair of dependency overloads collapses onto one
-//! `IntoIterator<Item = &AsyncTask>`, both for the reasons the two async
-//! modules give.
-//!
-//! # Where a group's children are queued, and the ceiling that sets (#119)
-//!
-//! In the executor's shared buffers, where upstream pushes onto the
-//! submitting worker's own queue -- the `if(auto w = this_worker(); w)`
-//! branch of `_schedule_async_task`. #119 gave that branch to the submitters
-//! that can name the worker running them, and a group is not one of them.
-//! Two reasons, and the second is the one that would still hold if the first
-//! were fixed:
-//!
-//! - **A group has no `WorkerThread` to hand the submission.** It holds
-//!   `worker: usize`, an id, because [`Executor::task_group`] is a call on
-//!   the *executor* made from inside a task body: the owning end of that
-//!   worker's queue is in the `WorkerThread` frame that called the body, and
-//!   a frame cannot be named by the code it called. `executor::async`'s
-//!   module docs have that argument in full; the id comes from
-//!   `this_worker_id`, which is what a thread local can carry and the owning
-//!   end is not.
-//! - **A group waits on the other end of the queue anyway.**
-//!   [`TaskGroup::corun`] takes `&self` and runs on a
-//!   `WorkerThread::corun_view`, which by construction has no owning end, so
-//!   its local pops are *steals from this worker's own queue* -- the
-//!   first-in end. Pushing children LIFO onto a queue whose waiter pops FIFO
-//!   would buy nothing: the corun would still get the oldest outstanding
-//!   subtree rather than the child it just spawned, which is the whole of the
-//!   mechanism. A [`Runtime`] differs in exactly this: its `corun` holds the
-//!   `&mut WorkerThread` and pops the owning end, so push and pop are the
-//!   same LIFO end.
-//!
-//! So a group keeps the lower ceiling, and it is a **stack-depth** ceiling
-//! rather than a correctness one -- every child runs, at any worker count.
-//! Measured against a worker's default 2 MiB stack, in the debug build
-//! `cargo test` uses: the recursive Fibonacci of `tests/task_group.rs`
-//! passes at `fib(15)` and overflows at `fib(16)`, and its two sorts pass at
-//! 2000 elements and overflow at 3000. In a release build the same recursion
-//! passes `fib(17)` at one worker and `fib(23)` at twenty-four, which is
-//! `BENCHMARKS.md`'s `fibonacci` table. Upstream's `fib(25)` is therefore out
-//! of reach through a group, and `tests/task_group.rs` ships inputs a factor
-//! of two inside the cliff with the figures in its header.
-//!
-//! Lifting it would mean one of two things, both outside this port's rules as
-//! they stand: a thread local holding a pointer into another frame's
-//! `WorkerThread`, which is the `!Sync` argument `executor::queue` rests on
-//! given away for an `unsafe` block; or a second constructor on
-//! [`Runtime`] handing out a group that borrows the worker mutably, which is
-//! public API upstream does not have -- its `TaskGroup` comes from the
-//! executor and nowhere else.
-//!
-//! # Why a group cannot leave its worker
-//!
-//! Upstream deletes `TaskGroup`'s copy *and* move constructors, so a group
-//! cannot escape the scope that opened it. The same statement here is that
-//! [`TaskGroup`] is neither [`Send`] nor [`Sync`], and it matters for one
-//! reason: the group remembers which worker opened it, because that is the
-//! worker upstream's `corun` hands to `_corun_until`, and a group that could
-//! be moved to another thread could corun on a worker id that is not the
-//! calling thread's. Keeping it on its own thread is also what makes
-//! [`TaskGroup::executor`] free, where a `Runtime` cannot have one at all.
+//! Upstream's four each dispatch on the shape of the callable with
+//! `if constexpr(is_runtime_task_v<F>)`, so one name covers both a `void()`
+//! body and a `void(tf::Runtime&)` one. Rust has no overloading, so each
+//! splits into a pair and the runtime-shaped half takes the `_runtime` suffix
+//! `Executor::spawn_runtime` and `FlowBuilder::emplace_runtime` already use.
+//! `async` becomes `spawn` for the reason `DESIGN.md` gives, and the other
+//! three names are upstream's verbatim. Its `TaskParams` overloads collapse
+//! onto the unnamed forms and its variadic-plus-iterator dependency overloads
+//! onto one `IntoIterator<Item = &AsyncTask>`, both as the two async modules
+//! have them.
 
 use std::any::Any;
 use std::fmt;
@@ -225,12 +115,12 @@ use std::sync::atomic::Ordering;
 
 use crate::async_task::AsyncTask;
 use crate::executor::Executor;
-use crate::executor::r#async::{AsyncHandle, ESTATE_NONE};
+use crate::executor::r#async::{AsyncHandle, Spawn, Submission};
 use crate::executor::corun::CorunError;
 use crate::executor::run_handle::RunError;
-use crate::executor::topology::{Cancellable, Nested, Parent};
+use crate::executor::topology::{Cancellable, Nested};
 use crate::executor::worker::WorkerThread;
-use crate::graph::{AsyncWork, Node};
+use crate::graph::Node;
 use crate::runtime::Runtime;
 
 impl Executor {
@@ -239,8 +129,7 @@ impl Executor {
     ///
     /// Upstream's `Executor::task_group`. The group borrows this executor for
     /// as long as it lives, submits its children to it, and is **not**
-    /// counted in [`Executor::wait_for_all`]'s work -- the module docs have
-    /// which counter waits for what.
+    /// counted in [`Executor::wait_for_all`]'s work.
     ///
     /// ```
     /// use std::sync::Arc;
@@ -307,35 +196,26 @@ impl Executor {
 /// on the opening worker without taking that worker out of the pool;
 /// [`TaskGroup::cancel`] stops the ones that have not started.
 ///
-/// # Dropping a group does not join it
-///
-/// There is no implicit join: dropping a group with children outstanding
-/// leaves them running, with nothing waiting for them and a failure of one of
-/// them reported to nobody. That is upstream's behaviour -- its `TaskGroup`
-/// has no destructor either -- minus the undefined behaviour, since the
-/// anchor here is shared with every child rather than being a value on the
-/// opening frame. A caller who wants the join calls [`TaskGroup::corun`]
-/// before the group goes out of scope, which is also the only place a child's
-/// panic can be reported. The module docs argue the decision.
+/// **Dropping a group does not join it.** Children outstanding at that point
+/// keep running, with nothing waiting for them and a failure of one of them
+/// reported to nobody -- upstream's behaviour, minus the undefined behaviour,
+/// for the reason the module docs give. A caller who wants the join calls
+/// [`TaskGroup::corun`] before the group goes out of scope, which is also the
+/// only place a child's panic can be reported.
 ///
 /// Neither [`Send`] nor [`Sync`], which is upstream's deleted copy and move
-/// constructors: a group belongs to the worker that opened it, and the module
-/// docs say what would go wrong if it could leave.
+/// constructors: a group belongs to the worker that opened it.
 pub struct TaskGroup<'a> {
     /// The executor that opened this group, upstream's `Executor& _executor`:
     /// where every child is submitted and whose pool the corun runs on.
     executor: &'a Executor,
     /// The id of the worker that opened the group, upstream's `Worker&
     /// _worker`: the worker whose scheduling loop [`TaskGroup::corun`]
-    /// re-enters, which is the one this group was opened on.
+    /// re-enters.
     worker: usize,
     /// What the children count down and what a failure under them lands on:
-    /// upstream's `NodeBase _node_base`, as the `Parent::Nested` with no
-    /// resume job the module docs describe.
-    ///
-    /// Shared rather than owned by this value, because every job of every
-    /// child holds a share of it -- which is what makes a group that is
-    /// dropped with work outstanding merely unjoined rather than undefined.
+    /// upstream's `NodeBase _node_base`, shared rather than owned by this
+    /// value because every job of every child holds a share.
     anchor: Arc<Nested>,
     /// What makes the group neither [`Send`] nor [`Sync`]: upstream's deleted
     /// move and copy constructors, in the one vocabulary Rust has for it.
@@ -350,19 +230,15 @@ impl<'a> TaskGroup<'a> {
     /// Opens a group on `worker` of `executor`: upstream's private
     /// constructor, with `friend class Executor` spelled as the module
     /// boundary.
-    ///
-    /// The anchor is born `IMPLICITLY_ANCHORED`, which is upstream's own
-    /// initialiser and not an afterthought: a child can fail before this
-    /// call's caller has done anything with the group, and the bit is what
-    /// decides whether that payload has somewhere to go.
     fn new(executor: &'a Executor, worker: usize) -> Self {
         let anchor = Nested::new(None);
 
-        // Upstream's `NSTATE::IMPLICITLY_ANCHORED` constructor argument. In
-        // `nstate` rather than `estate` because that is the word upstream
-        // puts it in and the word `Job::record_panic` reads it from; the
-        // explicit bit, which this anchor also takes for the length of a
-        // corun, lives in the other one.
+        // Upstream's `NSTATE::IMPLICITLY_ANCHORED` constructor argument, and
+        // not an afterthought: a child can fail before this call's caller has
+        // done anything with the group, and the bit is what decides whether
+        // that payload has somewhere to go. In `nstate` rather than `estate`
+        // because that is the word upstream puts it in and the word
+        // `Job::record_panic` reads it from.
         anchor
             .base()
             .nstate()
@@ -380,11 +256,9 @@ impl<'a> TaskGroup<'a> {
     /// `TaskGroup::executor`.
     ///
     /// Available here where `Runtime::num_workers` has to stand in for it on
-    /// a runtime handle, and for the reason `crate::runtime`'s docs give: a
-    /// worker thread holds the executor's shared state rather than the
-    /// `Executor` value, so a handle built *by* a worker cannot name one --
-    /// but a group is built by a call on the value itself, which is sitting
-    /// right there in the caller's hands.
+    /// a runtime handle, and for the reason `DESIGN.md` gives: a group is
+    /// built by a call on the `Executor` value itself, so the borrow it keeps
+    /// is the caller's own and no back-pointer is involved.
     #[must_use]
     pub fn executor(&self) -> &'a Executor {
         self.executor
@@ -394,16 +268,13 @@ impl<'a> TaskGroup<'a> {
     /// result.
     ///
     /// Upstream's `TaskGroup::async`, under [`Executor::spawn`]'s name. The
-    /// task is submitted to the executor exactly as that call's is, with one
-    /// difference and it is the point of a group: the child is parented to
-    /// the anchor, so [`TaskGroup::corun`] waits for it and
-    /// [`TaskGroup::cancel`] can stop it before it starts.
-    ///
-    /// The [`AsyncHandle`] behaves as [`Executor::spawn`]'s does, including
-    /// that dropping it detaches -- the task still runs, and the group still
-    /// waits for it -- and that a panic out of `body` is **this handle's**
-    /// failure rather than the group's. The module docs have the whole of
-    /// which failure reaches which waiter.
+    /// task is submitted exactly as that call's is, with one difference and it
+    /// is the point of a group: the child is parented to the anchor, so
+    /// [`TaskGroup::corun`] waits for it and [`TaskGroup::cancel`] can stop it
+    /// before it starts. The [`AsyncHandle`] behaves as [`Executor::spawn`]'s
+    /// does, including that dropping it detaches -- the task still runs, and
+    /// the group still waits for it -- and that a panic out of `body` is
+    /// **this handle's** failure rather than the group's.
     ///
     /// ```
     /// use std::sync::Arc;
@@ -437,14 +308,10 @@ impl<'a> TaskGroup<'a> {
         R: Send + 'static,
         F: FnOnce() -> R + Send + 'static,
     {
-        // Upstream's `std::packaged_task<R()>` and the `get_future()` beside
-        // it, through the one seam in the crate that builds a handle: what
-        // the group adds to `Executor::spawn` is the parent, and nothing
-        // else.
-        let (wrapper, handle) = AsyncHandle::for_body(body);
-        self.executor
-            .schedule_async_task(AsyncWork::plain(wrapper), &self.parent(), ESTATE_NONE);
-        handle
+        self.executor.shared.schedule_async_task(
+            Spawn::handled(body),
+            &Submission::under_anchor(&self.anchor),
+        )
     }
 
     /// Runs `body` as a task of this group, with no handle on it at all.
@@ -457,9 +324,8 @@ impl<'a> TaskGroup<'a> {
     ///
     /// A panic out of `body` lands on the **group's anchor**, where
     /// [`TaskGroup::corun`] re-raises it and [`TaskGroup::try_corun`] reports
-    /// it, and it stops the children of this group that had not started. That
-    /// is the one way a group is louder than [`Executor::silent_async`],
-    /// whose panic has nothing above it to reach and is dropped.
+    /// it, and it stops the children that had not started -- the one way a
+    /// group is louder than [`Executor::silent_async`].
     ///
     /// ```
     /// use std::sync::Arc;
@@ -505,23 +371,21 @@ impl<'a> TaskGroup<'a> {
         F: FnOnce() + Send + 'static,
     {
         self.executor
-            .schedule_async_task(AsyncWork::plain(body), &self.parent(), ESTATE_NONE);
+            .shared
+            .schedule_async_task(Spawn::silent(body), &Submission::under_anchor(&self.anchor));
     }
 
     /// Runs `body` as a task of this group, handing it the scheduler, and
     /// hands back a handle on its completion.
     ///
     /// The runtime-shaped half of [`TaskGroup::spawn`]: upstream's
-    /// `TaskGroup::async` over a `[](tf::Runtime&){}` body, which is the
-    /// `is_runtime_task_v<F>` branch of its `_async`. Everything
+    /// `TaskGroup::async` over a `[](tf::Runtime&){}` body. Everything
     /// [`Executor::spawn_runtime`] says about the body and about the handle
     /// carrying no value holds here, and what the group adds is the parent.
-    ///
-    /// The child's node is **explicitly anchored**, which is upstream's
-    /// estate argument for this form: a failure under the child -- its own
-    /// body, or anything the body spawned -- is reported through the handle
-    /// rather than to the group, so a `corun` of this group stays quiet about
-    /// it. The module docs' failure section has the four cases side by side.
+    /// The child's node is **explicitly anchored**, upstream's estate
+    /// argument for this form, so a failure under the child -- its own body,
+    /// or anything it spawned -- is reported through the handle rather than to
+    /// the group.
     ///
     /// ```
     /// use std::sync::Arc;
@@ -549,10 +413,10 @@ impl<'a> TaskGroup<'a> {
     where
         F: for<'r> FnOnce(&mut Runtime<'r>) + Send + 'static,
     {
-        let (work, handle) = reentrant_work(body);
-        self.executor
-            .schedule_async_task(work, &self.parent(), Cancellable::EXPLICITLY_ANCHORED);
-        handle
+        self.executor.shared.schedule_async_task(
+            Spawn::handled_runtime(body),
+            &Submission::under_anchor(&self.anchor),
+        )
     }
 
     /// Runs `body` as a task of this group, handing it the scheduler, with no
@@ -562,14 +426,16 @@ impl<'a> TaskGroup<'a> {
     /// `TaskGroup::silent_async` over a `[](tf::Runtime&){}` body. There is
     /// no second entry, as [`Executor::silent_async_runtime`] explains, and a
     /// panic out of `body` or out of anything it spawned lands on the
-    /// **group's anchor** -- this is the runtime-shaped form a `corun` reports
-    /// for.
+    /// **group's anchor** -- this is the runtime-shaped form a `corun`
+    /// reports for.
     pub fn silent_async_runtime<F>(&self, body: F)
     where
         F: for<'r> FnOnce(&mut Runtime<'r>) + Send + 'static,
     {
-        self.executor
-            .schedule_async_task(AsyncWork::runtime(body), &self.parent(), ESTATE_NONE);
+        self.executor.shared.schedule_async_task(
+            Spawn::silent_runtime(body),
+            &Submission::under_anchor(&self.anchor),
+        );
     }
 
     /// Runs `body` as a task of this group once every task in `dependencies`
@@ -577,15 +443,11 @@ impl<'a> TaskGroup<'a> {
     /// result.
     ///
     /// Upstream's `TaskGroup::dependent_async`. Everything
-    /// [`Executor::dependent_async`] says about naming dependencies holds --
-    /// they may be named from any thread, a finished one is not waited for,
-    /// an empty handle names nothing -- and what the group adds is the
-    /// parent, so that `corun` covers the whole chain rather than only the
-    /// task whose handle a caller happens to hold.
-    ///
-    /// A panic out of `body` goes into the [`AsyncHandle`] and not to the
-    /// group, as [`TaskGroup::spawn`]'s does, and it does not cancel the
-    /// tasks that depend on this one.
+    /// [`Executor::dependent_async`] says about naming dependencies holds,
+    /// and what the group adds is the parent, so that `corun` covers the whole
+    /// chain rather than only the task whose handle a caller happens to hold.
+    /// A panic out of `body` goes into the [`AsyncHandle`] as
+    /// [`TaskGroup::spawn`]'s does, and cancels nothing.
     ///
     /// ```
     /// use std::sync::Arc;
@@ -620,14 +482,11 @@ impl<'a> TaskGroup<'a> {
         R: Send + 'static,
         F: FnOnce() -> R + Send + 'static,
     {
-        let (wrapper, handle) = AsyncHandle::for_body(body);
-        let task = self.executor.schedule_dependent_async_task(
-            AsyncWork::plain(wrapper),
-            &self.parent(),
-            ESTATE_NONE,
+        self.executor.shared.schedule_dependent_async_task(
+            Spawn::handled(body),
+            &Submission::under_anchor(&self.anchor),
             dependencies,
-        );
-        (task, handle)
+        )
     }
 
     /// Runs `body` as a task of this group once every task in `dependencies`
@@ -635,12 +494,9 @@ impl<'a> TaskGroup<'a> {
     ///
     /// Upstream's `TaskGroup::silent_dependent_async`, and the form a chain
     /// is built out of: the [`AsyncTask`] it hands back is what names this
-    /// task as the dependency of the next one.
-    ///
-    /// A panic out of `body` is kept on the task, where
-    /// [`AsyncTask::take_panic`] hands it back, **and** reaches the group's
-    /// anchor -- the module docs' failure section says which of the two slots
-    /// each form writes.
+    /// task as the dependency of the next one. A panic out of `body` is kept
+    /// on the task, where [`AsyncTask::take_panic`] hands it back, **and**
+    /// reaches the group's anchor.
     ///
     /// ```
     /// use std::sync::Arc;
@@ -686,12 +542,14 @@ impl<'a> TaskGroup<'a> {
     where
         F: FnOnce() + Send + 'static,
     {
-        self.executor.schedule_dependent_async_task(
-            AsyncWork::plain(body),
-            &self.parent(),
-            ESTATE_NONE,
-            dependencies,
-        )
+        self.executor
+            .shared
+            .schedule_dependent_async_task(
+                Spawn::silent(body),
+                &Submission::under_anchor(&self.anchor),
+                dependencies,
+            )
+            .0
     }
 
     /// Runs `body` as a task of this group once every task in `dependencies`
@@ -711,14 +569,11 @@ impl<'a> TaskGroup<'a> {
     where
         F: for<'r> FnOnce(&mut Runtime<'r>) + Send + 'static,
     {
-        let (work, handle) = reentrant_work(body);
-        let task = self.executor.schedule_dependent_async_task(
-            work,
-            &self.parent(),
-            Cancellable::EXPLICITLY_ANCHORED,
+        self.executor.shared.schedule_dependent_async_task(
+            Spawn::handled_runtime(body),
+            &Submission::under_anchor(&self.anchor),
             dependencies,
-        );
-        (task, handle)
+        )
     }
 
     /// Runs `body` as a task of this group once every task in `dependencies`
@@ -735,12 +590,14 @@ impl<'a> TaskGroup<'a> {
     where
         F: for<'r> FnOnce(&mut Runtime<'r>) + Send + 'static,
     {
-        self.executor.schedule_dependent_async_task(
-            AsyncWork::runtime(body),
-            &self.parent(),
-            ESTATE_NONE,
-            dependencies,
-        )
+        self.executor
+            .shared
+            .schedule_dependent_async_task(
+                Spawn::silent_runtime(body),
+                &Submission::under_anchor(&self.anchor),
+                dependencies,
+            )
+            .0
     }
 
     /// Waits for every task of this group on the opening worker, without
@@ -750,12 +607,10 @@ impl<'a> TaskGroup<'a> {
     /// the worker stays in the work-stealing loop -- running this group's
     /// children, and anybody else's work it can steal -- until the anchor's
     /// join counter is back to zero. Nothing parks, so a group nested inside
-    /// another group's child costs the pool no threads and recursion is
-    /// bounded by the stack rather than by the worker count.
-    /// [`Executor::corun`]'s docs have what parking instead would do.
-    ///
-    /// It may be called any number of times, as upstream's own example does:
-    /// each call waits for whatever is outstanding when it starts.
+    /// another group's child costs the pool no threads, and
+    /// [`Executor::corun`]'s docs have what parking instead would do. It may
+    /// be called any number of times, as upstream's own example does: each
+    /// call waits for whatever is outstanding when it starts.
     ///
     /// # Panics
     ///
@@ -764,13 +619,11 @@ impl<'a> TaskGroup<'a> {
     /// payload keeps its identity, because it goes through
     /// [`resume_unwind`](panic::resume_unwind) rather than being re-panicked,
     /// so the task body that called `corun` can catch exactly what the child
-    /// panicked with -- or not, in which case the executor catches it where
-    /// it catches any other failing task. Taking the payload clears the
-    /// anchor, so a group whose failure has been reported is usable again.
+    /// panicked with. Taking the payload clears the anchor, so a group whose
+    /// failure has been reported is usable again.
     ///
     /// [`TaskGroup::try_corun`] is the same wait with that failure as an
-    /// `Err` instead. The module docs say which children can fail this way
-    /// and which report to their own handle.
+    /// `Err` instead.
     pub fn corun(&self) {
         if let Some(payload) = self.corun_payload() {
             // Upstream's `_node_base._rethrow_exception()`, and the last line
@@ -784,10 +637,9 @@ impl<'a> TaskGroup<'a> {
     /// error rather than raising it.
     ///
     /// [`TaskGroup::corun`] with the one difference the name says, and the
-    /// pair every other waiting surface in the crate has -- `Executor::corun`
-    /// and `Executor::try_corun`, `Runtime::corun` and `Runtime::try_corun`.
-    /// Reach for this one to inspect or ignore the failure, and for `corun`
-    /// to let it propagate as the calling task's own.
+    /// pair every other waiting surface in the crate has. Reach for this one
+    /// to inspect or ignore the failure, and for `corun` to let it propagate
+    /// as the calling task's own.
     ///
     /// # Errors
     ///
@@ -807,16 +659,17 @@ impl<'a> TaskGroup<'a> {
     /// Both shapes of corun, up to what is done with the payload.
     ///
     /// Upstream's `corun` body exactly: the explicit-anchor guard, the wait
-    /// on the anchor's counter, and then the payload -- in that order, and
-    /// the order is the whole of it. The guard is what makes a failure
-    /// *during* the wait land on this anchor rather than on whatever is
-    /// above, and it is released before the payload is taken so that the
-    /// bit is already clear when the caller decides what to do.
+    /// on the anchor's counter, and then the payload -- in that order, and the
+    /// order is the whole of it. The guard is what makes a failure *during*
+    /// the wait land on this anchor rather than on whatever is above, and it
+    /// is released before the payload is taken so that the bit is already
+    /// clear when the caller decides what to do.
     ///
-    /// The worker is the one that opened the group, which is upstream's
-    /// `_executor._corun_until(_worker, ...)`. A `WorkerThread::corun_view`
-    /// of it rather than the real frame, for `Executor::corun_until`'s
-    /// reason: a task body cannot name the frame running it.
+    /// The worker is the one that opened the group, upstream's
+    /// `_executor._corun_until(_worker, ...)`, through a
+    /// `WorkerThread::corun_view` rather than the real frame for
+    /// `Executor::corun_until`'s reason: a task body cannot name the frame
+    /// running it.
     fn corun_payload(&self) -> Option<Box<dyn Any + Send>> {
         {
             let _anchor = self.anchor.base().anchor_explicitly();
@@ -831,20 +684,15 @@ impl<'a> TaskGroup<'a> {
     /// Stops the tasks of this group that have not started.
     ///
     /// Upstream's `TaskGroup::cancel`, which is one `fetch_or` of
-    /// `ESTATE::CANCELLED` on the anchor and nothing more. Every child reads
-    /// that bit on its way in, so one that has not been picked up does not
-    /// run; a child already running runs to completion, because cancellation
-    /// is cooperative here as everywhere else in the crate.
+    /// `ESTATE::CANCELLED` on the anchor and nothing more: a child that has
+    /// not been picked up does not run, and one already running runs to
+    /// completion, cancellation being cooperative here as everywhere else in
+    /// the crate.
     ///
-    /// It is **not** a wait. A caller still coruns afterwards to synchronise
-    /// with the children that were already in flight, and
-    /// [`TaskGroup::corun`] is how the group is left in a state where nothing
-    /// of it is outstanding. Tasks spawned into a cancelled group do not run
-    /// either, and the bit is never cleared: a cancelled group stays
-    /// cancelled.
-    ///
-    /// The module docs have the one limit this port has and upstream does
-    /// not, which is about cancelling a chain of *dependent* children.
+    /// It is **not** a wait, so a caller still coruns afterwards to
+    /// synchronise with the children that were already in flight. Tasks
+    /// spawned into a cancelled group do not run either, and the bit is never
+    /// cleared: a cancelled group stays cancelled.
     pub fn cancel(&self) {
         self.anchor
             .base()
@@ -856,13 +704,11 @@ impl<'a> TaskGroup<'a> {
     ///
     /// Upstream's `TaskGroup::is_cancelled`, over upstream's mask: the
     /// `CANCELLED` bit alone, and not the `EXCEPTION` the scheduler reads as
-    /// the same thing. So a group whose silent child panicked answers `false`
-    /// here even though its remaining children are being skipped -- that is a
-    /// failure for [`TaskGroup::corun`] to report, not a cancellation, and
-    /// taking the payload clears it.
-    ///
-    /// Says nothing about whether anything has finished: a cancelled group
-    /// still has to be corun.
+    /// the same thing -- so a group whose silent child panicked answers
+    /// `false` here even though its remaining children are being skipped,
+    /// that being a failure for [`TaskGroup::corun`] to report rather than a
+    /// cancellation. It says nothing about whether anything has finished: a
+    /// cancelled group still has to be corun.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.anchor.base().estate().load(Ordering::Relaxed) & Cancellable::CANCELLED != 0
@@ -870,32 +716,21 @@ impl<'a> TaskGroup<'a> {
 
     /// How many tasks of this group are still outstanding.
     ///
-    /// Upstream's `TaskGroup::size`, and upstream's warning with it: the
-    /// value is a snapshot that may be stale before it is read, since
-    /// children are being spawned, started, finished and skipped while this
-    /// runs. It is for diagnostics, and the thing to synchronise with is
-    /// [`TaskGroup::corun`].
-    ///
-    /// Zero on a group nothing has been spawned into, and zero again after a
-    /// `corun` returns.
+    /// Upstream's `TaskGroup::size`, and upstream's warning with it: the value
+    /// is a snapshot that may be stale before it is read, children being
+    /// spawned, started, finished and skipped while this runs. It is for
+    /// diagnostics, and the thing to synchronise with is
+    /// [`TaskGroup::corun`]. Zero on a group nothing has been spawned into,
+    /// and zero again after a `corun` returns.
     #[must_use]
     pub fn size(&self) -> usize {
         self.anchor.outstanding()
-    }
-
-    /// The parent to submit a child under: upstream's `&_node_base`.
-    ///
-    /// A share per child, which is what keeps the anchor alive for as long as
-    /// any job of any child does -- the Drop decision rests on exactly this.
-    fn parent(&self) -> Parent {
-        self.anchor.as_parent()
     }
 }
 
 impl fmt::Debug for TaskGroup<'_> {
     /// Hand-written, because what is worth printing about a group is what it
-    /// is waiting for rather than the executor it borrows: the two words
-    /// `size` and `is_cancelled` read, plus the worker it belongs to.
+    /// is waiting for rather than the executor it borrows.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TaskGroup")
             .field("worker", &self.worker)
@@ -903,34 +738,6 @@ impl fmt::Debug for TaskGroup<'_> {
             .field("cancelled", &self.is_cancelled())
             .finish()
     }
-}
-
-/// `body` as the work of a runtime-shaped child somebody is waiting on, and
-/// the handle they wait on: upstream's `std::promise<void> p; auto
-/// fu{p.get_future()};` plus the `reentered` branch that delivers
-/// `rt._node->_exception_ptr` into it.
-///
-/// The pair `Executor::spawn_runtime` builds inline, factored out here
-/// because this module has two callers for it --
-/// [`TaskGroup::spawn_runtime`] and [`TaskGroup::dependent_async_runtime`] --
-/// which differ only in which submission they hand the work to. It builds no
-/// handle of its own: `AsyncHandle::pending` is the seam, and the writing end
-/// of that slot is what a runtime-shaped task needs, because its outcome is
-/// decided on the entry that *finishes* the node out of that node's payload
-/// slot rather than by what the body returned.
-fn reentrant_work<F>(body: F) -> (AsyncWork, AsyncHandle<()>)
-where
-    F: for<'r> FnOnce(&mut Runtime<'r>) + Send + 'static,
-{
-    let (handle, delivery) = AsyncHandle::pending();
-    let complete = move |payload: Option<Box<dyn Any + Send>>| {
-        // Upstream's `eptr ? p.object.set_exception(eptr) : p.object.set_value()`.
-        delivery.deliver(match payload {
-            Some(payload) => Err(RunError::Panicked(payload)),
-            None => Ok(()),
-        });
-    };
-    (AsyncWork::reentrant(body, complete), handle)
 }
 
 #[cfg(test)]

@@ -5,161 +5,66 @@
 //! defines out of line, plus the scheduling methods of `tf::Runtime` --
 //! `schedule`, `corun`, `corun_all` and `is_cancelled`. The `RUNTIME` arm of
 //! `_invoke` in `taskflow/core/executor.hpp` is one line into [`invoke`]
-//! below, as the module arm is into [`module`](crate::executor::module). The
-//! shell of [`Runtime`](crate::Runtime) is `src/runtime.rs`, which says what
-//! the handle holds and why it cannot hand back an executor.
+//! below. The shell of [`Runtime`] is `src/runtime.rs`, which says what the
+//! handle holds and why it cannot hand back an executor.
 //!
-//! # Three body shapes, one protocol
+//! # Design
 //!
-//! A runtime task of a graph is one of them. The other two are the
-//! runtime-shaped *async* bodies: upstream's
-//! `std::function<void(tf::Runtime&)>` and
-//! `std::function<void(tf::Runtime&, bool)>` alternatives, which are cases 1
-//! and 2 of `_invoke_async_task` in `taskflow/core/executor.hpp` and which it
-//! dispatches to the very same pair of `_invoke_runtime_task_impl`
-//! overloads. [`invoke_async`] is that dispatch, and the submitting calls are
-//! the `is_runtime_task_v<F>` branches of `_async` and `_silent_async` in
-//! `taskflow/core/async.hpp` -- ported as [`Executor::spawn_runtime`] and
-//! [`Executor::silent_async_runtime`] in the second `impl Executor` block
-//! below rather than beside the plain forms in `executor::async`, because
-//! what is interesting about them is the protocol in the next section and not
-//! the submission, which is `executor::async`'s own
-//! `Executor::schedule_async_task` called with one more argument.
-//!
-//! The `void(Runtime&, bool)` shape is the one that is *called* twice.
-//! Upstream hands one lambda a `reentered` flag: `false` to run the user's
-//! body, `true` to read `rt._node->_exception_ptr` into the promise behind
-//! the future. This port splits that into the two `FnOnce`s
-//! [`AsyncWork::Reentrant`] holds, for the reason that variant's own docs
-//! give, and [`invoke_async`] runs `body` on the first entry and `complete`
-//! on the entry that **finishes** the node -- the second one when the body
-//! left work outstanding, the first one when it did not. That is upstream's
-//! `work(rt, true)` after its `if`/`else`: exactly once, whichever branch
-//! got there.
-//!
-//! # A runtime task is the parent of its own children
+//! Three body shapes share one protocol. A runtime task of a graph is one of
+//! them; the other two are the runtime-shaped *async* bodies, upstream's
+//! `void(tf::Runtime&)` and `void(tf::Runtime&, bool)` alternatives, which
+//! are cases 1 and 2 of `_invoke_async_task` and which it dispatches to the
+//! very same pair of overloads. [`invoke_async`] is that dispatch, and the
+//! submitting calls for those two shapes are the `is_runtime_task_v<F>`
+//! branches of `_async` and `_silent_async` -- here rather than beside the
+//! plain forms in `executor::async` because what is particular to them is
+//! this protocol and not the submission, which is one delegation like every
+//! other in the family.
 //!
 //! The protocol is the preemption protocol the [`executor`](crate::executor)
-//! module docs set out, with one difference from a module or subflow task:
+//! module docs set out, with one difference from a module or a subflow task:
 //! what the node waits for is not a *graph* but however much asynchronous
-//! work the body chose to spawn, so the count cannot be known before the
-//! body has run. Upstream's answer is to make the body itself one reference:
+//! work the body chose to spawn, so the count cannot be known before the body
+//! has run. Upstream's answer is to make the body itself one reference. The
+//! first entry sets `PREEMPTED | IMPLICITLY_ANCHORED` and raises the node's
+//! own join counter **before** the body runs, because a child the body spawns
+//! raises that same counter and the bits are what tell the last child to
+//! re-queue this node; then it spends its own reference, which either finds
+//! nothing else outstanding -- the bits come off and the node finishes like a
+//! static task -- or leaves the node owned by children that are still
+//! running, the last of which re-queues the job it was dequeued as.
 //!
-//! 1. the first entry sets `PREEMPTED | IMPLICITLY_ANCHORED` and bumps the
-//!    node's own join counter by one, **before** the body runs -- a child the
-//!    body spawns raises that same counter, and the bits are what tell the
-//!    last child to re-queue this node;
-//! 2. the body runs, under the `catch_unwind` that every other task body runs
-//!    under;
-//! 3. the first entry then spends its own reference. If it was the last one,
-//!    nothing the body spawned is outstanding, so the bits come off and the
-//!    node finishes like a static task. If it was not, the children still
-//!    running own the node: it stays preempted, and the last of them to
-//!    finish re-queues the job it was dequeued as.
+//! The `void(Runtime&, bool)` shape is the one that is *called* twice:
+//! upstream hands one lambda a `reentered` flag, `false` to run the user's
+//! body and `true` to read `rt._node->_exception_ptr` into the promise behind
+//! the future. This port splits that into the two `FnOnce`s
+//! [`AsyncWork::Reentrant`] holds, and [`invoke_async`] runs `complete` on
+//! the entry that **finishes** the node -- the second one when the body left
+//! work outstanding, the first one when it did not, which is upstream's
+//! `work(rt, true)` after its `if`/`else`: exactly once, whichever branch got
+//! there.
 //!
-//! The `IMPLICITLY_ANCHORED` bit is what makes the node an anchor of last
-//! resort while that is going on -- `Job::record_panic` in the crate-private
-//! `executor::topology` is the walk that reads it, and issue #48 ported it
-//! for this arm to be the first to set it. A payload that reaches the node's
-//! slot is taken by [`Runtime::try_corun`]; one that nobody takes is dropped
-//! by the next `set_up_graph` of that graph, which is upstream's behaviour
-//! too.
+//! Two consequences are worth stating where no signature shows them. The arm
+//! answers with a value rather than letting its caller read `nstate` back,
+//! which is upstream's own comment on returning a `bool`: the instant the
+//! join counter drops to something non-zero a child may finish, re-queue this
+//! node and have another worker clear those very bits, so the answer has to
+//! be what the first entry computed while it still held a reference. And
+//! [`Runtime::try_corun`] waits for the counter to come back to **one**, that
+//! one being the body's own reference, which is upstream's predicate exactly
+//! -- so a body that spawned nothing returns at once, and what raises the
+//! counter above one is the `async` family in `executor::runtime_async`,
+//! where a task the body [`schedule`](Runtime::schedule)s is counted against
+//! the node's own parent and is a sibling rather than a child.
 //!
-//! # What a failure under each of the three shapes reaches
-//!
-//! Upstream constructs the node of the handle-returning async form
-//! `ESTATE::EXPLICITLY_ANCHORED` and the silent one `ESTATE::NONE`, and that
-//! one argument is the whole of the difference in what a caller sees:
-//!
-//! - [`Executor::spawn_runtime`]'s node is explicitly anchored from the
-//!   moment it is constructed, rather than for the length of a wait as
-//!   [`Runtime::try_corun`]'s guard is. So the panic walk stops *there* for
-//!   anything that fails under it -- the body itself, and a child the body
-//!   spawned (#92) -- and leaves the payload in the node's own slot.
-//!   `complete` reads that slot on the finishing entry and hands it to
-//!   [`AsyncHandle::wait`](crate::AsyncHandle::wait) as
-//!   [`RunError::Panicked`], which is upstream's `set_exception`.
-//!
-//!   One wrinkle, and it is upstream's too: a [`Runtime::corun`] inside such
-//!   a body takes the explicit-anchor *guard* over the same bit, and that
-//!   guard clears the bit on the way out -- upstream's
-//!   `ExplicitAnchorGuard` destructor is an unconditional
-//!   `fetch_and(~EXPLICITLY_ANCHORED)`, not a restore. It costs nothing,
-//!   because the node that has just lost the explicit bit still carries the
-//!   implicit one for as long as it is entered, and both anchors are the
-//!   same `NodeBase`: a later failure under it lands in the same slot, which
-//!   is the slot `complete` reads.
-//! - [`Executor::silent_async_runtime`]'s node carries no estate bit and is
-//!   an anchor only in the implicit sense above, only while it is entered.
-//!   A payload that lands in its slot is dropped with the node, because
-//!   there is no handle to read it from -- the answer
-//!   [`Executor::silent_async`](crate::Executor::silent_async) gives for a
-//!   plain body, and upstream's.
-//! - A runtime task of a graph is neither: its failure goes up the chain to
-//!   whatever is waiting for that graph, which for a top-level task is the
-//!   run.
-//!
-//! What a free node must never do is claim the sentinel run at the root of
-//! its chain, which is issue #105 and is `Job::record_panic`'s to get right
-//! rather than this module's: the two submitting calls below pass
-//! [`Parent::Run`] over that sentinel, exactly as the plain forms do.
-//!
-//! # Why the arm answers with a boolean rather than the state word
-//!
-//! Upstream returns a `bool` from `_invoke_runtime_task_impl` and says why in
-//! a comment: the caller cannot read `node->_nstate` to find out whether the
-//! node was preempted, because the instant the join counter above drops to
-//! something non-zero a child may finish, re-queue this node and have another
-//! worker clear those very bits -- so the caller's read would race the
-//! second entry's write. The answer therefore has to be a value the first
-//! entry computed while it still held a reference, which is exactly what the
-//! [`Option<Release>`](Release) this arm returns is: `None` is upstream's
-//! `true`.
-//!
-//! # What a corun waits for
-//!
-//! [`Runtime::corun`] waits for the node's join counter to come back to
-//! **one** -- the body's own reference, the one step 1 added -- which is
-//! upstream's predicate exactly. What raises it above one is the `async`
-//! family of [`Runtime`], which is `executor::runtime_async` (#92): each
-//! child a body spawns is counted against *this* node, where a task the body
-//! [`schedule`](Runtime::schedule)s is counted against the node's own parent
-//! and is therefore a sibling rather than a child. So the preemption branch
-//! above is reached by any body that spawns and does not wait, and the corun
-//! predicate has something to wait for in any body that spawns and does.
-//!
-//! The cases at the bottom of this file still drive one thing by hand, and
-//! the reason has moved: a free node's own submission is counted in
-//! `num_topologies`, so the pool's workers sweep the buffers while such a
-//! case runs and would race it for the child. A case about a *graph's*
-//! runtime node has no such count and drives real children --
-//! `executor::runtime_async` has those, and the helper there says why the
-//! pool cannot interfere.
-//!
-//! # Scheduling a sibling, and the same-graph limit
-//!
-//! [`Runtime::schedule`] is upstream's `schedule`: it puts an *active* task
-//! -- a task of a running taskflow -- straight onto this worker's queue,
-//! bypassing the graph's dependencies. Upstream takes a `tf::Task`, which is
-//! a pointer to the node, and reaches the node's parent through it. A
-//! [`Task`] here is an index into one arena, so the method is limited to a
-//! task of **the same graph as the runtime task**, and that limit is what
-//! makes the parent question answerable: a sibling's parent is this node's
-//! own parent, which the job in hand already holds. See the method's own
-//! docs, and the README's design decisions.
-//!
-//! What `schedule` bypasses is the target's dependency *count*, not its
-//! edges: a strong predecessor of a scheduled task still releases it when it
-//! finishes, onto the zero `schedule` stored. Upstream's release arm wraps
-//! that zero to `SIZE_MAX`, which is a counter no corun predicate and no
-//! resume ever matches again; this port floors the decrement at zero
-//! instead, the one departure its successor arm makes from upstream's bare
-//! `fetch_sub`. That is issue #98. What the floor cannot make harmless is the
-//! *order*, which is issue #107: the same arm now refuses a strong release
-//! onto a node that has already preempted itself, as [`Runtime::schedule`]
-//! refuses a target that has, and the method's docs work through all three
-//! orderings -- the two that are reported and the one second run that stays
-//! the caller's own doing.
+//! Where a failure under each of the three shapes goes is one argument in
+//! `DESIGN.md` and one line of difference here: the node of a
+//! handle-returning async form is explicitly anchored from construction, so
+//! the walk stops there and `complete` hands the slot to the handle; a silent
+//! one is an anchor only in the implicit sense, only while it is entered, and
+//! its payload is dropped with the node; a runtime task of a graph is
+//! neither, so its failure goes up the chain to whatever is waiting for that
+//! graph.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
@@ -167,10 +72,9 @@ use std::sync::atomic::Ordering;
 
 use crate::Runtime;
 use crate::executor::Executor;
-use crate::executor::r#async::{AsyncHandle, ESTATE_NONE};
+use crate::executor::r#async::{AsyncHandle, Spawn, Submission};
 use crate::executor::run_handle::RunError;
-use crate::executor::runtime_async::completion;
-use crate::executor::topology::{Cancellable, Job, Parent};
+use crate::executor::topology::Job;
 use crate::executor::worker::{Release, Worker, WorkerThread, is_entered};
 use crate::graph::{AsyncWork, Node, OnceWork, RuntimeWork, Task};
 
@@ -185,17 +89,12 @@ const ENTERED: u32 = Node::PREEMPTED | Node::IMPLICITLY_ANCHORED;
 /// `None` means the node has been preempted -- work the body spawned is still
 /// running, and the last of it to finish will re-queue this job -- and is
 /// what keeps `WorkerThread::invoke` from re-arming the node or releasing
-/// successors that have the body's own children still to wait for. The module
-/// docs say why that answer is a return value rather than a bit the caller
-/// could read back.
+/// successors that have the body's own children still to wait for.
 ///
 /// A panic out of the body is recorded exactly as a static task's is, through
-/// [`Job::record_panic`]: delivered to whatever is waiting for the graph this
-/// node is part of, and cancelling the rest of that graph. The bookkeeping in
-/// [`enter`] still runs, because the node has been entered and the counters
-/// have to balance whatever the body did -- which is upstream's arrangement
-/// too, its exception handler being a statement inside the first entry rather
-/// than a return.
+/// [`Job::record_panic`], and the bookkeeping in [`enter`] still runs: the
+/// node has been entered and the counters have to balance whatever the body
+/// did, which is upstream's arrangement too.
 pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &RuntimeWork) -> Option<Release> {
     // Called *through* the slot rather than taken out of it, which is the one
     // way a graph's runtime task differs from the two async shapes below: a
@@ -209,12 +108,8 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &RuntimeWork) -
 /// `_invoke_async_task`, which are the two `_invoke_runtime_task_impl`
 /// overloads over the body of a free-standing node.
 ///
-/// The answer is [`invoke`]'s answer and means the same thing, which is why
-/// the `ASYNC` arm in `executor::async` can hand both shapes straight here:
-/// `Some` for a node that is finished, `None` for one that is preempted and
-/// whose counters its second entry will settle. The module docs' first
-/// section has which upstream function each arm is, and its anchor section
-/// has what a failure under each reaches.
+/// The answer is [`invoke`]'s and means the same thing, which is why both
+/// async dispatch arms can hand these two shapes straight here.
 pub(crate) fn invoke_async(
     worker: &mut WorkerThread,
     job: &Job,
@@ -222,11 +117,10 @@ pub(crate) fn invoke_async(
 ) -> Option<Release> {
     match work {
         // Upstream's case 0, which is `executor::async`'s own arm: both
-        // callers -- the `ASYNC` arm and #91's `DEPENDENT_ASYNC` one -- match
-        // the two runtime-shaped alternatives before calling here, exactly as
-        // upstream's two switches do. Named rather than quietly handled,
-        // because a third caller that forgot to would otherwise run a plain
-        // body under a protocol that preempts its node.
+        // callers match the two runtime-shaped alternatives before calling
+        // here, exactly as upstream's two switches do. Named rather than
+        // quietly handled, because a third caller that forgot to would
+        // otherwise run a plain body under a protocol that preempts its node.
         AsyncWork::Plain(_) => {
             unreachable!("a plain async body is not a runtime-shaped one: see `executor::async`")
         }
@@ -236,22 +130,18 @@ pub(crate) fn invoke_async(
         // Upstream's case 2. The `complete` half is its `work(rt, true)`,
         // after the `if`/`else` and therefore on the entry that finished the
         // node -- never on an entry that preempted it, which is what the `?`
-        // says: `None` is a node whose children are still running, and a
-        // promise fulfilled then would be fulfilled before the work it is a
-        // promise about was done.
+        // says: a promise fulfilled then would be fulfilled before the work
+        // it is a promise about was done.
         AsyncWork::Reentrant { body, complete } => {
             let release = enter(worker, job, |runtime| take_and_run(body, runtime))?;
 
             // Upstream's `auto& eptr = rt._node->_exception_ptr; eptr ?
             // p.set_exception(eptr) : p.set_value()`, with the node reached
             // through the job because that is the one thing the second entry
-            // has -- upstream reaches it through the `Runtime` it rebuilds,
-            // which this half of the body needs for nothing else.
-            //
-            // `None` would mean the slot had already been spent, which takes
-            // a node entered twice without being preempted in between; doing
-            // nothing is the one answer to that which cannot fulfil one
-            // promise twice.
+            // has. `None` would mean the slot had already been spent, which
+            // takes a node entered twice without being preempted in between;
+            // doing nothing is the one answer to that which cannot fulfil
+            // one promise twice.
             if let Some(complete) = complete.take() {
                 complete(job.node().base().take_panic());
             }
@@ -264,8 +154,8 @@ pub(crate) fn invoke_async(
 /// the shared half of both `_invoke_runtime_task_impl` overloads, which differ
 /// in nothing else.
 ///
-/// The module docs' protocol section is the argument for every line of this,
-/// and the answer is the `bool` upstream returns inverted into the
+/// The module docs' `# Design` section is the argument for every line of
+/// this, and the answer is the `bool` upstream returns inverted into the
 /// `Option<Release>` the dispatch wants: `None` is upstream's `true`.
 fn enter(
     worker: &mut WorkerThread,
@@ -312,13 +202,9 @@ fn enter(
 }
 
 /// Runs the body against a handle over `node`, recording a panic out of it as
-/// this job's failure.
-///
-/// Upstream's `TF_EXECUTOR_EXCEPTION_HANDLER(worker, node, { work(rt); })`,
-/// which `WorkerThread::invoke` spells the same way for a static task:
-/// `AssertUnwindSafe` is the honest annotation, since the state a panicking
-/// body can leave half-written is the caller's own, reachable only through
-/// what the closure captured.
+/// this job's failure: upstream's `TF_EXECUTOR_EXCEPTION_HANDLER(worker,
+/// node, { work(rt); })`, which `WorkerThread::invoke` spells the same way
+/// for a static task.
 ///
 /// A function of its own so that the mutable borrow the handle takes of the
 /// worker's scheduling loop ends where the body does, which is before
@@ -338,6 +224,9 @@ fn run_body(
     let record: &Worker = &shared.workers[worker.id];
 
     let mut runtime = Runtime::new(record, node, job, worker);
+    // `AssertUnwindSafe` is the honest annotation: the state a panicking body
+    // can leave half-written is the caller's own, reachable only through what
+    // the closure captured.
     if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| body(&mut runtime))) {
         job.record_panic(payload);
     }
@@ -354,11 +243,9 @@ type AsyncRuntimeSlot = OnceWork<dyn for<'a> FnOnce(&mut Runtime<'a>) + Send + '
 /// Takes an async task's body out of `slot` and runs it against `runtime`.
 ///
 /// Taken rather than called through, because an async body is a `FnOnce` and
-/// a `FnOnce` cannot be called through a shared reference -- the same step
-/// the plain arm in `executor::async` takes, and `None` means the same thing
-/// there as here: a body already spent, which one submission and one job
-/// cannot reach, and which doing nothing is the only answer to that cannot
-/// run a body twice.
+/// a `FnOnce` cannot be called through a shared reference -- the step the
+/// plain arm in `executor::async` takes, where `None` means what it means
+/// here: a body already spent, which one submission and one job cannot reach.
 fn take_and_run(slot: &AsyncRuntimeSlot, runtime: &mut Runtime<'_>) {
     if let Some(body) = slot.take() {
         body(runtime);
@@ -371,31 +258,20 @@ impl Executor {
     ///
     /// Upstream's `async` over a `[](tf::Runtime&){}` body -- the
     /// `is_runtime_task_v<F>` branch of `_async` -- under
-    /// [`Executor::spawn`]'s name, for the reason `executor::async` gives.
-    /// Everything that call says about where the body runs, about dropping
-    /// the handle to detach and about awaiting it as a
-    /// [`Future`] holds here too.
+    /// [`Executor::spawn`]'s name. Everything that call says about where the
+    /// body runs, about dropping the handle to detach and about awaiting it
+    /// as a [`Future`] holds here too.
     ///
     /// What is different is the body and the answer. The body is handed a
     /// [`Runtime`], so it can do what a runtime task of a graph can do --
-    /// [`Runtime::schedule`] has the one limit, and since #92 it can also
-    /// spawn children of its own and [`Runtime::corun`] on them. The
-    /// handle therefore carries no value: `AsyncHandle<()>` where
-    /// [`Executor::spawn`] carries whatever the body returned, because what
-    /// there is to report about a runtime-shaped task is **whether anything
-    /// under it failed**. That is upstream's own shape -- a
-    /// `std::promise<void>` -- and it is what the second entry exists for.
-    ///
-    /// # What a caller sees
-    ///
+    /// [`Runtime::schedule`] has the one limit, and it can spawn children of
+    /// its own and [`Runtime::corun`] on them. The handle therefore carries
+    /// no value, because what there is to report about a runtime-shaped task
+    /// is **whether anything under it failed**: upstream's own shape, a
+    /// `std::promise<void>`, and what the second entry exists for.
     /// [`AsyncHandle::wait`] answers `Ok(())` once the body *and* everything
-    /// it spawned are done, and `Err(`[`RunError::Panicked`]`(payload))` if
-    /// the body panicked or anything it spawned did (#92). Only the
-    /// first such failure is reported, as everywhere else in the crate; the
-    /// node is an explicit anchor from the moment it is created, which is
-    /// what makes it the thing the panic walk stops at, and the module docs'
-    /// anchor section says why that is a construction argument rather than a
-    /// guard -- and what one `corun` inside the body does to it.
+    /// it spawned are done, and [`RunError::Panicked`] -- the first such
+    /// failure only -- if any of that panicked.
     ///
     /// ```
     /// use rustflow::{Executor, Runtime};
@@ -421,28 +297,8 @@ impl Executor {
     where
         F: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
     {
-        // Upstream's `std::promise<void> p; auto fu{p.get_future()};` and
-        // the `reentered` branch that fills it, which is
-        // `runtime_async::completion` because four submissions need exactly
-        // that pair (#92). The *wrapper* half of the handle seam --
-        // `AsyncHandle::for_body`, which is what `Executor::spawn` uses -- is
-        // deliberately not used: a runtime-shaped task's outcome is decided
-        // on its finishing entry out of the node's payload slot, not by what
-        // the body returned, so what this needs is the writing end of the
-        // slot and no wrapper at all.
-        let (handle, complete) = completion();
-
-        self.schedule_async_task(
-            AsyncWork::reentrant(body, complete),
-            &Parent::Run,
-            // Upstream's `ESTATE::EXPLICITLY_ANCHORED` argument, and the one
-            // place in the crate that bit is set other than by a waiting
-            // frame's guard: there *is* a waiter here -- whoever holds the
-            // handle -- and it is waiting for the whole of what runs under
-            // this node, for as long as the node exists.
-            Cancellable::EXPLICITLY_ANCHORED,
-        );
-        handle
+        self.shared
+            .schedule_async_task(Spawn::handled_runtime(body), &Submission::parentless())
     }
 
     /// Runs `body` on this executor as soon as a worker picks it up, handing
@@ -451,22 +307,16 @@ impl Executor {
     /// Upstream's `silent_async` over a `[](tf::Runtime&){}` body -- the
     /// `is_runtime_task_v<F>` branch of `_silent_async` -- and the cheaper
     /// half of the pair, for
-    /// [`Executor::silent_async`](crate::Executor::silent_async)'s reason:
-    /// there is no slot to deliver into, so a submission costs the node and
-    /// the body and nothing else. There is no second entry either, which is
-    /// upstream's case 1 against case 2: the node finishes when the body and
-    /// everything under it are done, and nothing is reported.
+    /// [`Executor::silent_async`](crate::Executor::silent_async)'s reason.
+    /// There is no second entry either, which is upstream's case 1 against
+    /// case 2: the node finishes when the body and everything under it are
+    /// done, and nothing is reported.
     ///
-    /// # What a caller sees
-    ///
-    /// Nothing, which is what "silent" means. A panic out of `body` -- or out
-    /// of anything it spawned (#92) -- is **dropped**, as a
-    /// [`Executor::silent_async`](crate::Executor::silent_async) body's is
-    /// and for the same reason: the payload lands in the node's own slot and
-    /// goes with the node, because no handle was ever handed out to read it
-    /// from. The default panic hook still prints it, so a silent task that
-    /// fails is not an invisible one. [`Executor::wait_for_all`] is the one
-    /// thing that waits for such a task, as it is for every free node.
+    /// A panic out of `body` -- or out of anything it spawned -- is
+    /// **dropped**: the payload lands in the node's own slot and goes with
+    /// the node, no handle having been handed out to read it from, though the
+    /// default panic hook still prints it. [`Executor::wait_for_all`] is the
+    /// one thing that waits for such a task.
     ///
     /// ```
     /// use std::sync::Arc;
@@ -494,10 +344,8 @@ impl Executor {
     where
         F: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
     {
-        // Upstream's `_silent_async`, whose runtime branch and whose static
-        // branch are one call with one `ESTATE::NONE`: the shape of the body
-        // is the whole difference, and `AsyncWork` is where it is said.
-        self.schedule_async_task(AsyncWork::runtime(body), &Parent::Run, ESTATE_NONE);
+        self.shared
+            .schedule_async_task(Spawn::silent_runtime(body), &Submission::parentless());
     }
 }
 
@@ -506,101 +354,20 @@ impl Runtime<'_> {
     /// graph's dependencies: upstream's `Runtime::schedule`.
     ///
     /// `task` must be an *active* task -- a task of the taskflow this runtime
-    /// task is itself part of, which is to say of a run that is in flight. It
-    /// may or may not be running already; what this does is put it in the
-    /// queue of the worker running this body, which is why upstream describes
-    /// it as scheduling "immediately".
+    /// task is itself part of -- and of **the same graph as the runtime
+    /// task**, the limit `DESIGN.md` argues for and the one that makes the
+    /// accounting answerable: the parent to count the scheduled task against
+    /// is this node's own parent. It is not fully checkable, a [`Task`] being
+    /// a bare index; what is checked is every index this graph does not have.
     ///
-    /// # The same-graph limit
-    ///
-    /// `task` has to be a task of **the same graph as the runtime task**.
-    /// Upstream's `tf::Task` is a pointer to a node, so its `schedule` can
-    /// reach any node of any graph and read the parent and topology stored on
-    /// it; a [`Task`] here is an index into one arena, and the thing that
-    /// resolves it is the graph this job already holds. The limit is
-    /// therefore what makes the accounting answerable at all: the parent to
-    /// count the scheduled task against is this node's own parent -- the run,
-    /// for a top-level task, and the enclosing node for a task of a nested
-    /// graph -- which is upstream's `node->_parent ? .. : node->_topology`
-    /// with the two cases decided by the job rather than by a null check.
-    ///
-    /// The limit cannot be fully checked, and that is worth being plain
-    /// about: a `Task` is a bare index, so a task of *another* graph whose
-    /// index happens to be live in this one would schedule this graph's node
-    /// at that index. What is checked is every index this graph does not
-    /// have, which panics as any stale index does, and the README records the
-    /// decision. Upstream has one more unchecked caveat of its own here --
-    /// that only the parent worker of the runtime may call this, which the
-    /// `&mut self` on a handle that cannot leave its own invocation is this
-    /// port's answer to. Its other, that scheduling a *runtime* task is
-    /// "currently not supported", is half-diagnosed as of issue #107: a
-    /// runtime task that is **entered** is refused below, and one that is
-    /// not is an ordinary target.
-    ///
-    /// # A bypassed dependency is still an edge
-    ///
-    /// Zeroing the target's join counter bypasses what it owes; it does not
-    /// remove the edges that made it owe anything. A strong predecessor of
-    /// the target that has yet to run therefore still releases it when it
-    /// finishes, and that release lands on the zero stored here. Issue #98
-    /// is what used to happen then: upstream's release arm is a bare
-    /// `fetch_sub` on a `size_t`, so the counter wrapped to `SIZE_MAX`, and
-    /// a counter past zero never again equals the one
-    /// [`Runtime::try_corun`] waits for nor the zero a preempted node is
-    /// resumed on -- a silent wrap one `schedule` and one `precede` away
-    /// from a hang. This port floors that decrement at zero instead, so the
-    /// zero stored here is the zero the target is dequeued with, and the
-    /// departure is noted where the floor is.
-    ///
-    /// What the floor does not and cannot do is make the *order* harmless,
-    /// and the order has three outcomes. Which one a caller gets turns on
-    /// what the target was doing when the bypass reached it a second time --
-    /// the second `schedule`, or the predecessor's release:
-    ///
-    /// 1. **Its body is running.** Two workers in one body is the one class
-    ///    of this the work handles arbitrate themselves:
-    ///    [`Work::invoke`](crate::Work::invoke) takes the body with
-    ///    `try_lock` and panics rather than blocking, naming the invariant.
-    ///    A bypassed *dependency* cannot reach it -- the target's counter is
-    ///    the zero stored here for as long as its body runs, so the
-    ///    floored decrement queues nothing -- but a second `schedule`
-    ///    racing the first one's run can, and that is what the panic is for.
-    /// 2. **It has preempted itself**: a runtime, module or subflow task
-    ///    whose nested work is outstanding, which is upstream's dangerous
-    ///    half. The body has returned, so no lock is held and nothing
-    ///    arbitrates; what the node is holding instead is one join-counter
-    ///    reference per piece of outstanding work, and a bypass that spends
-    ///    or zeroes those resumes the node before its own children are done.
-    ///    Both bypasses are therefore **refused and reported** rather than
-    ///    delivered: this method panics on an *entered* target, and the
-    ///    successor arm of the dispatch drops a strong release onto one,
-    ///    recording it as the failure of the task that released. "Entered"
-    ///    is the `PREEMPTED` bit on a node of a kind whose arm sets it,
-    ///    which is `executor::worker`'s `is_entered` and which that function
-    ///    argues is both halves of one question. Each asks it before it
-    ///    touches the counter, so a node that preempts itself in the window
-    ///    after that read is not seen -- and nothing turns a node that was
-    ///    never entered into a refusal, since a node still owing a strong
-    ///    dependency cannot have been entered by anything but a bypass.
-    /// 3. **It has finished and re-armed** its counter to its strong
-    ///    dependency count. Then the predecessor's release is an *ordinary*
-    ///    one: the decrement reaches zero legitimately and the target runs
-    ///    **a second time**, which is the caller's own doing and is not
-    ///    diagnosed. Nothing on a plain node records that it has already
-    ///    run, the second run is strictly after the first, and so the lock
-    ///    in (1) is free by then and has nothing to report. Upstream neither
-    ///    diagnoses this nor survives it, and its own answer is the rule its
-    ///    `ConditionalTasking` page states for the other bypass:
-    ///    **schedule a task the graph cannot otherwise reach.** Upstream's
-    ///    example gates the target's one strong predecessor behind a
-    ///    condition that is never taken, and this crate's
-    ///    `Runtime.Schedule.ModuleTask` port is built the same way.
-    ///
-    /// A conditioner is the other bypass and reaches (2) and (3) the same
-    /// way, since the arm that selects a successor stores the same zero this
-    /// method does. The refusal above covers the release it is given, not
-    /// the selection: a conditioner that selects a node of its own nested
-    /// work stays upstream's rule rather than this port's check.
+    /// Zeroing the target's join counter bypasses what it owes and does not
+    /// remove the edges that made it owe anything, so a strong predecessor
+    /// that has yet to run still releases the target onto that zero. The
+    /// decrement floors at zero rather than wrapping, and a release onto a
+    /// node that has already *preempted* itself is refused rather than
+    /// delivered -- `DESIGN.md` has both halves of that decision and the
+    /// third ordering it leaves alone, a target that has finished and
+    /// re-armed its counter simply running a second time.
     ///
     /// # Panics
     ///
@@ -609,8 +376,8 @@ impl Runtime<'_> {
     /// one does not have. The panic is
     /// [`Graph::node`](crate::Graph::node)'s.
     ///
-    /// Panics if `task` names a node that has already preempted itself,
-    /// which is case (2) above.
+    /// Panics if `task` names a node that has already preempted itself, which
+    /// is the refusal above.
     ///
     /// Either reaches the caller as the failure of this runtime task, since
     /// it happens inside the body.
@@ -620,25 +387,18 @@ impl Runtime<'_> {
         // can encounter bug when inserting a nested flow (e.g., module
         // task)". A stored zero rather than an arithmetic one, for the reason
         // a conditioner's selected successor gets one: the count the target
-        // is carrying is exactly what this call means to bypass, so there is
-        // no arithmetic that would arrive at zero. What may still decrement
-        // the zero afterwards is a strong predecessor of the target, which
-        // the docs above work through -- it is issue #98, and the release arm
-        // is where the answer to it lives.
+        // is carrying is exactly what this call means to bypass.
         let target = self.job.graph().node(task);
 
-        // Issue #107, and the one case this call can see for itself: the
-        // store below would wipe a count that is not a dependency count at
-        // all -- a preempted node's counter holds one reference per piece of
-        // nested work still outstanding, and work that finished against a
-        // zeroed counter would drive it past zero rather than resume the
-        // node. Refused before anything is written, so a body that schedules
-        // a node it should not have scheduled fails *as a body*: the panic is
-        // this runtime task's, through `run_body`'s handler, rather than the
-        // hang the store would have left. `is_entered` is the same question
-        // the successor arm asks before its own decrement, asked here of the
-        // same node; the docs above have the two orderings neither of them
-        // can see.
+        // The one case this call can see for itself: the store below would
+        // wipe a count that is not a dependency count at all -- a preempted
+        // node's counter holds one reference per piece of nested work still
+        // outstanding, and work that finished against a zeroed counter would
+        // drive it past zero rather than resume the node. Refused before
+        // anything is written, so a body that schedules a node it should not
+        // have fails *as a body* rather than leaving the hang the store would
+        // have. `is_entered` is the same question the successor arm asks
+        // before its own decrement.
         assert!(
             !is_entered(target),
             "a task that is already running cannot be scheduled: a bypassed \
@@ -662,39 +422,24 @@ impl Runtime<'_> {
 
     /// Waits for everything this runtime task has spawned, reporting a
     /// failure under it rather than raising it: upstream's `corun`, in the
-    /// `try_` shape issue #48 established.
+    /// `try_` shape the crate's other waiting surfaces have.
     ///
     /// The calling worker stays in the work-stealing loop while it waits, for
-    /// the reason the [`corun`](crate::executor::corun) module docs give: a
-    /// worker that parked here would be a worker the work it is waiting for
-    /// cannot use. The predicate is upstream's -- the node's join counter
-    /// back to one, that one being this body's own reference -- so a body
-    /// that has spawned nothing returns immediately, and one that spawned
-    /// children through [`Runtime::silent_async`] or one of its siblings
-    /// waits for the last of them.
-    ///
-    /// Being an *equality* rather than a `<=`, the predicate is only as good
-    /// as the guarantee that nothing drives the counter below the reference
-    /// the first entry added. Two things in the successor arm of
-    /// `WorkerThread::invoke_one` make that guarantee. It floors its
-    /// decrement at zero, which is issue #98, so a node whose counter was
-    /// zeroed by [`Runtime::schedule`] or by a conditioner still enters its
-    /// body at exactly one rather than at `usize::MAX + 1`; and it drops
-    /// altogether a strong release onto a node that has already preempted
-    /// itself, which is issue #107 and the one remaining way to lose the
-    /// reference --
-    /// a predecessor releasing this node while this body runs, after
-    /// something bypassed the dependency it was owed. That release is
-    /// reported as the releasing task's failure instead, so what used to be
-    /// a corun that never terminated is a run that answers.
+    /// the reason the [`corun`](crate::executor::corun) module docs give. The
+    /// predicate is upstream's -- the node's join counter back to one, that
+    /// one being this body's own reference -- so a body that has spawned
+    /// nothing returns immediately. Being an *equality* rather than a `<=`,
+    /// it is only as good as the guarantee that nothing drives the counter
+    /// below that reference, and the two halves of that guarantee are the
+    /// floored decrement and the refused release [`Runtime::schedule`] points
+    /// at.
     ///
     /// The node is explicitly anchored for the length of the wait, which is
-    /// what makes a failure under it *this frame's*: the panic walk in
-    /// `Job::record_panic` stops at the first explicit anchor it meets, so
-    /// the payload is handed to the thread that is about to look for it
-    /// rather than to the run. Taking the payload clears the node's slot, as
-    /// upstream's `_rethrow_exception` does, so a second corun of the same
-    /// body starts clean.
+    /// what makes a failure under it *this frame's*: the walk stops at the
+    /// first explicit anchor it meets, so the payload is handed to the thread
+    /// that is about to look for it rather than to the run. Taking it clears
+    /// the node's slot, as upstream's `_rethrow_exception` does, so a second
+    /// corun of the same body starts clean.
     ///
     /// # Errors
     ///
@@ -722,11 +467,9 @@ impl Runtime<'_> {
     /// failure under it on this worker: upstream's `corun`.
     ///
     /// [`Runtime::try_corun`] with the failure raised instead of returned,
-    /// which is the pair [`Executor::corun`](crate::Executor::corun) and
-    /// [`Executor::try_corun`](crate::Executor::try_corun) established and
-    /// the shape that composes: a body that wrapped this call in nothing has
-    /// the failure propagate out of itself, where the executor catches it as
-    /// this task's own failure and the run reports it.
+    /// which is the shape that composes: a body that wrapped this call in
+    /// nothing has the failure propagate out of itself, where the executor
+    /// catches it as this task's own and the run reports it.
     ///
     /// # Panics
     ///
@@ -762,10 +505,9 @@ impl Runtime<'_> {
     /// of what cancellation can do to a task that is already running: nothing
     /// interrupts a body, so a body that means to be cancellable has to ask.
     /// Both terms of upstream's condition are here, as
-    /// `Job::is_parent_cancelled` has them -- the run's own cancellation
-    /// bits, and the estate of every parent above this job -- which is why a
-    /// runtime task inside a nested graph sees a failure in that graph as
-    /// well as a cancel of the whole run.
+    /// `Job::is_parent_cancelled` has them -- the run's own cancellation bits
+    /// and the estate of every parent above this job -- so a runtime task
+    /// inside a nested graph sees a failure in that graph as well.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.job.is_parent_cancelled()
@@ -781,9 +523,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::executor::r#async::ESTATE_NONE;
     use crate::executor::async_node::AsyncNode;
     use crate::executor::queue::WorkerQueue;
-    use crate::executor::topology::{GraphOwner, Topology, set_up_graph};
+    use crate::executor::topology::{Cancellable, GraphOwner, Parent, Topology, set_up_graph};
     use crate::prelude::*;
 
     /// How long a case waits for a worker to deliver before it gives up.
@@ -797,7 +540,7 @@ mod tests {
     /// A free-standing async node of `work` and the job that runs it,
     /// accounted for as a submission accounts for one but **not** queued.
     ///
-    /// `Executor::schedule_async_task` is the real submission and takes the
+    /// `Shared::schedule_async_task` is the real submission and takes the
     /// same three steps before its push; what the cases below need that it
     /// cannot give them is the node itself, so that the state words can be
     /// read after the entry that finished it. The `increment_async` is not

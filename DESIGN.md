@@ -469,10 +469,6 @@ follow are measured against those numbers.
 
 ## Decisions taken in M6
 
-Nothing yet: this heading is where M6's own decisions are appended as its
-issues land, so that the list above stays the record of what was decided
-before the milestone opened.
-
 - **The run splits into three modules and the ownership quartet stays four**
   (issue #131). `executor::topology` was one 2,352-line file over a dozen
   types, and six of M5's seven post-merge bugs were counter or share-lifecycle
@@ -499,6 +495,48 @@ before the milestone opened.
   `tests/loom_storage.rs` are what says so -- and `Worker::invoke_one` gained
   two named empty seams, `observer_prologue` and `observer_epilogue`, so that
   the observers of step 6 add a call rather than a reading of that function.
+- **One async core on `impl Shared`, and three receivers that delegate**
+  (issue #133). The async family is upstream's overload set over three
+  receivers, and writing out what varies across it answers where the code
+  belongs. The matrix has four axes -- receiver, dependent-or-free,
+  handle-or-silent, plain-or-runtime body -- and 24 public methods, which is
+  every combination; of those axes only the first three reach the scheduler,
+  because the body shape and the handle decide the same thing. So the core is
+  **two functions over two parameters**: `Shared::schedule_async_task` and
+  `Shared::schedule_dependent_async_task`, each taking a `Spawn<H>` -- the
+  work, the estate word and the handle the call hands back, built by one of
+  four constructors for the four body shapes -- and a `Submission` -- the
+  parent the child is accounted to and the worker whose own queue its job goes
+  onto, built by one of three constructors for the three receivers. A third
+  function, `Shared::new_free_node`, is the half both submissions share.
+  Every `pub fn` of `Executor`, `Runtime` and `TaskGroup` is then one
+  delegation, and the layer that was written twice -- `spawn_child`,
+  `spawn_dependent_child` and `child_parent` in `executor::runtime_async`
+  against their twins in `src/task_group.rs`, plus two spellings of the
+  promise-and-future pair -- is gone rather than shared, each of those names
+  now appearing nowhere in the crate.
+
+  The receiver is `Shared` because a `Runtime` holds `Arc<Shared>` and no
+  `&Executor` by the design the entry above on `rt.executor()` sets out, which
+  is also why the two `Executor::schedule_*_async_task` forwarders are gone:
+  what they added was a `None` worker, and that is now what
+  `Submission::parentless` says. This extends the M5 entry on one
+  `AsyncHandle` construction site rather than replacing it -- both of its
+  claims still hold, and the four body shapes are now the only callers of that
+  seam.
+
+  The three invariants of submission each live in exactly one function, which
+  is the point of the consolidation rather than a side effect: the routing
+  decision that puts a child of a task body on the submitting worker's own
+  queue (#119) is `Submission::queue`; the rule that only a *parentless*
+  submission touches the executor's two counters (#115) is
+  `Shared::new_free_node`, and the tear-down in `executor::async` asks the
+  same question on the way out; and the join-counter guard a dependent
+  submission starts at one (#91) is the one function that has a dependency
+  loop. Before this each of the three was open-coded per receiver, which is
+  how all three became bugs. No behaviour changed: the identical test-name
+  set, the identical `pub fn` list over the five files and the suite are what
+  says so.
 
 ## Rationale moved out of the executor's periphery
 
