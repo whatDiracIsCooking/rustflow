@@ -340,7 +340,9 @@ the same split:
   paragraph — the wake-after-last-release rule and the delivery of a failure
   under a runtime task (`tests/loom_*.rs`, one model each),
   `criterion` for the ported benchmarks, `rayon` as the baseline those
-  benchmarks compare against, in the role TBB plays upstream.
+  benchmarks compare against, in the role TBB plays upstream, and `proptest`
+  for the generated inputs `tests/properties.rs` checks the algorithms
+  against `std`'s own answer over.
 
 ### Design decisions already taken
 
