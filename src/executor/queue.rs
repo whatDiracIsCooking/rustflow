@@ -70,6 +70,15 @@ impl<T: Send> WorkerQueue<T> {
         self.deque.is_empty()
     }
 
+    /// How many items the queue held at the moment of the call, worth what
+    /// upstream's `size()` is: the same caveat as [`is_empty`](Self::is_empty)
+    /// applies, a thief or the owner being free to change the count the
+    /// instant after it is read.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.deque.len()
+    }
+
     /// Creates a handle other threads can steal from: independent per call,
     /// and [`Clone`], so the executor can hand one to every worker.
     #[must_use]
@@ -104,6 +113,15 @@ impl<T: Send> Thief<T> {
     /// Whether the queue held no items at the moment of the call.
     pub fn is_empty(&self) -> bool {
         self.stealer.is_empty()
+    }
+
+    /// How many items the queue held at the moment of the call, seen from
+    /// the stealing side: the same snapshot caveat as
+    /// [`WorkerQueue::len`](WorkerQueue::len), which this reads the same
+    /// underlying deque as.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.stealer.len()
     }
 }
 
@@ -334,17 +352,21 @@ mod tests {
     fn the_owner_takes_the_newest_item_first() {
         let queue = WorkerQueue::new();
         assert!(queue.is_empty());
+        assert_eq!(queue.len(), 0);
 
         queue.push(1);
         queue.push(2);
         queue.push(3);
         assert!(!queue.is_empty());
+        assert_eq!(queue.len(), 3);
 
         assert_eq!(queue.pop(), Some(3));
+        assert_eq!(queue.len(), 2);
         assert_eq!(queue.pop(), Some(2));
         assert_eq!(queue.pop(), Some(1));
         assert_eq!(queue.pop(), None);
         assert!(queue.is_empty());
+        assert_eq!(queue.len(), 0);
     }
 
     #[test]
@@ -352,16 +374,19 @@ mod tests {
         let queue = WorkerQueue::new();
         let thief = queue.thief();
         assert_eq!(thief.steal(), None);
+        assert_eq!(thief.len(), 0);
 
         queue.push(1);
         queue.push(2);
         queue.push(3);
+        assert_eq!(thief.len(), 3);
 
         assert_eq!(thief.steal(), Some(1));
         assert_eq!(thief.steal(), Some(2));
         assert_eq!(thief.clone().steal(), Some(3));
         assert_eq!(thief.steal(), None);
         assert!(thief.is_empty());
+        assert_eq!(thief.len(), 0);
     }
 
     #[test]

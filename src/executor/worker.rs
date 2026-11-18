@@ -107,13 +107,54 @@ impl Worker {
     }
 
     /// Returns `true` if this worker's queue held nothing at the moment of the
-    /// call. Upstream exposes `queue_size()` and `queue_capacity()` here; a
-    /// `crossbeam` deque reports neither, and its capacity would be a moving
-    /// target where upstream's is bounded, so this is the part of that
-    /// interface the port can answer.
+    /// call. Upstream's `empty()`-style read beside `queue_size()` below,
+    /// rather than defined in terms of it: each is its own direct read of the
+    /// underlying deque.
     #[must_use]
     pub fn is_queue_empty(&self) -> bool {
         self.thief.is_empty()
+    }
+
+    /// Returns how many items this worker's queue held at the moment of the
+    /// call. Upstream's `Worker::queue_size`.
+    ///
+    /// The number is stale the instant it is returned: a sibling worker may
+    /// steal from this queue, and this worker's own thread may push or pop
+    /// it, at any point afterward. Treat it as a rough load signal across
+    /// workers, never as a fact an [`Observer`](crate::observer::Observer)
+    /// reading it through [`WorkerView::queue_size`] can act on. Upstream
+    /// pairs this with `queue_capacity`; `DESIGN.md`'s "Decisions taken in
+    /// M9" section is why this port has no counterpart for that half.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::any::Any;
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    ///
+    /// use rustflow::{Executor, Worker, WorkerInterface};
+    ///
+    /// struct Peek(Arc<AtomicUsize>);
+    ///
+    /// impl WorkerInterface for Peek {
+    ///     fn scheduler_prologue(&self, worker: &Worker) {
+    ///         // Nothing can be scheduled yet, so a worker's own queue is
+    ///         // always empty on the way in.
+    ///         self.0.store(worker.queue_size(), Ordering::SeqCst);
+    ///     }
+    ///
+    ///     fn scheduler_epilogue(&self, _worker: &Worker, _panicked: Option<Box<dyn Any + Send>>) {}
+    /// }
+    ///
+    /// let seen = Arc::new(AtomicUsize::new(usize::MAX));
+    /// drop(Executor::with_worker_interface(1, Arc::new(Peek(Arc::clone(&seen)))));
+    ///
+    /// assert_eq!(seen.load(Ordering::SeqCst), 0);
+    /// ```
+    #[must_use]
+    pub fn queue_size(&self) -> usize {
+        self.thief.len()
     }
 
     /// Returns `true` once the executor has asked this worker to stop.

@@ -22,10 +22,13 @@
 //! [`Executor::make_observer`](crate::Executor::make_observer) does the
 //! `Arc::new` and the `set_up` upstream's does.
 //!
-//! **A worker's queue answers only `is_queue_empty`, not `queue_size` or
+//! **A worker's queue answers `is_queue_empty` and `queue_size`, but not
 //! `queue_capacity`,** and **the registered list is one atomic check on the
 //! path with no observers, and a mutex only when there is work to do** --
-//! `DESIGN.md` has both, under "Decisions taken in M7".
+//! `DESIGN.md` has both, the first split across "Decisions taken in M7" (why
+//! `is_queue_empty` alone shipped first) and "Decisions taken in M9" (why
+//! `queue_size` joined it and `queue_capacity` still has not), the second
+//! under "Decisions taken in M7".
 //!
 //! **`TaskView` borrows a node and the graph it lives in, not a node and the
 //! index that names it.** Upstream's holds a `const Node&` alone; a
@@ -103,12 +106,60 @@ impl<'a> WorkerView<'a> {
     }
 
     /// Whether this worker's queue held nothing at the moment of the call.
-    ///
-    /// The module docs' "Design" section is why this answers upstream's
-    /// `queue_size`/`queue_capacity` pair with one bool instead of two sizes.
+    /// Upstream's `WorkerView::empty`-style read beside
+    /// [`queue_size`](Self::queue_size), rather than defined in terms of it.
     #[must_use]
     pub fn is_queue_empty(&self) -> bool {
         self.worker.is_queue_empty()
+    }
+
+    /// How many items this worker's queue held at the moment of the call.
+    /// Upstream's `WorkerView::queue_size`.
+    ///
+    /// [`Worker::queue_size`]'s doc has the staleness caveat that applies
+    /// here too: a sibling worker may steal from this queue, and the worker
+    /// itself may push or pop it, at any point after this returns, so the
+    /// number is not a fact this method's caller can act on, only a
+    /// snapshot of a moment already past. The module docs' "Design" section
+    /// is why there is no `queue_capacity` beside it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    ///
+    /// use rustflow::Executor;
+    /// use rustflow::observer::{Observer, TaskView, WorkerView};
+    /// use rustflow::prelude::*;
+    ///
+    /// struct Peek(Arc<AtomicUsize>);
+    ///
+    /// impl Observer for Peek {
+    ///     fn set_up(&self, _num_workers: usize) {}
+    ///
+    ///     fn on_entry(&self, worker: WorkerView<'_>, _task: TaskView<'_>) {
+    ///         self.0.store(worker.queue_size(), Ordering::SeqCst);
+    ///     }
+    ///
+    ///     fn on_exit(&self, _worker: WorkerView<'_>, _task: TaskView<'_>) {}
+    /// }
+    ///
+    /// let seen = Arc::new(AtomicUsize::new(usize::MAX));
+    /// let executor = Executor::new(1);
+    /// let _observer = executor.make_observer(Peek(Arc::clone(&seen)));
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// taskflow.emplace(|| {});
+    /// executor.run(&taskflow).wait().unwrap();
+    ///
+    /// // The one worker's only task was already taken off the queue before
+    /// // `on_entry` runs, so there is nothing left in it to see.
+    /// assert_eq!(seen.load(Ordering::SeqCst), 0);
+    /// ```
+    #[must_use]
+    pub fn queue_size(&self) -> usize {
+        self.worker.queue_size()
     }
 }
 

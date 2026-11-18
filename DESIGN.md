@@ -1044,3 +1044,23 @@ entry above does.
   own self-contained block -- exactly what `TfProfObserver::dump` writes,
   with no shared state between them -- one after another, in whatever order
   the caller chooses.
+- **`WorkerView` and `Worker` gain `queue_size`, not `queue_capacity`**
+  (issue #206). #167 scoped the pair down to `is_queue_empty` alone because
+  answering either half needed `src/executor/queue.rs` and a wider `Worker`
+  surface, both outside that issue's file list; #206 is the follow-up those
+  two files were left for. `crossbeam-deque`'s `Worker::len` and
+  `Stealer::len` read the same front/back indices `is_empty` already does,
+  so `queue_size` is as honest a read as upstream's `BoundedWSQ::size` --
+  a live count, stale the instant it is returned, which is what
+  `Worker::queue_size` and `WorkerView::queue_size`'s own doc comments say
+  rather than letting a caller treat the number as a fact to act on.
+
+  `queue_capacity` stays unanswered, because it has no truthful answer to
+  give. Upstream's `BoundedWSQ::capacity` returns a fixed bound fixed at
+  construction; a `crossbeam-deque` worker queue instead grows its ring
+  buffer on demand from a 64-item minimum (per its own source, not part of
+  its published API) and publishes that buffer's size through neither
+  `Worker` nor `Stealer`. There is no call this port could make that would
+  not be inventing a number: a hard-coded constant, `usize::MAX`, or the
+  current `queue_size` would each look plausible and each be meaningless,
+  which is worse than the method staying absent.
