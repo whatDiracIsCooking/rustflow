@@ -1,10 +1,11 @@
 //! Translated from `unittests/test_basics.cpp` (Taskflow v4.1.0).
 //!
 //! The cases ported here are the ones that exercise the task handle API --
-//! `Type`, `Builder`, `Task.RemoveDependencies`, the per-task half of
-//! `Iterators`, `Hash` -- and the ones that exercise running a graph at all:
-//! `Future`, `SerialRuns`, `ParallelRuns`, `RunAndWait` and `WorkerID`. Three
-//! standing adaptations, because the port is not yet where upstream is:
+//! `Type`, `Builder`, `Taskflow.RemoveDependency`, `Task.RemoveDependencies`,
+//! the per-task half of `Iterators`, `Hash` -- and the ones that exercise
+//! running a graph at all: `Future`, `SerialRuns`, `ParallelRuns`,
+//! `RunAndWait` and `WorkerID`. Three standing adaptations, because the port
+//! is not yet where upstream is:
 //!
 //! - `corun` is a later issue, so a case that nests one run inside another says
 //!   how it stands in for `corun` where it does; `RunAndWait.Complex` is the
@@ -18,6 +19,9 @@
 //! - `Iterators/Generic` renames tasks from inside `for_each_successor`, which
 //!   an index-handle visitor cannot do while the walk borrows the graph; the
 //!   walk collects the indices and the renaming follows it.
+//!
+//! One further section, between `Task.RemoveDependencies` and `Iterators`, is
+//! not upstream's either: its own header says why.
 //!
 //! The last two sections are not upstream's at all. Upstream has no
 //! `RunHandle` and therefore no case for leaking one, while this port's
@@ -440,6 +444,69 @@ fn builder_kite() {
 }
 
 // --------------------------------------------------------
+// Testcase: Taskflow.RemoveDependency
+// --------------------------------------------------------
+
+#[test]
+fn taskflow_remove_dependency() {
+    let mut taskflow = Taskflow::new();
+    let a = placeholder(&mut taskflow, "a");
+    let b = placeholder(&mut taskflow, "b");
+    let c = placeholder(&mut taskflow, "c");
+    let d = placeholder(&mut taskflow, "d");
+
+    assert_eq!(taskflow.task_ref(a).num_successors(), 0);
+    assert_eq!(taskflow.task_ref(a).num_predecessors(), 0);
+
+    taskflow.task(a).precede([b, c, d]);
+    assert_eq!(taskflow.task_ref(a).num_successors(), 3);
+    assert_eq!(taskflow.task_ref(b).num_predecessors(), 1);
+    assert_eq!(taskflow.task_ref(c).num_predecessors(), 1);
+    assert_eq!(taskflow.task_ref(d).num_predecessors(), 1);
+
+    taskflow.remove_dependency(a, b);
+    assert_eq!(taskflow.task_ref(a).num_successors(), 2);
+    assert_eq!(taskflow.task_ref(b).num_predecessors(), 0);
+
+    taskflow.remove_dependency(a, c);
+    assert_eq!(taskflow.task_ref(a).num_successors(), 1);
+    assert_eq!(taskflow.task_ref(c).num_predecessors(), 0);
+
+    taskflow.remove_dependency(a, d);
+    assert_eq!(taskflow.task_ref(a).num_successors(), 0);
+    assert_eq!(taskflow.task_ref(d).num_predecessors(), 0);
+
+    // A duplicated dependency: `remove_dependency` drops every occurrence of
+    // it, as upstream's does.
+    taskflow.task(a).precede([b, b, c, c, d, d]);
+    assert_eq!(taskflow.task_ref(a).num_successors(), 6);
+    assert_eq!(taskflow.task_ref(b).num_predecessors(), 2);
+
+    taskflow.remove_dependency(a, b);
+    assert_eq!(taskflow.task_ref(a).num_successors(), 4);
+    assert_eq!(taskflow.task_ref(b).num_predecessors(), 0);
+
+    taskflow.remove_dependency(a, c);
+    assert_eq!(taskflow.task_ref(a).num_successors(), 2);
+    assert_eq!(taskflow.task_ref(c).num_predecessors(), 0);
+
+    taskflow.remove_dependency(a, d);
+    assert_eq!(taskflow.task_ref(a).num_successors(), 0);
+    assert_eq!(taskflow.task_ref(d).num_predecessors(), 0);
+
+    // Not upstream's case: calling it again on an edge that is already gone
+    // is a no-op rather than a panic or an underflow, which is the half of
+    // "a no-op on an edge that is not there" nothing above exercises.
+    taskflow.remove_dependency(a, b);
+    assert_eq!(taskflow.task_ref(a).num_successors(), 0);
+    assert_eq!(taskflow.task_ref(b).num_predecessors(), 0);
+    // And on two tasks that were never joined at all.
+    taskflow.remove_dependency(b, c);
+    assert_eq!(taskflow.task_ref(b).num_successors(), 0);
+    assert_eq!(taskflow.task_ref(c).num_predecessors(), 0);
+}
+
+// --------------------------------------------------------
 // Testcase: Task.RemoveDependencies
 // --------------------------------------------------------
 
@@ -479,6 +546,41 @@ fn task_remove_dependencies() {
     // The surviving successors keep their order; `c` left no hole behind.
     let successors = taskflow.graph().successors(a).to_vec();
     assert_eq!(successors, vec![b, d]);
+}
+
+// --------------------------------------------------------
+// Testcase: the data slot a run does not touch (issue #191)
+//
+// Not upstream's: `examples/attach_data.cpp` reads the slot from inside the
+// task's own body through the aliasing `tf::Task` the closure captures,
+// which this port's `FnMut() + Send + 'static` body has no way to do -- see
+// `src/task.rs` for why. What is upstream's is the property the example
+// relies on, that a run leaves the slot alone, which this checks from
+// outside the body instead.
+// --------------------------------------------------------
+
+#[test]
+fn task_data_survives_a_run() {
+    let mut taskflow = Taskflow::new();
+    let counter = Arc::new(AtomicUsize::new(0));
+    let bumped = Arc::clone(&counter);
+    let a = emplace(&mut taskflow, move || {
+        bumped.fetch_add(1, Ordering::Relaxed);
+    });
+
+    taskflow.task(a).set_data(7i32);
+    assert_eq!(taskflow.task_ref(a).data::<i32>(), Some(&7));
+
+    run(&taskflow);
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
+    // The run did not touch the slot: still there, still the right type.
+    assert_eq!(taskflow.task_ref(a).data::<i32>(), Some(&7));
+
+    // Survives more than one run too, which is the iterative use
+    // `attach_data.cpp` makes of it.
+    run(&taskflow);
+    assert_eq!(counter.load(Ordering::Relaxed), 2);
+    assert_eq!(taskflow.task_ref(a).data::<i32>(), Some(&7));
 }
 
 // --------------------------------------------------------

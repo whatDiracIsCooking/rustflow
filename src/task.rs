@@ -27,9 +27,14 @@
 //! getter and setter, so [`TaskMut::name`] is the setter and [`TaskRef::name`]
 //! the getter. The rest of what departs from upstream:
 //!
-//! - `data()`/`data(void*)` are **not** ported. A raw `void*` side channel on a
-//!   node has no Rust shape, and it exists upstream only so that a lambda can
-//!   reach mutable state it does not own; here the closure captures that state.
+//! - `data()`/`data(void*)` become [`TaskRef::data`], [`TaskMut::set_data`],
+//!   [`TaskMut::data_mut`] and [`TaskMut::take_data`], over a typed
+//!   `Box<dyn Any + Send + Sync>` slot rather than upstream's untyped
+//!   pointer: a raw `void*` has no Rust shape, and the caller's `static_cast`
+//!   back to the type it put in becomes a checked `downcast_ref`/`downcast`
+//!   instead of trusting the caller to remember. `Send + Sync` where
+//!   upstream's pointer is neither, because the node sits behind a shared
+//!   `&Graph` that any worker may reach.
 //! - `reset()` means something different. Upstream's nulls the aliasing
 //!   pointer -- `_node = nullptr` -- which an index handle has no analogue
 //!   for, so what is ported is the node-level reset upstream performs on
@@ -50,10 +55,16 @@
 //!   points at outlives it. Upstream's `(first, last)` overloads become
 //!   [`TaskMut::acquire_each`] and [`TaskMut::release_each`], there being no
 //!   overloading to hang them on.
-//! - `exception_ptr()`, `dump()` and `for_each_subflow_task()` wait for the
-//!   milestones that give them meaning, and so does the
-//!   `composed_of()`/`adopt()` pair upstream has on `tf::Task` as well as on
-//!   its builder: the builder forms are
+//! - `for_each_subflow_task()` is [`TaskRef::for_each_subflow_task`], and the
+//!   one place its visitor differs from [`TaskRef::for_each_successor`]'s:
+//!   the subgraph it walks is a different [`Graph`] from the one this handle
+//!   borrows, so the visitor takes a [`TaskRef`] scoped to *that* graph
+//!   rather than a bare [`Task`] index, which upstream's single `Node*`-based
+//!   handle has no need to tell apart but a bare arena index here would
+//!   invite a caller to look up against the wrong one.
+//! - `exception_ptr()` and `dump()` wait for the milestones that give them
+//!   meaning, and so does the `composed_of()`/`adopt()` pair upstream has on
+//!   `tf::Task` as well as on its builder: the builder forms are
 //!   [`FlowBuilder::composed_of`](crate::FlowBuilder::composed_of) and
 //!   [`FlowBuilder::adopt`](crate::FlowBuilder::adopt), and turning an
 //!   existing task into a module has no caller in this port yet.
@@ -64,9 +75,10 @@
 
 use core::fmt;
 use core::hash::{Hash, Hasher};
+use std::any::Any;
 use std::hash::DefaultHasher;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::graph::{Graph, Handle, RuntimeWork, SubflowWork, Task, Work};
 use crate::runtime::Runtime;
@@ -312,6 +324,57 @@ impl<'a> TaskRef<'a> {
         }
     }
 
+    /// Applies `visitor` to every task of this subflow task's spawned
+    /// subgraph, in creation order. A no-op if this task is not a subflow
+    /// task, or if it is one whose subgraph was cleared rather than
+    /// [retained](crate::Subflow::set_retain) past its last join.
+    ///
+    /// Upstream's `for_each_subflow_task`, which hands the visitor a
+    /// `tf::Task` reached through the same `Node*` every other accessor
+    /// uses. The subgraph here is a *different* [`Graph`] from the one this
+    /// handle borrows, so the visitor takes a [`TaskRef`] scoped to it --
+    /// see the module docs -- rather than a bare [`Task`] index that a
+    /// caller could mistake for one of this handle's own graph and look up
+    /// through [`FlowBuilder::task_ref`](crate::FlowBuilder::task_ref) against
+    /// the wrong arena.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rustflow::prelude::*;
+    /// use rustflow::Executor;
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// let b = taskflow.emplace_subflow(|subflow: &mut Subflow<'_>| {
+    ///     let b1 = subflow.emplace(|| {});
+    ///     subflow.task(b1).name("B1");
+    ///     subflow.set_retain(true);
+    /// });
+    ///
+    /// Executor::new(1).run(&taskflow).wait().expect("no task panicked");
+    ///
+    /// let mut names = Vec::new();
+    /// taskflow.task_ref(b).for_each_subflow_task(|stask| {
+    ///     names.push(stask.name().to_string());
+    /// });
+    /// assert_eq!(names, ["B1"]);
+    /// ```
+    pub fn for_each_subflow_task<V>(self, mut visitor: V)
+    where
+        V: FnMut(TaskRef<'_>),
+    {
+        let Handle::Subflow { subgraph, .. } = self.graph.node(self.task).handle() else {
+            return;
+        };
+        // A poisoned lock means some body panicked, not that the graph is
+        // unreadable: `src/subflow.rs`'s own readers take a poisoned lock's
+        // contents for the same reason.
+        let subgraph = subgraph.lock().unwrap_or_else(PoisonError::into_inner);
+        for task in subgraph.tasks() {
+            visitor(TaskRef::new(&subgraph, task));
+        }
+    }
+
     /// How many semaphores this task acquires before its work runs.
     ///
     /// Upstream has no query for this at all, its `Node::Semaphores` being
@@ -333,6 +396,34 @@ impl<'a> TaskRef<'a> {
             .node(self.task)
             .semaphores()
             .map_or(0, |semaphores| semaphores.to_release.len())
+    }
+
+    /// Returns the user data attached to this task, downcast to `T`.
+    ///
+    /// `None` if nothing was ever attached, or if it was attached as a type
+    /// other than `T`. Upstream's `data()`, which hands back the untyped
+    /// `void*` for the caller's `static_cast` to trust; the type parameter
+    /// here is the check that cast skips. See [`TaskMut::set_data`] for what
+    /// attaches it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rustflow::prelude::*;
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// let (tagged, untagged) = taskflow.emplace_n((|| {}, || {}));
+    /// taskflow.task(tagged).set_data(7i32);
+    ///
+    /// assert_eq!(taskflow.task_ref(tagged).data::<i32>(), Some(&7));
+    /// // Attached as `i32`, not `f64`: the downcast fails rather than
+    /// // reinterpreting the bytes.
+    /// assert_eq!(taskflow.task_ref(tagged).data::<f64>(), None);
+    /// assert_eq!(taskflow.task_ref(untagged).data::<i32>(), None);
+    /// ```
+    #[must_use]
+    pub fn data<T: Any>(self) -> Option<&'a T> {
+        self.graph.node(self.task).data()?.downcast_ref::<T>()
     }
 }
 
@@ -414,6 +505,97 @@ impl<'a> TaskMut<'a> {
     pub fn name(&mut self, name: impl Into<String>) -> &mut Self {
         self.graph.node_mut(self.task).set_name(name);
         self
+    }
+
+    /// Attaches `data` to this task, dropping whatever was attached before.
+    ///
+    /// Upstream's `data(void* data)`, over a typed `Box<dyn Any + Send +
+    /// Sync>` slot rather than a raw pointer -- see the module docs. Read it
+    /// back with [`TaskRef::data`], edit it in place with
+    /// [`TaskMut::data_mut`], or lift it out with [`TaskMut::take_data`]. A
+    /// task that never calls this pays for the `Option` and nothing more.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rustflow::prelude::*;
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// let a = taskflow.placeholder();
+    ///
+    /// taskflow.task(a).set_data(String::from("first"));
+    /// assert_eq!(taskflow.task_ref(a).data::<String>(), Some(&"first".to_string()));
+    ///
+    /// // A second call replaces it, even with a different type.
+    /// taskflow.task(a).set_data(42i32);
+    /// assert_eq!(taskflow.task_ref(a).data::<String>(), None);
+    /// assert_eq!(taskflow.task_ref(a).data::<i32>(), Some(&42));
+    /// ```
+    pub fn set_data(&mut self, data: impl Any + Send + Sync) -> &mut Self {
+        self.graph.node_mut(self.task).set_data(Box::new(data));
+        self
+    }
+
+    /// Returns the user data attached to this task, downcast to `T` and
+    /// mutable. `None` under the same rule as [`TaskRef::data`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rustflow::prelude::*;
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// let a = taskflow.placeholder();
+    /// taskflow.task(a).set_data(vec![1, 2, 3]);
+    ///
+    /// taskflow
+    ///     .task(a)
+    ///     .data_mut::<Vec<i32>>()
+    ///     .expect("just attached as this type")
+    ///     .push(4);
+    ///
+    /// assert_eq!(taskflow.task_ref(a).data::<Vec<i32>>(), Some(&vec![1, 2, 3, 4]));
+    /// ```
+    pub fn data_mut<T: Any>(&mut self) -> Option<&mut T> {
+        self.graph
+            .node_mut(self.task)
+            .data_mut()?
+            .downcast_mut::<T>()
+    }
+
+    /// Takes the user data attached to this task out of it, leaving the slot
+    /// empty, and downcasts it to `T`.
+    ///
+    /// `None` under the same rule as [`TaskRef::data`] -- including when `T`
+    /// is the wrong type, in which case the slot is left exactly as it was:
+    /// a failed downcast hands the box back to the node rather than losing
+    /// it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rustflow::prelude::*;
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// let a = taskflow.placeholder();
+    /// taskflow.task(a).set_data(99u32);
+    ///
+    /// // The wrong type leaves the slot untouched.
+    /// assert_eq!(taskflow.task(a).take_data::<i64>(), None);
+    /// assert_eq!(taskflow.task_ref(a).data::<u32>(), Some(&99));
+    ///
+    /// assert_eq!(taskflow.task(a).take_data::<u32>(), Some(99));
+    /// assert_eq!(taskflow.task_ref(a).data::<u32>(), None);
+    /// ```
+    pub fn take_data<T: Any>(&mut self) -> Option<T> {
+        let data = self.graph.node_mut(self.task).take_data()?;
+        match data.downcast::<T>() {
+            Ok(data) => Some(*data),
+            Err(data) => {
+                self.graph.node_mut(self.task).set_data(data);
+                None
+            }
+        }
     }
 
     /// Attaches `callable` as this task's work, replacing whatever was there.
@@ -903,6 +1085,43 @@ mod tests {
         // subgraph and all.
         taskflow.task(t[1]).subflow_work(|_| {}).reset();
         assert!(taskflow.task_ref(t[1]).is_empty());
+    }
+
+    /// `for_each_subflow_task` walks whatever is currently in the node's
+    /// subgraph slot: nothing for a task that is not a subflow task at all,
+    /// nothing for a fresh subflow task's empty graph, and the tasks of
+    /// whatever was put there otherwise -- which is what a retained join
+    /// leaves behind, built here by hand rather than through a real run.
+    #[test]
+    fn for_each_subflow_task_visits_whatever_the_slot_currently_holds() {
+        let (mut taskflow, t) = taskflow_of(2);
+        taskflow.task(t[0]).subflow_work(|_| {});
+
+        let mut visited: Vec<String> = Vec::new();
+        taskflow
+            .task_ref(t[0])
+            .for_each_subflow_task(|stask| visited.push(stask.name().to_string()));
+        assert!(visited.is_empty(), "a fresh subflow's subgraph is empty");
+
+        taskflow
+            .task_ref(t[1])
+            .for_each_subflow_task(|stask| visited.push(stask.name().to_string()));
+        assert!(visited.is_empty(), "t[1] is not a subflow task at all");
+
+        // What a retained join leaves in the slot, done here without an
+        // executor: a subgraph with a task of its own.
+        let Handle::Subflow { subgraph, .. } = taskflow.graph().node(t[0]).handle() else {
+            panic!("subflow_work left something else behind");
+        };
+        subgraph
+            .lock()
+            .expect("uncontended")
+            .add_named_node("s1", Handle::Placeholder);
+
+        taskflow
+            .task_ref(t[0])
+            .for_each_subflow_task(|stask| visited.push(stask.name().to_string()));
+        assert_eq!(visited, vec!["s1".to_string()]);
     }
 
     /// The setters are upstream's `work()` arms, so they replace whatever was
