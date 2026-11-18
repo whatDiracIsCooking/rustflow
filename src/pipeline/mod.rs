@@ -4,7 +4,8 @@
 //!
 //! This is the crate's own module tree rather than a translation of a
 //! single upstream header; [`pipe`]'s own `//!` doc says which upstream file
-//! it translates. The scheduler that drives tokens through a sequence of
-//! pipes is built on these shapes and is not here yet.
+//! it translates. [`scheduler`] is the scheduler that drives tokens through
+//! a sequence of pipes, built on these shapes.
 
 pub mod pipe;
+pub mod scheduler;
