@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rustflow::Executor;
+use rustflow::observer::chrome::ChromeObserver;
 use rustflow::observer::{Observer, TaskView, WorkerView};
 use rustflow::prelude::*;
 
@@ -213,4 +214,104 @@ fn make_observer_returns_a_usable_share() {
 
     assert_eq!(observer.entries.load(Ordering::SeqCst), 1);
     assert_eq!(observer.exits.load(Ordering::SeqCst), 1);
+}
+
+/// Splits a Chrome trace-event dump into its individual flat objects, by
+/// brace depth alone: a hand-rolled reader for exactly the shape
+/// [`ChromeObserver::dump`] produces (one flat object per event, no
+/// nesting, and no task name here that embeds a literal `{` or `}`) rather
+/// than a `serde_json` dev-dependency -- #172's acceptance asks for this
+/// check, not a general-purpose JSON parser.
+fn parse_trace_events(trace: &str) -> Vec<&str> {
+    let trace = trace.trim();
+    assert!(
+        trace.starts_with('[') && trace.ends_with(']'),
+        "a dump must be a JSON array: {trace:?}"
+    );
+    let inner = &trace[1..trace.len() - 1];
+
+    let mut events = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, ch) in inner.char_indices() {
+        match ch {
+            '{' => {
+                if depth == 0 {
+                    start = i;
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth = depth.checked_sub(1).expect("a '}' always follows a '{'");
+                if depth == 0 {
+                    events.push(&inner[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    events
+}
+
+/// Reads the raw text after `"key":` in one flat JSON object up to the next
+/// top-level `,` or `}`, with surrounding quotes stripped if there were
+/// any. Good enough for the plain decimal and plain-ASCII-name fields
+/// [`ChromeObserver::dump`] writes; see [`parse_trace_events`] for why this
+/// is hand-rolled rather than a real parser.
+fn trace_field<'a>(event: &'a str, key: &str) -> &'a str {
+    let needle = format!("\"{key}\":");
+    let after = event
+        .find(&needle)
+        .unwrap_or_else(|| panic!("event has no {key:?} field: {event:?}"))
+        + needle.len();
+    let rest = &event[after..];
+    let end = rest.find([',', '}']).unwrap_or(rest.len());
+    rest[..end].trim_matches('"')
+}
+
+/// [`ChromeObserver`] records one segment per dispatch and dumps them as a
+/// Chrome trace-event JSON array: `num_tasks` matches the dispatch count,
+/// the dump parses back into exactly that many flat objects, and each
+/// object's `dur` is non-negative and `tid` names one of this executor's
+/// workers -- #172's acceptance, read literally.
+#[test]
+fn chrome_observer_dumps_a_valid_trace() {
+    let num_workers = 3;
+    let executor = Executor::new(num_workers);
+    let observer = executor.make_observer(ChromeObserver::new());
+
+    let mut taskflow = Taskflow::new();
+    let dispatched = mixed_graph(&mut taskflow);
+    executor
+        .run(&taskflow)
+        .wait()
+        .expect("no task of the graph panicked");
+
+    assert_eq!(observer.num_tasks(), dispatched);
+
+    let trace = observer.dump_to_string();
+    let events = parse_trace_events(&trace);
+    assert_eq!(
+        events.len(),
+        dispatched,
+        "the dump must hold exactly one event per dispatched task"
+    );
+
+    for event in events {
+        let dur: i128 = trace_field(event, "dur")
+            .parse()
+            .unwrap_or_else(|e| panic!("dur is not a decimal integer in {event:?}: {e}"));
+        assert!(
+            dur >= 0,
+            "a segment's duration must never be negative: {event:?}"
+        );
+
+        let tid: usize = trace_field(event, "tid")
+            .parse()
+            .unwrap_or_else(|e| panic!("tid is not a decimal integer in {event:?}: {e}"));
+        assert!(
+            tid < num_workers,
+            "tid {tid} names no worker of this {num_workers}-worker executor"
+        );
+    }
 }
