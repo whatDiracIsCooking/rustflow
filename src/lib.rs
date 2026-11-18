@@ -112,6 +112,7 @@
 
 #![doc(html_root_url = "https://docs.rs/rustflow/0.0.0")]
 
+pub mod algorithm;
 pub mod async_task;
 pub mod dump;
 pub mod executor;
