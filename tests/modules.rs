@@ -86,6 +86,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use rustflow::algorithm::module::make_module_task;
+use rustflow::flow_builder::Composable;
 use rustflow::prelude::*;
 use rustflow::{Executor, RunHandle};
 
@@ -451,6 +452,47 @@ fn cancelling_a_run_skips_the_rest_of_a_module() {
             "{context}: the tasks behind the gate were never started"
         );
     }
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: composing through the `Composable` trait
+// ----------------------------------------------------------------------------
+
+/// A hand-written [`Composable`], standing for what a pipeline's own type
+/// will be once #182 lands: something that owns a taskflow and hands out a
+/// share of it, rather than being an `Arc<Taskflow>` itself.
+struct Wrapped(Arc<Taskflow>);
+
+impl Composable for Wrapped {
+    fn taskflow(&self) -> Arc<Taskflow> {
+        Arc::clone(&self.0)
+    }
+}
+
+/// `composed_of` behaves exactly as it does for a bare `Arc<Taskflow>` when
+/// the target arrives through a type that only implements [`Composable`]:
+/// this port's own case, for issue #181, which generalised `composed_of`
+/// from `Arc<Taskflow>` to the trait with no change at any existing call
+/// site -- the other cases in this file are that claim, made 7500 runs over.
+#[test]
+fn composed_of_accepts_a_hand_written_composable() {
+    let counter = counter();
+    let target = chain(5, &counter);
+    let wrapped = Wrapped(Arc::clone(&target));
+
+    let mut taskflow = Taskflow::new();
+    let module = taskflow.composed_of(wrapped);
+
+    let executor = Executor::new(2);
+    executor.run(&taskflow).wait().expect("no task panicked");
+    assert_eq!(count(&counter), 5, "the wrapped target's five tasks ran");
+
+    // The trait hands back a share of the very graph `target` names, exactly
+    // as `Arc::clone` would have.
+    let Handle::Module(composed) = taskflow.graph().node(module).handle() else {
+        panic!("composed_of left something else behind");
+    };
+    assert!(Arc::ptr_eq(composed, &target));
 }
 
 // ----------------------------------------------------------------------------

@@ -547,6 +547,49 @@ fn a_two_level_composition_dumps_a_cluster_per_graph_in_visit_order() {
     assert_unique_node_ids(&f2.dump());
 }
 
+/// A module task built through [`FlowBuilder::composed_of`] rather than by
+/// hand, dumping exactly as the raw `Handle::Module` cases above do: this
+/// port's own case, for issue #181, since every golden above builds its
+/// module node with [`Graph::add_node`] by the file's own convention and none
+/// of them exercises the builder a caller actually uses.
+///
+/// Named `"pipeline"`, standing for the graph a pipeline owns once #182
+/// lands -- a `Taskflow` like any other, named by the user or left to fall
+/// back to `"pipeline"`, composed into another graph the same way any module
+/// target is.
+#[test]
+fn a_taskflow_composed_through_the_builder_renders_its_cluster() {
+    use rustflow::FlowBuilder;
+
+    let mut pipeline = Taskflow::with_name("pipeline");
+    pipeline
+        .graph_mut()
+        .add_named_node("stage", Handle::Placeholder);
+    let pipeline = Arc::new(pipeline);
+
+    let mut taskflow = Taskflow::with_name("composer");
+    let module = taskflow.composed_of(Arc::clone(&pipeline));
+    taskflow.task(module).name("call-pipeline");
+
+    assert_eq!(
+        taskflow.dump(),
+        concat!(
+            "digraph Taskflow {\n",
+            "  compound=true;\n",
+            "  subgraph cluster_p0 {\n",
+            "    label=\"Taskflow: composer\";\n",
+            "    p0[shape=box3d, color=blue, label=\"call-pipeline\"];\n",
+            "  }\n",
+            "    subgraph cluster_p1 {\n",
+            "      label=\"call-pipeline\";\n",
+            "      p1_0[label=\"stage\" ];\n",
+            "    }\n",
+            "}\n",
+        )
+    );
+    assert_unique_node_ids(&taskflow.dump());
+}
+
 /// Upstream:
 ///
 /// ```cpp

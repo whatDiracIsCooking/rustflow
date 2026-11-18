@@ -406,7 +406,10 @@ impl Runtime<'_> {
     /// [`Graph::node`](crate::Graph::node)'s.
     ///
     /// Panics if `task` names a node that has already preempted itself, which
-    /// is the refusal above.
+    /// is the refusal above. A pipeline line task is one caller this is safe
+    /// for: it schedules a sibling line task of its own graph and spawns no
+    /// children of its own, so neither the caller nor the target ever carries
+    /// outstanding work for this call to find.
     ///
     /// Either reaches the caller as the failure of this runtime task, since
     /// it happens inside the body.
