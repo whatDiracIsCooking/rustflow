@@ -1129,3 +1129,82 @@ fn a_subflow_bearing_taskflow_is_editable_the_instant_its_run_reports_done() {
         );
     }
 }
+
+// ----------------------------------------------------------------------------
+// Giving a task subflow work after the fact, which is this port's own case
+// ----------------------------------------------------------------------------
+
+/// `TaskMut::subflow_work` makes a task a subflow task, replacing whatever
+/// work was there -- and the node gets a *fresh* subgraph, so the graph a
+/// previous body retained is dropped with the body that built it.
+///
+/// Upstream's own suites only ever reach this arm of `Task::work` at
+/// `emplace` time, where the callable's parameter picks it; what the port
+/// adds is naming the arm, and with it the question of what happens to the
+/// subgraph already in the node. The retained dump is how that is observed,
+/// as in `a_retained_subgraph_survives_the_run_and_dumps` above.
+#[test]
+fn subflow_work_replaces_the_body_and_starts_from_a_fresh_subgraph() {
+    /// A body that builds `children` named children, each bumping `counted`,
+    /// and retains the subgraph so that the dump can be read.
+    fn body(
+        counted: &Counter,
+        label: &'static str,
+        children: usize,
+    ) -> impl for<'a> FnMut(&mut Subflow<'a>) + Send + 'static {
+        let counted = Arc::clone(counted);
+        move |subflow: &mut Subflow<'_>| {
+            for child in 0..children {
+                let counted = Arc::clone(&counted);
+                let task = subflow.emplace(move || {
+                    seq_bump(&counted);
+                });
+                subflow.task(task).name(format!("{label} {child}"));
+            }
+            subflow.set_retain(true);
+        }
+    }
+
+    let executor = Executor::new(2);
+    let counted = seq_counter();
+    let mut taskflow = Taskflow::with_name("replaced");
+
+    let spawner = taskflow.placeholder();
+    taskflow.task(spawner).name("spawner");
+    assert_eq!(
+        taskflow.task_ref(spawner).task_type(),
+        TaskType::Placeholder
+    );
+
+    taskflow
+        .task(spawner)
+        .subflow_work(body(&counted, "first", 2));
+    assert_eq!(
+        taskflow.task_ref(spawner).task_type(),
+        TaskType::Subflow,
+        "the work is what makes the task a subflow task"
+    );
+
+    executor.run(&taskflow).wait().expect("no body panicked");
+    assert_eq!(seq_count(&counted), 2, "the first body's two children ran");
+    let dot = taskflow.dump();
+    assert!(dot.contains("label=\"first 1\""), "{dot}");
+
+    // The same task, given subflow work a second time.
+    taskflow
+        .task(spawner)
+        .subflow_work(body(&counted, "second", 3));
+
+    executor.run(&taskflow).wait().expect("no body panicked");
+    assert_eq!(
+        seq_count(&counted),
+        5,
+        "the second body's three children ran"
+    );
+    let dot = taskflow.dump();
+    assert!(dot.contains("label=\"second 2\""), "{dot}");
+    assert!(
+        !dot.contains("label=\"first 1\""),
+        "the graph the first body retained went with it: {dot}"
+    );
+}

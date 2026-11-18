@@ -203,7 +203,6 @@ pub use crate::async_task::AsyncTask;
 pub use crate::executor::Executor;
 pub use crate::executor::r#async::AsyncHandle;
 pub use crate::executor::corun::CorunError;
-pub use crate::executor::queue::{Buffers, Thief, WorkerQueue};
 pub use crate::executor::rng::{Xorshift32, Xorshift64};
 pub use crate::executor::run_handle::{Canceller, RunError, RunHandle};
 pub use crate::executor::scope::Scope;

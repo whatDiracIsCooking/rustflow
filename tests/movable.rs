@@ -331,3 +331,71 @@ fn parallel_moved_runs() {
 
     assert_eq!(count(), SOME * (N * 2 + 4));
 }
+
+// ----------------------------------------------------------------------------
+// The two owning overloads upstream's own cases never call (not upstream's)
+// ----------------------------------------------------------------------------
+
+/// `run_owned_n_with` and `run_owned_until`, upstream's
+/// `run_n(Taskflow&&, size_t, C&&)` and `run_until(Taskflow&&, P&&)`.
+///
+/// Both are declared in upstream's `executor.hpp` and neither is called by
+/// `test_movable.cpp`, which reaches the other six members of the owning
+/// family: it runs `run_n(std::move(tf), 3)` without a callback and
+/// `run_until(std::move(tf), p, c)` with one. So this case is the port's own,
+/// and it counts what every case above counts -- one increment per body run
+/// and one per captured value dropped -- because that is what says the
+/// handle, and not the call, is what frees a moved-in taskflow.
+#[test]
+fn moved_run_n_with_and_moved_run_until() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let count = || counter.load(Ordering::Relaxed);
+    let mut taskflow = Taskflow::new();
+
+    let bump_by_n = {
+        let counter = Arc::clone(&counter);
+        move || {
+            counter.fetch_add(N, Ordering::Relaxed);
+        }
+    };
+
+    // Three runs of a moved-in taskflow with a callback: `3 * N` bodies, `N`
+    // drops once the handle frees the taskflow, and `N` from the callback.
+    make_taskflow(&mut taskflow, &counter, N);
+    Executor::default()
+        .run_owned_n_with(mem::take(&mut taskflow), 3, bump_by_n)
+        .wait()
+        .expect("a task panicked");
+    assert_eq!(count(), 5 * N);
+    assert_eq!(taskflow.num_tasks(), 0, "the taskflow was moved out");
+
+    // Two runs under a predicate and no callback: `2 * N` bodies and `N`
+    // drops.
+    make_taskflow(&mut taskflow, &counter, N);
+    Executor::default()
+        .run_owned_until(mem::take(&mut taskflow), repeat(2))
+        .wait()
+        .expect("a task panicked");
+    assert_eq!(count(), 8 * N);
+    assert_eq!(taskflow.num_tasks(), 0);
+
+    // A predicate true from the start runs nothing -- upstream's "one true
+    // from the start runs nothing", on the owning half of the family -- and
+    // the moved-in taskflow is freed by the handle all the same, so the `N`
+    // values it holds are dropped and nothing is run.
+    make_taskflow(&mut taskflow, &counter, N);
+    Executor::default()
+        .run_owned_until(mem::take(&mut taskflow), || true)
+        .wait()
+        .expect("nothing ran, so nothing panicked");
+    assert_eq!(count(), 9 * N, "the taskflow was freed but never run");
+    assert_eq!(taskflow.num_tasks(), 0);
+
+    // And the empty one: the predicate is never even asked, nothing runs and
+    // there is nothing to free.
+    Executor::default()
+        .run_owned_until(mem::take(&mut taskflow), || panic!("not asked"))
+        .wait()
+        .expect("an empty run cannot panic");
+    assert_eq!(count(), 9 * N);
+}

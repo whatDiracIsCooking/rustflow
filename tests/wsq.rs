@@ -68,7 +68,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustflow::{Buffers, WorkerQueue};
+use rustflow::executor::queue::{Buffers, WorkerQueue};
 
 #[macro_use]
 mod common;

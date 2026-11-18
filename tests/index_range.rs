@@ -351,6 +351,32 @@ fn index_ranges_nd_dim_accessor() {
     assert_eq!(r.dim(1), (1, 7, 3));
 }
 
+// `dim_mut` rebinds one dimension's bounds in place: upstream's non-const
+// `dim(d)`, which is what `IndexRange::reset` is for `N == 1`. Upstream's own
+// suite has no case for either -- `index_range_1d_reset` above is this port's
+// too -- so what is asserted is that the rebinding reaches every derived
+// quantity and no other dimension.
+#[test]
+fn index_ranges_nd_dim_mut_rebinds_one_dimension() {
+    let mut r = IndexRanges::from_ranges([IndexRange::new(0, 4, 1), IndexRange::new(0, 10, 2)]);
+    assert_eq!((r.dim_size(0), r.dim_size(1)), (4, 5));
+    assert_eq!(r.size(), 20);
+
+    *r.dim_mut(1) = (6, 0, -2);
+
+    assert_eq!(r.dim(1), (6, 0, -2), "the rebound dimension reads back");
+    assert_eq!(r.dim(0), (0, 4, 1), "and no other dimension moved");
+    assert_eq!(r.dim_size(1), 3, "6, 4 and 2 under a step of -2");
+    assert_eq!(r.size(), 12, "the product follows the rebinding");
+
+    let elements = enumerate_2d(&r);
+    assert_eq!(elements.len(), 12, "and so does what the range enumerates");
+    assert!(
+        elements.iter().all(|&(_, j)| [6, 4, 2].contains(&j)),
+        "every element of the rebound dimension is one of its new ones: {elements:?}"
+    );
+}
+
 // Upstream's own worked `r3.size() == 120` example, named directly rather
 // than only through the doctest that also carries it.
 #[test]
