@@ -889,12 +889,14 @@ entry above does.
   `Arc`s into a `Vec` of its own, and releases it before calling anything,
   so an observer that calls back into `make_observer` or `remove_observer`
   cannot deadlock against the seam that is visiting it. The same issue
-  settles what a `WorkerView` can answer about a worker's queue: upstream
-  exposes `queue_size()` and `queue_capacity()`, and a `crossbeam` deque
-  reports neither, its capacity being a moving target where upstream's is
-  bounded, so `WorkerView::is_queue_empty` is the part of that interface
-  the port can answer, repeating exactly what `Worker` already exposes
-  rather than a second, inconsistent one.
+  scopes what a `WorkerView` answers about a worker's queue down to
+  `is_queue_empty` alone, repeating exactly what `Worker` already exposes
+  rather than a second, inconsistent one -- not because upstream's
+  `queue_size()`/`queue_capacity()` pair turns out to be unanswerable, but
+  because answering either half needs `src/executor/queue.rs` and a wider
+  `Worker` surface, both outside this issue's own files. Issue #206 is the
+  follow-up those two files were left for, and the two halves turn out to
+  need different answers: see "Decisions taken in M9" for which.
 - **An observer epilogue skip is folded into the exhaustive dispatch
   match, not read from a side `matches!`** (issues #211, #212). Two handle
   kinds, `Handle::Async` and `Handle::DependentAsync`, tear themselves down
@@ -1045,15 +1047,13 @@ entry above does.
   with no shared state between them -- one after another, in whatever order
   the caller chooses.
 - **`WorkerView` and `Worker` gain `queue_size`, not `queue_capacity`**
-  (issue #206). #167 scoped the pair down to `is_queue_empty` alone because
-  answering either half needed `src/executor/queue.rs` and a wider `Worker`
-  surface, both outside that issue's file list; #206 is the follow-up those
-  two files were left for. `crossbeam-deque`'s `Worker::len` and
-  `Stealer::len` read the same front/back indices `is_empty` already does,
-  so `queue_size` is as honest a read as upstream's `BoundedWSQ::size` --
-  a live count, stale the instant it is returned, which is what
-  `Worker::queue_size` and `WorkerView::queue_size`'s own doc comments say
-  rather than letting a caller treat the number as a fact to act on.
+  (issue #206, following on from #167's "Decisions taken in M7" entry
+  above). `crossbeam-deque`'s `Worker::len` and `Stealer::len` read the same
+  front/back indices `is_empty` already does, so `queue_size` is as honest
+  a read as upstream's `BoundedWSQ::size` -- a live count, stale the
+  instant it is returned, which is what `Worker::queue_size` and
+  `WorkerView::queue_size`'s own doc comments say rather than letting a
+  caller treat the number as a fact to act on.
 
   `queue_capacity` stays unanswered, because it has no truthful answer to
   give. Upstream's `BoundedWSQ::capacity` returns a fixed bound fixed at
