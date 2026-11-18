@@ -796,3 +796,27 @@ entry above does.
   same scope a sibling is borrowing from -- and `tests/loom_scope.rs` is the
   model, checked against the mutation of skipping the join `scope` performs
   on every path out of it.
+- **A lint policy gets its first exception, and the rule that admits it**
+  (issue #209). `RandomPartitioner::chunk_size_range` (PR #203) carries the
+  crate's first `#[allow]` anywhere in `src/`:
+  `#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]` on the
+  `f32`-to-`usize` conversion of `alpha * nw` and `beta * nw`. `Cargo.toml`'s
+  policy for those two lints reads "loud from the start rather than
+  retrofitted ... over a thousand call sites later", so the crate went from
+  zero such attributes to one without the policy gaining a documented
+  exception -- and a later contributor reading only `Cargo.toml` would
+  reasonably treat the existing attribute as licence for the next one.
+
+  The rule: a float-to-int conversion may carry a statement-scoped
+  `#[allow]` with an inline justification only when its input is a
+  genuinely user-supplied float with no integer-arithmetic equivalent, the
+  way `alpha`/`beta` are arbitrary tunables matching upstream's own `float`
+  parameters and `std` has no `TryFrom<f32> for usize` to fall back on. A
+  conversion derivable from integers already in hand does not qualify, and
+  must be done in integer arithmetic instead -- which is what the PR's
+  other candidate site, the guided partitioner's chunk step, turned out to
+  be: `r / (2 * w)` is a ratio of two integers already in hand, so integer
+  division gives the exact floor with no float round-trip, and the
+  `floor_to_usize` helper that had covered both sites was deleted once that
+  site moved off it. `chunk_size_range`'s is, for now, the one instance the
+  rule admits.
