@@ -178,7 +178,9 @@ per-line slot a `DataPipeline` pays for over a `Pipeline` of the same shape
 (#186, measured in #188). They are kept there rather than repeated here, so
 each figure has one owner. Benchmarks are deliberately outside the gate: a
 benchmark answers "how fast", which is not a pass or a fail, so what CI
-holds the suite to is that it still compiles.
+holds the suite to is that it still compiles — and that it is still *run
+once*, the `examples` job executing every benchmark id a single untimed time
+in criterion's `--test` mode, which asks only whether it runs.
 
 One of those results is bad, and tracked rather than filed away, because the
 honest state of play is more useful than a table of the shapes that happen to

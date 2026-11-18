@@ -139,7 +139,9 @@ jobs:
   # clippy and the doc-tests cover *that* they build; this job covers that
   # they still run cleanly end to end, which is what `devtools/run-examples.sh`
   # does -- cargo auto-discovers `examples/*.rs`, and so does that script's
-  # glob, so a new example from #194-#200 needs no edit here.
+  # glob, so a new example from #194-#200 needs no edit here. The bench step
+  # after it is here for the same reason applied to `benches/*.rs`: compiled by
+  # the gate, run once by this job.
   examples:
     runs-on: ubuntu-latest
     container:
@@ -162,6 +164,25 @@ jobs:
 
       - name: Run examples
         run: bash devtools/run-examples.sh
+
+      # Criterion's own `--test` mode: every benchmark id runs exactly once,
+      # untimed, and the harness exits non-zero if a body panics. That makes
+      # this a smoke test and not a measurement -- nothing is timed, saved or
+      # compared against a baseline -- so the README's rule that benchmarks
+      # sit outside the gate holds: "how fast" is not a pass or a fail, while
+      # "does it still run" is, and `cargo clippy --all-targets` in `ci`
+      # answers only "does it still compile".
+      #
+      # A step of THIS job rather than of `ci`: the examples above are built
+      # with dev-dependencies available and under the same `release` profile a
+      # bench build gives its dependencies, so criterion and rayon are already
+      # compiled here and the marginal cost is the bench targets themselves.
+      # `cargo bench` runs every `[[bench]]` in Cargo.toml, so the fourteen
+      # targets #335-#341 add need no edit here -- but they are also what makes
+      # this step's cost worth watching, and #345 is where a decision to split
+      # it into a job of its own would be recorded.
+      - name: Smoke-run the benchmarks
+        run: cargo bench --all-features -- --test
 
   # The one gate command that is not a step of `ci` above: `cargo deny check`
   # against deny.toml -- licenses, RustSec advisories, duplicate versions,
