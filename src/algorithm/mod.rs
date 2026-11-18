@@ -25,17 +25,17 @@
 //!
 //! # Design
 //!
-//! **One extension trait for the whole family.** [`FlowBuilder`] is a
-//! *trait* -- `src/flow_builder.rs`'s own `# Design` section says why --
-//! implemented by `Taskflow` and `Subflow` rather than a single struct a
-//! second `impl` block could extend, so an algorithm's owned-data wrapper
-//! cannot be an inherent method and lives on a blanket-implemented
-//! extension trait instead: [`AlgorithmBuilder`], whose every method is one
-//! [`FlowBuilder::emplace_runtime`] call over the [`Runtime`] method or the
-//! `make_*_task` factory of the same name. One trait carries all of them
-//! rather than one trait per algorithm, because a per-algorithm trait holds
-//! no concept of its own -- the family shares one vocabulary of owned
-//! parameters, one partitioner set and one lock-once-per-invocation
+//! **One extension trait for the whole family.** [`FlowBuilder`] is a *trait*
+//! -- `src/flow_builder.rs`'s own `# Design` section says why -- implemented
+//! by `Taskflow` and `Subflow` rather than a single struct a second `impl`
+//! block could extend, so an algorithm's owned-data wrapper cannot be an
+//! inherent method and lives on a blanket-implemented extension trait
+//! instead: [`AlgorithmBuilder`], whose every method is one
+//! [`FlowBuilder::emplace_runtime`] call over the [`Runtime`](crate::Runtime)
+//! method or the `make_*_task` factory of the same name. One trait carries
+//! all of them rather than one trait per algorithm, because a per-algorithm
+//! trait holds no concept of its own -- the family shares one vocabulary of
+//! owned parameters, one partitioner set and one lock-once-per-invocation
 //! ownership rule -- and each would cost a caller another name in scope and
 //! another prelude line for nothing. `DESIGN.md`'s "Decisions taken in M10"
 //! entry has the rest, including why the wrappers are not moved into
@@ -102,7 +102,6 @@ use crate::algorithm::partitioner::{DynamicLoop, Partitioner, StaticLoop};
 use crate::algorithm::reduce::ReducePartitioner;
 use crate::flow_builder::FlowBuilder;
 use crate::graph::Task;
-use crate::runtime::Runtime;
 
 pub mod fill;
 pub mod find;
@@ -134,6 +133,10 @@ pub use crate::algorithm::partitioner::{
     ClosureWrapper, DefaultClosureWrapper, DefaultPartitioner, DynamicPartitioner,
     GuidedPartitioner, RandomPartitioner, StaticPartitioner,
 };
+pub use crate::algorithm::reduce::{
+    make_reduce_by_index_task, make_reduce_task, make_transform_reduce_task,
+    make_transform_reduce2_task,
+};
 pub use crate::algorithm::scan::{
     make_exclusive_scan_task, make_inclusive_scan_task, make_inclusive_scan_with_init_task,
     make_transform_exclusive_scan_task, make_transform_inclusive_scan_task,
@@ -145,8 +148,8 @@ pub use crate::algorithm::transform::{make_transform_task, make_transform2_task}
 /// Every algorithm's owned-data [`FlowBuilder`] wrapper: upstream's
 /// `FlowBuilder::for_each`, `for_each_index`, `transform`, `fill`,
 /// `generate`, `reduce`, `find_if`, `sort`, `*_scan` and `merge` members,
-/// each queueing the [`Runtime`] method of the same name into the graph as a
-/// runtime task over data it owns a share of.
+/// each queueing the [`Runtime`](crate::Runtime) method of the same name into
+/// the graph as a runtime task over data it owns a share of.
 ///
 /// Blanket-implemented for every [`FlowBuilder`], so a wrapper reads at the
 /// call site exactly as [`Taskflow`](crate::Taskflow)'s own methods do, and
@@ -177,10 +180,10 @@ pub use crate::algorithm::transform::{make_transform_task, make_transform2_task}
 /// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
 /// ```
 pub trait AlgorithmBuilder: FlowBuilder {
-    /// Creates a runtime task that locks `data` and runs [`Runtime::for_each`]
-    /// over it: upstream's `for_each(beg, end, c, part)`, over a shared
-    /// owned `Vec` rather than an iterator pair a caller must otherwise keep
-    /// alive.
+    /// Creates a runtime task that locks `data` and runs
+    /// [`Runtime::for_each`](crate::Runtime::for_each) over it: upstream's
+    /// `for_each(beg, end, c, part)`, over a shared owned `Vec` rather than
+    /// an iterator pair a caller must otherwise keep alive.
     ///
     /// `f` and `part` are cloned on every run of the task -- relevant only
     /// for a task revisited by a cycle -- matching upstream copying `c` and
@@ -263,9 +266,10 @@ pub trait AlgorithmBuilder: FlowBuilder {
     }
 
     /// Creates a runtime task that locks `out`, borrows `input`, and runs
-    /// [`Runtime::transform`] over them: upstream's one-input
-    /// `FlowBuilder::transform`, over owned, `Arc`-shared data rather than an
-    /// iterator pair a caller must otherwise keep alive.
+    /// [`Runtime::transform`](crate::Runtime::transform) over them:
+    /// upstream's one-input `FlowBuilder::transform`, over owned,
+    /// `Arc`-shared data rather than an iterator pair a caller must otherwise
+    /// keep alive.
     ///
     /// `f` and `part` are cloned on every run of the task, matching upstream
     /// copying `c` and `part` into the closure by value.
@@ -308,7 +312,7 @@ pub trait AlgorithmBuilder: FlowBuilder {
 
     /// The two-input half of the owned-data wrapper: upstream's two-input
     /// `FlowBuilder::transform` overload, named `transform2` for the reason
-    /// [`Runtime::transform2`]'s own doc gives.
+    /// [`Runtime::transform2`](crate::Runtime::transform2)'s own doc gives.
     ///
     /// ```
     /// use std::sync::{Arc, Mutex};
@@ -485,11 +489,12 @@ pub trait AlgorithmBuilder: FlowBuilder {
         self.emplace_runtime(make_generate_n_task(out, count, generator, part))
     }
 
-    /// Creates a runtime task that runs [`Runtime::reduce`] over `data`,
-    /// locking `init` for the task's whole run: upstream's `reduce(beg, end,
-    /// init, bop, part)`, over a shared owned `Vec` and a shared,
-    /// lock-guarded `init` rather than iterator and reference parameters a
-    /// caller must otherwise keep alive.
+    /// Creates a runtime task that runs
+    /// [`Runtime::reduce`](crate::Runtime::reduce) over `data`, locking
+    /// `init` for the task's whole run: upstream's `reduce(beg, end, init,
+    /// bop, part)`, over a shared owned `Vec` and a shared, lock-guarded
+    /// `init` rather than iterator and reference parameters a caller must
+    /// otherwise keep alive.
     ///
     /// `bop` and `part` are cloned on every run of the task -- relevant only
     /// for a task revisited by a cycle -- matching upstream copying both into
@@ -521,13 +526,11 @@ pub trait AlgorithmBuilder: FlowBuilder {
         O: Fn(&T, &T) -> T + Sync + Clone + Send + 'static,
         P: ReducePartitioner + Clone + Send + 'static,
     {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = init.lock().unwrap_or_else(PoisonError::into_inner);
-            runtime.reduce(&data, &mut *guard, bop.clone(), part.clone());
-        })
+        self.emplace_runtime(make_reduce_task(data, init, bop, part))
     }
 
-    /// The owned-data half of [`Runtime::transform_reduce`]: see
+    /// The owned-data half of
+    /// [`Runtime::transform_reduce`](crate::Runtime::transform_reduce): see
     /// [`AlgorithmBuilder::reduce`] for what is cloned on every run.
     fn transform_reduce<T, R, O, U, P>(
         &mut self,
@@ -544,13 +547,11 @@ pub trait AlgorithmBuilder: FlowBuilder {
         U: Fn(&T) -> R + Sync + Clone + Send + 'static,
         P: ReducePartitioner + Clone + Send + 'static,
     {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = init.lock().unwrap_or_else(PoisonError::into_inner);
-            runtime.transform_reduce(&data, &mut *guard, bop.clone(), uop.clone(), part.clone());
-        })
+        self.emplace_runtime(make_transform_reduce_task(data, init, bop, uop, part))
     }
 
-    /// The owned-data half of [`Runtime::transform_reduce2`]: see
+    /// The owned-data half of
+    /// [`Runtime::transform_reduce2`](crate::Runtime::transform_reduce2): see
     /// [`AlgorithmBuilder::reduce`] for what is cloned on every run.
     fn transform_reduce2<T1, T2, R, O, U, P>(
         &mut self,
@@ -569,20 +570,13 @@ pub trait AlgorithmBuilder: FlowBuilder {
         U: Fn(&T1, &T2) -> R + Sync + Clone + Send + 'static,
         P: ReducePartitioner + Clone + Send + 'static,
     {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = init.lock().unwrap_or_else(PoisonError::into_inner);
-            runtime.transform_reduce2(
-                &data1,
-                &data2,
-                &mut *guard,
-                bop.clone(),
-                uop.clone(),
-                part.clone(),
-            );
-        })
+        self.emplace_runtime(make_transform_reduce2_task(
+            data1, data2, init, bop, uop, part,
+        ))
     }
 
-    /// The owned-data half of [`Runtime::reduce_by_index`]: see
+    /// The owned-data half of
+    /// [`Runtime::reduce_by_index`](crate::Runtime::reduce_by_index): see
     /// [`AlgorithmBuilder::reduce`] for what is cloned on every run. `range`
     /// is a plain value, not `Arc`-wrapped, since [`IndexRange`] is `Copy` --
     /// [`for_each_index`]'s own wrapper over an `IndexRange` takes it the
@@ -602,16 +596,14 @@ pub trait AlgorithmBuilder: FlowBuilder {
         G: Fn(&T, &T) -> T + Sync + Clone + Send + 'static,
         P: ReducePartitioner + Clone + Send + 'static,
     {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = init.lock().unwrap_or_else(PoisonError::into_inner);
-            runtime.reduce_by_index(range, &mut *guard, lop.clone(), gop.clone(), part.clone());
-        })
+        self.emplace_runtime(make_reduce_by_index_task(range, init, lop, gop, part))
     }
 
-    /// Creates a runtime task that runs [`Runtime::find_if`] over `data` and
-    /// writes its answer into `result`: upstream's `find_if(beg, end,
-    /// result, predicate, part)`, over a shared owned `Vec` rather than an
-    /// iterator pair a caller must otherwise keep alive.
+    /// Creates a runtime task that runs
+    /// [`Runtime::find_if`](crate::Runtime::find_if) over `data` and writes
+    /// its answer into `result`: upstream's `find_if(beg, end, result,
+    /// predicate, part)`, over a shared owned `Vec` rather than an iterator
+    /// pair a caller must otherwise keep alive.
     ///
     /// `predicate` and `part` are cloned on every run of the task --
     /// relevant only for a task revisited by a cycle -- matching upstream
@@ -672,7 +664,8 @@ pub trait AlgorithmBuilder: FlowBuilder {
         self.emplace_runtime(make_find_if_not_task(data, result, predicate, part))
     }
 
-    /// The owned-data half of [`Runtime::min_element`]: see
+    /// The owned-data half of
+    /// [`Runtime::min_element`](crate::Runtime::min_element): see
     /// [`AlgorithmBuilder::find_if`].
     fn min_element<T, C, P>(
         &mut self,
@@ -707,8 +700,9 @@ pub trait AlgorithmBuilder: FlowBuilder {
     }
 
     /// Creates a runtime task that locks `out` and runs
-    /// [`Runtime::inclusive_scan`] over it and `input`: upstream's
-    /// `FlowBuilder::inclusive_scan(first, last, d_first, bop)`.
+    /// [`Runtime::inclusive_scan`](crate::Runtime::inclusive_scan) over it
+    /// and `input`: upstream's `FlowBuilder::inclusive_scan(first, last,
+    /// d_first, bop)`.
     ///
     /// `rustflow::prelude::*` is the only import this example needs:
     /// `AlgorithmBuilder` itself is one of the prelude's names, not imported
@@ -738,8 +732,9 @@ pub trait AlgorithmBuilder: FlowBuilder {
     }
 
     /// Creates a runtime task that locks `out` and runs
-    /// [`Runtime::inclusive_scan_with_init`] over it and `input`: upstream's
-    /// `FlowBuilder::inclusive_scan(first, last, d_first, bop, init)`.
+    /// [`Runtime::inclusive_scan_with_init`](crate::Runtime::inclusive_scan_with_init)
+    /// over it and `input`: upstream's `FlowBuilder::inclusive_scan(first,
+    /// last, d_first, bop, init)`.
     fn inclusive_scan_with_init<T, F>(
         &mut self,
         input: Arc<Vec<T>>,
@@ -755,8 +750,9 @@ pub trait AlgorithmBuilder: FlowBuilder {
     }
 
     /// Creates a runtime task that locks `out` and runs
-    /// [`Runtime::exclusive_scan`] over it and `input`: upstream's
-    /// `FlowBuilder::exclusive_scan(first, last, d_first, init, bop)`.
+    /// [`Runtime::exclusive_scan`](crate::Runtime::exclusive_scan) over it
+    /// and `input`: upstream's `FlowBuilder::exclusive_scan(first, last,
+    /// d_first, init, bop)`.
     fn exclusive_scan<T, F>(
         &mut self,
         input: Arc<Vec<T>>,
@@ -772,7 +768,8 @@ pub trait AlgorithmBuilder: FlowBuilder {
     }
 
     /// Creates a runtime task that locks `out` and runs
-    /// [`Runtime::transform_inclusive_scan`] over it and `input`: upstream's
+    /// [`Runtime::transform_inclusive_scan`](crate::Runtime::transform_inclusive_scan)
+    /// over it and `input`: upstream's
     /// `FlowBuilder::transform_inclusive_scan(first, last, d_first, bop,
     /// uop)`.
     fn transform_inclusive_scan<T, F, Uop>(
@@ -791,9 +788,10 @@ pub trait AlgorithmBuilder: FlowBuilder {
     }
 
     /// Creates a runtime task that locks `out` and runs
-    /// [`Runtime::transform_inclusive_scan_with_init`] over it and `input`:
-    /// upstream's `FlowBuilder::transform_inclusive_scan(first, last,
-    /// d_first, bop, uop, init)`.
+    /// [`Runtime::transform_inclusive_scan_with_init`](crate::Runtime::transform_inclusive_scan_with_init)
+    /// over it and `input`: upstream's
+    /// `FlowBuilder::transform_inclusive_scan(first, last, d_first, bop, uop,
+    /// init)`.
     fn transform_inclusive_scan_with_init<T, F, Uop>(
         &mut self,
         input: Arc<Vec<T>>,
@@ -813,7 +811,8 @@ pub trait AlgorithmBuilder: FlowBuilder {
     }
 
     /// Creates a runtime task that locks `out` and runs
-    /// [`Runtime::transform_exclusive_scan`] over it and `input`: upstream's
+    /// [`Runtime::transform_exclusive_scan`](crate::Runtime::transform_exclusive_scan)
+    /// over it and `input`: upstream's
     /// `FlowBuilder::transform_exclusive_scan(first, last, d_first, init,
     /// bop, uop)`.
     fn transform_exclusive_scan<T, F, Uop>(
@@ -834,9 +833,10 @@ pub trait AlgorithmBuilder: FlowBuilder {
         ))
     }
 
-    /// Creates a runtime task that locks `data` and runs [`Runtime::sort_by`]
-    /// over it: upstream's `sort(beg, end, cmp)`, over a shared owned `Vec`
-    /// rather than an iterator pair a caller must otherwise keep alive.
+    /// Creates a runtime task that locks `data` and runs
+    /// [`Runtime::sort_by`](crate::Runtime::sort_by) over it: upstream's
+    /// `sort(beg, end, cmp)`, over a shared owned `Vec` rather than an
+    /// iterator pair a caller must otherwise keep alive.
     ///
     /// `cmp` is cloned on every run of the task -- relevant only for a task
     /// revisited by a cycle -- matching upstream copying `cmp` into the
@@ -866,8 +866,9 @@ pub trait AlgorithmBuilder: FlowBuilder {
         self.emplace_runtime(make_sort_by_task(data, cmp))
     }
 
-    /// Creates a runtime task that locks `data` and runs [`Runtime::sort`]
-    /// over it: upstream's `sort(beg, end)`.
+    /// Creates a runtime task that locks `data` and runs
+    /// [`Runtime::sort`](crate::Runtime::sort) over it: upstream's `sort(beg,
+    /// end)`.
     ///
     /// ```
     /// use std::sync::{Arc, Mutex};

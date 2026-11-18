@@ -24,6 +24,11 @@
 //! [`rustflow::algorithm::reduce::ReducePartitioner::drive_fold`] is taken
 //! once per worker *task*, never once per chunk or per element.
 //!
+//! [`make_reduce_task_runs_from_a_silent_dependent_async_body`] has no
+//! upstream counterpart: `test_reduce.cpp` submits every case through a
+//! taskflow, and the factory layer is what lets this port hand one of these
+//! algorithms to an async submission instead.
+//!
 //! What is not here: the `TransformReduce.MoveOnlyData.*` cases.
 //! `src/algorithm/reduce.rs`'s own `# Design` section says why --
 //! `data: &[T]` is borrowed, not consumed, so this port's `reduce` needs
@@ -34,6 +39,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rustflow::algorithm::index_range::IndexRange;
+use rustflow::algorithm::make_reduce_task;
 use rustflow::algorithm::partitioner::{
     DefaultClosureWrapper, DynamicPartitioner, GuidedPartitioner, RandomPartitioner,
     StaticPartitioner,
@@ -697,4 +703,45 @@ fn flow_builder_reduce_wrappers_coverage() {
         *indexed.lock().expect("uncontended"),
         10 + data.iter().sum::<i64>()
     );
+}
+
+// ----------------------------------------------------------------------------
+// make_reduce_task, submitted from outside a graph
+// ----------------------------------------------------------------------------
+
+/// `make_reduce_task` handed straight to
+/// [`Executor::silent_dependent_async_runtime`] and waited for through
+/// [`Executor::wait_for_all`]: the submission neither [`Runtime::reduce`] nor
+/// the owned-data `AlgorithmBuilder` wrapper reaches, since a silent
+/// dependent-async task is never queued into a [`Taskflow`] for the wrapper
+/// to build through.
+///
+/// `init` starts at 5 rather than 0, so the assertion also pins that the
+/// caller's own starting value re-enters the fold exactly once; `n == 0`
+/// leaves it alone, which the same formula covers.
+#[test]
+fn make_reduce_task_runs_from_a_silent_dependent_async_body() {
+    let executor = Executor::new(3);
+
+    for &n in &[0usize, 1, 7, 150, 2000] {
+        let data = Arc::new((1..=n).collect::<Vec<usize>>());
+        let sum = Arc::new(Mutex::new(5usize));
+
+        let _task = executor.silent_dependent_async_runtime(
+            make_reduce_task(
+                Arc::clone(&data),
+                Arc::clone(&sum),
+                |a: &usize, b: &usize| a + b,
+                GuidedPartitioner::<DefaultClosureWrapper>::default(),
+            ),
+            [],
+        );
+        executor.wait_for_all();
+
+        assert_eq!(
+            *sum.lock().expect("uncontended"),
+            5 + data.iter().sum::<usize>(),
+            "n = {n}"
+        );
+    }
 }
