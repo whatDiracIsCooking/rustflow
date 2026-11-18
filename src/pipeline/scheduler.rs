@@ -2,7 +2,7 @@
 //!
 //! [`Pipeline`] is upstream's `tf::Pipeline`: a fixed chain of [`Pipe`]s run
 //! over `num_lines` parallel lines, composed into another graph as a module
-//! task. `DESIGN.md`'s "Decisions taken in M8" section covers the three
+//! task. `DESIGN.md`'s "Pipelines" section covers the three
 //! choices the whole family is built on -- why a line is a
 //! [`Handle::NonpreemptiveRuntime`](crate::graph::Handle::NonpreemptiveRuntime)
 //! task rather than an ordinary [`Handle::Runtime`](crate::graph::Handle::Runtime)
@@ -134,7 +134,7 @@ pub struct Pipeline {
 /// A pipeline's state, shared by every line task of its graph: upstream's
 /// `Pipeline::_lines`, `_pipeflows`, `_num_tokens` and `_pipes` together,
 /// behind the one `Arc` [`Pipeline`] and every line's closure hold a share
-/// of -- `DESIGN.md`'s "Decisions taken in M8" says why one allocation
+/// of -- `DESIGN.md`'s "Pipelines" section says why one allocation
 /// rather than upstream's `this`.
 #[derive(Debug)]
 struct State {

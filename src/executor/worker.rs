@@ -1085,8 +1085,8 @@ fn preempts_itself(handle: &Handle) -> bool {
         // The whole reason this variant exists: no protocol ever sets
         // `PREEMPTED` for it, so this answers `false` unconditionally rather
         // than depending on whether the body has spawned anything --
-        // `DESIGN.md`'s "Decisions taken in M8" has the failure that made
-        // this arm necessary.
+        // `DESIGN.md`'s entry on `Runtime::schedule`'s hole has the failure
+        // that made this arm necessary.
         | Handle::NonpreemptiveRuntime(_)
         | Handle::Async(_)
         | Handle::DependentAsync(_) => false,

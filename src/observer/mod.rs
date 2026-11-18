@@ -25,10 +25,10 @@
 //! **A worker's queue answers `is_queue_empty` and `queue_size`, but not
 //! `queue_capacity`,** and **the registered list is one atomic check on the
 //! path with no observers, and a mutex only when there is work to do** --
-//! `DESIGN.md` has both, the first split across "Decisions taken in M7" (why
-//! `is_queue_empty` alone shipped first) and "Decisions taken in M9" (why
-//! `queue_size` joined it and `queue_capacity` still has not), the second
-//! under "Decisions taken in M7".
+//! `DESIGN.md` has both, the first split across the "Observers" entry on the
+//! observer list (why `is_queue_empty` alone shipped first) and the "Executor
+//! core" entry on `queue_size` (why that joined it and `queue_capacity` still
+//! has not), the second in that same "Observers" entry.
 //!
 //! **A hook may panic, and the run reports it rather than the worker dying
 //! of it.** [`Observer::on_entry`] and [`Observer::on_exit`] are called

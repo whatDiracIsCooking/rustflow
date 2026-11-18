@@ -101,7 +101,7 @@
 //! handing out aliasing indices into one `&mut`, which is where this port
 //! and upstream's raw iterators part company; an index-driven one walks an
 //! [`IndexRange`](algorithm::index_range::IndexRange) in place of a slice.
-//! `DESIGN.md`'s "Decisions taken in M10" entry on the family's three layers
+//! `DESIGN.md`'s "Three layers, not two forms" entry, under "Algorithms",
 //! has why each layer stays.
 //!
 //! [`pipeline`] is the family with no Rust equivalent to lean on. A
@@ -129,9 +129,9 @@
 //! [`Notifier`](executor::notifier::Notifier), keeps its module path, where
 //! the docs explaining it are. [`prelude`] is the smaller list inside that
 //! one: the names a program's first page spells, which [`prelude`]'s own docs
-//! state as a rule. `DESIGN.md`'s "Decisions taken in M10" entry has why both
-//! lists are drawn where they are, and which re-exports it leaves to be
-//! withdrawn.
+//! state as a rule. `DESIGN.md`'s entry on the prelude and the crate root has
+//! why both lists are drawn where they are, and which re-export it leaves to
+//! be withdrawn.
 //!
 //! # Status
 //!
@@ -142,22 +142,31 @@
 //! public class, free function and example `taskflow/` ships there has a
 //! counterpart here or a recorded reason it does not, which the README
 //! lists. Two consolidation milestones punctuate the steps, one between
-//! steps 5 and 6 and one after the parity pass, and most of what they change
-//! is what a reader of the source meets: the async family's public methods
-//! are one-line delegations onto a single core on the executor's shared
-//! state, the run's machinery is the `executor::topology` module tree rather
-//! than one file, the graph is the [`graph`] module tree, and every doc
-//! comment in the crate is held to the documentation contract in
-//! `DESIGN.md`. The second also settles this crate root's own namespace,
-//! which "Where the names live" above states as a rule.
+//! steps 5 and 6 and one after the parity pass, and both have run. Most of
+//! what they change is what a reader of the source meets: the async family's
+//! public methods are one-line delegations onto a single core on the
+//! executor's shared state, the run's machinery is the `executor::topology`
+//! module tree rather than one file, the graph is the [`graph`] module tree,
+//! and every doc comment in the crate is held to the documentation contract
+//! in `DESIGN.md`. The second reaches the surface as well: it settles this
+//! crate root's own namespace and [`prelude`]'s, which "Where the names live"
+//! above states as a rule; the algorithm family's eight extension traits are
+//! one [`AlgorithmBuilder`](algorithm::AlgorithmBuilder) with a `make_*_task`
+//! factory behind every wrapper, so a dependent-async body can reach the
+//! algorithms too; every async submission has a `_named` twin; and two
+//! scheduler defects its own panic matrix found -- a dispatch claim a bypass
+//! could leak, and an observer hook whose panic killed a worker -- are fixed.
+//! `DESIGN.md`'s entries for those are under "Documentation and tooling",
+//! "Algorithms" and "Executor core".
 //!
 //! The crate's `unsafe` blocks live in two modules and nowhere else:
 //! [`notifier`](executor::notifier), in the lock-free waiter stack, and
 //! [`scope`](executor::scope), where [`Runtime::scope`] erases a borrowed
 //! child closure's lifetime and is sound only because it joins every child
 //! before returning. The scheduler itself has none. `DESIGN.md` is why the
-//! port is shaped the way it is, and its "Decisions taken in M6" and
-//! "Decisions taken in M10" sections are the two consolidations' record.
+//! port is shaped the way it is: one entry per decision, grouped by the part
+//! of the port it decides and each naming the issue that took it, the two
+//! consolidations' among them.
 //!
 //! The port follows **Taskflow v4.1.0** (commit `45366fe5`, 2026-06-19). See
 //! the README's "Upstream pin" section before translating anything.
@@ -232,8 +241,8 @@ pub use crate::taskflow::Taskflow;
 /// async family, task groups, semaphores, scoped spawns, observers, pipelines,
 /// the algorithms' free-function and partitioner forms -- and its names are
 /// imported by name from the crate root or from the family's own module at the
-/// point the program chooses it. `DESIGN.md`'s "Decisions taken in M10" entry
-/// has why this reading and not the narrower one.
+/// point the program chooses it. `DESIGN.md`'s entry on the prelude and the
+/// crate root has why this reading and not the narrower one.
 ///
 /// ```
 /// use rustflow::prelude::*;

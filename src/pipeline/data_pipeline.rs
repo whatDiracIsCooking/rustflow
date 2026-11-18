@@ -11,7 +11,7 @@
 //!
 //! # Design
 //!
-//! `DESIGN.md`'s "Decisions taken in M8" section has why this chain is built
+//! `DESIGN.md`'s "Pipelines" section has why this chain is built
 //! from two callable shapes rather than upstream's three, and what the slot
 //! that carries a token's value from one pipe to the next costs.
 //!
@@ -44,7 +44,7 @@ type SlotValue = Option<Box<dyn Any + Send>>;
 /// One line's slot: upstream's `CachelineAligned<data_t>`, a `std::variant`
 /// over every pipe's own output type. Rust has no anonymous union of an open
 /// type list without a caller-supplied enum, so a type-erased box stands in
-/// -- `DESIGN.md`'s "Decisions taken in M8" section has what that costs.
+/// -- `DESIGN.md`'s "Pipelines" section has what that costs.
 type Slot = Mutex<SlotValue>;
 
 /// Locks `slot`, tolerating poison: a pipeline's own line protocol already
@@ -57,7 +57,7 @@ fn lock_slot(slot: &Slot) -> MutexGuard<'_, SlotValue> {
 }
 
 /// A [`DataPipe`]'s own callable, already normalized to the one shape every
-/// constructor below builds: `DESIGN.md`'s "Decisions taken in M8" section
+/// constructor below builds: `DESIGN.md`'s "Pipelines" section
 /// says why there is one shape here rather than upstream's three.
 type Callable<I, O> = Box<dyn Fn(I, &mut Pipeflow) -> O + Send + Sync>;
 

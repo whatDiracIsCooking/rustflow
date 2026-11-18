@@ -4,7 +4,7 @@
 # DESIGN.md: a file's prose lines at or under 1.2x its code lines.
 #
 #   devtools/doc-ratio.sh                   # every src/**/*.rs, plus a total
-#   devtools/doc-ratio.sh src/executor/runtime.rs src/graph.rs
+#   devtools/doc-ratio.sh src/executor/runtime.rs src/graph/node.rs
 #
 # This is a REPORT, not a gate: it exits 0 whatever it finds, so an acceptance
 # check or a PR body can quote its numbers without the script deciding what

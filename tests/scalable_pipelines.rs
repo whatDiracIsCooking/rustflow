@@ -1,7 +1,7 @@
 //! Translated from `unittests/test_scalable_pipelines.cpp` (Taskflow v4.1.0).
 //!
 //! Upstream's `tf::ScalablePipeline` is this port's own [`Pipeline`] --
-//! `DESIGN.md`'s "Decisions taken in M8" section says why one type stands
+//! `DESIGN.md`'s "Pipelines" section says why one type stands
 //! for both of upstream's templates -- so what this file actually exercises
 //! is [`Pipeline::reset_pipes`] and [`Pipeline::reset_lines`]: `Basics`,
 //! `Reset`, `LinesReset`, `IterativeReset`, and then four matrices that

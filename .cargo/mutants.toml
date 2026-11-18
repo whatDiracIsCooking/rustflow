@@ -1,7 +1,8 @@
 # Mutants `cargo mutants` must not report, because no test should kill them:
 # each is equivalent to the original, or pins a value the design leaves free.
-# The argument for every one of them is in `DESIGN.md`, under "Decisions taken
-# in M10" -- in particular that the third mutant of `partitioner.rs:429:22`,
+# The argument for every one of them is in `DESIGN.md`, under "Documentation
+# and tooling" -- in particular that the third mutant of
+# `partitioner.rs:429:22`,
 # `q > chunk_size`, is *not* here and is killed by
 # `the_guided_loop_shrinks_its_chunks_with_the_remaining_work`.
 #

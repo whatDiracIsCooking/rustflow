@@ -37,8 +37,8 @@
 //! trait holds no concept of its own -- the family shares one vocabulary of
 //! owned parameters, one partitioner set and one lock-once-per-invocation
 //! ownership rule -- and each would cost a caller another name in scope and
-//! another prelude line for nothing. `DESIGN.md`'s "Decisions taken in M10"
-//! entry has the rest, including why the wrappers are not moved into
+//! another prelude line for nothing. `DESIGN.md`'s entry on the one
+//! `AlgorithmBuilder` has the rest, including why the wrappers are not moved into
 //! [`FlowBuilder`] itself.
 //!
 //! **A shared chunk-loop driver.** Every one of upstream's `make_*_task`

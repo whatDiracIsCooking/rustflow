@@ -18,6 +18,45 @@ provenance lines, which belong in the modules they describe; and the status of
 the work, which is the README's "Order of work" section and the milestones
 behind it.
 
+The contract below keeps a rationale in one place, and for a module that is a
+dozen lines of dispatch over machinery somebody else owns -- or a handful of
+value types whose own doc comments would otherwise retell a decision made
+once, elsewhere -- that place cannot be the module itself. Some of the entries
+are that place: #130 moved the executor periphery's rationale here first, and
+the modules after it that were in the same position add to it the same way,
+each naming the issue whose decision it records, as every other entry does.
+
+A decision does not always add an entry of its own either. The first
+consolidation ran 17 issues against the 11 it opened with, and the rest of its
+decisions extended an entry rather than adding one. Where each is: the anchor
+window and the companion walk in `enter` (#157) under "A failure inside a
+nested graph is delivered to whoever is waiting for that graph"; the one-node
+arena and why three heap blocks cannot be two (#144) under "An async task is
+one `Arc`-owned free-standing node"; the debug assertion and the loom model
+that replaced a paragraph (#138, #141) under "A run's waiter is released by the
+last share of its storage hold"; and a task body's own queue (#119) and naming
+a task in two statements (#120) in entries of their own. Two issues
+deliberately left none: #128 and #151 are the weekly loom workflow, whose own
+file and the README say what it runs, and #146 was two module docs still
+calling the async family a later milestone.
+
+The entries are grouped by the part of the port they decide rather than by the
+milestone that decided them; each still names its issue, which is where the
+order they were taken in is recorded.
+
+## Index
+
+- [Documentation contract](#documentation-contract) -- what a doc comment says
+- [Graph and flow builder](#graph-and-flow-builder) -- the arena and the builder
+- [Executor core](#executor-core) -- what a run owns, and how a job is dispatched
+- [Control flow and cancellation](#control-flow-and-cancellation) -- where a failure goes
+- [Dynamic tasking](#dynamic-tasking) -- subflows, module tasks and task groups
+- [The async family](#the-async-family) -- free nodes, handles and named submissions
+- [Observers](#observers) -- the two hook seams and the profiler
+- [Algorithms](#algorithms) -- the three layers and the ownership rule they share
+- [Pipelines](#pipelines) -- lines, the nonpreemptive node kind and `DataPipeline`
+- [Documentation and tooling](#documentation-and-tooling) -- the surface and the instruments
+
 ## Documentation contract
 
 An item doc (`///`) states **what the item is**, the **upstream name** it
@@ -108,17 +147,94 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   reader has in front of them, and a committed one would be a second copy of
   the test list to keep in step with the tests (#262).
 
-## Design decisions already taken
+## Graph and flow builder
 
 - **Graph as an arena.** The upstream API hands out `tf::Task` handles that
   alias into a graph the caller still owns and mutates, which does not survive
   translation to Rust's aliasing rules. Here the taskflow owns a vector of
   nodes and a `Task` is a `Copy` index. Dependency edits go through the
-  taskflow via a short-lived fluent borrow, so the graph is plain `Send + Sync`
-  with no `unsafe`, and a run can hold `&Taskflow` across worker threads.
-  Upstream's rule "do not mutate a taskflow while it runs" becomes a lifetime
-  on the run handle — which makes the ordinary case a compile error, and is
-  not on its own enough; see the next entry.
+  taskflow via a short-lived fluent borrow, so the graph is plain `Send +
+  Sync` with no `unsafe`, and a run can hold `&Taskflow` across worker
+  threads. Upstream's rule "do not mutate a taskflow while it runs" becomes a
+  lifetime on the run handle — which makes the ordinary case a compile error,
+  and is not on its own enough; see "A run owns the graph it walks" under
+  "Executor core".
+- **Naming a task is two statements, not `emplace(..).name("A")`** (issue
+  #120). Upstream's `emplace` returns a `tf::Task` by value, so a name chains
+  straight onto it; here `emplace` returns the `Copy` index and the fluent
+  methods live on `TaskMut`, which is a `&mut` borrow of the builder. Handing
+  that borrow back from `emplace` is what the chain would cost: a
+  `let a = tf.emplace(..)` would then hold the taskflow borrowed until `a`
+  dies, so a second `emplace` on the next line would not borrow-check, and
+  every example in the crate would break. So it is `let a = tf.emplace(..);`
+  and then `tf.task(a).name("a");`. The two other shapes considered are rejected for
+  their own reasons: a consuming `TaskMut::name(self) -> Task` breaks the
+  documented `tf.task(a).name("a").work(..).precede([b, c])` chain, and an
+  `emplace_named` family needs a twin for each of the five emplace kinds plus
+  `placeholder` to save one line. What the port does instead is put `task()`
+  and `task_ref()` on `FlowBuilder` rather than on `Taskflow`, so that the
+  two-statement form reads the same inside a subflow body as outside one.
+- **Task bodies are `FnMut() + Send + 'static`.** Condition tasks create
+  cycles, so a body runs many times per run and upstream invokes it mutably;
+  the scheduler's one-worker-per-node guarantee is the safety argument.
+  Panics take the role of upstream's exceptions: caught per task, stored in the
+  topology, surfaced from `wait`.
+- **Per-node runtime state stays in the node** as atomics, matching upstream's
+  join counter and state words, so runs of one taskflow serialise exactly as
+  they do upstream.
+- **`FlowBuilder` is a trait with provided methods, not a base class**
+  (issue #23). Upstream's `tf::FlowBuilder` is a base class holding a
+  `Graph&`, which `tf::Taskflow` and `tf::Subflow` inherit for the
+  task-building API; Rust has no inheritance for code reuse, so the trait
+  asks an implementor for the one thing it cannot provide itself -- the
+  graph it builds into, as `FlowBuilder::graph` and `FlowBuilder::graph_mut`
+  -- and supplies everything else as a default method over that. `Runtime`
+  deliberately does not implement it: the graph a runtime task runs in is
+  the enclosing one, scheduled into but never edited, so it has no `task`
+  method to offer.
+- **`FlowBuilder::composed_of` takes anything `Composable`, not a concrete
+  `Arc<Taskflow>`** (issue #181). Upstream's own `composed_of` is a template
+  over its `GraphLike` concept rather than a `Taskflow` overload, because a
+  pipeline composes its own graph the same way a plain taskflow does; the
+  port gets that for free once the one thing `composed_of` needs -- a share
+  of the target's `Taskflow` -- is asked for through a trait instead of a
+  concrete type. `Composable` is implemented for `Arc<Taskflow>` so every
+  caller from before the trait existed is unaffected; a pipeline's own graph
+  is the other implementor.
+- **`Task::data` is a typed slot, and `for_each_subflow_task` is ported
+  because a retained subflow's graph survives its join** (issue #191).
+  Upstream's `Node::_data` is `void* {nullptr}`, read and written through
+  `Task::data()`/`data(void*)` with no check that a caller's cast matches
+  what was stored. The port's slot is `Option<Box<dyn Any + Send + Sync>>`
+  on `Node` instead -- `Send + Sync` because a node is reachable from any
+  worker, where upstream's bare pointer needs neither -- and
+  `TaskMut::set_data`, `TaskMut::data_mut` and `TaskMut::take_data` write it
+  while `TaskRef::data::<T>()` reads it typed, a failed downcast answering
+  `None` rather than trusting whatever bytes happen to be there. The type
+  change does not rescue upstream's own premise that a task body can read
+  its own attached data back through a `tf::Task` that still aliases the
+  live graph while the body runs: a body here is `'static` and owns nothing
+  of the taskflow holding it, so `examples/attach_data.rs` sets the value
+  with `TaskMut::set_data` before a run and reads it back with
+  `TaskRef::data` after `wait()` returns, rather than inside the body itself
+  -- the one example in #194's batch where the ownership model forces a
+  different program shape rather than a different spelling of the same one
+  (`docs/api-friction.md` records it as a "keep").
+
+  `for_each_subflow_task` is ported on `TaskRef`, not left absent: a subflow's
+  subgraph lives in the node's `Mutex<Graph>` (see `src/subflow.rs` and the
+  entry on leasing a subgraph under "Dynamic tasking"), and after a join that
+  retained it (`Subflow::set_retain(true)`) the graph is still there for the
+  method to walk, exactly as upstream's is. Its visitor hands back a `TaskRef`
+  scoped to that subgraph's own lock rather than a bare `Task`, because the
+  index space a subflow's tasks live in is not the composing taskflow's own --
+  which is also where the trap `docs/api-friction.md` records from #194's own
+  example lives: calling `for_each_subflow_task` again from inside the first
+  call's own visitor, to resolve a successor's name, re-enters the same
+  `Mutex` on the same thread and hangs rather than panics.
+
+## Executor core
+
 - **A run owns the graph it walks** (issue #40). A lifetime on the run handle
   is only as good as the handle: `mem::forget` on one ends the borrow under
   NLL with the run still in flight, and a blocking `Drop` cannot help, because
@@ -144,40 +260,380 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   measures nothing but scheduler overhead. A real regression, and the right
   one to accept: the alternative was a safe API with a reachable
   use-after-free.
-- **Naming a task is two statements, not `emplace(..).name("A")`** (issue
-  #120). Upstream's `emplace` returns a `tf::Task` by value, so a name chains
-  straight onto it; here `emplace` returns the `Copy` index and the fluent
-  methods live on `TaskMut`, which is a `&mut` borrow of the builder. Handing
-  that borrow back from `emplace` is what the chain would cost: a
-  `let a = tf.emplace(..)` would then hold the taskflow borrowed until `a`
-  dies, so a second `emplace` on the next line would not borrow-check, and
-  every example in the crate would break. So it is `let a = tf.emplace(..);`
-  and then `tf.task(a).name("a");`. The two other shapes considered are rejected for
-  their own reasons: a consuming `TaskMut::name(self) -> Task` breaks the
-  documented `tf.task(a).name("a").work(..).precede([b, c])` chain, and an
-  `emplace_named` family needs a twin for each of the five emplace kinds plus
-  `placeholder` to save one line. What the port does instead is put `task()`
-  and `task_ref()` on `FlowBuilder` rather than on `Taskflow`, so that the
-  two-statement form reads the same inside a subflow body as outside one.
-- **Task bodies are `FnMut() + Send + 'static`.** Condition tasks create
-  cycles, so a body runs many times per run and upstream invokes it mutably;
-  the scheduler's one-worker-per-node guarantee is the safety argument.
-  Panics take the role of upstream's exceptions: caught per task, stored in the
-  topology, surfaced from `wait`.
-- **Per-node runtime state stays in the node** as atomics, matching upstream's
-  join counter and state words, so runs of one taskflow serialise exactly as
-  they do upstream.
-- **A module task shares its target, `Arc<Taskflow>`.** Upstream's
-  `composed_of` stores a bare `Graph&` and leaves the caller to keep the
-  composed taskflow alive for as long as any run of the composing one may be
-  in flight — an obligation a safe Rust API cannot state, so the module owns a
-  share of its target instead. `adopt(Graph)` is the owned form of the same
-  thing, for a graph with no other owner.
+- **A run's waiter is released by the last share of its storage hold** (issues
+  #109, #112). Two rules used to carry the promise that a `wait` returning
+  means the taskflow is editable: a job gives up its share of the storage
+  before the decrement that can end the run, and the tear-down drops the run's
+  own share before releasing the waiter. The pair does not add up, because a
+  node that *preempts* is dequeued as a job and that job is then copied three
+  times — onto the frame inside the dispatch arm, into the parent its nested
+  graph is scheduled under, and as the job the last child re-queues to resume
+  it — and only the third copy is ever finished. The other two are dropped by
+  frames that have moved on, and nothing orders those instructions against the
+  resumed node ending the run, so a `wait` could return, and on CI did, with a
+  copy still holding the storage and the caller's next `emplace` panicking.
+  Eliminating the copies is not available: the join counter a child decrements
+  lives in the parent node, inside what one of those copies keeps alive. So the
+  release of the waiter moved instead — the run's hold on the storage is one
+  allocation every job of the run's graph shares, and its `Drop` releases the
+  storage, then the executor's count, then the waiter, in that order. One
+  waiter cannot be released that way, and takes the same hold from the other
+  side: a `corun` frame parks nowhere, so it *owns* the hold and waits for
+  `Arc::get_mut` to call it unique, which is the one question no mere holder of
+  a share can answer (#112). The rule the two shapes share — a thread is woken
+  only by the drop of the last hold on whatever it will touch next — is since
+  #138 and #141 a debug assertion and a loom model rather than a paragraph.
+- **The run splits into three modules and the ownership quartet stays four**
+  (issue #131). `executor::topology` was one 2,352-line file over a dozen
+  types, and six of M5's seven post-merge bugs were counter or share-lifecycle
+  errors in it, so it is now a module tree: `run` for `Topology`, `RunPolicy`,
+  `Completion`, `Cancellable` and `set_up_graph`, `job` for `Job`, `Finished`
+  and `Anchor`, and `ownership` for `GraphOwner`, `Storage`, `Inside`,
+  `Parent` and `Nested`. The split is by what owns what rather than by size,
+  which is why the file's one `//!` became three `# Design` sections and why
+  the lock orderings -- spread over field docs before -- are one list in
+  `ownership`'s.
+
+  The quartet was the question the issue asked, and the answer is that **four
+  stay four**, with one of the three candidate merges available on cost and
+  two forbidden outright. `Storage` into `Inside` share only "an `Arc` with a
+  `Drop`". `GraphOwner::Run` into `GraphOwner::Flow` *is* possible, an ungated
+  hold behaving exactly as a bare share of the storage does, and is declined
+  because every module task would then allocate a hold whose only property is
+  that it gates nothing, on the hottest resolution in the crate. `Nested` into
+  `Parent` is forbidden by an invariant: the state words a nested graph's jobs
+  count down have to be one allocation shared by every job under that parent,
+  and `Parent` is `Clone` and travels by value on every job, so an inline
+  payload would hand each child a counter of its own. Nothing merged, nothing
+  weakened, no behaviour changed -- the unchanged test-name set and
+  `tests/loom_storage.rs` are what says so -- and `Worker::invoke_one` gained
+  two named empty seams, `observer_prologue` and `observer_epilogue`, so that
+  the observers of step 6 add a call rather than a reading of that function.
+- **A node that parents a graph is entered twice, and the parent travels with
+  the job** (issue #47). Every graph the executor schedules is scheduled
+  *under* something, whose join counter the jobs of that graph decrement as
+  they finish: the run, for the nodes of a taskflow's own graph, whose counter
+  reaching zero ends the run; or something nested inside it — a node whose own
+  graph is running, the anchor a `corun` schedules a taskflow under, a node
+  whose children are async tasks, a `TaskGroup`'s anchor with no run around it
+  at all — whose counter reaching zero ends nothing and instead resumes the
+  node that was waiting or releases the frame watching it. Upstream stores that
+  parent on the node as `node->_parent`; here it is carried by the job, so a
+  parent chain is a chain of *jobs* and the parent of a node is reached as the
+  job that node was dequeued as — which is exactly what has to be queued again
+  to resume it.
+
+  A node that parents a graph cannot finish when its body returns, its
+  successors having to wait for that graph, so it is entered twice with
+  `NSTATE::PREEMPTED` saying which entry this is. The first entry runs whatever
+  the node does, sets the bit and schedules the nested graph under the node,
+  then answers "preempted": the node's counter is not re-armed and no successor
+  is released. The children are ordinary jobs, each counted against the node.
+  The tear-down of the last of them finds the counter at zero and the bit set
+  and queues the node's own job a second time — reading the bit *before* the
+  decrement, because the instant that counter reaches zero another worker may
+  be running the node. The second entry skips the cancellation check, an
+  entered node having to come back out through the dispatch whatever happened
+  meanwhile, clears the bit and answers with an ordinary release. The protocol
+  costs one requeue per nested graph where upstream resumes the parent on the
+  worker that finished the last child, its `_update_cache` being unported
+  (#62), and all four arms that can preempt a node do: a module task (#49,
+  #74), a runtime task that spawned work (#51), a subflow left to its implicit
+  join (#50) and a free node whose body is handed a `Runtime` (#90).
+- **A worker that waits for a nested graph does not park** (issue #16). A task
+  body runs on a worker thread, and an executor's workers are a fixed pool: the
+  only threads that will ever take a job out of its queues. So a task that
+  calls `Executor::run` and then waits — with `RunHandle::wait`, or by letting
+  the handle drop — parks one of those threads in the inner run's completion
+  slot while the work it waits for sits in the pool's queues. Nothing undoes
+  that: a parked thread is woken by the topology it waited on finishing, and
+  that topology finishes when some *other* worker runs its last job, so the
+  pool has to have a worker to spare. Four such waits on a four-worker executor
+  leave none, and at one worker it takes one. That is the deadlock upstream's
+  own documentation warns about, and `Executor::corun` is the answer: the
+  calling worker stays in the work-stealing loop, running the inner graph's
+  jobs and anybody else's until the inner run's last job has finished, so the
+  pool never loses a thread to waiting and no amount of nesting can drain it.
+  Three consequences a caller feels. The wait is not ordered, a corunning
+  worker running whatever it can steal, so a corun returns no sooner than the
+  inner run finishes and no later than the next job it picked up is done. It is
+  for a worker of *that* executor and nothing else, any other thread getting
+  `CorunError::NotAWorker` rather than the blocking wait, which would be a
+  mistake about which thread the code is on. And nesting a run on a *different*
+  executor and blocking on it is still fine, two pools being unable to starve
+  each other the way one starves itself. Every blocking wait on a nested graph
+  in the crate is this loop: `Subflow::join` (#50), `Runtime::corun` (#51) and
+  `TaskGroup::corun` (#93) as much as `Executor::corun` itself.
+- **Waiting on a nested graph comes in two shapes, `corun` and `try_corun`**
+  (issue #48). Upstream has one `corun`, which rethrows: a failure of the inner
+  graph is raised on the calling worker, where the task body that called it can
+  catch it — or not, in which case it becomes that task's own failure and the
+  outer run reports it. That composition is worth keeping, so `corun` is it:
+  the payload goes to `std::panic::resume_unwind`, which keeps its identity, so
+  a handler two levels up still downcasts it to what the inner task panicked
+  with. `try_corun` is the same call with the failure as an
+  `Err(CorunError::Run(RunError::Panicked(..)))` instead, for a caller that
+  means to inspect it — upstream's `try`/`catch` around the call. Both still
+  report a `corun` from a non-worker thread as `CorunError::NotAWorker`, which
+  is the one failure a caller can act on rather than propagate.
+- **A task body's async child is queued on the worker running the body**
+  (issue #119). Upstream's `_schedule_async_task` branches on whether the
+  submitting thread is one of its workers, and the port takes that branch on
+  whether the caller was *handed* its worker rather than by looking the thread
+  up — the owning end of a worker's queue lives in the `WorkerThread` frame
+  that called the body, and a frame cannot be named by the code it called. So
+  `Executor::spawn` from inside a task body still goes to the shared buffers,
+  and a `Runtime`'s eight forms, which are given the scheduler, push onto the
+  worker's own queue. The difference is not a micro-optimisation: that queue is
+  LIFO, so a body that spawns a child and then coruns gets *that child* back
+  rather than the oldest job in the pool, and each nested corun that picks up
+  somebody else's work adds a frame without retiring one. The port's
+  `Runtime.Fibonacci` overflowed a worker's stack in under a second with the
+  children in the buffers; with this branch it computes upstream's own
+  `fib(25)` at one to four workers, which is the input that test ships.
+
+- **Semaphore waiters are jobs, and an over-release is the releasing task's own
+  failure** (issues #87, #89). Upstream's waiting list holds `Node*` and leaves
+  the caller to keep those nodes alive; here it holds the crate's unit of
+  queued work, which owns the run, the graph and the node it names for as long
+  as it sits in the list — and a task keeps an `Arc<Semaphore>` where upstream
+  stores the address of one, since a graph cannot promise that an object it
+  only points at outlives it. Three consequences are decisions in their own
+  right. A parked job is *not* finished, so nothing is counted down and the run
+  stays exactly as outstanding as it was. The jobs a release wakes go to the
+  shared buffers rather than into the worker's continuation slot: that slot is
+  for a successor of *this* node's graph counted against *this* node's parent,
+  and a woken job may belong to another graph and another run entirely, while a
+  release wakes a whole set where the slot holds one. And releasing past the
+  maximum, which is upstream's `TF_THROW` out of the worker loop, is here a
+  failure of the task that did it — delivered to the same anchor a panic in its
+  body would reach, surfaced from `wait` as `RunError::Panicked`, with the
+  semaphore's counter left alone and the jobs woken by that task's *earlier*
+  successful releases still queued, since dropping those would leave their
+  counts outstanding for ever.
+
+  One interaction is **recorded rather than fixed**, because it is upstream's:
+  a job parked on a semaphore when its run is cancelled stays parked. Nothing
+  sweeps a waiting list, so that job runs only when some other task releases,
+  and until then the run's join counter never reaches zero — the one way a
+  cancelled run does not complete promptly. The order of the two hooks bounds
+  it, the cancellation check coming before the acquire, and `Semaphore::reset`
+  is not the rescue either: it drops the waiting list, which unschedules those
+  tasks for good. The executor's module docs have the race that is left.
+- **`WorkerView` and `Worker` gain `queue_size`, not `queue_capacity`** (issue
+  #206, following on from #167's entry on the observer list under
+  "Observers"). `crossbeam-deque`'s `Worker::len` and `Stealer::len` read the
+  same front/back indices `is_empty` already does, so `queue_size` is as
+  honest a read as upstream's `BoundedWSQ::size` -- a live count, stale the
+  instant it is returned, which is what `Worker::queue_size` and
+  `WorkerView::queue_size`'s own doc comments say rather than letting a caller
+  treat the number as a fact to act on.
+
+  `queue_capacity` stays unanswered, because it has no truthful answer to
+  give. Upstream's `BoundedWSQ::capacity` returns a fixed bound fixed at
+  construction; a `crossbeam-deque` worker queue instead grows its ring
+  buffer on demand from a 64-item minimum (per its own source, not part of
+  its published API) and publishes that buffer's size through neither
+  `Worker` nor `Stealer`. There is no call this port could make that would
+  not be inventing a number: a hard-coded constant, `usize::MAX`, or the
+  current `queue_size` would each look plausible and each be meaningless,
+  which is worse than the method staying absent.
+- **`Runtime::schedule`'s hole is closed in the scheduler, not documented and
+  left to the caller** (issues #244, #245). M8's original premise is false a
+  second time over, and in the opposite direction from the entry on the
+  eleventh `Handle` variant under "Pipelines":
+  `Handle::NonpreemptiveRuntime`'s dispatch arm never sets `PREEMPTED` so that
+  `is_entered` would stop blocking a pipeline's own `schedule` bypass, but
+  that same deliberate `false` means `is_entered` also stops answering the
+  question it originally existed to answer -- whether this node's callable is
+  genuinely running right now. `is_entered` only ever answers `true` for the
+  four handle kinds `preempts_itself` does, and only once their dispatch arm
+  has actually set `PREEMPTED`. Every other handle kind (`Handle::Static`,
+  either conditioner, `Handle::NonpreemptiveRuntime`) is never "entered" by
+  that reckoning even while its body is genuinely running, and
+  `Handle::Subflow` is not either for as long as its body is still *building*
+  the subgraph that would make it preempt -- so a `schedule` bypass targeting
+  any of those, while the target's callable is actually locked, found nothing
+  to stop it and could queue a second job onto a callable the first had not
+  finished with, tripping `lock_callable`'s one-worker-per-node assertion.
+
+  **Issue #244 tried to close this from the caller first, and that attempt
+  is why #245 closes it in the scheduler instead.** A per-line
+  `{Idle, Running, RunningWithWake}` status in the pipeline, re-armed before
+  a line's body returns, fixed the *unbounded* version of the race -- and
+  found two further real bugs on the way, a `stop()` early return that
+  never released its claim and a `compare_exchange`/`fetch_max` gap that let
+  a release land on the `Idle` a raise then overwrote. It still reproduced
+  the panic at roughly 5 of 40 full-suite runs under `taskset -c 0,1`, with
+  zero instrumentation, because the instant that matters -- the callable's
+  `MutexGuard` actually dropping -- is several stack frames below the
+  line's own body, inside `NonpreemptiveRuntimeWork::invoke`. A caller can
+  flip its own status to `Idle` only *before* it returns; it has no frame to
+  run code *after* the guard it does not own has dropped. No caller-side
+  scheme can close that window, because no caller is the one that drops the
+  guard. The dispatch layer is, so the dispatch layer is where the claim
+  lives.
+
+  **The fix is a claim per node, `Node::dispatch_claim` in `src/graph.rs`,
+  independent of `PREEMPTED`.** Every dispatch arm that locks a node's
+  callable -- `Handle::Static`, both conditioners, `Handle::Subflow`,
+  `Handle::NonpreemptiveRuntime` -- claims it immediately before the lock and
+  releases it immediately after the guard has dropped, except
+  `Handle::Subflow`'s own preempting entry, which defers the release to its
+  second entry: the point the node is genuinely idle again, rather than the
+  point its body merely returned, since a fresh job racing the node's own
+  still-outstanding nested run would be exactly the double dispatch this claim
+  exists to prevent. `schedule_bypassing`'s own `assert!(!is_entered(target))`
+  is untouched -- #240's reasoning for keeping `is_entered` answering a
+  different question than this claim stands -- and what follows it now calls
+  `DispatchClaim::wake` instead of queueing outright: a claim already held
+  defers (`PENDING` set) rather than races, and the claim holder's own release
+  queues the deferred job once it is actually safe to. `Handle::Runtime`'s own
+  `enter` and the two module handles were deliberately **not** given a claim,
+  on the reasoning that `enter` sets `PREEMPTED` *before* the body it locks
+  ever runs, so `is_entered` already covers the entire locked window for an
+  ordinary runtime task, and that the two module handles lock no callable at
+  all, so `lock_callable` cannot trip on either of them. **That part of this
+  entry is wrong, and the entry below on the dispatch claim has the defect it
+  caused and the rule that replaces it**: reasoning per handle kind about
+  which arms lock a callable missed that `wake` sets the bit for whatever
+  target a body names, so a kind whose arm never released it leaked the claim.
+  What stands here unchanged is the rest: that the claim lives in the dispatch
+  layer rather than in any caller, and that the existing case asserting
+  `schedule` refuses an *entered* node is kept exactly as a caller bug, not
+  softened into a defer.
+
+  What the claim holds every dispatch arm to is stricter than anything
+  upstream promises: upstream's line task is a bare `std::function<void()>`
+  call, invoked through whatever pointer `this` happens to be, with nothing
+  in the language or the library stopping two threads from calling the same
+  one at once -- only the join-counter arithmetic upstream trusts to never
+  schedule that. This port's one-worker-per-node invariant is the scheduler's
+  own rule rather than an accounting side effect, so the claim polices it
+  directly for every dispatch arm that can be asked to run a node twice,
+  pipeline or not, rather than trusting each caller's own counting to add up.
+
+  A node queued twice through two *unrelated* channels before either has
+  been claimed -- a real predecessor's release and a `schedule` bypass,
+  racing to be the one that queues the node at all -- is not this claim's
+  concern and is not newly introduced by it: `wake` only answers "is this
+  node's callable locked right now", the same question a `claim` already
+  held, taken by an in-flight dispatch, asks. `tests/loom_dispatch_claim.rs`
+  models the narrower, in-scope property on its own terms and names the
+  limit again.
+- **The dispatch claim is one pair of calls per job dispatch, not one per
+  handle kind** (issue #320). The entry above on `Runtime::schedule`'s hole
+  reasoned about which dispatch *arms* lock a node's callable and gave the
+  claim to the five that do, withholding it from `Handle::Runtime`, the two
+  module handles and -- unexamined -- `Handle::Placeholder`. That reasoning
+  asks the wrong question. `DispatchClaim::wake` is what `Runtime::schedule`'s
+  bypass calls on its target, and it sets `CLAIMED` on **whatever node a body
+  names**, handing the claim to the job it queues; a handle kind whose arm
+  never released it therefore left the bit set for the whole life of the
+  graph, and the next bypass of that node got `false`, queued nothing, and
+  left the `count_queued(+1)` it had already paid outstanding -- a parent
+  whose join counter never reaches zero. Three independent witnesses, each
+  hanging on the second run of one taskflow on a single worker: a static task
+  bypassed by a body that then panics, so the queued job is skipped by
+  `WorkerThread::invoke_one`'s cancellation early-out, which returns before
+  the dispatch `match` and so claimed and released nothing; a bypassed
+  `Handle::Placeholder`; and a bypassed preemptive `Handle::Runtime`. Only the
+  first needs a panic anywhere. The realistic witness is a pipeline, whose
+  line tasks are all bypass-scheduled and all but one reachable *only* that
+  way, which is how `tests/pipelines.rs` and `tests/data_pipelines.rs` came to
+  have a cell apiece that hung under `taskset -c 0,1`.
+
+  So the claim is the **job's**, and `WorkerThread::invoke_one` is the one
+  place it is taken and given back: one `claim` before the handle `match`,
+  one `release` after it, and the requeue of a deferred bypass at that
+  release. Three things follow, and they are why this shape is the one taken
+  rather than a sixth, seventh and eighth per-arm pair. A kind added to
+  `Handle` cannot forget the claim, there being nowhere left to forget it.
+  Preemption needs no special case: holding the claim across it *is* the
+  existing `Epilogue` `None`, so `src/executor/subflow.rs`'s hand-written
+  deferral to its second entry -- the subtle half of #245 -- is now what the
+  `None` means for every preempting kind, and the arm just returns.
+  And the cancellation early-out takes the same pair before `finish_job`,
+  which is what closes the first witness: its `release` hands the claim back
+  without a dispatch ever running, requeueing a pending bypass whose own job
+  is skipped in turn, with the accounting unchanged because that bypass had
+  already paid its count.
+
+  The alternative the issue allows -- a `QUEUED` bit, so that `wake` stops
+  setting `CLAIMED` on a node it has merely queued -- was rejected: it still
+  needs one generic point that consumes the bit and honours `PENDING` for
+  the kinds whose arms do nothing, so it buys a third state and a wider
+  protocol for no property the pair above lacks, and #245's lost-wake
+  argument would have to be re-answered for the new state rather than kept.
+
+  The audit the fix rests on, over every path that retires a job without
+  dispatching it. The cancellation early-out leaked, as above. The four arms
+  that never released leaked, as above. `Node::acquire_all`'s refusal -- the
+  semaphore park -- does **not**: the job is parked rather than retired, so
+  the claim is still owed by a live job, a bypass landing meanwhile defers
+  onto `PENDING`, and the eventual dispatch of the parked clone honours it;
+  a run cancelled while the job is parked funnels into the early-out and is
+  covered there. The dependent-async job copies "dropped undequeued" in
+  `src/executor/dependent_async.rs` do **not**: those are free nodes, and
+  `Runtime::schedule` takes a `Task` of a graph, so no claim is ever taken
+  on them. The `is_entered(next)` branch of the successor-release loop does
+  **not**: it declines to queue a successor nothing bypassed, so no `wake`
+  ever ran. And the two async arms that refuse a handle built into a graph
+  are now covered like every other kind, by the generic pair.
+- **An observer hook may panic, and the scheduler catches it** (issue #304).
+  The two answers the issue put were to catch the hook or to forbid a
+  panicking one in `Observer`'s documented obligations, and the first is
+  taken: `WorkerThread::observer_prologue` and
+  `WorkerThread::observer_epilogue` call each registered hook under a
+  `catch_unwind` and hand a payload to `Job::record_panic`, so the run
+  fails with `RunError::Panicked` carrying the hook's own payload and the
+  executor stays usable. What decided it is the cost of the violation, not
+  the elegance of the rule. The hook calls bracket the dispatch *inside*
+  the worker's scheduling loop, so a payload that escapes kills the worker
+  thread with the job in flight never finished: the run's join counter
+  stays short, `RunHandle::wait` blocks for ever, and the pool is one
+  worker down with no diagnostic beyond the default hook's print. A rule
+  the library cannot enforce, whose breach is a silent hang, loses to a
+  rule the scheduler keeps by construction -- and an `Observer` is
+  typically an adapter onto a caller's own logging or accounting, where a
+  panic is as reachable as it is in a task body the executor already
+  catches.
+
+  Three consequences are worth naming. The catch is **inside** the two
+  seam methods rather than at their call sites, which is what covers all
+  six `observer_epilogue` callers -- the generic one under
+  `WorkerThread::invoke_one`'s dispatch `match` and the five in
+  `executor::async` and `executor::dependent_async` -- and what keeps
+  #320's one `claim`/`release` pair balanced: a hook that panics now
+  cannot unwind out from between the claim and the release, so this fix
+  does not trade this hang for that one. It is one `catch_unwind` **per
+  observer** rather than one around the loop, matching what the successor
+  loop's `is_entered` branch and `Node::release_all` already do with a
+  failure mid-iteration: record it and carry on with the rest, so one
+  failing hook does not cost the observers after it their callback, with
+  the run keeping the first payload offered. And the failure does not
+  retract the dispatch the hook brackets: a panicking `on_entry` still
+  lets the body run -- this entry's cancellation check is already past --
+  and a panicking `on_exit` still leaves the node's tear-down to the
+  caller, exactly as a panicking task body still releases its successors.
+
+  Upstream is departed from knowingly here. Its `_observer_prologue` and
+  `_observer_epilogue` calls sit *outside* the
+  `TF_EXECUTOR_EXCEPTION_HANDLER` wrapping each `_invoke_*_task` body, so a
+  throwing hook unwinds into the `catch(...)` around its `_spawn` loop,
+  reaches `scheduler_epilogue` and ends that worker -- the same hang, in
+  C++. The third hook needs none of this: `Executor::make_observer` calls
+  `Observer::set_up` on the registering thread before inserting anything,
+  so its panic is raised to that caller and no observer is registered,
+  which `tests/observers.rs` pinned before this change and still does.
+
+## Control flow and cancellation
+
 - **A failure inside a nested graph is delivered to whoever is waiting for
   that graph** (issue #48), not to the run. Upstream calls the thing that is
   waiting an *anchor* and finds it by walking the failing node's parent chain;
-  the walk is ported with one change of priority — an explicit anchor
-  (a frame blocked right now in an `Executor::corun`, a `Subflow::join`, a
+  the walk is ported with one change of priority — an explicit anchor (a frame
+  blocked right now in an `Executor::corun`, a `Subflow::join`, a
   `Runtime::corun` or a `TaskGroup::corun`, and since the async family also a
   free node whose runtime-shaped body hands back a handle, which is anchored
   for its whole life because the waiter is whoever holds that handle) beats an
@@ -186,8 +642,9 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   body, or a task group's anchor, which carries the bit from the moment the
   group is opened) beats the run, which is every chain's root. The one root
   that is no destination at all is the sentinel run a free async task's job
-  names; the entry on it below says why. Two decisions came out of #48 that
-  upstream does not have to make, and the change of priority is #157's.
+  names; the entry on it under "The async family" says why. Two decisions came
+  out of #48 that upstream does not have to make, and the change of priority
+  is #157's.
 
   The payload slot is **on the node**, as upstream's `_exception_ptr` is, even
   though a chain of parents in this port is a chain of `Nested` allocations
@@ -233,24 +690,15 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   checked against in its header; the alternative of giving `ENTERED` the
   explicit bit instead was rejected for needing the same companion while
   blurring what "explicit" means, which is a frame blocked right now.
-- **Waiting on a nested graph comes in two shapes, `corun` and `try_corun`**
-  (issue #48). Upstream has one `corun`, which rethrows: a failure of the inner
-  graph is raised on the calling worker, where the task body that called it can
-  catch it — or not, in which case it becomes that task's own failure and the
-  outer run reports it. That composition is worth keeping, so `corun` is it:
-  the payload goes to `std::panic::resume_unwind`, which keeps its identity, so
-  a handler two levels up still downcasts it to what the inner task panicked
-  with. `try_corun` is the same call with the failure as an
-  `Err(CorunError::Run(RunError::Panicked(..)))` instead, for a caller that
-  means to inspect it — upstream's `try`/`catch` around the call. Both still
-  report a `corun` from a non-worker thread as `CorunError::NotAWorker`, which
-  is the one failure a caller can act on rather than propagate.
-- **A subflow's subgraph lives in a `Mutex<Graph>` inside the node's handle,**
-  because the body builds it through a node the run only *borrows*: a worker
-  reaches its node as `&Node`, so the graph it writes needs interior
-  mutability of its own. The `Subflow` handle holds the guard for the body's
-  duration, which cannot deadlock one — a nested subflow locks its own node's
-  graph, so no body ever takes the same lock twice.
+- **The cancellation early-out reads the whole parent chain** (issue #48).
+  Upstream's `Node::_is_parent_cancelled` reads the immediate parent only,
+  which it can afford because `_process_exception` marks every ancestor on its
+  way up — and the walk here does that too, so one level would be enough. Every
+  level is read anyway: it costs one relaxed load per level of nesting and
+  answers strictly more, since a job whose own parent is unmarked can still
+  have a marked *grandparent*, when the failure was in a sibling subtree under
+  the same anchor, and every job under a failed anchor is one whose result
+  nobody will collect.
 - **`Runtime::schedule` is limited to a task of the runtime task's own
   graph** (issue #51). Upstream's `schedule` takes a `tf::Task`, which is a
   pointer to a node, and reaches that node's parent and topology through it;
@@ -267,6 +715,119 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   caller's error upstream too. One case did become checkable, and the entry on
   bypassed dependencies below has it: a target the run has already *entered*
   is refused rather than resumed early (#107).
+- **A bypassed dependency may not re-enter a task the run has entered**
+  (issues #98, #107). A join counter can be driven to zero by something other
+  than its dependencies — `Runtime::schedule` stores a zero, and a conditioner
+  zeroes the successor it selects — so a later strong release can arrive at a
+  counter that is already zero. Upstream's bare `fetch_sub` on a `size_t`
+  wraps it to `SIZE_MAX`, which is silent and not benign: a wrapped counter
+  never equals the one a `Runtime::corun` waits for nor the zero a parent waits
+  for, so a bypassed node that later coruns or preempts hangs. The decrement
+  therefore **floors at zero**, which keeps the counter's meaning and loses no
+  release upstream delivers. The other half the floor cannot reach is a bypass
+  that lands on a node already *entered* — one whose count is one reference per
+  piece of its own outstanding work rather than a dependency count — because
+  spending one of those resumes the node before that work is done. Both
+  bypasses ask the question before they touch the counter and both are
+  **refused**: `Runtime::schedule` panics on an entered target, and a strong
+  release onto one is dropped and recorded as the failure of the task that
+  released it, so the run answers with a reported failure where it used to
+  hang. A task that has *finished* and re-armed its counter is a different
+  case and is not diagnosed: it simply runs a second time, which is the
+  caller's own doing and stays upstream's rule to keep rather than this port's
+  check — schedule a task the graph cannot otherwise reach.
+- **A cancelled task group should not be corun while a dependent-async chain
+  behind it still has successors to release** (issue #93). Upstream's skip
+  for a cancelled child goes through `_tear_down_invoke`, draining that
+  child's successor list as it tears the node down; the port's equivalent,
+  the skip at the top of `WorkerThread::invoke_one`, counts the anchor down
+  but does not drain it, which is the dependent-async arm's own job and is
+  never reached for a child that was skipped rather than run. A chain
+  cancelled mid-flight therefore leaves the jobs behind the cancelled link
+  unqueued, their counts still outstanding on the anchor, and a `corun`
+  after that does not return. The fix is a rule for the caller rather than
+  the scheduler: cancel a group whose outstanding children are
+  dependent-async tasks only once none of them still has a successor
+  waiting to be released.
+
+## Dynamic tasking
+
+- **A module task shares its target, `Arc<Taskflow>`.** Upstream's
+  `composed_of` stores a bare `Graph&` and leaves the caller to keep the
+  composed taskflow alive for as long as any run of the composing one may be
+  in flight — an obligation a safe Rust API cannot state, so the module owns a
+  share of its target instead. `adopt(Graph)` is the owned form of the same
+  thing, for a graph with no other owner.
+- **A module task reaches its target through whatever owns it** (issues #49,
+  #74). Upstream's three module functions are two forwarders onto one `_impl`
+  over a `Graph&`, which is all they need: a reference reaches the nodes and
+  the caller is left to keep them alive. A job of a graph here owns what it
+  names, so the forwarders differ in who owns the target.
+  `Handle::Module` owns a share and hands over `Taskflow::flow`;
+  `Handle::AdoptedModule` owns its graph *inline*, in the arena the module
+  node itself is in, so the only thing that names it is the outer owner plus
+  that node's index — the path `Job::graph_inside` builds. What the path has to
+  be right about is which arena an index means: a job of an adopted graph
+  built over the outer owner would resolve its tasks against the composing
+  taskflow's own nodes, silently, against whatever sits at those indices.
+- **A module task may not run a graph its own run is inside of** (issues #49,
+  #82). Upstream's obligation for `composed_of` — "thread-safe as long as the
+  target is not concurrently ran by two or more threads" — survives
+  translation, because what makes it an obligation is the target's per-node
+  state rather than anything about C++: a join counter and a state word belong
+  to one run at a time. Sharing the target as an `Arc<Taskflow>` buys the
+  caller the lifetime half of that rule and not this half; what it changes is
+  the failure, two workers reaching one node finding `Work::invoke`'s
+  `try_lock` taken and panicking, which the run reports, where a silent race
+  on a counter is the alternative.
+
+  One shape of that error a run *can* see coming is refused rather than left
+  to the caller: a target that is a graph the module node is already inside
+  of. A taskflow cannot be composed of itself when it is built — `composed_of`
+  takes an `Arc<Taskflow>` and the taskflow it builds into needs `&mut` — but a
+  subflow body can do it while the taskflow runs, a `Subflow` being a
+  `FlowBuilder` and the taskflow a body belongs to being alive behind an `Arc`
+  the caller holds. None of what that did is about locking: scheduling a graph
+  re-arms every node of it, so the subflow node the module node hangs under
+  loses the `PREEMPTED` bit and the join counter of one that `finish_job`
+  would have resumed it by; the subgraph then finishes, nothing re-queues that
+  node, the run's counter never reaches zero and `wait` never returns — with
+  every worker parked, the run being not slow but over and unreported. So a
+  module node's first entry asks whether the target is a graph this job is
+  already inside of, its own or that of any node on its parent chain, and
+  reports a panic payload instead of running it: the payload becomes the run's,
+  the rest of the run is cancelled, and `wait` answers `Err`. Two taskflows
+  composing each other are the same cycle one link longer, and the walk costs
+  one pointer comparison per level of nesting. What it cannot see is a chain a
+  `corun`'s anchor ends without naming the job that started it, and that route
+  needs no second answer: a corun of the taskflow whose task is coruning
+  re-enters a node whose body is still running, which the `try_lock` above
+  reports. A preempted node's body is *not* running, which is the whole of why
+  this case slipped past it.
+- **A subflow's subgraph lives in a `Mutex<Graph>` inside the node's handle,**
+  because the body builds it through a node the run only *borrows*: a worker
+  reaches its node as `&Node`, so the graph it writes needs interior
+  mutability of its own. The `Subflow` handle holds the guard for the body's
+  duration, which cannot deadlock one — a nested subflow locks its own node's
+  graph, so no body ever takes the same lock twice.
+- **A subgraph is *leased* for the length of its run, and the last share of
+  the lease is what puts it back** (issues #74, #50). Running a graph needs
+  whatever owns it, because every job of a graph owns what it names, and a
+  `MutexGuard` is not something a job can own — so the subgraph is moved out
+  of that `Mutex` while it runs and held by its jobs through one shared
+  allocation. No lock is then on the scheduler's hot path, where upstream has
+  a plain `Graph&`; the price is that somebody has to put the graph back, and
+  it cannot be the frame waiting for the nested run. A job of a graph nested
+  *inside* a leased subgraph decrements the join counter of its parent node,
+  which is a node of that subgraph — so the counter is inside the lease, the
+  job holds the lease across the decrement that can end the subgraph's run,
+  and no holder can prove it is the last one. A `Drop` needs no such proof,
+  so that is where the graph goes home, and dropping it instead *is*
+  upstream's `clear()` for a subflow that was not retained. Two visible
+  consequences: a retained subgraph goes back under `try_lock`, never a
+  blocking one, because the thread holding the last share is a worker that
+  something else may be waiting for; and `retain(true)` is reliable set
+  *before* the join it is meant to keep, not after.
 - **A runtime or subflow handle cannot hand back the executor** (issues #50,
   #51). Upstream's `tf::Runtime` and `tf::Subflow` hold an `Executor&`, and
   this port's cannot, because the two are not the same object here: upstream's
@@ -291,24 +852,33 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   gives rather than against it: a group is opened by a call on the `Executor`
   value itself, so the borrow it keeps is the caller's own and no
   back-pointer is involved.
-- **A subgraph is *leased* for the length of its run, and the last share of
-  the lease is what puts it back** (issues #74, #50). Running a graph needs
-  whatever owns it, because every job of a graph owns what it names, and a
-  `MutexGuard` is not something a job can own — so the subgraph is moved out
-  of that `Mutex` while it runs and held by its jobs through one shared
-  allocation. No lock is then on the scheduler's hot path, where upstream has
-  a plain `Graph&`; the price is that somebody has to put the graph back, and
-  it cannot be the frame waiting for the nested run. A job of a graph nested
-  *inside* a leased subgraph decrements the join counter of its parent node,
-  which is a node of that subgraph — so the counter is inside the lease, the
-  job holds the lease across the decrement that can end the subgraph's run,
-  and no holder can prove it is the last one. A `Drop` needs no such proof,
-  so that is where the graph goes home, and dropping it instead *is*
-  upstream's `clear()` for a subflow that was not retained. Two visible
-  consequences: a retained subgraph goes back under `try_lock`, never a
-  blocking one, because the thread holding the last share is a worker that
-  something else may be waiting for; and `retain(true)` is reliable set
-  *before* the join it is meant to keep, not after.
+- **A task group has no implicit join on drop** (issue #93). Upstream's
+  `TaskGroup` has no destructor, so a group that goes out of scope with work
+  outstanding dangles the `NodeBase` its children are still counting down —
+  undefined behaviour, which upstream's own documentation says in as many
+  words. This port mirrors the *behaviour* without the undefined half: the
+  anchor is an `Arc` shared with every child rather than a value on the opening
+  frame, so an unjoined group is merely unjoined — the children run, their
+  counts land on an anchor that is still alive, and the last share goes with
+  the last child, taking a payload nobody came for with it. A `Drop` that
+  coruns was the alternative and is declined deliberately: it would put a wait
+  on the one path a caller cannot see, cannot opt out of and cannot handle a
+  failure from, including an unwind, where coruning inside a `Drop` risks a
+  second panic and an abort. `TaskGroup::corun` is where the join and the
+  failure both live.
+
+  A group's children are also queued in the shared buffers where a runtime
+  body's go onto the submitting worker's own queue, and that stays true even
+  for a group that could name its worker: `corun` on a group runs without the
+  owning end of that queue, so its pops are steals from the first-in end, and
+  pushing LIFO against a FIFO waiter would hand the corun the oldest
+  outstanding subtree rather than the child it just spawned. What that leaves
+  is a **stack-depth** ceiling, not a correctness one — every child still runs
+  — and `src/task_group.rs` has where the cliff is, with the test inputs kept a
+  factor of two inside it.
+
+## The async family
+
 - **`async` is `spawn`, and nothing else in the family is renamed** (issue
   #88). `async` is a reserved word in Rust 2024, so upstream's value-returning
   `async` is `spawn` on every surface that has one — the executor, a
@@ -444,146 +1014,6 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   state and no `Executor` at all, for the reason the entry above on
   `rt.executor()` gives, so a submission that lived on the `Executor` would
   have been a submission a task body could not make.
-- **Semaphore waiters are jobs, and an over-release is the releasing task's own
-  failure** (issues #87, #89). Upstream's waiting list holds `Node*` and leaves
-  the caller to keep those nodes alive; here it holds the crate's unit of
-  queued work, which owns the run, the graph and the node it names for as long
-  as it sits in the list — and a task keeps an `Arc<Semaphore>` where upstream
-  stores the address of one, since a graph cannot promise that an object it
-  only points at outlives it. Three consequences are decisions in their own
-  right. A parked job is *not* finished, so nothing is counted down and the run
-  stays exactly as outstanding as it was. The jobs a release wakes go to the
-  shared buffers rather than into the worker's continuation slot: that slot is
-  for a successor of *this* node's graph counted against *this* node's parent,
-  and a woken job may belong to another graph and another run entirely, while a
-  release wakes a whole set where the slot holds one. And releasing past the
-  maximum, which is upstream's `TF_THROW` out of the worker loop, is here a
-  failure of the task that did it — delivered to the same anchor a panic in its
-  body would reach, surfaced from `wait` as `RunError::Panicked`, with the
-  semaphore's counter left alone and the jobs woken by that task's *earlier*
-  successful releases still queued, since dropping those would leave their
-  counts outstanding for ever.
-
-  One interaction is **recorded rather than fixed**, because it is upstream's:
-  a job parked on a semaphore when its run is cancelled stays parked. Nothing
-  sweeps a waiting list, so that job runs only when some other task releases,
-  and until then the run's join counter never reaches zero — the one way a
-  cancelled run does not complete promptly. The order of the two hooks bounds
-  it, the cancellation check coming before the acquire, and `Semaphore::reset`
-  is not the rescue either: it drops the waiting list, which unschedules those
-  tasks for good. The executor's module docs have the race that is left.
-- **A task group has no implicit join on drop** (issue #93). Upstream's
-  `TaskGroup` has no destructor, so a group that goes out of scope with work
-  outstanding dangles the `NodeBase` its children are still counting down —
-  undefined behaviour, which upstream's own documentation says in as many
-  words. This port mirrors the *behaviour* without the undefined half: the
-  anchor is an `Arc` shared with every child rather than a value on the opening
-  frame, so an unjoined group is merely unjoined — the children run, their
-  counts land on an anchor that is still alive, and the last share goes with
-  the last child, taking a payload nobody came for with it. A `Drop` that
-  coruns was the alternative and is declined deliberately: it would put a wait
-  on the one path a caller cannot see, cannot opt out of and cannot handle a
-  failure from, including an unwind, where coruning inside a `Drop` risks a
-  second panic and an abort. `TaskGroup::corun` is where the join and the
-  failure both live.
-
-  A group's children are also queued in the shared buffers where a runtime
-  body's go onto the submitting worker's own queue, and that stays true even
-  for a group that could name its worker: `corun` on a group runs without the
-  owning end of that queue, so its pops are steals from the first-in end, and
-  pushing LIFO against a FIFO waiter would hand the corun the oldest
-  outstanding subtree rather than the child it just spawned. What that leaves
-  is a **stack-depth** ceiling, not a correctness one — every child still runs
-  — and `src/task_group.rs` has where the cliff is, with the test inputs kept a
-  factor of two inside it.
-- **A bypassed dependency may not re-enter a task the run has entered**
-  (issues #98, #107). A join counter can be driven to zero by something other
-  than its dependencies — `Runtime::schedule` stores a zero, and a conditioner
-  zeroes the successor it selects — so a later strong release can arrive at a
-  counter that is already zero. Upstream's bare `fetch_sub` on a `size_t`
-  wraps it to `SIZE_MAX`, which is silent and not benign: a wrapped counter
-  never equals the one a `Runtime::corun` waits for nor the zero a parent waits
-  for, so a bypassed node that later coruns or preempts hangs. The decrement
-  therefore **floors at zero**, which keeps the counter's meaning and loses no
-  release upstream delivers. The other half the floor cannot reach is a bypass
-  that lands on a node already *entered* — one whose count is one reference per
-  piece of its own outstanding work rather than a dependency count — because
-  spending one of those resumes the node before that work is done. Both
-  bypasses ask the question before they touch the counter and both are
-  **refused**: `Runtime::schedule` panics on an entered target, and a strong
-  release onto one is dropped and recorded as the failure of the task that
-  released it, so the run answers with a reported failure where it used to
-  hang. A task that has *finished* and re-armed its counter is a different
-  case and is not diagnosed: it simply runs a second time, which is the
-  caller's own doing and stays upstream's rule to keep rather than this port's
-  check — schedule a task the graph cannot otherwise reach.
-- **A run's waiter is released by the last share of its storage hold** (issues
-  #109, #112). Two rules used to carry the promise that a `wait` returning
-  means the taskflow is editable: a job gives up its share of the storage
-  before the decrement that can end the run, and the tear-down drops the run's
-  own share before releasing the waiter. The pair does not add up, because a
-  node that *preempts* is dequeued as a job and that job is then copied three
-  times — onto the frame inside the dispatch arm, into the parent its nested
-  graph is scheduled under, and as the job the last child re-queues to resume
-  it — and only the third copy is ever finished. The other two are dropped by
-  frames that have moved on, and nothing orders those instructions against the
-  resumed node ending the run, so a `wait` could return, and on CI did, with a
-  copy still holding the storage and the caller's next `emplace` panicking.
-  Eliminating the copies is not available: the join counter a child decrements
-  lives in the parent node, inside what one of those copies keeps alive. So the
-  release of the waiter moved instead — the run's hold on the storage is one
-  allocation every job of the run's graph shares, and its `Drop` releases the
-  storage, then the executor's count, then the waiter, in that order. One
-  waiter cannot be released that way, and takes the same hold from the other
-  side: a `corun` frame parks nowhere, so it *owns* the hold and waits for
-  `Arc::get_mut` to call it unique, which is the one question no mere holder of
-  a share can answer (#112). The rule the two shapes share — a thread is woken
-  only by the drop of the last hold on whatever it will touch next — is since
-  #138 and #141 a debug assertion and a loom model rather than a paragraph.
-- **A task body's async child is queued on the worker running the body**
-  (issue #119). Upstream's `_schedule_async_task` branches on whether the
-  submitting thread is one of its workers, and the port takes that branch on
-  whether the caller was *handed* its worker rather than by looking the thread
-  up — the owning end of a worker's queue lives in the `WorkerThread` frame
-  that called the body, and a frame cannot be named by the code it called. So
-  `Executor::spawn` from inside a task body still goes to the shared buffers,
-  and a `Runtime`'s eight forms, which are given the scheduler, push onto the
-  worker's own queue. The difference is not a micro-optimisation: that queue is
-  LIFO, so a body that spawns a child and then coruns gets *that child* back
-  rather than the oldest job in the pool, and each nested corun that picks up
-  somebody else's work adds a frame without retiring one. The port's
-  `Runtime.Fibonacci` overflowed a worker's stack in under a second with the
-  children in the buffers; with this branch it computes upstream's own
-  `fib(25)` at one to four workers, which is the input that test ships.
-
-## Decisions taken in M6
-
-- **The run splits into three modules and the ownership quartet stays four**
-  (issue #131). `executor::topology` was one 2,352-line file over a dozen
-  types, and six of M5's seven post-merge bugs were counter or share-lifecycle
-  errors in it, so it is now a module tree: `run` for `Topology`, `RunPolicy`,
-  `Completion`, `Cancellable` and `set_up_graph`, `job` for `Job`, `Finished`
-  and `Anchor`, and `ownership` for `GraphOwner`, `Storage`, `Inside`,
-  `Parent` and `Nested`. The split is by what owns what rather than by size,
-  which is why the file's one `//!` became three `# Design` sections and why
-  the lock orderings -- spread over field docs before -- are one list in
-  `ownership`'s.
-
-  The quartet was the question the issue asked, and the answer is that **four
-  stay four**, with one of the three candidate merges available on cost and
-  two forbidden outright. `Storage` into `Inside` share only "an `Arc` with a
-  `Drop`". `GraphOwner::Run` into `GraphOwner::Flow` *is* possible, an ungated
-  hold behaving exactly as a bare share of the storage does, and is declined
-  because every module task would then allocate a hold whose only property is
-  that it gates nothing, on the hottest resolution in the crate. `Nested` into
-  `Parent` is forbidden by an invariant: the state words a nested graph's jobs
-  count down have to be one allocation shared by every job under that parent,
-  and `Parent` is `Clone` and travels by value on every job, so an inline
-  payload would hand each child a counter of its own. Nothing merged, nothing
-  weakened, no behaviour changed -- the unchanged test-name set and
-  `tests/loom_storage.rs` are what says so -- and `Worker::invoke_one` gained
-  two named empty seams, `observer_prologue` and `observer_epilogue`, so that
-  the observers of step 6 add a call rather than a reading of that function.
 - **One async core on `impl Shared`, and three receivers that delegate**
   (issue #133). The async family is upstream's overload set over three
   receivers, and writing out what varies across it answers where the code
@@ -609,7 +1039,7 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   `&Executor` by the design the entry above on `rt.executor()` sets out, which
   is also why the two `Executor::schedule_*_async_task` forwarders are gone:
   what they added was a `None` worker, and that is now what
-  `Submission::parentless` says. This extends the M5 entry on one
+  `Submission::parentless` says. This extends the entry above on one
   `AsyncHandle` construction site rather than replacing it -- both of its
   claims still hold, and the four body shapes are now the only callers of that
   seam.
@@ -626,277 +1056,55 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   how all three became bugs. No behaviour changed: the identical test-name
   set, the identical `pub fn` list over the five files and the suite are what
   says so.
-- **The suites share one test module, and the worker matrices are a macro**
-  (issues #127, #132). The suites under `tests/` carried one hand-written
-  `fn starvation_loop_4_threads() { starvation_loop(4) }` per worker count per
-  family, six private copies of `spin_until` and five each of a counter and a
-  body-maker; 489 of their `#[test]` functions across 13 suites now come out
-  of 89 `worker_matrix!` blocks, and each helper is defined once under
-  `tests/common/`. The test names do not change, which is the constraint the
-  shape is built around and the rule every pass after this one inherits: a
-  suite's names are upstream's `TEST_CASE` names, so renaming one edits the
-  acceptance oracle rather than tidying a file. Why the helpers are topic
-  files a suite pulls by path, and why a macro beats a single `#[test]` over
-  a loop, are argued once where they are implemented — `tests/common/mod.rs`'s
-  own docs — because the reason is that module's own (every file under
-  `tests/` is a separate crate) rather than something the port shares.
-- **The documentation contract, and the three questions applying it asked**
-  (issues #126, #129, #130, #134). The contract is the section at the top of
-  this file, written at the start of the milestone against a tree measured at
-  2.2× carrying 210 issue citations in its doc comments (#126). Two passes
-  applied it, to the graph side (#129, ten files) and to the executor's
-  periphery (#130, nine files, plus the `unsafe` audit that left all 15 sites
-  in `src/executor/notifier.rs` carrying a `// SAFETY:` and promoted
-  `clippy::undocumented_unsafe_blocks` to `deny`); both met the same three
-  questions about the ratio, the citations below a test module and what an
-  unchanged test-name set can mean, and the closing pass settled all three
-  inside the contract itself (#134) rather than letting three issues answer
-  them three ways. One of those answers is a rule about documentation passes
-  in general and belongs with the others here: **a pass may not buy the number
-  by cutting a `# Design` section or deleting a doctest**, so what moved to
-  fit the contract was the measurement.
+- **A free async task is named by a `_named` twin of its submitting method,
+  and the name rides in `Spawn`** (issue #258).
 
-The milestone ran 17 issues against the 11 it opened with, and the rest of its
-decisions extended an entry above rather than adding one here. Where each is:
-the anchor window and the companion walk in `enter` (#157) under "A failure
-inside a nested graph is delivered to whoever is waiting for that graph"; the
-one-node arena and why three heap blocks cannot be two (#144) under "An async
-task is one `Arc`-owned free-standing node"; the debug assertion and the loom
-model that replaced a paragraph (#138, #141) under "A run's waiter is released
-by the last share of its storage hold"; and a task body's own queue (#119) and
-naming a task in two statements (#120) in entries of their own. Two issues
-deliberately left none: #128 and #151 are the weekly loom workflow, whose own
-file and the README say what it runs, and #146 was two module docs still
-calling the async family a later milestone.
+  Upstream's shape at the pin is an *optional leading argument*, not a second
+  verb: `async(f)` forwards to `async(DefaultTaskParams{}, f)`, and
+  `TaskParamsLike` admits `TaskParams`, `DefaultTaskParams` or anything
+  `StringLike`, so `executor.async("async1", f)` and
+  `rt.async("my task", f)` are one overload of the same four names. C++
+  spells "optional" as an overload and Rust has no overloading, so the
+  rendering is a second method name: `spawn_named`, `silent_async_named`,
+  `dependent_async_named` and their `_runtime` twins, on each of the three
+  receivers, which is twenty-four new methods beside the twenty-four already
+  there. Each is its unnamed twin plus one step, because the name travels in
+  `Spawn<H>` rather than as a parameter of `Shared::schedule_async_task` --
+  which makes that value upstream's leading `(params, f)` pair exactly as
+  `Submission` is its trailing `(tpg, parent)` pair, and leaves the unnamed
+  twenty-four, the submission core's signature and every existing call site
+  untouched. This supersedes the last sentence of the entry above on `async`
+  being `spawn` (#88): the `TaskParams` overloads no longer collapse onto the
+  unnamed forms, because the observers it deferred them to arrived in M7 and
+  `TaskView::name` is now something to read a name back with.
 
-## Rationale moved out
+  The alternative was a submission builder, `executor.named("a").spawn(f)`,
+  with one `named` step on each receiver that every existing method is reached
+  through. By method count it is the smaller surface and that is the one thing
+  it wins: a single public builder holding a private three-variant target --
+  parentless, under a node, under an anchor -- carries eight methods where the
+  twins carry twenty-four. Three things decide against it. It adds a **public
+  type no program using the crate ever writes**, which is precisely the test
+  the entry on root re-exports under "Documentation and tooling" applies to
+  earn a root line, so the builder would need a root line to be documented at
+  all while failing the rule that hands them out; a `_named` method adds no
+  type and no name to place. It **separates the name from the call it is an
+  argument of**: `spawn`/`spawn_named` and
+  `spawn_runtime`/`spawn_runtime_named` sort next to each other on the same
+  rustdoc page, so a reader who found the unnamed form has found the name,
+  where a builder puts the named forms on a page reached only through a verb
+  that sorts nowhere near them. And the thing a builder is actually for --
+  more than one optional parameter -- **is not there**: `TaskParams` has two
+  fields, and the second, `void* data`, does not survive translation at all,
+  user data in Rust travelling in the closure. If a second parameter ever does
+  arrive, a builder is the shape to revisit and these twins are its front end
+  rather than an obstacle.
 
-The contract at the top of this file keeps a rationale in one place, and for
-a module that is a dozen lines of dispatch over machinery somebody else owns
--- or a handful of value types whose own doc comments would otherwise retell
-a decision made once, elsewhere -- that place cannot be the module itself.
-These entries are that place: #130 moved the executor periphery's rationale
-here first, and the modules after it that were in the same position add to
-it the same way, each naming the issue whose decision it records, as every
-entry above does.
-
-- **A module task reaches its target through whatever owns it** (issues #49,
-  #74). Upstream's three module functions are two forwarders onto one `_impl`
-  over a `Graph&`, which is all they need: a reference reaches the nodes and
-  the caller is left to keep them alive. A job of a graph here owns what it
-  names, so the forwarders differ in who owns the target.
-  `Handle::Module` owns a share and hands over `Taskflow::flow`;
-  `Handle::AdoptedModule` owns its graph *inline*, in the arena the module
-  node itself is in, so the only thing that names it is the outer owner plus
-  that node's index — the path `Job::graph_inside` builds. What the path has to
-  be right about is which arena an index means: a job of an adopted graph
-  built over the outer owner would resolve its tasks against the composing
-  taskflow's own nodes, silently, against whatever sits at those indices.
-- **A module task may not run a graph its own run is inside of** (issues #49,
-  #82). Upstream's obligation for `composed_of` — "thread-safe as long as the
-  target is not concurrently ran by two or more threads" — survives
-  translation, because what makes it an obligation is the target's per-node
-  state rather than anything about C++: a join counter and a state word belong
-  to one run at a time. Sharing the target as an `Arc<Taskflow>` buys the
-  caller the lifetime half of that rule and not this half; what it changes is
-  the failure, two workers reaching one node finding `Work::invoke`'s
-  `try_lock` taken and panicking, which the run reports, where a silent race
-  on a counter is the alternative.
-
-  One shape of that error a run *can* see coming is refused rather than left
-  to the caller: a target that is a graph the module node is already inside
-  of. A taskflow cannot be composed of itself when it is built — `composed_of`
-  takes an `Arc<Taskflow>` and the taskflow it builds into needs `&mut` — but a
-  subflow body can do it while the taskflow runs, a `Subflow` being a
-  `FlowBuilder` and the taskflow a body belongs to being alive behind an `Arc`
-  the caller holds. None of what that did is about locking: scheduling a graph
-  re-arms every node of it, so the subflow node the module node hangs under
-  loses the `PREEMPTED` bit and the join counter of one that `finish_job`
-  would have resumed it by; the subgraph then finishes, nothing re-queues that
-  node, the run's counter never reaches zero and `wait` never returns — with
-  every worker parked, the run being not slow but over and unreported. So a
-  module node's first entry asks whether the target is a graph this job is
-  already inside of, its own or that of any node on its parent chain, and
-  reports a panic payload instead of running it: the payload becomes the run's,
-  the rest of the run is cancelled, and `wait` answers `Err`. Two taskflows
-  composing each other are the same cycle one link longer, and the walk costs
-  one pointer comparison per level of nesting. What it cannot see is a chain a
-  `corun`'s anchor ends without naming the job that started it, and that route
-  needs no second answer: a corun of the taskflow whose task is coruning
-  re-enters a node whose body is still running, which the `try_lock` above
-  reports. A preempted node's body is *not* running, which is the whole of why
-  this case slipped past it.
-- **A node that parents a graph is entered twice, and the parent travels with
-  the job** (issue #47). Every graph the executor schedules is scheduled
-  *under* something, whose join counter the jobs of that graph decrement as
-  they finish: the run, for the nodes of a taskflow's own graph, whose counter
-  reaching zero ends the run; or something nested inside it — a node whose own
-  graph is running, the anchor a `corun` schedules a taskflow under, a node
-  whose children are async tasks, a `TaskGroup`'s anchor with no run around it
-  at all — whose counter reaching zero ends nothing and instead resumes the
-  node that was waiting or releases the frame watching it. Upstream stores that
-  parent on the node as `node->_parent`; here it is carried by the job, so a
-  parent chain is a chain of *jobs* and the parent of a node is reached as the
-  job that node was dequeued as — which is exactly what has to be queued again
-  to resume it.
-
-  A node that parents a graph cannot finish when its body returns, its
-  successors having to wait for that graph, so it is entered twice with
-  `NSTATE::PREEMPTED` saying which entry this is. The first entry runs whatever
-  the node does, sets the bit and schedules the nested graph under the node,
-  then answers "preempted": the node's counter is not re-armed and no successor
-  is released. The children are ordinary jobs, each counted against the node.
-  The tear-down of the last of them finds the counter at zero and the bit set
-  and queues the node's own job a second time — reading the bit *before* the
-  decrement, because the instant that counter reaches zero another worker may
-  be running the node. The second entry skips the cancellation check, an
-  entered node having to come back out through the dispatch whatever happened
-  meanwhile, clears the bit and answers with an ordinary release. The protocol
-  costs one requeue per nested graph where upstream resumes the parent on the
-  worker that finished the last child, its `_update_cache` being unported
-  (#62), and all four arms that can preempt a node do: a module task (#49,
-  #74), a runtime task that spawned work (#51), a subflow left to its implicit
-  join (#50) and a free node whose body is handed a `Runtime` (#90).
-- **The cancellation early-out reads the whole parent chain** (issue #48).
-  Upstream's `Node::_is_parent_cancelled` reads the immediate parent only,
-  which it can afford because `_process_exception` marks every ancestor on its
-  way up — and the walk here does that too, so one level would be enough. Every
-  level is read anyway: it costs one relaxed load per level of nesting and
-  answers strictly more, since a job whose own parent is unmarked can still
-  have a marked *grandparent*, when the failure was in a sibling subtree under
-  the same anchor, and every job under a failed anchor is one whose result
-  nobody will collect.
-- **A worker that waits for a nested graph does not park** (issue #16). A task
-  body runs on a worker thread, and an executor's workers are a fixed pool: the
-  only threads that will ever take a job out of its queues. So a task that
-  calls `Executor::run` and then waits — with `RunHandle::wait`, or by letting
-  the handle drop — parks one of those threads in the inner run's completion
-  slot while the work it waits for sits in the pool's queues. Nothing undoes
-  that: a parked thread is woken by the topology it waited on finishing, and
-  that topology finishes when some *other* worker runs its last job, so the
-  pool has to have a worker to spare. Four such waits on a four-worker executor
-  leave none, and at one worker it takes one. That is the deadlock upstream's
-  own documentation warns about, and `Executor::corun` is the answer: the
-  calling worker stays in the work-stealing loop, running the inner graph's
-  jobs and anybody else's until the inner run's last job has finished, so the
-  pool never loses a thread to waiting and no amount of nesting can drain it.
-  Three consequences a caller feels. The wait is not ordered, a corunning
-  worker running whatever it can steal, so a corun returns no sooner than the
-  inner run finishes and no later than the next job it picked up is done. It is
-  for a worker of *that* executor and nothing else, any other thread getting
-  `CorunError::NotAWorker` rather than the blocking wait, which would be a
-  mistake about which thread the code is on. And nesting a run on a *different*
-  executor and blocking on it is still fine, two pools being unable to starve
-  each other the way one starves itself. Every blocking wait on a nested graph
-  in the crate is this loop: `Subflow::join` (#50), `Runtime::corun` (#51) and
-  `TaskGroup::corun` (#93) as much as `Executor::corun` itself.
-- **A cancelled task group should not be corun while a dependent-async chain
-  behind it still has successors to release** (issue #93). Upstream's skip
-  for a cancelled child goes through `_tear_down_invoke`, draining that
-  child's successor list as it tears the node down; the port's equivalent,
-  the skip at the top of `WorkerThread::invoke_one`, counts the anchor down
-  but does not drain it, which is the dependent-async arm's own job and is
-  never reached for a child that was skipped rather than run. A chain
-  cancelled mid-flight therefore leaves the jobs behind the cancelled link
-  unqueued, their counts still outstanding on the anchor, and a `corun`
-  after that does not return. The fix is a rule for the caller rather than
-  the scheduler: cancel a group whose outstanding children are
-  dependent-async tasks only once none of them still has a successor
-  waiting to be released.
-- **`FlowBuilder` is a trait with provided methods, not a base class**
-  (issue #23). Upstream's `tf::FlowBuilder` is a base class holding a
-  `Graph&`, which `tf::Taskflow` and `tf::Subflow` inherit for the
-  task-building API; Rust has no inheritance for code reuse, so the trait
-  asks an implementor for the one thing it cannot provide itself -- the
-  graph it builds into, as `FlowBuilder::graph` and `FlowBuilder::graph_mut`
-  -- and supplies everything else as a default method over that. `Runtime`
-  deliberately does not implement it: the graph a runtime task runs in is
-  the enclosing one, scheduled into but never edited, so it has no `task`
-  method to offer.
-- **`FlowBuilder::composed_of` takes anything `Composable`, not a concrete
-  `Arc<Taskflow>`** (issue #181). Upstream's own `composed_of` is a template
-  over its `GraphLike` concept rather than a `Taskflow` overload, because a
-  pipeline composes its own graph the same way a plain taskflow does; the
-  port gets that for free once the one thing `composed_of` needs -- a share
-  of the target's `Taskflow` -- is asked for through a trait instead of a
-  concrete type. `Composable` is implemented for `Arc<Taskflow>` so every
-  caller from before the trait existed is unaffected; a pipeline's own graph
-  is the other implementor.
-- **A serial pipe pays the same callable bound as a parallel one, and
-  upstream's second callable shape is not ported** (issue #180). `Pipe`'s
-  bound, `Fn(&mut Pipeflow) + Send + Sync`, is forced by `PipeType::Parallel`
-  alone -- a parallel pipe runs its callable on more than one line's worker
-  at once, so it must be callable through one shared `&Pipe` from more than
-  one thread at the same time, which is exactly `Sync`. A serial pipe never
-  needs that on its own, but `Pipe::set_type` lets a caller change a pipe's
-  direction after it is built, so a serial pipe pays the bound a parallel
-  one would need rather than this type carrying two incompatible shapes that
-  a `set_type` call could silently make unsound.
-
-  Upstream's own `Pipe` accepts a second callable shape,
-  `(Pipeflow&, NonpreemptiveRuntime&)`, checked for with `is_invocable_v` the
-  same way `DataPipeline::_on_pipe` picks between its own three (the M8
-  entry on `DataPipe` above has that one); the port does not add a twin for
-  `Pipe`. A pipe that could reach the line's own `NonpreemptiveRuntime` could
-  call `schedule` on it directly, racing the very three-way outcome --
-  `rt.schedule(next line)` or not -- the pipeline's own line task already
-  computes from the two `fetch_sub`s around every pipe call; nothing a user
-  pipe body could legitimately schedule that the line task is not already
-  scheduling for it, and a seam that let it try would be a second, uncounted
-  way to reach exactly the double-dispatch hazard the entry below on
-  `Runtime::schedule`'s hole exists to close.
-- **`src/executor/corun.rs` comes under the 1.2x guide and
-  `src/executor/runtime.rs` does not** (issue #276). The executor's
-  documentation pass took the two files #228's re-measured disposition marks
-  *pass*, and they end in different places.
-
-  `corun.rs` goes from 1.6x to 1.2x by moving three arguments into its own
-  module `# Design` section: that cancellation is not one of the ways a corun
-  fails, which `CorunError` carried; what `InnerRun`'s `Drop` is for, which
-  the struct doc carried; and that the anchor is taken before the graph is
-  scheduled, which `corun_graph`'s four-step recital carried. What its
-  private methods and that recital said about those a second time is cut.
-
-  `runtime.rs` goes from 2.3x to 2.0x and stops there, which the arithmetic
-  settles rather than a judgement about any one paragraph. 123 of its prose
-  lines are inline `//` comments at the atomics -- why both state bits go on
-  before the body runs, why the body's own reference is a `Release`
-  `fetch_add` and its spending an `AcqRel` `fetch_sub`, why the payload
-  forward waits for those bits to come off, why `CAUGHT` is read before the
-  lock -- and 17 more are the module header above the `# Design` section.
-  Against a budget of 1.2 x 187 code lines, that leaves 84 prose lines for 27
-  documented items, fourteen of them public and four carrying a `# Panics` or
-  `# Errors` section a caller is owed: three lines each. The file reaches the
-  figure only by moving an ordering argument away from the atomic it is
-  about, which is the move #276 refuses for `src/executor/scope.rs` and the
-  ground on which #228 marks `src/executor/dependent_async.rs` exempt. What
-  the pass did take are the redundancies that disposition named:
-  `Runtime::schedule`'s `# Panics` no longer re-derives the M8 failure the
-  "`Runtime::schedule`'s hole is closed in the scheduler" entry below argues,
-  `Runtime::try_corun` no longer makes the anchor argument a third time, and
-  `NonpreemptiveRuntime`'s `private_bounds` rationale is in the module's
-  `# Design` section rather than on the type.
-- **The `graph/` submodules keep their own rationale, and this file keeps
-  what they share** (issue #277). `handle.rs`, `node.rs` and `work.rs` are
-  private modules behind the public `graph` facade, so a `# Design` section
-  of one of them is read in the source rather than in the rendered docs.
-  That is still where the documentation pass moved the rationale out of
-  their item docs, because each piece of it belongs to exactly one of the
-  three modules -- what a conditioner's `i32` buys, why a subflow's subgraph
-  sits behind a `Mutex`, why the dispatch claim is independent of
-  `PREEMPTED`, what one `Work<R>` folds together -- and an entry per variant
-  here would split one module's reasoning across two files.
-  `src/graph/mod.rs`'s own section carries the tree's shared decisions, the
-  arena and the tombstone; what an item doc keeps is the half-line pointer
-  the contract allows. The one fact three modules do share is that the
-  restricted `NonpreemptiveRuntime` handle is not part of the public
-  surface: a body closure is handed one with its parameter's type inferred,
-  so `graph::Handle`'s variant, `graph::work`'s `NonpreemptiveRuntimeWork`
-  and `FlowBuilder::emplace_nonpreemptive_runtime` each state the one
-  consequence they meet -- no type annotation in a doctest, no type to link
-  to -- and none of them re-derives the rest.
-
-## Decisions taken in M7
+  The default is deliberately unchanged: an unnamed submission names its node
+  the empty string, which is what `DefaultTaskParams` leaves `Node::_name`
+  as upstream, and `Graph::add_named_node` already took the name a free
+  node's one-node arena is built with -- nothing in `src/graph/` moved for
+  this.
 
 - **A scoped spawn, and the crate's second `unsafe` module** (issue #164).
   `Runtime::scope` is this port's own addition -- upstream has nothing to
@@ -923,30 +1131,76 @@ entry above does.
   same scope a sibling is borrowing from -- and `tests/loom_scope.rs` is the
   model, checked against the mutation of skipping the join `scope` performs
   on every path out of it.
-- **A lint policy gets its first exception, and the rule that admits it**
-  (issue #209). `RandomPartitioner::chunk_size_range` (PR #203) carries the
-  crate's first `#[allow]` anywhere in `src/`:
-  `#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]` on the
-  `f32`-to-`usize` conversion of `alpha * nw` and `beta * nw`. `Cargo.toml`'s
-  policy for those two lints reads "loud from the start rather than
-  retrofitted ... over a thousand call sites later", so the crate went from
-  zero such attributes to one without the policy gaining a documented
-  exception -- and a later contributor reading only `Cargo.toml` would
-  reasonably treat the existing attribute as licence for the next one.
 
-  The rule: a float-to-int conversion may carry a statement-scoped
-  `#[allow]` with an inline justification only when its input is a
-  genuinely user-supplied float with no integer-arithmetic equivalent, the
-  way `alpha`/`beta` are arbitrary tunables matching upstream's own `float`
-  parameters and `std` has no `TryFrom<f32> for usize` to fall back on. A
-  conversion derivable from integers already in hand does not qualify, and
-  must be done in integer arithmetic instead -- which is what the PR's
-  other candidate site, the guided partitioner's chunk step, turned out to
-  be: `r / (2 * w)` is a ratio of two integers already in hand, so integer
-  division gives the exact floor with no float round-trip, and the
-  `floor_to_usize` helper that had covered both sites was deleted once that
-  site moved off it. `chunk_size_range`'s is, for now, the one instance the
-  rule admits.
+## Observers
+
+- **The observer list is one atomic check on the path with no observers, and a
+  mutex only when there is work to do** (issue #167). Upstream's own
+  `_observer_prologue`/`_observer_epilogue` iterate `_observers` -- an
+  `unordered_set` -- under no lock at all, relying on nothing ever mutating it
+  while a run is in flight, which upstream's own docs do not promise and this
+  port will not assume. The crate-private `ObserverList` instead keeps a plain
+  `AtomicUsize` count beside the list: the empty check both scheduling seams
+  open with is one relaxed load, and `ObserverList::insert` and
+  `ObserverList::remove` -- called rarely, never from a worker's hot path --
+  are the only two callers that take the list's mutex to write it. A non-empty
+  seam takes that same mutex once, to clone the registered `Arc`s into a `Vec`
+  of its own, and releases it before calling anything, so an observer that
+  calls back into `make_observer` or `remove_observer` cannot deadlock against
+  the seam that is visiting it. The same issue scopes what a `WorkerView`
+  answers about a worker's queue down to `is_queue_empty` alone, repeating
+  exactly what `Worker` already exposes rather than a second, inconsistent one
+  -- not because upstream's `queue_size()`/`queue_capacity()` pair turns out
+  to be unanswerable, but because answering either half needs
+  `src/executor/queue.rs` and a wider `Worker` surface, both outside this
+  issue's own files. Issue #206 is the follow-up those two files were left
+  for, and the two halves turn out to need different answers: see the entry on
+  `queue_size` versus `queue_capacity` under "Executor core" for which.
+- **An observer epilogue skip is folded into the exhaustive dispatch
+  match, not read from a side `matches!`** (issues #211, #212). Two handle
+  kinds, `Handle::Async` and `Handle::DependentAsync`, tear themselves down
+  and signal a waiter from inside their own dispatch arms, before
+  `WorkerThread::invoke_one`'s generic post-match `observer_epilogue` call
+  could otherwise run -- so those two arms call it themselves and
+  `invoke_one` must skip its own call for them. Spelling that skip as a
+  `matches!` beside the exhaustive `match` that already dispatches on the
+  handle left the two lists able to drift: a later `Handle` variant that
+  also signals a waiter from inside its own tear-down could compile without
+  being added to it, silently reintroducing the exact missing-`on_exit`
+  defect #167 found. The fix makes each dispatch arm return an `Epilogue`
+  value instead -- `Pending` if the generic call still has to run,
+  `AlreadyRun` if the arm already made it -- read back from the same
+  `match`'s result rather than re-derived from the handle a second time, so
+  a new variant is a compile error there until it states which it is. A
+  second exhaustive match on `Handle` in `src/graph.rs` was considered and
+  declined: it would answer the question in a different place from the one
+  that already knows it, which is the two-places-to-keep-in-step problem
+  this entry exists to close rather than move.
+- **`TFProfManager` is not ported** (issue #193). `tfprof.hpp` at the pinned
+  v4.1.0 tag builds a process-global singleton around `TfProfObserver`,
+  constructed with `_fpath{get_env(TF_ENABLE_PROFILER)}`; its destructor
+  opens that path and, if it opens, writes a complete `.tfp` file there, or
+  prints a text summary to stderr otherwise. A library has no business
+  installing a process-global singleton whose destructor writes a file to
+  a path an environment variable names -- that is an application's choice
+  to make, not something this crate should do on a caller's behalf without
+  being asked. The port exposes `TfProfObserver::dump` and
+  `TfProfObserver::summary` directly and leaves the sink to the caller, as
+  every other `Observer` in this crate does.
+
+  Preserved as documentation rather than code: a caller who wants a real,
+  multi-executor `.tfp` file -- several `TfProfObserver`s, one file -- can
+  still build exactly the one upstream's `TFProfManager::dump` writes
+  around this port's own `dump` output. Its 12-byte file header, all
+  integers little-endian: `"TFPX"` (4 bytes, the magic), `version` (`u16`,
+  `1` at the pin), `flags` (`u16`, `0` at the pin), `num_exec` (`u32`, how
+  many executor blocks follow). After that header, each `TfProfObserver`'s
+  own self-contained block -- exactly what `TfProfObserver::dump` writes,
+  with no shared state between them -- one after another, in whatever order
+  the caller chooses.
+
+## Algorithms
+
 - **The index algorithms take a slice or an `IndexRange`, never a generic
   iterator pair** (issues #166, #170, #171). Upstream's `for_each`,
   `for_each_index` and the rest are templates over `B`/`E` iterator pairs
@@ -970,48 +1224,217 @@ entry above does.
   iterator-pair vocabulary the entry above declines, so the result is
   `Option<usize>` instead, `None` where upstream returns `end`. A caller
   that wants the element back indexes `data` with it.
-- **The observer list is one atomic check on the path with no observers,
-  and a mutex only when there is work to do** (issue #167). Upstream's own
-  `_observer_prologue`/`_observer_epilogue` iterate `_observers` -- an
-  `unordered_set` -- under no lock at all, relying on nothing ever mutating
-  it while a run is in flight, which upstream's own docs do not promise and
-  this port will not assume. The crate-private `ObserverList` instead keeps
-  a plain `AtomicUsize` count beside the list: the empty check both
-  scheduling seams open with is one relaxed load, and `ObserverList::insert`
-  and `ObserverList::remove` -- called rarely, never from a worker's hot
-  path -- are the only two callers that take the list's mutex to write it.
-  A non-empty seam takes that same mutex once, to clone the registered
-  `Arc`s into a `Vec` of its own, and releases it before calling anything,
-  so an observer that calls back into `make_observer` or `remove_observer`
-  cannot deadlock against the seam that is visiting it. The same issue
-  scopes what a `WorkerView` answers about a worker's queue down to
-  `is_queue_empty` alone, repeating exactly what `Worker` already exposes
-  rather than a second, inconsistent one -- not because upstream's
-  `queue_size()`/`queue_capacity()` pair turns out to be unanswerable, but
-  because answering either half needs `src/executor/queue.rs` and a wider
-  `Worker` surface, both outside this issue's own files. Issue #206 is the
-  follow-up those two files were left for, and the two halves turn out to
-  need different answers: see "Decisions taken in M9" for which.
-- **An observer epilogue skip is folded into the exhaustive dispatch
-  match, not read from a side `matches!`** (issues #211, #212). Two handle
-  kinds, `Handle::Async` and `Handle::DependentAsync`, tear themselves down
-  and signal a waiter from inside their own dispatch arms, before
-  `WorkerThread::invoke_one`'s generic post-match `observer_epilogue` call
-  could otherwise run -- so those two arms call it themselves and
-  `invoke_one` must skip its own call for them. Spelling that skip as a
-  `matches!` beside the exhaustive `match` that already dispatches on the
-  handle left the two lists able to drift: a later `Handle` variant that
-  also signals a waiter from inside its own tear-down could compile without
-  being added to it, silently reintroducing the exact missing-`on_exit`
-  defect #167 found. The fix makes each dispatch arm return an `Epilogue`
-  value instead -- `Pending` if the generic call still has to run,
-  `AlreadyRun` if the arm already made it -- read back from the same
-  `match`'s result rather than re-derived from the handle a second time, so
-  a new variant is a compile error there until it states which it is. A
-  second exhaustive match on `Handle` in `src/graph.rs` was considered and
-  declined: it would answer the question in a different place from the one
-  that already knows it, which is the two-places-to-keep-in-step problem
-  this entry exists to close rather than move.
+- **`IndexRanges<T, N>` extends the one-dimensional range to `N` dimensions,
+  and `discrete_domain` only ever narrows the outermost one** (issue #192).
+  `src/algorithm/index_range.rs`'s own `# Design` section has the full
+  argument -- why `IndexRanges<T, N>` is its own const-generic struct rather
+  than `IndexRange<T>` aliased to `N == 1` (Rust has no `if constexpr`-shaped
+  gate inside one generic-over-`N` `impl` block, so a method only the `N == 1`
+  case has cannot live in a block that type-checks for every `N`), and why
+  narrowing a flattened `[part_beg, part_end)` chunk back to a rectangular
+  sub-range only ever touches dimension 0 (any other split produces a
+  staircase, not a box). `for_each_by_index_nd` is `for_each_by_index`'s own
+  N-dimensional counterpart, dispatching over that same outermost dimension
+  so every worker's chunk stays one hyper-rectangle rather than a scattered
+  set of cells; `src/algorithm/for_each_index.rs`'s own module docs have the
+  rest. Recorded here only because this issue's own acceptance names an
+  entry for it -- the rationale itself stays in the two modules that need it,
+  per the documentation contract's rule that it lives once.
+- **Three layers, not two forms: the `Runtime::` method and the `FlowBuilder`
+  wrapper both stay, and the `make_*_task` factory is the middle layer the
+  port is missing** (issue #257).
+
+  `docs/api-friction.md`'s "Algorithms (step 6): two forms where upstream has
+  one" is the evidence for this entry, and the first thing reading upstream
+  does to it is correct its framing. Upstream does not have one shape; it has
+  two, and the one it treats as primitive is the one this port lacks. Every
+  `FlowBuilder` algorithm method in `taskflow/algorithm/*.hpp` at the pin is
+  literally `return emplace(make_X_task(args...));` -- in `for_each.hpp`,
+  `transform.hpp`, `fill.hpp`, `generate.hpp`, `reduce.hpp`, `find.hpp`,
+  `sort.hpp`, `scan.hpp` and `merge.hpp` alike, without exception. Upstream's
+  primitive is therefore the factory, a cold callable over `tf::Runtime&`,
+  and its `FlowBuilder` method is one derived line over it. What upstream has
+  no counterpart for at all is this port's *other* form: `tf::Runtime`
+  carries no loop, sort, reduce or scan members, so `Runtime::for_each` and
+  its 27 siblings are this port's own invention.
+
+  The port has upstream's derived layer and a primitive of its own, and is
+  missing the layer in between. It needs three where upstream needs two for
+  one reason: upstream's `make_for_each_task(b, e, c, part)` is at once a
+  `'static` callable and a borrow of the caller's container, which compiles
+  only because its iterators are unchecked pointers and nothing verifies the
+  container outlives the task. In Rust a `'static` callable cannot hold a
+  `&mut [T]`, so the owned/borrowed split is forced and the only open question
+  is where the seam falls. It falls here: `Runtime::X(&mut [T], ..)` is the
+  borrowed primitive a body that already holds a live slice calls directly,
+  `make_X_task(owned, ..) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send +
+  'static` is the `'static` callable, and `FlowBuilder::X` is one
+  `emplace_runtime` line over the factory. Counting the surface at the time
+  of the decision: 28 `Runtime::` methods, 28 `FlowBuilder` wrapper methods
+  across eight extension traits, and 11 factories -- three for
+  `for_each_index`, two for `merge`, six for `scan` -- so 17 are missing and
+  the completed family is 1:1 with the wrappers.
+
+  **Neither existing shape goes.** Both carry real weight in the corpus: of
+  the 103 algorithm call sites in `tests/`, `examples/` and `benches/`, 62
+  call a `Runtime::` method and 41 call a wrapper, and the split is not
+  uniform per algorithm -- `find` is 15 to 0 (its four wrapper methods have
+  no call site outside `src/` at all, only a unit test and four doctests),
+  while `scan` is 2 to 14 and `tests/scan.rs` is wrapper-only, 12 calls with
+  no `Runtime::` call anywhere in the file. Dropping the wrapper would make
+  `scan` and `for_each_index` cost a hand-written closure per use at a dozen
+  sites that read like upstream today; dropping the `Runtime::` method would
+  delete the implementation every wrapper is built on and the only form that
+  reaches a `&mut [T]` a body already owns without a lock. The friction log's
+  own reading survives intact -- `taskflow.sort(Arc::clone(&data))` reads
+  almost exactly like upstream's `taskflow.sort(beg, end)`, and
+  `runtime.sort_by(&mut local, cmp)` is nicer than anything upstream can
+  write -- and the honest conclusion is that those two sentences describe two
+  different jobs rather than two candidates for one.
+
+  **The factory family is how a dependent-async body gets the algorithms**,
+  and completing it is the work this decision commissions. The gap the
+  friction log calls the widest it found is real: all three stages of
+  `examples/dependent_async_algorithm.rs` hand-lock an `Arc<Mutex<_>>` and
+  call a `Runtime::` method, because the wrapper builds through
+  `FlowBuilder::emplace_runtime` and a dependent-async task is never queued
+  into a `Taskflow` for that to call. The factory closes it with nothing new
+  invented: `impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static` is
+  accepted by `emplace_runtime`, by `Executor::spawn_runtime` and
+  `silent_async_runtime`, and by `dependent_async_runtime` and
+  `silent_dependent_async_runtime` whose bound is the weaker `FnOnce`. The
+  precedent is already tested: `src/algorithm/module.rs`'s
+  `a_module_task_runs_from_a_dependent_async_body` submits
+  `make_module_task` straight through `Executor::dependent_async_runtime`.
+  The one argument on record against a factory for the other families --
+  `examples/dependent_async_algorithm.rs`'s claim that a `Runtime::` method
+  is "not a callable a factory can hand back cold, because the chunk loop
+  underneath every one of them is built on `Runtime::scope`" -- does not
+  hold, and `make_inclusive_scan_task` is the counterexample sitting in the
+  tree: it hands back exactly such a callable, and `Runtime::inclusive_scan`
+  underneath it calls `rt.scope`. A factory's product is handed its
+  `&mut Runtime` when it *runs*; it never needed one to be built. The
+  seventeen factories, each beside the `Runtime::` method it wraps and with
+  the parameter list its wrapper already has, are filed as #292
+  (`make_for_each_task`, `make_sort_task`, `make_sort_by_task`), #293
+  (`make_transform_task`, `make_transform2_task`, `make_fill_task`,
+  `make_fill_n_task`, `make_generate_task`, `make_generate_n_task`), #294
+  (`make_reduce_task`, `make_transform_reduce_task`,
+  `make_transform_reduce2_task`, `make_reduce_by_index_task`) and #295
+  (`make_find_if_task`, `make_find_if_not_task`, `make_min_element_task`,
+  `make_max_element_task`), with #296 rewriting the example on them -- the
+  check that the gap actually closed, and the place the stale claim above
+  gets corrected. Each of the four also reduces its wrapper methods to the
+  `self.emplace_runtime(make_X_task(..))` one-liner `ScanBuilder` and
+  `ForEachIndexBuilder` already are, which is what makes the derived layer
+  cheap enough to keep.
+
+  **The `Arc<Mutex<_>>` is accepted, and the absence of a `std::ref(range)`
+  counterpart is permanent rather than pending.** Upstream's reference wrapper
+  is sound there only because its graph edges are trusted by convention:
+  `make_for_each_task(std::ref(beg), std::ref(end), ..)` hands the task an
+  unchecked alias into a container the caller still mutates, and what keeps
+  that from being a data race is the programmer's claim about the dependency
+  edges, nothing the compiler reads. Reproducing it would need `unsafe` and
+  would hand a caller exactly that footgun, which this port's stated posture
+  refuses; a lock taken once per invocation -- not once per element -- is the
+  price, and `src/algorithm/for_each_index.rs`'s "No deferred
+  `beg`/`end`/`step`/`range`" `# Design` section already names the same gap
+  from the implementation side. Two measurements make the cost smaller than
+  the friction log's framing suggests. It is a *slice* algorithm's cost, not
+  the family's: of the 28 wrappers, 23 take at least one `Arc`, two (`merge`,
+  `merge_by`) take owned `Vec`s and return the slot they publish into, and
+  three -- the `for_each_index` trio -- take no data at all, since an index
+  range is `Copy` and travels by value. And the port has a form upstream does
+  not for the case that actually chafes: a caller who wants no lock computes
+  the slice in a `Runtime` body and calls the `Runtime::` method on it, which
+  is what `tests/for_each.rs`'s stateful cases do in place of upstream's
+  `std::ref` ones. The rule the seventeen new factories follow, so the family
+  stays one vocabulary rather than three: a value the body only reads is any
+  `SliceSource` -- `Arc<Vec<T>>`, `Arc<Mutex<Vec<T>>>` or an owned `Vec<T>`,
+  the read side the entry below on a factory's read parameter states and the
+  reason it is wider than one `Arc` -- one it writes is `Arc<Mutex<Vec<T>>>`,
+  a scalar result is `Arc<Mutex<T>>`, a `Copy` range or index travels by
+  value, and a factory that *creates* the output storage returns `(body,
+  slot)` as `make_merge_task` does.
+
+  **What #216 inherits.** It is collapsing the *derived* layer -- 28 one-line
+  wrappers once #292 through #295 land -- not a primitive, which is why the
+  collapse is cheap and why it does not have to wait for those four: a factory
+  changes a wrapper's body, never its signature. It should keep all 28 methods
+  (none is redundant; the counts above show which algorithms lean on which
+  form, not that any method is unused), fold the eight traits into one whose
+  every method is a single `emplace_runtime` call, and, per #256's entry under
+  "Documentation and tooling", flatten `rustflow::algorithm`'s own front door:
+  the collapsed trait, the four partitioners and their `ClosureWrapper`,
+  `IndexRange` and `IndexRanges`, and the `make_*_task` family. The collapsed
+  trait replaces the eight prelude lines with one; the factories are *not*
+  prelude names, which is #256's boundary applied unchanged -- a program
+  importing a free-function form is choosing it, and chooses it by name.
+
+- **A factory's read parameter is one sealed source trait, and the family's
+  locking discipline is "every guard in parameter order, none past the body's
+  return"** (issue #318).
+
+  The ownership rule above gives every *writing* factory an
+  `Arc<Mutex<Vec<T>>>` and gave every *reading* one an `Arc<Vec<T>>`, and the
+  two are not interconvertible without copying the data. Across the eleven
+  factories with a read parameter -- `transform`, `transform2`, the six
+  scans, the three `reduce` forms that take a vector, the four finds and the
+  two merges -- that made the family unable to express a chain: the longest
+  one statable was for-each/sort into for-each/sort, the only factories that
+  read and write the same locked vector, and no factory could terminate a
+  chain by reducing what an earlier stage wrote. The program #296 specifies
+  compiled for its first stage and failed for its second and third with
+  `expected &Arc<Vec<_>>, found &Arc<Mutex<Vec<i32>>>`.
+
+  **What lands is `SliceSource`**, a trait sealed the way
+  `algorithm::SlicePartitioner` and `index_range::IndexInt` are, with an
+  `Item` associated type and a GAT guard that derefs to `Vec<Item>`:
+  `&'a Vec<T>` for `Arc<Vec<T>>` and for an owned `Vec<T>`, and
+  `MutexGuard<'a, Vec<T>>` for `Arc<Mutex<Vec<T>>>`. Every read parameter of
+  those eleven factories takes it -- fifteen parameters, the whole read side
+  rather than only the three factories #296 needs, since a half-converted
+  family is a worse API than either end state -- as
+  `impl SliceSource<Item = T>` in argument position rather than as a named
+  type parameter, which is what keeps every call site, doctest and turbofish
+  inferring unchanged and leaves all 28 `AlgorithmBuilder` wrapper signatures
+  byte for byte as they were. The guard is why this is a trait rather than a
+  `From` conversion: a locked source cannot hand out a `&[T]` without
+  something owning the lock for the duration of the read, and that something
+  is the guard the body holds for its own run.
+
+  **The alternative was a second `_locked` factory per read parameter**, and
+  it is rejected: it doubles eleven factories into two families a caller
+  picks between by name, each wrapper would still call only one of the two,
+  and the pair would have to be kept in step for every later change to
+  either. An `Arc<RwLock<Vec<T>>>` source was considered too, since a
+  read-write lock would let two *reading* stages run at once where a `Mutex`
+  serialises them. It is not taken: every writing factory publishes into an
+  `Arc<Mutex<Vec<T>>>`, so a chain built on `RwLock` would have to convert at
+  the seam -- the copy this decision exists to remove -- and a second lock
+  flavour in the vocabulary buys concurrency only for the reader-reader case
+  an edge already orders.
+
+  **The locking discipline**, stated here and in `src/algorithm/mod.rs`'s own
+  `# Design` section. A factory body locks each of its sources once per run,
+  in the order its signature lists them, and drops every guard before it
+  returns; the find family and `make_merge_task_by` release their read guards
+  before taking the lock they publish into, so a read guard is never held
+  across a write lock the read itself does not need. Two stages joined by a
+  dependency edge therefore cannot deadlock over a lock they share, in either
+  lock order, since the earlier body has returned -- and dropped its guards
+  -- before the later one is scheduled at all. Two stages that share a lock
+  and are *not* joined by an edge are a caller error, two readers included: a
+  body holds its guard across the chunk loop under it, that loop's wait runs
+  other ready work on the same worker (`WorkerThread::corun_until` steals),
+  and `Mutex` has no shared mode, so a worker that picks up the unordered
+  second stage blocks on a guard only its own stack could release. Handing
+  one `Arc<Mutex<Vec<T>>>` to two parameters of a single factory -- two read
+  sources, or a read source and the write target -- is that same error inside
+  one call, which is also why an in-place scan stays unexpressible: `input`
+  and `out` have to be two different locks, exactly as
+  `Runtime::inclusive_scan`'s own `&[T]`/`&mut [T]` pair cannot alias.
 - **One per-algorithm `FlowBuilder` extension trait per module, rather than
   one shared trait** (issues #170, #171, #173, #174, #175, #176, #177,
   #178). `FlowBuilder` is a trait, not a struct, so an algorithm's
@@ -1029,7 +1452,69 @@ entry above does.
   pressure is gone, or keep the split and call it settled, is issue #216's
   to answer, not this entry's.
 
-## Decisions taken in M8
+- **One `AlgorithmBuilder` for all 28 wrappers, declared in
+  `src/algorithm/mod.rs` and flattened at `rustflow::algorithm`'s front
+  door** (issue #216).
+
+  This supersedes the entry above on one per-algorithm `FlowBuilder` extension
+  trait per module, which named the question and left it here. The eight
+  traits it created -- `FindBuilder`, `ForEachBuilder`, `ForEachIndexBuilder`,
+  `MergeBuilder`, `ReduceBuilder`, `ScanBuilder`, `SortBuilder`,
+  `ElementwiseBuilder` -- are one `AlgorithmBuilder: FlowBuilder`,
+  blanket-implemented for every `FlowBuilder` exactly as each of them was,
+  carrying all 28 methods unchanged in signature and in body. The eight
+  prelude lines are one, and the corpus shows what the split was costing: of
+  the 38 files in `tests/` that import the prelude, 37 named none of the eight
+  at all, and the one that did -- `tests/for_each_index.rs` -- imported it
+  beside a partitioner trait rather than for anything the trait itself said;
+  no example and no benchmark imported one. A trait per algorithm was never a
+  distinction a caller could use, because none of the eight held a concept of
+  its own: the family shares one vocabulary of owned parameters, one
+  partitioner set and one lock-once-per-invocation ownership rule, all three
+  decided in the "Three layers, not two forms" entry above rather than per
+  algorithm.
+
+  **Not moved into `src/flow_builder.rs`.** That is the other shape #216
+  offered, and it reads better at first -- zero new names, since
+  `FlowBuilder` is already a prelude and a root name -- but it puts the
+  algorithm family inside the trait that defines what a task *is*. The
+  honest test is what each file then has to know: `FlowBuilder` would gain
+  28 methods whose signatures name `SlicePartitioner`, `ReducePartitioner`,
+  `FindPartitioner`, `IndexDispatch`, `IndexInt`, `IndexRange` and
+  `IndexRanges`, so `src/flow_builder.rs` -- the file `src/graph/`,
+  `src/taskflow.rs` and `src/subflow.rs` all build against -- would import
+  seven types from the algorithm tree to declare a layer *derived* from it.
+  The dependency runs the wrong way: an algorithm wrapper is built on
+  `FlowBuilder::emplace_runtime`, and nothing in the builder is built on an
+  algorithm. Keeping the wrappers in `src/algorithm/` keeps that arrow
+  pointing one way, and the extension trait is what Rust charges for it: one
+  name, in the prelude, which a caller writing `use rustflow::prelude::*;`
+  never spells.
+
+  **The front door.** Per the prelude/root entry under "Documentation and
+  tooling", `rustflow::algorithm` is flattened here rather than at the crate
+  root: `AlgorithmBuilder`, the four partitioners with `DefaultPartitioner`,
+  `ClosureWrapper` and `DefaultClosureWrapper`, `IndexRange` and
+  `IndexRanges`, and the twelve `make_*_task` factories are re-exported from
+  `src/algorithm/mod.rs`. The factories are *not* prelude names, which is that
+  entry's boundary applied unchanged -- a program reaching for a free-function
+  form chooses it, and chooses it by name. The submodule paths all still
+  resolve, so no caller lost an import.
+
+  **What moved, and what a reader should expect of the diff.** The 28 method
+  bodies are untouched: a wrapper is still one `emplace_runtime` call over
+  the `Runtime` method or `make_*_task` factory of the same name, and the
+  four issues completing that factory family (#292 through #295) change
+  bodies, never signatures, so they land on top of this with no
+  re-collapsing. The one thing a `--list` comparison does see is that a
+  wrapper's doctest is now named `algorithm::AlgorithmBuilder::sort` where it
+  was `algorithm::sort::SortBuilder::sort`: 15 doctest item paths moved,
+  which is the trait rename itself and not a test gained or lost, and every
+  other name in the 2549 is identical. The per-module `# Design` sections
+  that each argued for their own trait are one paragraph in
+  `src/algorithm/mod.rs`, where the trait now is.
+
+## Pipelines
 
 - **A pipeline's lines need the eleventh `Handle` variant after all**
   (issues #180, #181, #230). The premise M8 was planned on was that a
@@ -1152,91 +1637,6 @@ entry above does.
   `test_scalable_pipelines.cpp` resets before its one `composed_of` of a
   given object, never after. `src/pipeline/scheduler.rs`'s own `# Design`
   section has the full argument.
-- **`Runtime::schedule`'s hole is closed in the scheduler, not documented
-  and left to the caller** (issues #244, #245). M8's original premise is
-  false a second time over, and in the opposite direction from the bullet
-  above: `Handle::NonpreemptiveRuntime`'s dispatch arm never sets
-  `PREEMPTED` so that `is_entered` would stop blocking a pipeline's own
-  `schedule` bypass, but that same deliberate `false` means `is_entered`
-  also stops answering the question it originally existed to answer --
-  whether this node's callable is genuinely running right now. `is_entered`
-  only ever answers `true` for the four handle kinds `preempts_itself`
-  does, and only once their dispatch arm has actually set `PREEMPTED`.
-  Every other handle kind
-  (`Handle::Static`, either conditioner, `Handle::NonpreemptiveRuntime`) is
-  never "entered" by that reckoning even while its body is genuinely
-  running, and `Handle::Subflow` is not either for as long as its body is
-  still *building* the subgraph that would make it preempt -- so a
-  `schedule` bypass targeting any of those, while the target's callable is
-  actually locked, found nothing to stop it and could queue a second job
-  onto a callable the first had not finished with, tripping `lock_callable`'s
-  one-worker-per-node assertion.
-
-  **Issue #244 tried to close this from the caller first, and that attempt
-  is why #245 closes it in the scheduler instead.** A per-line
-  `{Idle, Running, RunningWithWake}` status in the pipeline, re-armed before
-  a line's body returns, fixed the *unbounded* version of the race -- and
-  found two further real bugs on the way, a `stop()` early return that
-  never released its claim and a `compare_exchange`/`fetch_max` gap that let
-  a release land on the `Idle` a raise then overwrote. It still reproduced
-  the panic at roughly 5 of 40 full-suite runs under `taskset -c 0,1`, with
-  zero instrumentation, because the instant that matters -- the callable's
-  `MutexGuard` actually dropping -- is several stack frames below the
-  line's own body, inside `NonpreemptiveRuntimeWork::invoke`. A caller can
-  flip its own status to `Idle` only *before* it returns; it has no frame to
-  run code *after* the guard it does not own has dropped. No caller-side
-  scheme can close that window, because no caller is the one that drops the
-  guard. The dispatch layer is, so the dispatch layer is where the claim
-  lives.
-
-  **The fix is a claim per node, `Node::dispatch_claim` in `src/graph.rs`,
-  independent of `PREEMPTED`.** Every dispatch arm that locks a node's
-  callable -- `Handle::Static`, both conditioners, `Handle::Subflow`,
-  `Handle::NonpreemptiveRuntime` -- claims it immediately before the lock
-  and releases it immediately after the guard has dropped, except
-  `Handle::Subflow`'s own preempting entry, which defers the release to its
-  second entry: the point the node is genuinely idle again, rather than the
-  point its body merely returned, since a fresh job racing the node's own
-  still-outstanding nested run would be exactly the double dispatch this
-  claim exists to prevent. `schedule_bypassing`'s own
-  `assert!(!is_entered(target))` is untouched -- #240's reasoning for keeping
-  `is_entered` answering a different question than this claim stands --
-  and what follows it now calls `DispatchClaim::wake` instead of queueing
-  outright: a claim already held defers (`PENDING` set) rather than races,
-  and the claim holder's own release queues the deferred job once it is
-  actually safe to. `Handle::Runtime`'s own `enter` and the two module
-  handles were deliberately **not** given a claim, on the reasoning that
-  `enter` sets `PREEMPTED` *before* the body it locks ever runs, so
-  `is_entered` already covers the entire locked window for an ordinary
-  runtime task, and that the two module handles lock no callable at all, so
-  `lock_callable` cannot trip on either of them. **That part of this entry
-  is wrong, and "Decisions taken in M10" has the defect it caused and the
-  rule that replaces it**: reasoning per handle kind about which arms lock a
-  callable missed that `wake` sets the bit for whatever target a body names,
-  so a kind whose arm never released it leaked the claim. What stands here
-  unchanged is the rest: that the claim lives in the dispatch layer rather
-  than in any caller, and that the existing case asserting `schedule`
-  refuses an *entered* node is kept exactly as a caller bug, not softened
-  into a defer.
-
-  What the claim holds every dispatch arm to is stricter than anything
-  upstream promises: upstream's line task is a bare `std::function<void()>`
-  call, invoked through whatever pointer `this` happens to be, with nothing
-  in the language or the library stopping two threads from calling the same
-  one at once -- only the join-counter arithmetic upstream trusts to never
-  schedule that. This port's one-worker-per-node invariant is the scheduler's
-  own rule rather than an accounting side effect, so the claim polices it
-  directly for every dispatch arm that can be asked to run a node twice,
-  pipeline or not, rather than trusting each caller's own counting to add up.
-
-  A node queued twice through two *unrelated* channels before either has
-  been claimed -- a real predecessor's release and a `schedule` bypass,
-  racing to be the one that queues the node at all -- is not this claim's
-  concern and is not newly introduced by it: `wake` only answers "is this
-  node's callable locked right now", the same question a `claim` already
-  held, taken by an in-flight dispatch, asks. `tests/loom_dispatch_claim.rs`
-  models the narrower, in-scope property on its own terms and names the
-  limit again.
 - **A `DataPipe`'s callable has two shapes, not upstream's three, and the
   slot between two pipes is a `Mutex<Option<Box<dyn Any + Send>>>`, 24 bytes
   per line** (issue #186). Upstream's `DataPipeline::_on_pipe` picks one of
@@ -1302,130 +1702,31 @@ entry above does.
   then handed to `Pipeline::new` unchanged, so the token loop upstream
   duplicates between `Pipeline::_build` and `DataPipeline::_build` exists
   here exactly once.
-- **`src/pipeline/mod.rs` is exempted from the 1.2× ratio, the same way a
-  crate root already is** (issue #189). Its code is three `pub mod`
-  declarations; the file's whole purpose is the module-tree overview above
-  them, naming what each of `pipe`, `scheduler` and `data_pipeline` is for a
-  reader who has not yet opened any of the three. Cutting that overview to
-  3 prose lines to match 3 lines of code would not shrink a rationale this
-  contract puts elsewhere -- there is none to move, the whole file *is* the
-  pointer -- it would just delete the one place a reader meets the tree
-  before the modules themselves. The contract already exempts a crate root
-  on exactly this reasoning (`src/lib.rs`'s own code is a `pub mod`/`pub use`
-  list, so its denominator measures nothing a ratio can judge); a module
-  tree's own root is the same shape one level down, and issue #228, which
-  asks the more general question of whether a per-file ratio is the right
-  instrument for this crate at all, is where that reasoning would extend
-  further if it does.
+- **A serial pipe pays the same callable bound as a parallel one, and
+  upstream's second callable shape is not ported** (issue #180). `Pipe`'s
+  bound, `Fn(&mut Pipeflow) + Send + Sync`, is forced by `PipeType::Parallel`
+  alone -- a parallel pipe runs its callable on more than one line's worker
+  at once, so it must be callable through one shared `&Pipe` from more than
+  one thread at the same time, which is exactly `Sync`. A serial pipe never
+  needs that on its own, but `Pipe::set_type` lets a caller change a pipe's
+  direction after it is built, so a serial pipe pays the bound a parallel
+  one would need rather than this type carrying two incompatible shapes that
+  a `set_type` call could silently make unsound.
 
-## Decisions taken in M9
+  Upstream's own `Pipe` accepts a second callable shape, `(Pipeflow&,
+  NonpreemptiveRuntime&)`, checked for with `is_invocable_v` the same way
+  `DataPipeline::_on_pipe` picks between its own three (the entry above on a
+  `DataPipe`'s two callable shapes has that one); the port does not add a twin
+  for `Pipe`. A pipe that could reach the line's own `NonpreemptiveRuntime`
+  could call `schedule` on it directly, racing the very three-way outcome --
+  `rt.schedule(next line)` or not -- the pipeline's own line task already
+  computes from the two `fetch_sub`s around every pipe call; nothing a user
+  pipe body could legitimately schedule that the line task is not already
+  scheduling for it, and a seam that let it try would be a second, uncounted
+  way to reach exactly the double-dispatch hazard the entry on
+  `Runtime::schedule`'s hole under "Executor core" exists to close.
 
-- **`Task::data` is a typed slot, and `for_each_subflow_task` is ported
-  because a retained subflow's graph survives its join** (issue #191).
-  Upstream's `Node::_data` is `void* {nullptr}`, read and written through
-  `Task::data()`/`data(void*)` with no check that a caller's cast matches
-  what was stored. The port's slot is `Option<Box<dyn Any + Send + Sync>>`
-  on `Node` instead -- `Send + Sync` because a node is reachable from any
-  worker, where upstream's bare pointer needs neither -- and
-  `TaskMut::set_data`, `TaskMut::data_mut` and `TaskMut::take_data` write it
-  while `TaskRef::data::<T>()` reads it typed, a failed downcast answering
-  `None` rather than trusting whatever bytes happen to be there. The type
-  change does not rescue upstream's own premise that a task body can read
-  its own attached data back through a `tf::Task` that still aliases the
-  live graph while the body runs: a body here is `'static` and owns nothing
-  of the taskflow holding it, so `examples/attach_data.rs` sets the value
-  with `TaskMut::set_data` before a run and reads it back with
-  `TaskRef::data` after `wait()` returns, rather than inside the body itself
-  -- the one example in #194's batch where the ownership model forces a
-  different program shape rather than a different spelling of the same one
-  (`docs/api-friction.md` records it as a "keep").
-
-  `for_each_subflow_task` is ported on `TaskRef`, not left absent: a
-  subflow's subgraph lives in the node's `Mutex<Graph>` (see `src/subflow.rs`
-  and the entry above on leasing a subgraph), and after a join that retained
-  it (`Subflow::set_retain(true)`) the graph is still there for the method to
-  walk, exactly as upstream's is. Its visitor hands back a `TaskRef` scoped
-  to that subgraph's own lock rather than a bare `Task`, because the index
-  space a subflow's tasks live in is not the composing taskflow's own --
-  which is also where the trap `docs/api-friction.md` records from #194's own
-  example lives: calling `for_each_subflow_task` again from inside the first
-  call's own visitor, to resolve a successor's name, re-enters the same
-  `Mutex` on the same thread and hangs rather than panics.
-- **`IndexRanges<T, N>` extends the one-dimensional range to `N` dimensions,
-  and `discrete_domain` only ever narrows the outermost one** (issue #192).
-  `src/algorithm/index_range.rs`'s own `# Design` section has the full
-  argument -- why `IndexRanges<T, N>` is its own const-generic struct rather
-  than `IndexRange<T>` aliased to `N == 1` (Rust has no `if constexpr`-shaped
-  gate inside one generic-over-`N` `impl` block, so a method only the `N == 1`
-  case has cannot live in a block that type-checks for every `N`), and why
-  narrowing a flattened `[part_beg, part_end)` chunk back to a rectangular
-  sub-range only ever touches dimension 0 (any other split produces a
-  staircase, not a box). `for_each_by_index_nd` is `for_each_by_index`'s own
-  N-dimensional counterpart, dispatching over that same outermost dimension
-  so every worker's chunk stays one hyper-rectangle rather than a scattered
-  set of cells; `src/algorithm/for_each_index.rs`'s own module docs have the
-  rest. Recorded here only because this issue's own acceptance names an
-  entry for it -- the rationale itself stays in the two modules that need it,
-  per the documentation contract's rule that it lives once.
-- **`TFProfManager` is not ported** (issue #193). `tfprof.hpp` at the pinned
-  v4.1.0 tag builds a process-global singleton around `TfProfObserver`,
-  constructed with `_fpath{get_env(TF_ENABLE_PROFILER)}`; its destructor
-  opens that path and, if it opens, writes a complete `.tfp` file there, or
-  prints a text summary to stderr otherwise. A library has no business
-  installing a process-global singleton whose destructor writes a file to
-  a path an environment variable names -- that is an application's choice
-  to make, not something this crate should do on a caller's behalf without
-  being asked. The port exposes `TfProfObserver::dump` and
-  `TfProfObserver::summary` directly and leaves the sink to the caller, as
-  every other `Observer` in this crate does.
-
-  Preserved as documentation rather than code: a caller who wants a real,
-  multi-executor `.tfp` file -- several `TfProfObserver`s, one file -- can
-  still build exactly the one upstream's `TFProfManager::dump` writes
-  around this port's own `dump` output. Its 12-byte file header, all
-  integers little-endian: `"TFPX"` (4 bytes, the magic), `version` (`u16`,
-  `1` at the pin), `flags` (`u16`, `0` at the pin), `num_exec` (`u32`, how
-  many executor blocks follow). After that header, each `TfProfObserver`'s
-  own self-contained block -- exactly what `TfProfObserver::dump` writes,
-  with no shared state between them -- one after another, in whatever order
-  the caller chooses.
-- **`WorkerView` and `Worker` gain `queue_size`, not `queue_capacity`**
-  (issue #206, following on from #167's "Decisions taken in M7" entry
-  above). `crossbeam-deque`'s `Worker::len` and `Stealer::len` read the same
-  front/back indices `is_empty` already does, so `queue_size` is as honest
-  a read as upstream's `BoundedWSQ::size` -- a live count, stale the
-  instant it is returned, which is what `Worker::queue_size` and
-  `WorkerView::queue_size`'s own doc comments say rather than letting a
-  caller treat the number as a fact to act on.
-
-  `queue_capacity` stays unanswered, because it has no truthful answer to
-  give. Upstream's `BoundedWSQ::capacity` returns a fixed bound fixed at
-  construction; a `crossbeam-deque` worker queue instead grows its ring
-  buffer on demand from a 64-item minimum (per its own source, not part of
-  its published API) and publishes that buffer's size through neither
-  `Worker` nor `Stealer`. There is no call this port could make that would
-  not be inventing a number: a hard-coded constant, `usize::MAX`, or the
-  current `queue_size` would each look plausible and each be meaningless,
-  which is worse than the method staying absent.
-- **The four files M9 itself pushed over 1.2x stay over it, reviewed rather
-  than cut** (issue #201). #192's N-dimensional extension, #191's
-  `Task::data` slot and #206's `queue_size` left
-  `src/algorithm/index_range.rs` (1.4x), `src/graph.rs` (1.2x),
-  `src/executor/queue.rs` (1.2x) and `src/executor/worker.rs` (1.2x) over
-  the contract's guide -- the same four issue #228 counts among the tree's
-  21 (#228 has the rest, almost all predating M9). None is a
-  `src/pipeline/mod.rs`-shaped case: that file's whole purpose is a
-  module-tree pointer with nothing to move, where these four carry ordinary
-  item docs plus, for `index_range.rs`, a `# Design` section arguing a real
-  question (why `IndexRanges<T, N>` is its own type, why `discrete_domain`
-  narrows one dimension). Cutting either to buy the number is exactly what
-  the documentation contract above refuses, so none of the four were cut.
-  They stand in the same bucket the contract already names for
-  `src/executor/runtime.rs`, `src/task_group.rs`, `src/executor/corun.rs`
-  and `src/executor/dependent_async.rs` -- a file a reviewer looks at, with
-  the reason given once here rather than reinvented per PR.
-
-## Decisions taken in M10
+## Documentation and tooling
 
 - **The prelude is a program's first page, and the crate root is the flat
   namespace for the names a caller writes -- with each family flattened at
@@ -1433,28 +1734,28 @@ entry above does.
 
   `rustflow::prelude` takes the wider of the two readings
   `docs/api-friction.md` put side by side: it is the first-page vocabulary --
-  the names a program spells to build a taskflow, submit it to an executor
-  and read the run's outcome. That is `Taskflow`, `FlowBuilder` and the eight
-  algorithm extension traits; the graph vocabulary `Graph`, `Node`, `Task`,
-  `Handle` and `Work`; `TaskMut`, `TaskRef` and `TaskType`; the `Subflow` and
-  `Runtime` body parameters the dynamic task kinds hand their closures; and
-  `Executor` with `RunHandle`, `RunError` and `Canceller`. The narrow reading
-  -- only the traits a glob import needs to make `FlowBuilder`'s methods
-  callable -- is what was there by accident, and the corpus answers it: all
-  44 example programs write `Executor` in an import of their own, 40 of them
-  on the line after `use rustflow::prelude::*;`, as do 33 of the 34
-  prelude-using files in `tests/`. A prelude that leaves the single most
-  written name in the crate out of the one import a program makes first is
-  not a prelude; it is a list of trait fixups. The boundary is drawn at the
-  point a program *chooses* something, which is why the async family, task
-  groups, semaphores, scoped spawns, observers, pipelines and the algorithms'
-  free-function and partitioner forms stay out: a program imports those by
-  name, where it makes the choice. It also stops one step short of a prelude
-  member's own nested-wait outcome -- `JoinError` from `Subflow::join`,
-  `CorunError` from `Runtime::corun` -- because a body that joins or coruns
-  is past its first page; both are root names. Nothing was taken out of the
-  prelude, so no caller lost an import and an example's now-redundant
-  `use rustflow::Executor;` is free to stay.
+  the names a program spells to build a taskflow, submit it to an executor and
+  read the run's outcome. That is `Taskflow`, `FlowBuilder` and the eight
+  algorithm extension traits, one `AlgorithmBuilder` since #216; the graph
+  vocabulary `Graph`, `Node`, `Task`, `Handle` and `Work`; `TaskMut`,
+  `TaskRef` and `TaskType`; the `Subflow` and `Runtime` body parameters the
+  dynamic task kinds hand their closures; and `Executor` with `RunHandle`,
+  `RunError` and `Canceller`. The narrow reading -- only the traits a glob
+  import needs to make `FlowBuilder`'s methods callable -- is what was there
+  by accident, and the corpus answers it: all 44 example programs write
+  `Executor` in an import of their own, 40 of them on the line after `use
+  rustflow::prelude::*;`, as do 33 of the 34 prelude-using files in `tests/`.
+  A prelude that leaves the single most written name in the crate out of the
+  one import a program makes first is not a prelude; it is a list of trait
+  fixups. The boundary is drawn at the point a program *chooses* something,
+  which is why the async family, task groups, semaphores, scoped spawns,
+  observers, pipelines and the algorithms' free-function and partitioner forms
+  stay out: a program imports those by name, where it makes the choice. It
+  also stops one step short of a prelude member's own nested-wait outcome --
+  `JoinError` from `Subflow::join`, `CorunError` from `Runtime::corun` --
+  because a body that joins or coruns is past its first page; both are root
+  names. Nothing was taken out of the prelude, so no caller lost an import and
+  an example's now-redundant `use rustflow::Executor;` is free to stay.
 
   The crate root is the port's counterpart of upstream's flat `tf::`
   namespace, and a name earns a line in it by being one a program *using* the
@@ -1463,19 +1764,19 @@ entry above does.
   `RunHandle`, `SemaphoreError`, `Scope`), or a trait whose methods it calls
   or implements (`FlowBuilder`, `Composable`, `WorkerInterface`). Applying
   that added the two names it showed were missing, `Composable` and
-  `SemaphoreError`, and it answers the friction log's `Xorshift32` report
-  with "already a root name, and not a prelude one" -- upstream documents
+  `SemaphoreError`, and it answers the friction log's `Xorshift32` report with
+  "already a root name, and not a prelude one" -- upstream documents
   `tf::Xorshift` as a utility with its own examples, and
   `examples/switch_case.rs` uses it as a caller would, standing in for
   upstream's `rand()`. Two kinds of name do not earn a root line. A *family*
-  -- `algorithm`, `observer`, `pipeline` -- is flattened at its own front
-  door instead: `rustflow::pipeline::{Pipeline, DataPipeline, Pipe, PipeType,
-  Pipeflow, ...}` is this issue's own application of that, `rustflow::algorithm`
-  is issue #216's to flatten as it collapses the eight extension traits, and
-  `rustflow::observer` wants the two lines that would put `ChromeObserver`
-  and `TfProfObserver` beside `Observer` in files this issue does not own.
-  Flattening all three at the root would roughly double a 35-name list for
-  no gain: `rustflow::pipeline::Pipeline` reads as well as
+  -- `algorithm`, `observer`, `pipeline` -- is flattened at its own front door
+  instead: `rustflow::pipeline::{Pipeline, DataPipeline, Pipe, PipeType,
+  Pipeflow, ...}` is this issue's own application of that,
+  `rustflow::algorithm` is issue #216's to flatten as it collapses the eight
+  extension traits, and `rustflow::observer` wants the two lines that would
+  put `ChromeObserver` and `TfProfObserver` beside `Observer` in files this
+  issue does not own. Flattening all three at the root would roughly double a
+  35-name list for no gain: `rustflow::pipeline::Pipeline` reads as well as
   `rustflow::Pipeline` and says more, which is a distinction a single C++
   namespace has nowhere to draw. And a part of the scheduler that no program
   outside the crate can drive is not a root name and ought not be `pub`
@@ -1484,195 +1785,54 @@ entry above does.
   lists the first as deliberately not user-facing), the `executor::topology`
   types, and the `executor::queue` trio `Buffers`, `Thief` and `WorkerQueue`,
   whose only caller anywhere is `tests/wsq.rs` -- a test of the queue layer,
-  not a program using it. Those three root lines are the rule's one
-  outstanding application: withdrawing them edits `tests/wsq.rs` to name
-  `rustflow::executor::queue::...` instead, the same module path
-  `tests/notifiers.rs` already uses for the notifiers, which were never root
-  names, and that edit belongs to #279, which owns the file.
+  not a program using it. Those three root lines were the rule's first
+  outstanding application, and #279 took it: withdrawing them edited
+  `tests/wsq.rs` to name `rustflow::executor::queue::...` instead, the same
+  module path `tests/notifiers.rs` already uses for the notifiers, which were
+  never root names.
 
-- **Three layers, not two forms: the `Runtime::` method and the `FlowBuilder`
-  wrapper both stay, and the `make_*_task` factory is the middle layer the
-  port is missing** (issue #257).
+  **`SemaphoreError` has since stopped qualifying, and is the rule's one
+  outstanding application now.** #329 demoted `SemaphoreError::max_value` to
+  `pub(crate)`, and the only release a caller can reach is a task's own,
+  through `TaskMut::release`, whose over-release `src/executor/worker.rs`
+  turns into the panic payload the run reports -- the error's `Display` text
+  rather than the value. So no public API hands a `SemaphoreError` out or asks
+  for one, and the rule above no longer earns it the root line applying that
+  rule added. The *type* stays `pub` in `rustflow::semaphore` either way: the
+  module's own docs link it, and its `Display` is what a caller reads the
+  maximum back from. Withdrawing the root line is the one-line change this
+  closing pass leaves, the trio above being the shape of it.
 
-  `docs/api-friction.md`'s "Algorithms (step 6): two forms where upstream has
-  one" is the evidence for this entry, and the first thing reading upstream
-  does to it is correct its framing. Upstream does not have one shape; it has
-  two, and the one it treats as primitive is the one this port lacks. Every
-  `FlowBuilder` algorithm method in `taskflow/algorithm/*.hpp` at the pin is
-  literally `return emplace(make_X_task(args...));` -- in `for_each.hpp`,
-  `transform.hpp`, `fill.hpp`, `generate.hpp`, `reduce.hpp`, `find.hpp`,
-  `sort.hpp`, `scan.hpp` and `merge.hpp` alike, without exception. Upstream's
-  primitive is therefore the factory, a cold callable over `tf::Runtime&`,
-  and its `FlowBuilder` method is one derived line over it. What upstream has
-  no counterpart for at all is this port's *other* form: `tf::Runtime`
-  carries no loop, sort, reduce or scan members, so `Runtime::for_each` and
-  its 27 siblings are this port's own invention.
+- **The documentation contract, and the three questions applying it asked**
+  (issues #126, #129, #130, #134). The contract is the section at the top of
+  this file, written at the start of the first consolidation against a tree
+  measured at 2.2× carrying 210 issue citations in its doc comments (#126).
+  Two passes applied it, to the graph side (#129, ten files) and to the
+  executor's periphery (#130, nine files, plus the `unsafe` audit that left
+  all 15 sites in `src/executor/notifier.rs` carrying a `// SAFETY:` and
+  promoted `clippy::undocumented_unsafe_blocks` to `deny`); both met the same
+  three questions about the ratio, the citations below a test module and what
+  an unchanged test-name set can mean, and the closing pass settled all three
+  inside the contract itself (#134) rather than letting three issues answer
+  them three ways. One of those answers is a rule about documentation passes
+  in general and belongs with the others here: **a pass may not buy the number
+  by cutting a `# Design` section or deleting a doctest**, so what moved to
+  fit the contract was the measurement.
 
-  The port has upstream's derived layer and a primitive of its own, and is
-  missing the layer in between. It needs three where upstream needs two for
-  one reason: upstream's `make_for_each_task(b, e, c, part)` is at once a
-  `'static` callable and a borrow of the caller's container, which compiles
-  only because its iterators are unchecked pointers and nothing verifies the
-  container outlives the task. In Rust a `'static` callable cannot hold a
-  `&mut [T]`, so the owned/borrowed split is forced and the only open question
-  is where the seam falls. It falls here: `Runtime::X(&mut [T], ..)` is the
-  borrowed primitive a body that already holds a live slice calls directly,
-  `make_X_task(owned, ..) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send +
-  'static` is the `'static` callable, and `FlowBuilder::X` is one
-  `emplace_runtime` line over the factory. Counting the surface at the time
-  of the decision: 28 `Runtime::` methods, 28 `FlowBuilder` wrapper methods
-  across eight extension traits, and 11 factories -- three for
-  `for_each_index`, two for `merge`, six for `scan` -- so 17 are missing and
-  the completed family is 1:1 with the wrappers.
-
-  **Neither existing shape goes.** Both carry real weight in the corpus: of
-  the 103 algorithm call sites in `tests/`, `examples/` and `benches/`, 62
-  call a `Runtime::` method and 41 call a wrapper, and the split is not
-  uniform per algorithm -- `find` is 15 to 0 (its four wrapper methods have
-  no call site outside `src/` at all, only a unit test and four doctests),
-  while `scan` is 2 to 14 and `tests/scan.rs` is wrapper-only, 12 calls with
-  no `Runtime::` call anywhere in the file. Dropping the wrapper would make
-  `scan` and `for_each_index` cost a hand-written closure per use at a dozen
-  sites that read like upstream today; dropping the `Runtime::` method would
-  delete the implementation every wrapper is built on and the only form that
-  reaches a `&mut [T]` a body already owns without a lock. The friction log's
-  own reading survives intact -- `taskflow.sort(Arc::clone(&data))` reads
-  almost exactly like upstream's `taskflow.sort(beg, end)`, and
-  `runtime.sort_by(&mut local, cmp)` is nicer than anything upstream can
-  write -- and the honest conclusion is that those two sentences describe two
-  different jobs rather than two candidates for one.
-
-  **The factory family is how a dependent-async body gets the algorithms**,
-  and completing it is the work this decision commissions. The gap the
-  friction log calls the widest it found is real: all three stages of
-  `examples/dependent_async_algorithm.rs` hand-lock an `Arc<Mutex<_>>` and
-  call a `Runtime::` method, because the wrapper builds through
-  `FlowBuilder::emplace_runtime` and a dependent-async task is never queued
-  into a `Taskflow` for that to call. The factory closes it with nothing new
-  invented: `impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static` is
-  accepted by `emplace_runtime`, by `Executor::spawn_runtime` and
-  `silent_async_runtime`, and by `dependent_async_runtime` and
-  `silent_dependent_async_runtime` whose bound is the weaker `FnOnce`. The
-  precedent is already tested: `src/algorithm/module.rs`'s
-  `a_module_task_runs_from_a_dependent_async_body` submits
-  `make_module_task` straight through `Executor::dependent_async_runtime`.
-  The one argument on record against a factory for the other families --
-  `examples/dependent_async_algorithm.rs`'s claim that a `Runtime::` method
-  is "not a callable a factory can hand back cold, because the chunk loop
-  underneath every one of them is built on `Runtime::scope`" -- does not
-  hold, and `make_inclusive_scan_task` is the counterexample sitting in the
-  tree: it hands back exactly such a callable, and `Runtime::inclusive_scan`
-  underneath it calls `rt.scope`. A factory's product is handed its
-  `&mut Runtime` when it *runs*; it never needed one to be built. The
-  seventeen factories, each beside the `Runtime::` method it wraps and with
-  the parameter list its wrapper already has, are filed as #292
-  (`make_for_each_task`, `make_sort_task`, `make_sort_by_task`), #293
-  (`make_transform_task`, `make_transform2_task`, `make_fill_task`,
-  `make_fill_n_task`, `make_generate_task`, `make_generate_n_task`), #294
-  (`make_reduce_task`, `make_transform_reduce_task`,
-  `make_transform_reduce2_task`, `make_reduce_by_index_task`) and #295
-  (`make_find_if_task`, `make_find_if_not_task`, `make_min_element_task`,
-  `make_max_element_task`), with #296 rewriting the example on them -- the
-  check that the gap actually closed, and the place the stale claim above
-  gets corrected. Each of the four also reduces its wrapper methods to the
-  `self.emplace_runtime(make_X_task(..))` one-liner `ScanBuilder` and
-  `ForEachIndexBuilder` already are, which is what makes the derived layer
-  cheap enough to keep.
-
-  **The `Arc<Mutex<_>>` is accepted, and the absence of a `std::ref(range)`
-  counterpart is permanent rather than pending.** Upstream's reference
-  wrapper is sound there only because its graph edges are trusted by
-  convention: `make_for_each_task(std::ref(beg), std::ref(end), ..)` hands
-  the task an unchecked alias into a container the caller still mutates, and
-  what keeps that from being a data race is the programmer's claim about the
-  dependency edges, nothing the compiler reads. Reproducing it would need
-  `unsafe` and would hand a caller exactly that footgun, which this port's
-  stated posture refuses; a lock taken once per invocation -- not once per
-  element -- is the price, and `src/algorithm/for_each_index.rs`'s "No
-  deferred `beg`/`end`/`step`/`range`" `# Design` section already names the
-  same gap from the implementation side. Two measurements make the cost
-  smaller than the friction log's framing suggests. It is a *slice*
-  algorithm's cost, not the family's: of the 28 wrappers, 23 take at least
-  one `Arc`, two (`merge`, `merge_by`) take owned `Vec`s and return the slot
-  they publish into, and three -- the `for_each_index` trio -- take no data
-  at all, since an index range is `Copy` and travels by value. And the port
-  has a form upstream does not for the case that actually chafes: a caller
-  who wants no lock computes the slice in a `Runtime` body and calls the
-  `Runtime::` method on it, which is what `tests/for_each.rs`'s stateful
-  cases do in place of upstream's `std::ref` ones. The rule the seventeen new
-  factories follow, so the family stays one vocabulary rather than three: a
-  value the body only reads is any `SliceSource` -- `Arc<Vec<T>>`,
-  `Arc<Mutex<Vec<T>>>` or an owned `Vec<T>`, the read side the last entry of
-  this section states and the reason it is wider than one `Arc` -- one it
-  writes is `Arc<Mutex<Vec<T>>>`, a scalar result is `Arc<Mutex<T>>`, a
-  `Copy` range or
-  index travels by value, and a factory that *creates* the output storage
-  returns `(body, slot)` as `make_merge_task` does.
-
-  **What #216 inherits.** It is collapsing the *derived* layer -- 28 one-line
-  wrappers once #292 through #295 land -- not a primitive, which is why the
-  collapse is cheap and why it does not have to wait for those four: a
-  factory changes a wrapper's body, never its signature. It should keep all
-  28 methods (none is redundant; the counts above show which algorithms lean
-  on which form, not that any method is unused), fold the eight traits into
-  one whose every method is a single `emplace_runtime` call, and, per #256's
-  entry above, flatten `rustflow::algorithm`'s own front door: the collapsed
-  trait, the four partitioners and their `ClosureWrapper`, `IndexRange` and
-  `IndexRanges`, and the `make_*_task` family. The collapsed trait replaces
-  the eight prelude lines with one; the factories are *not* prelude names,
-  which is #256's boundary applied unchanged -- a program importing a
-  free-function form is choosing it, and chooses it by name.
-
-- **A free async task is named by a `_named` twin of its submitting method,
-  and the name rides in `Spawn`** (issue #258).
-
-  Upstream's shape at the pin is an *optional leading argument*, not a second
-  verb: `async(f)` forwards to `async(DefaultTaskParams{}, f)`, and
-  `TaskParamsLike` admits `TaskParams`, `DefaultTaskParams` or anything
-  `StringLike`, so `executor.async("async1", f)` and
-  `rt.async("my task", f)` are one overload of the same four names. C++
-  spells "optional" as an overload and Rust has no overloading, so the
-  rendering is a second method name: `spawn_named`, `silent_async_named`,
-  `dependent_async_named` and their `_runtime` twins, on each of the three
-  receivers, which is twenty-four new methods beside the twenty-four already
-  there. Each is its unnamed twin plus one step, because the name travels in
-  `Spawn<H>` rather than as a parameter of `Shared::schedule_async_task` --
-  which makes that value upstream's leading `(params, f)` pair exactly as
-  `Submission` is its trailing `(tpg, parent)` pair, and leaves the unnamed
-  twenty-four, the submission core's signature and every existing call site
-  untouched. This supersedes the last sentence of the entry above on `async`
-  being `spawn` (#88): the `TaskParams` overloads no longer collapse onto the
-  unnamed forms, because the observers it deferred them to arrived in M7 and
-  `TaskView::name` is now something to read a name back with.
-
-  The alternative was a submission builder, `executor.named("a").spawn(f)`,
-  with one `named` step on each receiver that every existing method is
-  reached through. By method count it is the smaller surface and that is the
-  one thing it wins: a single public builder holding a private three-variant
-  target -- parentless, under a node, under an anchor -- carries eight
-  methods where the twins carry twenty-four. Three things decide against it.
-  It adds a **public type no program using the crate ever writes**, which is
-  precisely the test the entry above on root re-exports applies to earn a
-  root line, so the builder would need a root line to be documented at all
-  while failing the rule that hands them out; a `_named` method adds no type
-  and no name to place. It **separates the name from the call it is an
-  argument of**: `spawn`/`spawn_named` and
-  `spawn_runtime`/`spawn_runtime_named` sort next to each other on the same
-  rustdoc page, so a reader who found the unnamed form has found the name,
-  where a builder puts the named forms on a page reached only through a verb
-  that sorts nowhere near them. And the thing a builder is actually for --
-  more than one optional parameter -- **is not there**: `TaskParams` has two
-  fields, and the second, `void* data`, does not survive translation at all,
-  user data in Rust travelling in the closure. If a second parameter ever
-  does arrive, a builder is the shape to revisit and these twins are its
-  front end rather than an obstacle.
-
-  The default is deliberately unchanged: an unnamed submission names its node
-  the empty string, which is what `DefaultTaskParams` leaves `Node::_name`
-  as upstream, and `Graph::add_named_node` already took the name a free
-  node's one-node arena is built with -- nothing in `src/graph/` moved for
-  this.
-
+- **The suites share one test module, and the worker matrices are a macro**
+  (issues #127, #132). The suites under `tests/` carried one hand-written
+  `fn starvation_loop_4_threads() { starvation_loop(4) }` per worker count per
+  family, six private copies of `spin_until` and five each of a counter and a
+  body-maker; 489 of their `#[test]` functions across 13 suites now come out
+  of 89 `worker_matrix!` blocks, and each helper is defined once under
+  `tests/common/`. The test names do not change, which is the constraint the
+  shape is built around and the rule every pass after this one inherits: a
+  suite's names are upstream's `TEST_CASE` names, so renaming one edits the
+  acceptance oracle rather than tidying a file. Why the helpers are topic
+  files a suite pulls by path, and why a macro beats a single `#[test]` over
+  a loop, are argued once where they are implemented — `tests/common/mod.rs`'s
+  own docs — because the reason is that module's own (every file under
+  `tests/` is a separate crate) rather than something the port shares.
 - **A module's `# Design` section is not prose, and the eleven files still
   over the figure are disposed of here** (issue #228).
 
@@ -1793,66 +1953,200 @@ entry above does.
   belongs to none of the three, which the exempt verdict settles rather than
   needing a fourth pass.
 
-- **One `AlgorithmBuilder` for all 28 wrappers, declared in
-  `src/algorithm/mod.rs` and flattened at `rustflow::algorithm`'s front
-  door** (issue #216).
+- **`src/executor/corun.rs` comes under the 1.2x guide and
+  `src/executor/runtime.rs` does not** (issue #276). The executor's
+  documentation pass took the two files #228's re-measured disposition marks
+  *pass*, and they end in different places.
 
-  This supersedes M7's "one per-algorithm extension trait per module" entry,
-  which named the question and left it here. The eight traits it created --
-  `FindBuilder`, `ForEachBuilder`, `ForEachIndexBuilder`, `MergeBuilder`,
-  `ReduceBuilder`, `ScanBuilder`, `SortBuilder`, `ElementwiseBuilder` -- are
-  one `AlgorithmBuilder: FlowBuilder`, blanket-implemented for every
-  `FlowBuilder` exactly as each of them was, carrying all 28 methods
-  unchanged in signature and in body. The eight prelude lines are one, and
-  the corpus shows what the split was costing: of the 38 files in `tests/`
-  that import the prelude, 37 named none of the eight at all, and the one
-  that did -- `tests/for_each_index.rs` -- imported it beside a partitioner
-  trait rather than for anything the trait itself said; no example and no
-  benchmark imported one. A trait per algorithm was never a
-  distinction a caller could use, because none of the eight held a concept of
-  its own: the family shares one vocabulary of owned parameters, one
-  partitioner set and one lock-once-per-invocation ownership rule, all three
-  decided in the entry above rather than per algorithm.
+  `corun.rs` goes from 1.6x to 1.2x by moving three arguments into its own
+  module `# Design` section: that cancellation is not one of the ways a corun
+  fails, which `CorunError` carried; what `InnerRun`'s `Drop` is for, which
+  the struct doc carried; and that the anchor is taken before the graph is
+  scheduled, which `corun_graph`'s four-step recital carried. What its
+  private methods and that recital said about those a second time is cut.
 
-  **Not moved into `src/flow_builder.rs`.** That is the other shape #216
-  offered, and it reads better at first -- zero new names, since
-  `FlowBuilder` is already a prelude and a root name -- but it puts the
-  algorithm family inside the trait that defines what a task *is*. The
-  honest test is what each file then has to know: `FlowBuilder` would gain
-  28 methods whose signatures name `SlicePartitioner`, `ReducePartitioner`,
-  `FindPartitioner`, `IndexDispatch`, `IndexInt`, `IndexRange` and
-  `IndexRanges`, so `src/flow_builder.rs` -- the file `src/graph/`,
-  `src/taskflow.rs` and `src/subflow.rs` all build against -- would import
-  seven types from the algorithm tree to declare a layer *derived* from it.
-  The dependency runs the wrong way: an algorithm wrapper is built on
-  `FlowBuilder::emplace_runtime`, and nothing in the builder is built on an
-  algorithm. Keeping the wrappers in `src/algorithm/` keeps that arrow
-  pointing one way, and the extension trait is what Rust charges for it: one
-  name, in the prelude, which a caller writing `use rustflow::prelude::*;`
-  never spells.
+  `runtime.rs` goes from 2.3x to 2.0x and stops there, which the arithmetic
+  settles rather than a judgement about any one paragraph. 123 of its prose
+  lines are inline `//` comments at the atomics -- why both state bits go on
+  before the body runs, why the body's own reference is a `Release`
+  `fetch_add` and its spending an `AcqRel` `fetch_sub`, why the payload
+  forward waits for those bits to come off, why `CAUGHT` is read before the
+  lock -- and 17 more are the module header above the `# Design` section.
+  Against a budget of 1.2 x 187 code lines, that leaves 84 prose lines for 27
+  documented items, fourteen of them public and four carrying a `# Panics` or
+  `# Errors` section a caller is owed: three lines each. The file reaches the
+  figure only by moving an ordering argument away from the atomic it is about,
+  which is the move #276 refuses for `src/executor/scope.rs` and the ground on
+  which #228 marks `src/executor/dependent_async.rs` exempt. What the pass did
+  take are the redundancies that disposition named: `Runtime::schedule`'s `#
+  Panics` no longer re-derives the failure the "`Runtime::schedule`'s hole is
+  closed in the scheduler" entry under "Executor core" argues,
+  `Runtime::try_corun` no longer makes the anchor argument a third time, and
+  `NonpreemptiveRuntime`'s `private_bounds` rationale is in the module's `#
+  Design` section rather than on the type.
+- **The `graph/` submodules keep their own rationale, and this file keeps
+  what they share** (issue #277). `handle.rs`, `node.rs` and `work.rs` are
+  private modules behind the public `graph` facade, so a `# Design` section
+  of one of them is read in the source rather than in the rendered docs.
+  That is still where the documentation pass moved the rationale out of
+  their item docs, because each piece of it belongs to exactly one of the
+  three modules -- what a conditioner's `i32` buys, why a subflow's subgraph
+  sits behind a `Mutex`, why the dispatch claim is independent of
+  `PREEMPTED`, what one `Work<R>` folds together -- and an entry per variant
+  here would split one module's reasoning across two files.
+  `src/graph/mod.rs`'s own section carries the tree's shared decisions, the
+  arena and the tombstone; what an item doc keeps is the half-line pointer
+  the contract allows. The one fact three modules do share is that the
+  restricted `NonpreemptiveRuntime` handle is not part of the public
+  surface: a body closure is handed one with its parameter's type inferred,
+  so `graph::Handle`'s variant, `graph::work`'s `NonpreemptiveRuntimeWork`
+  and `FlowBuilder::emplace_nonpreemptive_runtime` each state the one
+  consequence they meet -- no type annotation in a doctest, no type to link
+  to -- and none of them re-derives the rest.
 
-  **The front door.** Per the prelude/root entry above, `rustflow::algorithm`
-  is flattened here rather than at the crate root: `AlgorithmBuilder`, the
-  four partitioners with `DefaultPartitioner`, `ClosureWrapper` and
-  `DefaultClosureWrapper`, `IndexRange` and `IndexRanges`, and the twelve
-  `make_*_task` factories are re-exported from `src/algorithm/mod.rs`. The
-  factories are *not* prelude names, which is that entry's boundary applied
-  unchanged -- a program reaching for a free-function form chooses it, and
-  chooses it by name. The submodule paths all still resolve, so no caller
-  lost an import.
+- **The four files M9 itself pushed over 1.2x stay over it, reviewed rather
+  than cut** (issue #201). #192's N-dimensional extension, #191's
+  `Task::data` slot and #206's `queue_size` left
+  `src/algorithm/index_range.rs` (1.4x), `src/graph.rs` (1.2x),
+  `src/executor/queue.rs` (1.2x) and `src/executor/worker.rs` (1.2x) over
+  the contract's guide -- the same four issue #228 counts among the tree's
+  21 (#228 has the rest, almost all predating M9). None is a
+  `src/pipeline/mod.rs`-shaped case: that file's whole purpose is a
+  module-tree pointer with nothing to move, where these four carry ordinary
+  item docs plus, for `index_range.rs`, a `# Design` section arguing a real
+  question (why `IndexRanges<T, N>` is its own type, why `discrete_domain`
+  narrows one dimension). Cutting either to buy the number is exactly what
+  the documentation contract above refuses, so none of the four were cut.
+  They stand in the same bucket the contract already names for
+  `src/executor/runtime.rs`, `src/task_group.rs`, `src/executor/corun.rs`
+  and `src/executor/dependent_async.rs` -- a file a reviewer looks at, with
+  the reason given once here rather than reinvented per PR.
 
-  **What moved, and what a reader should expect of the diff.** The 28 method
-  bodies are untouched: a wrapper is still one `emplace_runtime` call over
-  the `Runtime` method or `make_*_task` factory of the same name, and the
-  four issues completing that factory family (#292 through #295) change
-  bodies, never signatures, so they land on top of this with no
-  re-collapsing. The one thing a `--list` comparison does see is that a
-  wrapper's doctest is now named `algorithm::AlgorithmBuilder::sort` where it
-  was `algorithm::sort::SortBuilder::sort`: 15 doctest item paths moved,
-  which is the trait rename itself and not a test gained or lost, and every
-  other name in the 2549 is identical. The per-module `# Design` sections
-  that each argued for their own trait are one paragraph in
-  `src/algorithm/mod.rs`, where the trait now is.
+- **`src/pipeline/mod.rs` is exempted from the 1.2× ratio, the same way a
+  crate root already is** (issue #189). Its code is three `pub mod`
+  declarations; the file's whole purpose is the module-tree overview above
+  them, naming what each of `pipe`, `scheduler` and `data_pipeline` is for a
+  reader who has not yet opened any of the three. Cutting that overview to
+  3 prose lines to match 3 lines of code would not shrink a rationale this
+  contract puts elsewhere -- there is none to move, the whole file *is* the
+  pointer -- it would just delete the one place a reader meets the tree
+  before the modules themselves. The contract already exempts a crate root
+  on exactly this reasoning (`src/lib.rs`'s own code is a `pub mod`/`pub use`
+  list, so its denominator measures nothing a ratio can judge); a module
+  tree's own root is the same shape one level down, and issue #228, which
+  asks the more general question of whether a per-file ratio is the right
+  instrument for this crate at all, is where that reasoning would extend
+  further if it does.
+
+- **A lint policy gets its first exception, and the rule that admits it**
+  (issue #209). `RandomPartitioner::chunk_size_range` (PR #203) carries the
+  crate's first `#[allow]` anywhere in `src/`:
+  `#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]` on the
+  `f32`-to-`usize` conversion of `alpha * nw` and `beta * nw`. `Cargo.toml`'s
+  policy for those two lints reads "loud from the start rather than
+  retrofitted ... over a thousand call sites later", so the crate went from
+  zero such attributes to one without the policy gaining a documented
+  exception -- and a later contributor reading only `Cargo.toml` would
+  reasonably treat the existing attribute as licence for the next one.
+
+  The rule: a float-to-int conversion may carry a statement-scoped
+  `#[allow]` with an inline justification only when its input is a
+  genuinely user-supplied float with no integer-arithmetic equivalent, the
+  way `alpha`/`beta` are arbitrary tunables matching upstream's own `float`
+  parameters and `std` has no `TryFrom<f32> for usize` to fall back on. A
+  conversion derivable from integers already in hand does not qualify, and
+  must be done in integer arithmetic instead -- which is what the PR's
+  other candidate site, the guided partitioner's chunk step, turned out to
+  be: `r / (2 * w)` is a ratio of two integers already in hand, so integer
+  division gives the exact floor with no float round-trip, and the
+  `floor_to_usize` helper that had covered both sites was deleted once that
+  site moved off it. `chunk_size_range`'s is, for now, the one instance the
+  rule admits.
+- **The eleven mutants of #274's run that no test should kill are
+  dispositioned rather than tested: `.cargo/mutants.toml` skips them and the
+  argument for each is here** (issue #309).
+
+  #274's run over `src/graph/`, `src/semaphore.rs` and
+  `src/algorithm/partitioner.rs` left 69 survivors, 53 of them killed by the
+  twelve tests its own PR added. Eleven of the rest are mutants no test should
+  kill: each is the same program as the original, or differs from it only in a
+  value nothing promises. A test written for one of those pins the mutation
+  instead of the behaviour, which is the one kind of test #274's acceptance
+  refuses, so what they are owed is a disposition. Both forms are written.
+  `exclude_re` in `.cargo/mutants.toml` keeps the next `cargo mutants` over
+  these two files from reporting them at all, and this entry carries the
+  reasoning, because the two rot differently: the regex is keyed on
+  `file:line:col`, so an edit above any of these lines makes a pattern stop
+  matching and the mutant comes back as a survivor pointing at an entry that
+  still explains it. That fail-open is the reason the patterns are not keyed on
+  the looser pair, function name plus operator, which would hide genuine `+`
+  and `*` mutants on `loop_dynamic_until`'s other lines for as long as nobody
+  looked. `cargo mutants 27.1.0` does read the key: its listing over the two
+  files goes from 242 mutants to 231, and the eleven that disappear are exactly
+  these.
+
+  **Two `|`s over disjoint bits.** `NodeBase::claim_panic` and
+  `NodeBase::take_panic` each build `Cancellable::EXCEPTION |
+  Cancellable::CAUGHT` out of two distinct single-bit constants
+  (`0x1000_0000` and `0x2000_0000`), and `a | b == a ^ b` whenever
+  `a & b == 0`. Mutating that `|` to `^` leaves the same constant, so it is
+  the same program. The `&` mutant of the same two expressions is a different
+  program and is killed.
+
+  **A swap guard that fires only on equal bounds.**
+  `RandomPartitioner::chunk_size_range` ends with
+  `if b1 > b2 { swap(&mut b1, &mut b2) }`, and `>=` for `>` swaps when the
+  two bounds are equal as well, which leaves them where they were. The other
+  two mutants of that comparison, `==` and `<`, change the range whenever
+  `alpha > beta` and are killed.
+
+  **A floor clamp its own branch condition makes unreachable.** The guided
+  loop's `if q < chunk_size { q = chunk_size }` sits in the `r >= p1` arm,
+  where `p1 == 2 * w * (chunk_size + 1)` and `q == r / (2 * w)`, so
+  `q >= chunk_size + 1` on every path that reaches it; `<=` and `==` for `<`
+  are false there exactly as `<` is. The third mutant of that comparison,
+  `>`, is always *true* there and is killed by
+  `the_guided_loop_shrinks_its_chunks_with_the_remaining_work`. The clamp is
+  upstream's and stays: it is dead in the unmutated program only, and it is
+  what makes the next group equivalent.
+
+  **Six mutants of `p1`, the threshold that picks the atomic rather than the
+  chunk size.** `let p1 = 2 * w * (chunk_size + 1)` chooses which arm hands
+  out the next chunk: below `p1` remaining, a `fetch_add(chunk_size)` loop; at
+  or above it, a compare-exchange of `q = max(r / (2 * w), chunk_size)`. Every
+  arithmetic mutant of that line -- `2 + w * (c + 1)`, `(2 / w) * (c + 1)`,
+  `2 * w + (c + 1)`, `2 * w / (c + 1)`, `2 * w * (c * 1)` and
+  `2 * w * (c - 1)`, writing `c` for the chunk size -- is at most `p1` for
+  every `w >= 1` and `c >= 1`, and `c >= 1` is what the loop's own
+  `if self.chunk_size == 0` guarantees. So the only remainders that change arm
+  are the `r` with `p1' <= r < p1`, and there `r / (2 * w) <= c`: the clamp of
+  the group above raises `q` back to `c` and the body is handed a chunk of
+  exactly the size the `fetch_add` arm would have handed it, with the same
+  boundaries, the same order and the same early exit, for one caller and for
+  `w` racing ones alike. Deleting the clamp as dead code would end that, and
+  these six patterns with it.
+
+  What does differ is the final value of the shared cursor, the `fetch_add`
+  arm overshooting `n` by one chunk where the compare-exchange arm stops at
+  `n`. Nothing pins that: every caller in the crate --
+  `find::drive_find_dynamic`, `reduce::drive_reduce_dynamic`,
+  `for_each_index`'s own loop and the `partition_dynamic` the slice
+  algorithms share -- drops its cursor unread once the loops return, and a
+  loop only ever compares it against `n`. The one cursor claim that *is* a contract, "a loop that arrives
+  at an exhausted cursor hands out no chunk and does not move it", is asserted
+  by `a_dynamic_loop_over_an_exhausted_cursor_hands_out_no_chunk`, and no
+  mutant of `p1` can reach it, the `while curr_b < n` loop never being
+  entered.
+
+  Those last two groups argue over the inputs the unmutated loop is defined
+  on: `w >= 1`, and a `2 * w * (chunk_size + 1)` that does not overflow.
+  Outside them the original panics -- `r / (2 * w)` divides by zero for
+  `w == 0`, `chunk_size + 1` overflows a debug build -- and a mutant that
+  moves where the panic happens, or gets past it, differs from the original in
+  nothing else. The crate's own callers are well inside the range: an executor
+  has at least one worker (`Executor::new` asserts it), and each algorithm's
+  driver has already returned for `n == 0` and taken the serial path for
+  `w_total <= 1` before a partitioner sees either number.
 
 - **Four API-shape questions the friction log left open are all "keep", and
   the reasons are here rather than in code** (issue #260).
@@ -1952,257 +2246,19 @@ entry above does.
   does not build those targets and the `use` an intra-doc link would need is
   `unused_imports` under `clippy --all-targets`.
 
-- **The eleven mutants of #274's run that no test should kill are
-  dispositioned rather than tested: `.cargo/mutants.toml` skips them and the
-  argument for each is here** (issue #309).
-
-  #274's run over `src/graph/`, `src/semaphore.rs` and
-  `src/algorithm/partitioner.rs` left 69 survivors, 53 of them killed by the
-  twelve tests its own PR added. Eleven of the rest are mutants no test should
-  kill: each is the same program as the original, or differs from it only in a
-  value nothing promises. A test written for one of those pins the mutation
-  instead of the behaviour, which is the one kind of test #274's acceptance
-  refuses, so what they are owed is a disposition. Both forms are written.
-  `exclude_re` in `.cargo/mutants.toml` keeps the next `cargo mutants` over
-  these two files from reporting them at all, and this entry carries the
-  reasoning, because the two rot differently: the regex is keyed on
-  `file:line:col`, so an edit above any of these lines makes a pattern stop
-  matching and the mutant comes back as a survivor pointing at an entry that
-  still explains it. That fail-open is the reason the patterns are not keyed on
-  the looser pair, function name plus operator, which would hide genuine `+`
-  and `*` mutants on `loop_dynamic_until`'s other lines for as long as nobody
-  looked. `cargo mutants 27.1.0` does read the key: its listing over the two
-  files goes from 242 mutants to 231, and the eleven that disappear are exactly
-  these.
-
-  **Two `|`s over disjoint bits.** `NodeBase::claim_panic` and
-  `NodeBase::take_panic` each build `Cancellable::EXCEPTION |
-  Cancellable::CAUGHT` out of two distinct single-bit constants
-  (`0x1000_0000` and `0x2000_0000`), and `a | b == a ^ b` whenever
-  `a & b == 0`. Mutating that `|` to `^` leaves the same constant, so it is
-  the same program. The `&` mutant of the same two expressions is a different
-  program and is killed.
-
-  **A swap guard that fires only on equal bounds.**
-  `RandomPartitioner::chunk_size_range` ends with
-  `if b1 > b2 { swap(&mut b1, &mut b2) }`, and `>=` for `>` swaps when the
-  two bounds are equal as well, which leaves them where they were. The other
-  two mutants of that comparison, `==` and `<`, change the range whenever
-  `alpha > beta` and are killed.
-
-  **A floor clamp its own branch condition makes unreachable.** The guided
-  loop's `if q < chunk_size { q = chunk_size }` sits in the `r >= p1` arm,
-  where `p1 == 2 * w * (chunk_size + 1)` and `q == r / (2 * w)`, so
-  `q >= chunk_size + 1` on every path that reaches it; `<=` and `==` for `<`
-  are false there exactly as `<` is. The third mutant of that comparison,
-  `>`, is always *true* there and is killed by
-  `the_guided_loop_shrinks_its_chunks_with_the_remaining_work`. The clamp is
-  upstream's and stays: it is dead in the unmutated program only, and it is
-  what makes the next group equivalent.
-
-  **Six mutants of `p1`, the threshold that picks the atomic rather than the
-  chunk size.** `let p1 = 2 * w * (chunk_size + 1)` chooses which arm hands
-  out the next chunk: below `p1` remaining, a `fetch_add(chunk_size)` loop; at
-  or above it, a compare-exchange of `q = max(r / (2 * w), chunk_size)`. Every
-  arithmetic mutant of that line -- `2 + w * (c + 1)`, `(2 / w) * (c + 1)`,
-  `2 * w + (c + 1)`, `2 * w / (c + 1)`, `2 * w * (c * 1)` and
-  `2 * w * (c - 1)`, writing `c` for the chunk size -- is at most `p1` for
-  every `w >= 1` and `c >= 1`, and `c >= 1` is what the loop's own
-  `if self.chunk_size == 0` guarantees. So the only remainders that change arm
-  are the `r` with `p1' <= r < p1`, and there `r / (2 * w) <= c`: the clamp of
-  the group above raises `q` back to `c` and the body is handed a chunk of
-  exactly the size the `fetch_add` arm would have handed it, with the same
-  boundaries, the same order and the same early exit, for one caller and for
-  `w` racing ones alike. Deleting the clamp as dead code would end that, and
-  these six patterns with it.
-
-  What does differ is the final value of the shared cursor, the `fetch_add`
-  arm overshooting `n` by one chunk where the compare-exchange arm stops at
-  `n`. Nothing pins that: every caller in the crate --
-  `find::drive_find_dynamic`, `reduce::drive_reduce_dynamic`,
-  `for_each_index`'s own loop and the `partition_dynamic` the slice
-  algorithms share -- drops its cursor unread once the loops return, and a
-  loop only ever compares it against `n`. The one cursor claim that *is* a contract, "a loop that arrives
-  at an exhausted cursor hands out no chunk and does not move it", is asserted
-  by `a_dynamic_loop_over_an_exhausted_cursor_hands_out_no_chunk`, and no
-  mutant of `p1` can reach it, the `while curr_b < n` loop never being
-  entered.
-
-  Those last two groups argue over the inputs the unmutated loop is defined
-  on: `w >= 1`, and a `2 * w * (chunk_size + 1)` that does not overflow.
-  Outside them the original panics -- `r / (2 * w)` divides by zero for
-  `w == 0`, `chunk_size + 1` overflows a debug build -- and a mutant that
-  moves where the panic happens, or gets past it, differs from the original in
-  nothing else. The crate's own callers are well inside the range: an executor
-  has at least one worker (`Executor::new` asserts it), and each algorithm's
-  driver has already returned for `n == 0` and taken the serial path for
-  `w_total <= 1` before a partitioner sees either number.
-
-- **A factory's read parameter is one sealed source trait, and the family's
-  locking discipline is "every guard in parameter order, none past the body's
-  return"** (issue #318).
-
-  The ownership rule above gives every *writing* factory an
-  `Arc<Mutex<Vec<T>>>` and gave every *reading* one an `Arc<Vec<T>>`, and the
-  two are not interconvertible without copying the data. Across the eleven
-  factories with a read parameter -- `transform`, `transform2`, the six
-  scans, the three `reduce` forms that take a vector, the four finds and the
-  two merges -- that made the family unable to express a chain: the longest
-  one statable was for-each/sort into for-each/sort, the only factories that
-  read and write the same locked vector, and no factory could terminate a
-  chain by reducing what an earlier stage wrote. The program #296 specifies
-  compiled for its first stage and failed for its second and third with
-  `expected &Arc<Vec<_>>, found &Arc<Mutex<Vec<i32>>>`.
-
-  **What lands is `SliceSource`**, a trait sealed the way
-  `algorithm::SlicePartitioner` and `index_range::IndexInt` are, with an
-  `Item` associated type and a GAT guard that derefs to `Vec<Item>`:
-  `&'a Vec<T>` for `Arc<Vec<T>>` and for an owned `Vec<T>`, and
-  `MutexGuard<'a, Vec<T>>` for `Arc<Mutex<Vec<T>>>`. Every read parameter of
-  those eleven factories takes it -- fifteen parameters, the whole read side
-  rather than only the three factories #296 needs, since a half-converted
-  family is a worse API than either end state -- as
-  `impl SliceSource<Item = T>` in argument position rather than as a named
-  type parameter, which is what keeps every call site, doctest and turbofish
-  inferring unchanged and leaves all 28 `AlgorithmBuilder` wrapper signatures
-  byte for byte as they were. The guard is why this is a trait rather than a
-  `From` conversion: a locked source cannot hand out a `&[T]` without
-  something owning the lock for the duration of the read, and that something
-  is the guard the body holds for its own run.
-
-  **The alternative was a second `_locked` factory per read parameter**, and
-  it is rejected: it doubles eleven factories into two families a caller
-  picks between by name, each wrapper would still call only one of the two,
-  and the pair would have to be kept in step for every later change to
-  either. An `Arc<RwLock<Vec<T>>>` source was considered too, since a
-  read-write lock would let two *reading* stages run at once where a `Mutex`
-  serialises them. It is not taken: every writing factory publishes into an
-  `Arc<Mutex<Vec<T>>>`, so a chain built on `RwLock` would have to convert at
-  the seam -- the copy this decision exists to remove -- and a second lock
-  flavour in the vocabulary buys concurrency only for the reader-reader case
-  an edge already orders.
-
-  **The locking discipline**, stated here and in `src/algorithm/mod.rs`'s own
-  `# Design` section. A factory body locks each of its sources once per run,
-  in the order its signature lists them, and drops every guard before it
-  returns; the find family and `make_merge_task_by` release their read guards
-  before taking the lock they publish into, so a read guard is never held
-  across a write lock the read itself does not need. Two stages joined by a
-  dependency edge therefore cannot deadlock over a lock they share, in either
-  lock order, since the earlier body has returned -- and dropped its guards
-  -- before the later one is scheduled at all. Two stages that share a lock
-  and are *not* joined by an edge are a caller error, two readers included: a
-  body holds its guard across the chunk loop under it, that loop's wait runs
-  other ready work on the same worker (`WorkerThread::corun_until` steals),
-  and `Mutex` has no shared mode, so a worker that picks up the unordered
-  second stage blocks on a guard only its own stack could release. Handing
-  one `Arc<Mutex<Vec<T>>>` to two parameters of a single factory -- two read
-  sources, or a read source and the write target -- is that same error inside
-  one call, which is also why an in-place scan stays unexpressible: `input`
-  and `out` have to be two different locks, exactly as
-  `Runtime::inclusive_scan`'s own `&[T]`/`&mut [T]` pair cannot alias.
-- **The dispatch claim is one pair of calls per job dispatch, not one per
-  handle kind** (issue #320). M8's entry above reasoned about which dispatch
-  *arms* lock a node's callable and gave the claim to the five that do,
-  withholding it from `Handle::Runtime`, the two module handles and --
-  unexamined -- `Handle::Placeholder`. That reasoning asks the wrong
-  question. `DispatchClaim::wake` is what `Runtime::schedule`'s bypass calls
-  on its target, and it sets `CLAIMED` on **whatever node a body names**,
-  handing the claim to the job it queues; a handle kind whose arm never
-  released it therefore left the bit set for the whole life of the graph,
-  and the next bypass of that node got `false`, queued nothing, and left the
-  `count_queued(+1)` it had already paid outstanding -- a parent whose join
-  counter never reaches zero. Three independent witnesses, each hanging on
-  the second run of one taskflow on a single worker: a static task bypassed
-  by a body that then panics, so the queued job is skipped by
-  `WorkerThread::invoke_one`'s cancellation early-out, which returns before
-  the dispatch `match` and so claimed and released nothing; a bypassed
-  `Handle::Placeholder`; and a bypassed preemptive `Handle::Runtime`. Only
-  the first needs a panic anywhere. The realistic witness is a pipeline,
-  whose line tasks are all bypass-scheduled and all but one reachable *only*
-  that way, which is how `tests/pipelines.rs` and `tests/data_pipelines.rs`
-  came to have a cell apiece that hung under `taskset -c 0,1`.
-
-  So the claim is the **job's**, and `WorkerThread::invoke_one` is the one
-  place it is taken and given back: one `claim` before the handle `match`,
-  one `release` after it, and the requeue of a deferred bypass at that
-  release. Three things follow, and they are why this shape is the one taken
-  rather than a sixth, seventh and eighth per-arm pair. A kind added to
-  `Handle` cannot forget the claim, there being nowhere left to forget it.
-  Preemption needs no special case: holding the claim across it *is* the
-  existing `Epilogue` `None`, so `src/executor/subflow.rs`'s hand-written
-  deferral to its second entry -- the subtle half of #245 -- is now what the
-  `None` means for every preempting kind, and the arm just returns.
-  And the cancellation early-out takes the same pair before `finish_job`,
-  which is what closes the first witness: its `release` hands the claim back
-  without a dispatch ever running, requeueing a pending bypass whose own job
-  is skipped in turn, with the accounting unchanged because that bypass had
-  already paid its count.
-
-  The alternative the issue allows -- a `QUEUED` bit, so that `wake` stops
-  setting `CLAIMED` on a node it has merely queued -- was rejected: it still
-  needs one generic point that consumes the bit and honours `PENDING` for
-  the kinds whose arms do nothing, so it buys a third state and a wider
-  protocol for no property the pair above lacks, and #245's lost-wake
-  argument would have to be re-answered for the new state rather than kept.
-
-  The audit the fix rests on, over every path that retires a job without
-  dispatching it. The cancellation early-out leaked, as above. The four arms
-  that never released leaked, as above. `Node::acquire_all`'s refusal -- the
-  semaphore park -- does **not**: the job is parked rather than retired, so
-  the claim is still owed by a live job, a bypass landing meanwhile defers
-  onto `PENDING`, and the eventual dispatch of the parked clone honours it;
-  a run cancelled while the job is parked funnels into the early-out and is
-  covered there. The dependent-async job copies "dropped undequeued" in
-  `src/executor/dependent_async.rs` do **not**: those are free nodes, and
-  `Runtime::schedule` takes a `Task` of a graph, so no claim is ever taken
-  on them. The `is_entered(next)` branch of the successor-release loop does
-  **not**: it declines to queue a successor nothing bypassed, so no `wake`
-  ever ran. And the two async arms that refuse a handle built into a graph
-  are now covered like every other kind, by the generic pair.
-- **An observer hook may panic, and the scheduler catches it** (issue #304).
-  The two answers the issue put were to catch the hook or to forbid a
-  panicking one in `Observer`'s documented obligations, and the first is
-  taken: `WorkerThread::observer_prologue` and
-  `WorkerThread::observer_epilogue` call each registered hook under a
-  `catch_unwind` and hand a payload to `Job::record_panic`, so the run
-  fails with `RunError::Panicked` carrying the hook's own payload and the
-  executor stays usable. What decided it is the cost of the violation, not
-  the elegance of the rule. The hook calls bracket the dispatch *inside*
-  the worker's scheduling loop, so a payload that escapes kills the worker
-  thread with the job in flight never finished: the run's join counter
-  stays short, `RunHandle::wait` blocks for ever, and the pool is one
-  worker down with no diagnostic beyond the default hook's print. A rule
-  the library cannot enforce, whose breach is a silent hang, loses to a
-  rule the scheduler keeps by construction -- and an `Observer` is
-  typically an adapter onto a caller's own logging or accounting, where a
-  panic is as reachable as it is in a task body the executor already
-  catches.
-
-  Three consequences are worth naming. The catch is **inside** the two
-  seam methods rather than at their call sites, which is what covers all
-  six `observer_epilogue` callers -- the generic one under
-  `WorkerThread::invoke_one`'s dispatch `match` and the five in
-  `executor::async` and `executor::dependent_async` -- and what keeps
-  #320's one `claim`/`release` pair balanced: a hook that panics now
-  cannot unwind out from between the claim and the release, so this fix
-  does not trade this hang for that one. It is one `catch_unwind` **per
-  observer** rather than one around the loop, matching what the successor
-  loop's `is_entered` branch and `Node::release_all` already do with a
-  failure mid-iteration: record it and carry on with the rest, so one
-  failing hook does not cost the observers after it their callback, with
-  the run keeping the first payload offered. And the failure does not
-  retract the dispatch the hook brackets: a panicking `on_entry` still
-  lets the body run -- this entry's cancellation check is already past --
-  and a panicking `on_exit` still leaves the node's tear-down to the
-  caller, exactly as a panicking task body still releases its successors.
-
-  Upstream is departed from knowingly here. Its `_observer_prologue` and
-  `_observer_epilogue` calls sit *outside* the
-  `TF_EXECUTOR_EXCEPTION_HANDLER` wrapping each `_invoke_*_task` body, so a
-  throwing hook unwinds into the `catch(...)` around its `_spawn` loop,
-  reaches `scheduler_epilogue` and ends that worker -- the same hang, in
-  C++. The third hook needs none of this: `Executor::make_observer` calls
-  `Observer::set_up` on the registering thread before inserting anything,
-  so its panic is raised to that caller and no observer is registered,
-  which `tests/observers.rs` pinned before this change and still does.
+**The instruments, and which of them decides anything.** Four measurements of
+this crate's own documentation and tests live in `devtools/`, and all four are
+**reports**: `doc-ratio.sh` (#126, with #228's `design` column) measures the
+ratio this contract names, `test-names.sh` (#262) is the test-name comparison a
+documentation pass is held to, `coverage.sh` (#263) runs `cargo-llvm-cov` over
+`src/` alone, and `api-witness.py` (#325, made type-aware there and precise
+about signatures and annotations in #331) counts the public declarations no
+test, example, benchmark or doc example witnesses, each call site read against
+the type it reaches rather than against a bare name. None of them is a gate:
+each exits 0 whatever it finds -- `test-names.sh diff` and `coverage.sh` exit
+non-zero only on a difference a PR asked for or a measurement that could not
+run -- so a number from one is something a reviewer reads rather than something
+that passes or fails. `cargo mutants` is the fifth, run by hand over a module
+at a time, with `.cargo/mutants.toml` carrying the equivalent mutants the entry
+on them dispositions. What does decide a pass is the gate `docs/development.md`
+names, plus `devtools/run-examples.sh` in CI's `examples` job.
