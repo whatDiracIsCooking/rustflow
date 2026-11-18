@@ -30,8 +30,9 @@
 //! even while its body is genuinely running, and [`Handle::Subflow`] is not
 //! either for as long as its body is still *building* the subgraph that
 //! would make it preempt. `DESIGN.md`'s "Decisions taken in M8" has the hole
-//! that left, the caller-side fix that was tried first and could not close
-//! it from outside the scheduler, and which dispatch arms take the claim.
+//! that left and the caller-side fix that was tried first and could not
+//! close it from outside the scheduler; "Decisions taken in M10" has why the
+//! claim is one pair per job dispatch rather than one pair per handle kind.
 //! The cost is an `AtomicU8` beside [`NodeBase`]'s own three words, which
 //! [`Semaphores`] and [`Node`]'s own data slot already account for
 //! themselves.
@@ -251,21 +252,28 @@ pub(crate) struct Semaphores {
     pub(crate) to_release: Vec<Arc<Semaphore>>,
 }
 
-/// Whether a node's own callable is locked by a dispatch in progress, and
+/// Whether a job dequeued for this node is in the dispatch right now, and
 /// whether a [`Runtime::schedule`](crate::Runtime::schedule) bypass asked --
 /// while it was -- to run the node again: the claim every node carries so
 /// that two dispatches cannot hold one callable, which the module's
 /// `# Design` section places against `schedule`'s own `is_entered` guard.
 ///
+/// One pair of calls per job `WorkerThread::invoke_one` dequeues, which is
+/// the invariant the whole claim rests on: a job that holds the claim --
+/// because `wake` handed it the claim to queue it -- gives it back whether
+/// it dispatched the node's callable or skipped it, so no handle kind and no
+/// early-out can retire a job and leave the bit set behind it.
+///
 /// # Ordering
 ///
 /// [`DispatchClaim::release`]'s successful store and the successful load
 /// half of [`DispatchClaim::claim`] or [`DispatchClaim::wake`] are the pair.
-/// A caller may call `release` only once its own callable's guard has
-/// already dropped -- every caller here does, since a `MutexGuard` drops at
-/// the end of the statement that locked it, strictly before the next
-/// statement runs, so there is nothing left to publish by the time `release`
-/// is reached. `release`'s `AcqRel` store therefore makes that drop, and
+/// A caller may call `release` only once the dispatched callable's guard has
+/// already dropped -- the one caller does, releasing after the dispatch
+/// returned, and a `MutexGuard` taken inside it drops at the end of the
+/// statement that locked it, strictly before the next statement runs, so
+/// there is nothing left to publish by the time `release` is reached.
+/// `release`'s `AcqRel` store therefore makes that drop, and
 /// everything the callable wrote before it, visible to whichever `claim` or
 /// `wake` is the first to read the bit clear with `Acquire`; that pairing is
 /// what makes the clear bit *reliable* to the thread that locks the same
@@ -286,17 +294,18 @@ impl DispatchClaim {
         Self(AtomicU8::new(0))
     }
 
-    /// Takes the claim, before the dispatch arm that calls this locks this
-    /// node's callable. Idempotent: a dispatch that was already claimed by
-    /// [`DispatchClaim::wake`]'s own first branch finds the bit already set
-    /// and changes nothing, which is how that branch and this call come to
-    /// share one claim rather than racing for two.
+    /// Takes the claim, before the dispatch that calls this locks this node's
+    /// callable. Idempotent: a job that was already claimed by
+    /// [`DispatchClaim::wake`]'s own first branch, or a second entry into a
+    /// node its first entry preempted, finds the bit already set and changes
+    /// nothing, which is how those cases and this call come to share one
+    /// claim rather than racing for two.
     pub(crate) fn claim(&self) {
         self.0.fetch_or(Self::CLAIMED, Ordering::AcqRel);
     }
 
-    /// Releases the claim, once the caller's own callable's guard has
-    /// dropped (the type's own `# Ordering` section), and reports whether a
+    /// Releases the claim, once the dispatched callable's guard has dropped
+    /// (the type's own `# Ordering` section), and reports whether a
     /// `schedule` bypass asked to run this node again while it was held --
     /// which the caller must then do itself, by queueing the node afresh:
     /// nothing else is watching for that flag.
@@ -324,9 +333,10 @@ impl DispatchClaim {
     /// not finished with -- if something does.
     ///
     /// Reports which: `true` means the caller must queue the node now,
-    /// exactly as `schedule` always did before this claim existed; `false`
-    /// means the current claim holder's own [`DispatchClaim::release`] will
-    /// queue it once it is done.
+    /// exactly as `schedule` always did before this claim existed, and the
+    /// job it queues is the one that now owes the claim back; `false` means
+    /// a job for this node is already in the dispatch and the
+    /// [`DispatchClaim::release`] that retires it will queue this one.
     ///
     /// Several concurrent calls are safe: only the one whose update is first
     /// to see the bit clear claims it and is told to queue, and every call
@@ -579,8 +589,8 @@ impl Node {
     }
 
     /// The dispatch claim [`Runtime::schedule`](crate::Runtime::schedule)'s
-    /// bypass and this node's own dispatch arm share: see [`DispatchClaim`]'s
-    /// docs for what it is for.
+    /// bypass and the dispatch of a job for this node share: see
+    /// [`DispatchClaim`]'s docs for what it is for.
     pub(crate) fn dispatch_claim(&self) -> &DispatchClaim {
         &self.dispatch_claim
     }

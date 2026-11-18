@@ -1205,12 +1205,19 @@ entry above does.
   outright: a claim already held defers (`PENDING` set) rather than races,
   and the claim holder's own release queues the deferred job once it is
   actually safe to. `Handle::Runtime`'s own `enter` and the two module
-  handles are deliberately **not** given a claim: `enter` sets `PREEMPTED`
-  *before* the body it locks ever runs, so `is_entered` already covers the
-  entire locked window for an ordinary runtime task, and the existing case
-  asserting `schedule` refuses an entered one is kept exactly as a caller
-  bug, not softened into a defer. The two module handles lock no callable at
-  all, so `lock_callable` cannot trip on either of them.
+  handles were deliberately **not** given a claim, on the reasoning that
+  `enter` sets `PREEMPTED` *before* the body it locks ever runs, so
+  `is_entered` already covers the entire locked window for an ordinary
+  runtime task, and that the two module handles lock no callable at all, so
+  `lock_callable` cannot trip on either of them. **That part of this entry
+  is wrong, and "Decisions taken in M10" has the defect it caused and the
+  rule that replaces it**: reasoning per handle kind about which arms lock a
+  callable missed that `wake` sets the bit for whatever target a body names,
+  so a kind whose arm never released it leaked the claim. What stands here
+  unchanged is the rest: that the claim lives in the dispatch layer rather
+  than in any caller, and that the existing case asserting `schedule`
+  refuses an *entered* node is kept exactly as a caller bug, not softened
+  into a defer.
 
   What the claim holds every dispatch arm to is stricter than anything
   upstream promises: upstream's line task is a bare `std::function<void()>`
@@ -2094,3 +2101,62 @@ entry above does.
   one call, which is also why an in-place scan stays unexpressible: `input`
   and `out` have to be two different locks, exactly as
   `Runtime::inclusive_scan`'s own `&[T]`/`&mut [T]` pair cannot alias.
+- **The dispatch claim is one pair of calls per job dispatch, not one per
+  handle kind** (issue #320). M8's entry above reasoned about which dispatch
+  *arms* lock a node's callable and gave the claim to the five that do,
+  withholding it from `Handle::Runtime`, the two module handles and --
+  unexamined -- `Handle::Placeholder`. That reasoning asks the wrong
+  question. `DispatchClaim::wake` is what `Runtime::schedule`'s bypass calls
+  on its target, and it sets `CLAIMED` on **whatever node a body names**,
+  handing the claim to the job it queues; a handle kind whose arm never
+  released it therefore left the bit set for the whole life of the graph,
+  and the next bypass of that node got `false`, queued nothing, and left the
+  `count_queued(+1)` it had already paid outstanding -- a parent whose join
+  counter never reaches zero. Three independent witnesses, each hanging on
+  the second run of one taskflow on a single worker: a static task bypassed
+  by a body that then panics, so the queued job is skipped by
+  `WorkerThread::invoke_one`'s cancellation early-out, which returns before
+  the dispatch `match` and so claimed and released nothing; a bypassed
+  `Handle::Placeholder`; and a bypassed preemptive `Handle::Runtime`. Only
+  the first needs a panic anywhere. The realistic witness is a pipeline,
+  whose line tasks are all bypass-scheduled and all but one reachable *only*
+  that way, which is how `tests/pipelines.rs` and `tests/data_pipelines.rs`
+  came to have a cell apiece that hung under `taskset -c 0,1`.
+
+  So the claim is the **job's**, and `WorkerThread::invoke_one` is the one
+  place it is taken and given back: one `claim` before the handle `match`,
+  one `release` after it, and the requeue of a deferred bypass at that
+  release. Three things follow, and they are why this shape is the one taken
+  rather than a sixth, seventh and eighth per-arm pair. A kind added to
+  `Handle` cannot forget the claim, there being nowhere left to forget it.
+  Preemption needs no special case: holding the claim across it *is* the
+  existing `Epilogue` `None`, so `src/executor/subflow.rs`'s hand-written
+  deferral to its second entry -- the subtle half of #245 -- is now what the
+  `None` means for every preempting kind, and the arm just returns.
+  And the cancellation early-out takes the same pair before `finish_job`,
+  which is what closes the first witness: its `release` hands the claim back
+  without a dispatch ever running, requeueing a pending bypass whose own job
+  is skipped in turn, with the accounting unchanged because that bypass had
+  already paid its count.
+
+  The alternative the issue allows -- a `QUEUED` bit, so that `wake` stops
+  setting `CLAIMED` on a node it has merely queued -- was rejected: it still
+  needs one generic point that consumes the bit and honours `PENDING` for
+  the kinds whose arms do nothing, so it buys a third state and a wider
+  protocol for no property the pair above lacks, and #245's lost-wake
+  argument would have to be re-answered for the new state rather than kept.
+
+  The audit the fix rests on, over every path that retires a job without
+  dispatching it. The cancellation early-out leaked, as above. The four arms
+  that never released leaked, as above. `Node::acquire_all`'s refusal -- the
+  semaphore park -- does **not**: the job is parked rather than retired, so
+  the claim is still owed by a live job, a bypass landing meanwhile defers
+  onto `PENDING`, and the eventual dispatch of the parked clone honours it;
+  a run cancelled while the job is parked funnels into the early-out and is
+  covered there. The dependent-async job copies "dropped undequeued" in
+  `src/executor/dependent_async.rs` do **not**: those are free nodes, and
+  `Runtime::schedule` takes a `Task` of a graph, so no claim is ever taken
+  on them. The `is_entered(next)` branch of the successor-release loop does
+  **not**: it declines to queue a successor nothing bypassed, so no `wake`
+  ever ran. And the two async arms that refuse a handle built into a graph
+  are now covered like every other kind, by the generic pair.
