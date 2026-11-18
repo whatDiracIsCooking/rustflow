@@ -1791,17 +1791,25 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   module path `tests/notifiers.rs` already uses for the notifiers, which were
   never root names.
 
-  **`SemaphoreError` has since stopped qualifying, and is the rule's one
-  outstanding application now.** #329 demoted `SemaphoreError::max_value` to
+  **`SemaphoreError` stopped qualifying, and the rule took the type as well as
+  its root line** (issue #347). #329 demoted `SemaphoreError::max_value` to
   `pub(crate)`, and the only release a caller can reach is a task's own,
   through `TaskMut::release`, whose over-release `src/executor/worker.rs`
-  turns into the panic payload the run reports -- the error's `Display` text
-  rather than the value. So no public API hands a `SemaphoreError` out or asks
-  for one, and the rule above no longer earns it the root line applying that
-  rule added. The *type* stays `pub` in `rustflow::semaphore` either way: the
-  module's own docs link it, and its `Display` is what a caller reads the
-  maximum back from. Withdrawing the root line is the one-line change this
-  closing pass leaves, the trio above being the shape of it.
+  turns into the panic payload the run reports -- a `String` of the error's
+  `Display` text, so not even a downcast of that payload reaches the type.
+  Both producers, `Semaphore::release` and `Node::release_all`, are
+  `pub(crate)`, the struct's one field is private and there is no public
+  constructor: no program outside the crate can hold, construct or ask for a
+  value of this type, and `Semaphore`'s own public API -- `new`, `value`,
+  `max_value`, `reset`, `reset_to` -- returns no `Result` at all. So the root
+  line is withdrawn and the rule's last clause takes the rest: the type is
+  `pub(crate)` outright rather than `pub` behind `rustflow::semaphore`. That
+  is where it parts from the queue trio #279 withdrew, which stayed `pub` in
+  their module because `tests/wsq.rs` really does drive a `WorkerQueue`
+  through that path, while a `rustflow::semaphore::SemaphoreError` would be a
+  name with nothing a caller could put behind it. The module's `# Design`
+  section names the type in backticks instead of linking it, a public doc
+  comment having nothing to link to once the type is crate-private.
 
 - **The documentation contract, and the three questions applying it asked**
   (issues #126, #129, #130, #134). The contract is the section at the top of

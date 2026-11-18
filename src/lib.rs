@@ -222,7 +222,7 @@ pub use crate::graph::{
     AsyncWork, Graph, Handle, Node, OnceWork, RuntimeWork, SubflowWork, Task, Work,
 };
 pub use crate::runtime::Runtime;
-pub use crate::semaphore::{Semaphore, SemaphoreError};
+pub use crate::semaphore::Semaphore;
 pub use crate::subflow::Subflow;
 pub use crate::task::{TaskMut, TaskRef, TaskType};
 pub use crate::task_group::TaskGroup;
