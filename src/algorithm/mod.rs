@@ -5,6 +5,8 @@
 //! upstream header; each submodule's own `//!` doc says which upstream file
 //! it translates, if any.
 //!
+//! - [`for_each_index`] `for_each_index` and `for_each_by_index`, over an
+//!   integer range and an [`index_range::IndexRange`] respectively.
 //! - [`index_range`] the one-dimensional index range an algorithm walks and
 //!   partitions, `[begin, end)` in steps of `step_size`.
 //! - [`partitioner`] the strategies that split `[0, n)` into chunks for a
@@ -74,6 +76,7 @@ use crate::algorithm::partitioner::{
 };
 
 pub mod for_each;
+pub mod for_each_index;
 pub mod index_range;
 pub mod module;
 pub mod partitioner;
