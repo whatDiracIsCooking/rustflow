@@ -20,17 +20,20 @@
 //! The family is upstream's overload set: three receivers -- [`Executor`], a
 //! [`Runtime`] body and a [`TaskGroup`](crate::TaskGroup) -- times
 //! dependent-or-free, times handle-or-silent, times a plain or a
-//! runtime-shaped body, which is 24 public methods over upstream's four
-//! names. Three things vary across them and the core names each once.
-//! [`Submission`] is the receiver: the [`Parent`] the child is accounted to
-//! and the worker whose own queue its job goes onto. [`Spawn`] is the body
-//! shape: the [`AsyncWork`] the node runs, the estate word it is constructed
-//! with, and the handle -- if any -- the caller is given back. The node kind
-//! is which submission is called, [`Shared::schedule_async_task`] for a free
-//! node and `Shared::schedule_dependent_async_task` in
-//! `executor::dependent_async` for one with a dependency list. Every public
-//! method is one delegation that builds those two and calls one of them;
-//! `DESIGN.md` records the placement and why the receiver is [`Shared`].
+//! runtime-shaped body, times named-or-not, which is 48 public methods over
+//! upstream's four names. Three things vary across them and the core names
+//! each once. [`Submission`] is the receiver: the [`Parent`] the child is
+//! accounted to and the worker whose own queue its job goes onto. [`Spawn`]
+//! is the body and its parameters: the [`AsyncWork`] the node runs, the
+//! estate word it is constructed with, the name the node carries and the
+//! handle -- if any -- the caller is given back. The node kind is which
+//! submission is called, [`Shared::schedule_async_task`] for a free node and
+//! `Shared::schedule_dependent_async_task` in `executor::dependent_async` for
+//! one with a dependency list. Every public method is one delegation that
+//! builds those two and calls one of them, a `_named` form adding one
+//! [`Spawn::named`] step to its twin's; `DESIGN.md` records the placement,
+//! why the receiver is [`Shared`] and why the name is a method suffix rather
+//! than a submission builder.
 //!
 //! Three invariants live in that core and in no receiver, each with its
 //! decision in `DESIGN.md`. A submission made from inside a task body goes
@@ -74,29 +77,46 @@ use crate::runtime::Runtime;
 /// absence of bits in.
 pub(crate) const ESTATE_NONE: u32 = 0;
 
-/// What the shape of a submitted body decides, as one value: the work a free
-/// node runs, the estate word its node is constructed with, and the handle
-/// the submitting call hands back.
+/// What a submitted body decides, as one value: the work a free node runs,
+/// the estate word its node is constructed with, the name that node carries
+/// and the handle the submitting call hands back.
 ///
-/// Upstream's `if constexpr(is_runtime_task_v<F>)` together with the
-/// `std::packaged_task` or `std::promise` its handle-returning forms build.
-/// `H` is `()` for a silent form and an [`AsyncHandle`] for one that reports,
-/// so the four constructors are the four body shapes.
+/// Upstream's leading `(params, f)` pair of `_async(params, f, tpg, parent)`,
+/// [`Submission`] being the `(tpg, parent)` pair after it: the
+/// `if constexpr(is_runtime_task_v<F>)` branch together with the
+/// `std::packaged_task` or `std::promise` its handle-returning forms build,
+/// and the `TaskParamsLike` argument its named overloads take. `H` is `()`
+/// for a silent form and an [`AsyncHandle`] for one that reports, so the four
+/// constructors are the four body shapes and [`Spawn::named`] is the one axis
+/// across all four.
 pub(crate) struct Spawn<H> {
     /// The body as the node's [`Handle`] will hold it.
     work: AsyncWork,
     /// Upstream's `ESTATE` argument to its internal forms.
     estate: u32,
+    /// The name the node is constructed with, which an observer reads back
+    /// through `TaskView::name`: upstream's `TaskParams::name`, and empty
+    /// unless [`Spawn::named`] was called -- upstream's `DefaultTaskParams`,
+    /// whose `Node` constructor leaves `_name` default-constructed.
+    name: String,
     /// What the submitting call returns.
     handle: H,
 }
 
 impl<H> Spawn<H> {
-    /// The three pieces, for the submission about to place them: the work
-    /// into the node's handle, the estate word into its state, the handle
-    /// back to the caller.
-    pub(crate) fn into_parts(self) -> (AsyncWork, u32, H) {
-        (self.work, self.estate, self.handle)
+    /// The same submission with the node named `name`: upstream's
+    /// `TaskParams{name}` where the forms below pass its
+    /// `DefaultTaskParams{}`.
+    pub(crate) fn named(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// The four pieces, for the submission about to place them: the work into
+    /// the node's handle, the estate word into its state, the name into the
+    /// node, the handle back to the caller.
+    pub(crate) fn into_parts(self) -> (AsyncWork, u32, String, H) {
+        (self.work, self.estate, self.name, self.handle)
     }
 }
 
@@ -110,6 +130,7 @@ impl Spawn<()> {
         Self {
             work: AsyncWork::plain(body),
             estate: ESTATE_NONE,
+            name: String::new(),
             handle: (),
         }
     }
@@ -124,6 +145,7 @@ impl Spawn<()> {
         Self {
             work: AsyncWork::runtime(body),
             estate: ESTATE_NONE,
+            name: String::new(),
             handle: (),
         }
     }
@@ -144,6 +166,7 @@ impl<R: Send + 'static> Spawn<AsyncHandle<R>> {
         Self {
             work: AsyncWork::plain(wrapper),
             estate: ESTATE_NONE,
+            name: String::new(),
             handle,
         }
     }
@@ -175,6 +198,7 @@ impl Spawn<AsyncHandle<()>> {
         Self {
             work: AsyncWork::reentrant(body, complete),
             estate: Cancellable::EXPLICITLY_ANCHORED,
+            name: String::new(),
             handle,
         }
     }
@@ -304,6 +328,59 @@ impl Executor {
             .schedule_async_task(Spawn::handled(body), &Submission::parentless())
     }
 
+    /// [`Executor::spawn`] with the free node this task is named `name`:
+    /// upstream's `async(params, f)`, over the `StringLike` reading of its
+    /// `TaskParamsLike`.
+    ///
+    /// The name is what an [`Observer`](crate::observer::Observer) is handed
+    /// as [`TaskView::name`](crate::observer::TaskView::name) when a worker
+    /// enters the task, and so what a profiler trace labels the segment
+    /// with. It is the only thing it changes: where and when the body runs,
+    /// what the handle delivers and where a panic goes are
+    /// [`Executor::spawn`]'s, and an unnamed submission is one whose node
+    /// carries the empty name. Every form of this family -- on [`Executor`],
+    /// on a [`Runtime`] and on a [`TaskGroup`](crate::TaskGroup) -- has a
+    /// `_named` twin that says exactly this about its own name.
+    ///
+    /// ```
+    /// use std::sync::Mutex;
+    ///
+    /// use rustflow::Executor;
+    /// use rustflow::observer::{Observer, TaskView, WorkerView};
+    ///
+    /// /// Records the name of every task a worker enters.
+    /// struct Names(Mutex<Vec<String>>);
+    ///
+    /// impl Observer for Names {
+    ///     fn set_up(&self, _num_workers: usize) {}
+    ///
+    ///     fn on_entry(&self, _worker: WorkerView<'_>, task: TaskView<'_>) {
+    ///         self.0.lock().expect("no body panicked").push(task.name().to_string());
+    ///     }
+    ///
+    ///     fn on_exit(&self, _worker: WorkerView<'_>, _task: TaskView<'_>) {}
+    /// }
+    ///
+    /// let executor = Executor::new(2);
+    /// let seen = executor.make_observer(Names(Mutex::new(Vec::new())));
+    ///
+    /// let answer = executor.spawn_named("answer", || 6 * 7);
+    /// assert_eq!(answer.wait().expect("the body did not panic"), 42);
+    /// executor.wait_for_all();
+    ///
+    /// // `on_entry` runs on the worker before the body does, so the name is
+    /// // recorded by the time the handle has a value.
+    /// assert_eq!(*seen.0.lock().expect("no body panicked"), ["answer"]);
+    /// ```
+    pub fn spawn_named<R, F>(&self, name: impl Into<String>, body: F) -> AsyncHandle<R>
+    where
+        R: Send + 'static,
+        F: FnOnce() -> R + Send + 'static,
+    {
+        self.shared
+            .schedule_async_task(Spawn::handled(body).named(name), &Submission::parentless())
+    }
+
     /// Runs `body` on this executor as soon as a worker picks it up, with no
     /// handle on it at all.
     ///
@@ -344,6 +421,18 @@ impl Executor {
     {
         self.shared
             .schedule_async_task(Spawn::silent(body), &Submission::parentless());
+    }
+
+    /// [`Executor::silent_async`] with the free node this task is named
+    /// `name`: upstream's `silent_async(params, f)`.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn silent_async_named<F>(&self, name: impl Into<String>, body: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.shared
+            .schedule_async_task(Spawn::silent(body).named(name), &Submission::parentless());
     }
 }
 
@@ -640,8 +729,8 @@ impl Shared {
     /// queueing a graph's sources. Only then is the job pushed, after which it
     /// may already be running.
     pub(crate) fn schedule_async_task<H>(&self, spawn: Spawn<H>, to: &Submission<'_>) -> H {
-        let (work, estate, handle) = spawn.into_parts();
-        let node = self.new_free_node(Handle::Async(work), estate, to);
+        let (work, estate, name, handle) = spawn.into_parts();
+        let node = self.new_free_node(name, Handle::Async(work), estate, to);
         let job = Job::free(&node, to.parent());
         to.parent().count_queued(Topology::free_standing(), 1);
         to.queue(self, job);
@@ -668,6 +757,7 @@ impl Shared {
     /// can fail.
     pub(crate) fn new_free_node(
         &self,
+        name: String,
         handle: Handle,
         estate: u32,
         to: &Submission<'_>,
@@ -676,7 +766,7 @@ impl Shared {
             self.increment_async();
         }
 
-        let node = AsyncNode::new("", handle);
+        let node = AsyncNode::new(name, handle);
         node.node()
             .base()
             .estate()
@@ -1198,5 +1288,45 @@ mod tests {
             "the parent's counter is where the child was counted, and the \
              tear-down is what spent it"
         );
+    }
+
+    /// A name given to a submission reaches the node the task is, and a
+    /// submission given none leaves that node's name empty: upstream's
+    /// `TaskParams{name}` against the `DefaultTaskParams{}` its unnamed
+    /// overloads pass.
+    ///
+    /// Read at the core rather than through [`Executor::spawn_named`],
+    /// because one `Spawn::named` step is the whole of what a `_named` form
+    /// adds to its twin and this is where that step lands; `tests/asyncs.rs`
+    /// reads the same name back through an observer, which is what a caller
+    /// has to read it with. Both submissions go under an anchor so that the
+    /// job can be taken and inspected before it runs, for
+    /// [`take_submitted_job`]'s reason.
+    #[test]
+    fn a_submission_names_its_node_and_an_unnamed_one_leaves_it_empty() {
+        let executor = Executor::new(1);
+        let mut worker = WorkerThread::new(Arc::clone(&executor.shared), 0, WorkerQueue::new());
+        let parent = Nested::new(None);
+
+        executor.shared.schedule_async_task(
+            Spawn::silent(|| {}).named("my task"),
+            &Submission::under_anchor(&parent),
+        );
+        let job = take_submitted_job(&executor);
+        assert_eq!(job.parts().0.name(), "my task");
+        worker.invoke(job);
+
+        executor
+            .shared
+            .schedule_async_task(Spawn::silent(|| {}), &Submission::under_anchor(&parent));
+        let job = take_submitted_job(&executor);
+        assert_eq!(
+            job.parts().0.name(),
+            "",
+            "an unnamed submission is upstream's `DefaultTaskParams`"
+        );
+        worker.invoke(job);
+
+        assert_eq!(parent.outstanding(), 0, "both children were accounted for");
     }
 }

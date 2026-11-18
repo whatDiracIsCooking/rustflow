@@ -131,6 +131,27 @@ impl Executor {
         )
     }
 
+    /// [`Executor::dependent_async`] with the free node this task is named
+    /// `name`: upstream's `dependent_async(params, f, tasks...)`.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn dependent_async_named<'a, R, F>(
+        &self,
+        name: impl Into<String>,
+        body: F,
+        dependencies: impl IntoIterator<Item = &'a AsyncTask>,
+    ) -> (AsyncTask, AsyncHandle<R>)
+    where
+        R: Send + 'static,
+        F: FnOnce() -> R + Send + 'static,
+    {
+        self.shared.schedule_dependent_async_task(
+            Spawn::handled(body).named(name),
+            &Submission::parentless(),
+            dependencies,
+        )
+    }
+
     /// Runs `body` on this executor once every task in `dependencies` has
     /// finished, with no handle on its result.
     ///
@@ -186,6 +207,29 @@ impl Executor {
             )
             .0
     }
+
+    /// [`Executor::silent_dependent_async`] with the free node this task is
+    /// named `name`: upstream's
+    /// `silent_dependent_async(params, f, tasks...)`.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn silent_dependent_async_named<'a, F>(
+        &self,
+        name: impl Into<String>,
+        body: F,
+        dependencies: impl IntoIterator<Item = &'a AsyncTask>,
+    ) -> AsyncTask
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.shared
+            .schedule_dependent_async_task(
+                Spawn::silent(body).named(name),
+                &Submission::parentless(),
+                dependencies,
+            )
+            .0
+    }
 }
 
 impl Shared {
@@ -208,8 +252,8 @@ impl Shared {
         to: &Submission<'_>,
         dependencies: impl IntoIterator<Item = &'a AsyncTask>,
     ) -> (AsyncTask, H) {
-        let (work, estate, handle) = spawn.into_parts();
-        let node = self.new_free_node(Handle::DependentAsync(work), estate, to);
+        let (work, estate, name, handle) = spawn.into_parts();
+        let node = self.new_free_node(name, Handle::DependentAsync(work), estate, to);
 
         // Upstream's `num_predecessors` as the counter's initial value, with
         // the guard standing in for a count it cannot take in advance.

@@ -19,13 +19,15 @@
 //! matters, since `wait_for_all` is the only thing that waits for a body
 //! nobody is holding a handle on.
 //!
-//! **The three `TaskParams` branches of `Async` are one branch here.**
-//! Upstream's loop picks between `async(f)`, `async(DefaultTaskParams{}, f)`
-//! and `async(TaskParams{std::to_string(i)}, f)` on `i % 3`, and all three
-//! differ only in the name the node is given. An async node has no name worth
-//! reading in this milestone -- nothing hands one back, and the observers
-//! that would are a later step -- so the port has one unnamed submitting call
-//! and the three branches collapse onto it.
+//! **The three `TaskParams` branches of `Async` are two here.** Upstream's
+//! loop picks between `async(f)`, `async(DefaultTaskParams{}, f)` and
+//! `async(TaskParams{std::to_string(i)}, f)` on `i % 3`, and all three differ
+//! only in the name the node is given. Its first two are one call in the
+//! port, an unnamed submission being the one that passes
+//! `DefaultTaskParams{}`; its third is
+//! [`Executor::spawn_named`](rustflow::Executor::spawn_named), so the pick
+//! survives as `i % 3 == 2`. Neither upstream nor the loop here ever reads
+//! one of those names back, which is what [`names_reach_an_observer`] is for.
 //!
 //! **`AsyncRuntime`** and **`RecursiveAsyncRuntime`** are the fourth and
 //! fifth, and are #92's: both need a runtime body able to spawn work *under
@@ -53,11 +55,13 @@
 //!   a follow-up rather than part of #90 or #92, both of which are about the
 //!   runtime-shaped bodies the groups above submit.
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rustflow::observer::{Observer, TaskView, WorkerView};
 use rustflow::prelude::*;
 
 // The matrix macro, and the spin the wait on the last share below is.
@@ -96,15 +100,23 @@ fn spawned_tasks(workers: usize) {
     let counter = Arc::new(AtomicUsize::new(0));
 
     let handles: Vec<AsyncHandle<i32>> = (0..TASKS)
-        .map(|_| {
+        .map(|task| {
             let counter = Arc::clone(&counter);
-            executor.spawn(move || {
+            let body = move || {
                 // Relaxed, as upstream's is: what orders these increments
                 // against the assertion below is `wait_for_all`, not this
                 // word.
                 counter.fetch_add(1, Ordering::Relaxed);
                 RESULT
-            })
+            };
+
+            // Upstream's `i % 3` over two branches rather than three, for the
+            // reason the module docs give.
+            if task % 3 == 2 {
+                executor.spawn_named(task.to_string(), body)
+            } else {
+                executor.spawn(body)
+            }
         })
         .collect();
 
@@ -590,4 +602,108 @@ worker_matrix! {
         recursive_async_runtime_3_threads(3),
         recursive_async_runtime_4_threads(4),
     }
+}
+
+/// Records the name of every task a worker enters, as a *set*.
+///
+/// Which names were seen rather than how many times each was, because a
+/// runtime-shaped node is entered a second time to report its outcome and
+/// nothing below is about that count.
+#[derive(Default)]
+struct Names(Mutex<BTreeSet<String>>);
+
+impl Observer for Names {
+    fn set_up(&self, _num_workers: usize) {}
+
+    fn on_entry(&self, _worker: WorkerView<'_>, task: TaskView<'_>) {
+        self.0
+            .lock()
+            .expect("an observer's own lock is never held across a body")
+            .insert(task.name().to_string());
+    }
+
+    fn on_exit(&self, _worker: WorkerView<'_>, _task: TaskView<'_>) {}
+}
+
+/// Invented: the name a free submission gives its node, read back the one way
+/// a caller can read it -- an observer's `on_entry` -- over every free form of
+/// the family, against a submission that names nothing.
+///
+/// Issue #258's bar. Upstream's own cases pass a `TaskParams` and never look
+/// at the name again, so what is added here is the read: the name reaches the
+/// node the task is, and an unnamed submission leaves that node with the
+/// empty name upstream's `DefaultTaskParams` leaves it. All three receivers,
+/// because each builds its own `Submission` and the name travels beside that
+/// rather than inside it. One worker, because the question is which name is
+/// on which node rather than who ran it.
+#[test]
+fn names_reach_an_observer() {
+    let executor = Arc::new(Executor::new(1));
+    let seen = executor.make_observer(Names::default());
+
+    // The executor's own four, parented to nothing.
+    executor
+        .spawn_named("spawned", || {})
+        .wait()
+        .expect("the body did not panic");
+    executor.silent_async_named("silent", || {});
+    let _detached = executor.spawn_runtime_named("runtime", |_: &mut Runtime<'_>| {});
+    executor.silent_async_runtime_named("silent runtime", |_: &mut Runtime<'_>| {});
+
+    // A runtime body's four, counted against the node the body is of, and
+    // waited for by its implicit join. The outer submission is left unnamed
+    // on purpose, so the empty name below is asserted twice over.
+    executor
+        .spawn_runtime(|runtime: &mut Runtime<'_>| {
+            let _handle = runtime.spawn_named("runtime's spawned", || {});
+            runtime.silent_async_named("runtime's silent", || {});
+            let _nested =
+                runtime.spawn_runtime_named("runtime's runtime", |_: &mut Runtime<'_>| {});
+            runtime
+                .silent_async_runtime_named("runtime's silent runtime", |_: &mut Runtime<'_>| {});
+        })
+        .wait()
+        .expect("nothing under the body panicked");
+
+    // And a task group's four, counted against the group's anchor.
+    executor
+        .spawn({
+            let executor = Arc::clone(&executor);
+            move || {
+                let group = executor.task_group().expect("a worker may open a group");
+                let _handle = group.spawn_named("group's spawned", || {});
+                group.silent_async_named("group's silent", || {});
+                let _nested =
+                    group.spawn_runtime_named("group's runtime", |_: &mut Runtime<'_>| {});
+                group
+                    .silent_async_runtime_named("group's silent runtime", |_: &mut Runtime<'_>| {});
+                group.corun();
+            }
+        })
+        .wait()
+        .expect("no task of the group panicked");
+
+    // The default, which this issue did not change: upstream's
+    // `DefaultTaskParams{}` leaves `_name` default-constructed.
+    executor.silent_async(|| {});
+
+    executor.wait_for_all();
+    assert_eq!(
+        *seen.0.lock().expect("no body panicked"),
+        BTreeSet::from([
+            String::new(),
+            "group's runtime".to_string(),
+            "group's silent".to_string(),
+            "group's silent runtime".to_string(),
+            "group's spawned".to_string(),
+            "runtime".to_string(),
+            "runtime's runtime".to_string(),
+            "runtime's silent".to_string(),
+            "runtime's silent runtime".to_string(),
+            "runtime's spawned".to_string(),
+            "silent".to_string(),
+            "silent runtime".to_string(),
+            "spawned".to_string(),
+        ])
+    );
 }

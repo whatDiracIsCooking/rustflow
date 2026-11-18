@@ -1,9 +1,12 @@
 //! Translated from `taskflow/core/runtime.hpp` (Taskflow v4.1.0): the `async`
 //! family of `tf::Runtime` -- `async`, `silent_async`, `dependent_async` and
-//! `silent_dependent_async`, in both of upstream's body shapes -- plus the
-//! runtime-shaped branches of `_dependent_async` and
+//! `silent_dependent_async`, in both of upstream's body shapes and with and
+//! without its `TaskParams` argument -- plus the runtime-shaped branches of
+//! `_async`, `_silent_async`, `_dependent_async` and
 //! `_silent_dependent_async` in `taskflow/core/async.hpp` of the same
-//! release, which are the two [`Executor`] forms at the end of this module.
+//! release, which are the [`Executor`] forms at the end of this module; the
+//! unnamed two of those four sit in `executor::runtime` beside the rest of
+//! that type's own surface.
 //!
 //! A body can spawn work **under its own node**, which is the only work a
 //! [`Runtime::corun`] can wait for and the only thing that makes the implicit
@@ -15,10 +18,11 @@
 //!
 //! Upstream's four methods are one line each -- raise `_node->_join_counter`,
 //! then call `_executor._silent_async(..., _node->_topology, _node)` -- and
-//! the ten here are one line each for the same reason: the submission core in
-//! [`async`](crate::executor::r#async) takes everything that varies, so a
-//! method of this module decides only which [`Spawn`] shape the body is and
-//! which [`Submission`] it goes under.
+//! the twenty-two here are one line each for the same reason: the submission
+//! core in [`async`](crate::executor::r#async) takes everything that varies,
+//! so a method of this module decides only which [`Spawn`] shape the body is,
+//! whether that [`Spawn`] is [`named`](Spawn::named), and which
+//! [`Submission`] it goes under.
 //!
 //! [`Submission::under_node`] answers upstream's two trailing arguments in
 //! one value, and three things follow. The counting is
@@ -105,6 +109,21 @@ impl Runtime<'_> {
         )
     }
 
+    /// [`Runtime::spawn`] with the free node this child is named `name`:
+    /// upstream's `Runtime::async(params, f)`.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn spawn_named<R, F>(&mut self, name: impl Into<String>, body: F) -> AsyncHandle<R>
+    where
+        R: Send + 'static,
+        F: FnOnce() -> R + Send + 'static,
+    {
+        self.thread.shared.schedule_async_task(
+            Spawn::handled(body).named(name),
+            &Submission::under_node(self.job, &*self.thread),
+        )
+    }
+
     /// Spawns `body` under this runtime task, handing it a [`Runtime`] of its
     /// own, and hands back a handle on its completion: upstream's
     /// `Runtime::async` over a `[](tf::Runtime&){}` body.
@@ -145,6 +164,21 @@ impl Runtime<'_> {
     {
         self.thread.shared.schedule_async_task(
             Spawn::handled_runtime(body),
+            &Submission::under_node(self.job, &*self.thread),
+        )
+    }
+
+    /// [`Runtime::spawn_runtime`] with the free node this child is named
+    /// `name`: upstream's `Runtime::async(params, f)` over a
+    /// `[](tf::Runtime&){}` body.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn spawn_runtime_named<F>(&mut self, name: impl Into<String>, body: F) -> AsyncHandle<()>
+    where
+        F: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
+    {
+        self.thread.shared.schedule_async_task(
+            Spawn::handled_runtime(body).named(name),
             &Submission::under_node(self.job, &*self.thread),
         )
     }
@@ -199,6 +233,20 @@ impl Runtime<'_> {
     {
         self.thread.shared.schedule_async_task(
             Spawn::silent(body),
+            &Submission::under_node(self.job, &*self.thread),
+        );
+    }
+
+    /// [`Runtime::silent_async`] with the free node this child is named
+    /// `name`: upstream's `Runtime::silent_async(params, f)`.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn silent_async_named<F>(&mut self, name: impl Into<String>, body: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.thread.shared.schedule_async_task(
+            Spawn::silent(body).named(name),
             &Submission::under_node(self.job, &*self.thread),
         );
     }
@@ -259,6 +307,21 @@ impl Runtime<'_> {
         );
     }
 
+    /// [`Runtime::silent_async_runtime`] with the free node this child is
+    /// named `name`: upstream's `Runtime::silent_async(params, f)` over a
+    /// `[](tf::Runtime&){}` body.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn silent_async_runtime_named<F>(&mut self, name: impl Into<String>, body: F)
+    where
+        F: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
+    {
+        self.thread.shared.schedule_async_task(
+            Spawn::silent_runtime(body).named(name),
+            &Submission::under_node(self.job, &*self.thread),
+        );
+    }
+
     /// Spawns `body` under this runtime task once every task in
     /// `dependencies` has finished, and hands back a handle on the task and a
     /// handle on its result: upstream's `Runtime::dependent_async`.
@@ -314,6 +377,27 @@ impl Runtime<'_> {
         )
     }
 
+    /// [`Runtime::dependent_async`] with the free node this child is named
+    /// `name`: upstream's `Runtime::dependent_async(params, f, tasks...)`.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn dependent_async_named<'t, R, F>(
+        &mut self,
+        name: impl Into<String>,
+        body: F,
+        dependencies: impl IntoIterator<Item = &'t AsyncTask>,
+    ) -> (AsyncTask, AsyncHandle<R>)
+    where
+        R: Send + 'static,
+        F: FnOnce() -> R + Send + 'static,
+    {
+        self.thread.shared.schedule_dependent_async_task(
+            Spawn::handled(body).named(name),
+            &Submission::under_node(self.job, &*self.thread),
+            dependencies,
+        )
+    }
+
     /// Spawns `body` under this runtime task once every task in
     /// `dependencies` has finished, handing it a [`Runtime`] of its own, and
     /// hands back a handle on the task and one on its completion: upstream's
@@ -333,6 +417,27 @@ impl Runtime<'_> {
     {
         self.thread.shared.schedule_dependent_async_task(
             Spawn::handled_runtime(body),
+            &Submission::under_node(self.job, &*self.thread),
+            dependencies,
+        )
+    }
+
+    /// [`Runtime::dependent_async_runtime`] with the free node this child is
+    /// named `name`: upstream's `Runtime::dependent_async(params, f,
+    /// tasks...)` over a `[](tf::Runtime&){}` body.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn dependent_async_runtime_named<'t, F>(
+        &mut self,
+        name: impl Into<String>,
+        body: F,
+        dependencies: impl IntoIterator<Item = &'t AsyncTask>,
+    ) -> (AsyncTask, AsyncHandle<()>)
+    where
+        F: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
+    {
+        self.thread.shared.schedule_dependent_async_task(
+            Spawn::handled_runtime(body).named(name),
             &Submission::under_node(self.job, &*self.thread),
             dependencies,
         )
@@ -401,6 +506,30 @@ impl Runtime<'_> {
             .0
     }
 
+    /// [`Runtime::silent_dependent_async`] with the free node this child is
+    /// named `name`: upstream's
+    /// `Runtime::silent_dependent_async(params, f, tasks...)`.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn silent_dependent_async_named<'t, F>(
+        &mut self,
+        name: impl Into<String>,
+        body: F,
+        dependencies: impl IntoIterator<Item = &'t AsyncTask>,
+    ) -> AsyncTask
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.thread
+            .shared
+            .schedule_dependent_async_task(
+                Spawn::silent(body).named(name),
+                &Submission::under_node(self.job, &*self.thread),
+                dependencies,
+            )
+            .0
+    }
+
     /// Spawns `body` under this runtime task once every task in
     /// `dependencies` has finished, handing it a [`Runtime`] of its own and
     /// no handle on its result: upstream's `Runtime::silent_dependent_async`
@@ -423,6 +552,31 @@ impl Runtime<'_> {
             .shared
             .schedule_dependent_async_task(
                 Spawn::silent_runtime(body),
+                &Submission::under_node(self.job, &*self.thread),
+                dependencies,
+            )
+            .0
+    }
+
+    /// [`Runtime::silent_dependent_async_runtime`] with the free node this
+    /// child is named `name`: upstream's
+    /// `Runtime::silent_dependent_async(params, f, tasks...)` over a
+    /// `[](tf::Runtime&){}` body.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn silent_dependent_async_runtime_named<'t, F>(
+        &mut self,
+        name: impl Into<String>,
+        body: F,
+        dependencies: impl IntoIterator<Item = &'t AsyncTask>,
+    ) -> AsyncTask
+    where
+        F: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
+    {
+        self.thread
+            .shared
+            .schedule_dependent_async_task(
+                Spawn::silent_runtime(body).named(name),
                 &Submission::under_node(self.job, &*self.thread),
                 dependencies,
             )
@@ -519,6 +673,81 @@ impl Executor {
         self.shared
             .schedule_dependent_async_task(
                 Spawn::silent_runtime(body),
+                &Submission::parentless(),
+                dependencies,
+            )
+            .0
+    }
+
+    /// [`Executor::spawn_runtime`](crate::Executor::spawn_runtime) with the
+    /// free node this task is named `name`: upstream's `async(params, f)`
+    /// over a `[](tf::Runtime&){}` body.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn spawn_runtime_named<F>(&self, name: impl Into<String>, body: F) -> AsyncHandle<()>
+    where
+        F: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
+    {
+        self.shared.schedule_async_task(
+            Spawn::handled_runtime(body).named(name),
+            &Submission::parentless(),
+        )
+    }
+
+    /// [`Executor::silent_async_runtime`](crate::Executor::silent_async_runtime)
+    /// with the free node this task is named `name`: upstream's
+    /// `silent_async(params, f)` over a `[](tf::Runtime&){}` body.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn silent_async_runtime_named<F>(&self, name: impl Into<String>, body: F)
+    where
+        F: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
+    {
+        self.shared.schedule_async_task(
+            Spawn::silent_runtime(body).named(name),
+            &Submission::parentless(),
+        );
+    }
+
+    /// [`Executor::dependent_async_runtime`] with the free node this task is
+    /// named `name`: upstream's `dependent_async(params, f, tasks...)` over a
+    /// `[](tf::Runtime&){}` body.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn dependent_async_runtime_named<'t, F>(
+        &self,
+        name: impl Into<String>,
+        body: F,
+        dependencies: impl IntoIterator<Item = &'t AsyncTask>,
+    ) -> (AsyncTask, AsyncHandle<()>)
+    where
+        F: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
+    {
+        self.shared.schedule_dependent_async_task(
+            Spawn::handled_runtime(body).named(name),
+            &Submission::parentless(),
+            dependencies,
+        )
+    }
+
+    /// [`Executor::silent_dependent_async_runtime`] with the free node this
+    /// task is named `name`: upstream's
+    /// `silent_dependent_async(params, f, tasks...)` over a
+    /// `[](tf::Runtime&){}` body.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn silent_dependent_async_runtime_named<'t, F>(
+        &self,
+        name: impl Into<String>,
+        body: F,
+        dependencies: impl IntoIterator<Item = &'t AsyncTask>,
+    ) -> AsyncTask
+    where
+        F: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
+    {
+        self.shared
+            .schedule_dependent_async_task(
+                Spawn::silent_runtime(body).named(name),
                 &Submission::parentless(),
                 dependencies,
             )

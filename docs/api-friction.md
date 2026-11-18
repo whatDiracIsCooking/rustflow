@@ -267,8 +267,15 @@ or a profiler trace can use later. `Executor::spawn`/`silent_async` here take
 only the body — there is no parameter to put a name into, not even one to
 ignore.
 
-- **Status: open.** No issue currently tracks adding an optional name to the
-  async submission methods, symmetrical with `TaskMut::name` on a graph task.
+- **Status: tracked by #258, and done there.** Every submitting form of the
+  family -- eight each on `Executor`, `Runtime` and `TaskGroup` -- gained a
+  `_named` twin that takes the name first and the body after it, so
+  `executor.spawn_named("answer", || 6 * 7)` is upstream's
+  `executor.async("answer", ...)` and an observer reads the name back as
+  `TaskView::name` in `on_entry`. A `_named` suffix rather than an
+  `Executor::named(..)` submission builder, and `DESIGN.md`'s M10 entry has
+  why; an unnamed submission is unchanged, naming its node the empty string
+  upstream's `DefaultTaskParams` leaves it with.
 - **Reported in:** PR #236 (#197).
 
 ## Error handling and run lifecycle
