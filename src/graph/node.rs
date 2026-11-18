@@ -717,3 +717,67 @@ impl fmt::Debug for Node {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::DispatchClaim;
+
+    /// The claim's transitions in isolation, where no race is needed to see
+    /// them: `tests/loom_dispatch_claim.rs` models the concurrent half, and a
+    /// run shows only the job a bypass queued or did not. #310 set the bar for
+    /// these four cases.
+    #[test]
+    fn the_first_bypass_takes_the_claim_and_is_told_to_queue() {
+        let claim = DispatchClaim::new();
+
+        assert!(claim.wake(), "nothing holds a fresh claim");
+        // The dispatch that bypass queues finds the claim already taken, so
+        // its own `claim` changes nothing and its `release` has no requeue to
+        // report: one bypass, one job.
+        claim.claim();
+        assert!(!claim.release());
+        assert!(claim.wake(), "the claim is idle again");
+    }
+
+    #[test]
+    fn a_bypass_onto_a_held_claim_defers_to_that_dispatch() {
+        let claim = DispatchClaim::new();
+        claim.claim();
+
+        assert!(!claim.wake(), "the holder owes the requeue, not the bypass");
+        assert!(claim.release(), "and `release` is where it learns that");
+    }
+
+    #[test]
+    fn two_bypasses_onto_a_held_claim_owe_exactly_one_requeue() {
+        let claim = DispatchClaim::new();
+        claim.claim();
+
+        assert!(!claim.wake());
+        assert!(!claim.wake(), "the second defers to the same release");
+        assert!(
+            claim.release(),
+            "the second bypass left the first one's pending flag where \
+             `release` finds it"
+        );
+        // Once, not twice: the dispatch the requeue queues finds nothing
+        // pending, so the two bypasses cost one extra run of the node.
+        claim.claim();
+        assert!(!claim.release());
+    }
+
+    #[test]
+    fn a_reported_requeue_leaves_the_claim_held() {
+        let claim = DispatchClaim::new();
+        claim.claim();
+        assert!(!claim.wake());
+        assert!(claim.release());
+
+        // Held rather than idle, so a bypass arriving between the requeue and
+        // the dispatch it queues is told to defer in its turn instead of
+        // queueing a second job for the same dispatch.
+        assert!(!claim.wake());
+        assert!(claim.release());
+        assert!(!claim.release(), "nothing is pending now");
+    }
+}
