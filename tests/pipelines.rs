@@ -64,6 +64,8 @@ use rustflow::prelude::*;
 mod common;
 #[path = "common/compose.rs"]
 mod compose;
+#[path = "common/panics.rs"]
+mod panics;
 #[path = "common/pipeline.rs"]
 mod pipeline;
 #[path = "common/serialized.rs"]
@@ -72,6 +74,7 @@ mod serialized;
 mod tokens;
 
 use compose::compose_module;
+use panics::assert_panicked_with;
 use pipeline::{Buffer, collecting_pipe, counting_source, propagating_pipe};
 use serialized::serialized;
 use tokens::{MAX_N, assert_consecutive_from};
@@ -613,4 +616,273 @@ worker_matrix! {
         pipeline_3p_spp_4l_3w(4, 3),
         pipeline_3p_spp_4l_4w(4, 4),
     }
+}
+
+// ----------------------------------------------------------------------------
+// The panic-path cells: a pipe callable that fails
+// ----------------------------------------------------------------------------
+//
+// Not upstream's: `test_pipelines.cpp` has no failing pipe anywhere. A pipe
+// callable runs inside a line's nonpreemptive runtime task, so the three
+// cases here are one per place that task can be when the panic happens --
+// the first serial pipe, which is the one generating tokens, a serial pipe
+// after it, and a parallel one. The reset-and-rerun half of the row is the
+// fourth case, `#[ignore]`d against the defect it found; its own doc comment
+// says why it is one case for the three chains rather than three.
+
+/// How many tokens each case below lets through when nothing panics.
+const TOKENS: usize = 5;
+
+/// The token the armed pipe panics on, which is far enough in that the
+/// tokens before it have been through the whole chain.
+const FAILS_AT: usize = 2;
+
+/// How many lines each case runs over: more than [`TOKENS`], so that every
+/// line is in use and a failing token is never alone on the pipeline.
+const LINES: usize = 4;
+
+/// The first pipe of each case: stops the pipeline after [`TOKENS`] tokens
+/// and counts the rest, panicking with `"x"` on token [`FAILS_AT`] if
+/// `armed` is the counter holding `1` -- which is how the first case makes
+/// the token *source* the pipe that fails.
+fn stopping_source(seen: &Arc<AtomicUsize>, armed: Option<&Arc<AtomicUsize>>) -> Pipe {
+    let seen = Arc::clone(seen);
+    let armed = armed.cloned();
+    Pipe::new(PipeType::Serial, move |pf: &mut Pipeflow| {
+        if pf.token() == TOKENS {
+            pf.stop();
+            return;
+        }
+        fail_if_armed(armed.as_ref(), pf.token());
+        seen.fetch_add(1, Ordering::Relaxed);
+    })
+}
+
+/// A pipe after the source that counts the tokens it is handed and fails on
+/// token [`FAILS_AT`] while `armed` holds `1`.
+fn failing_pipe(kind: PipeType, seen: &Arc<AtomicUsize>, armed: &Arc<AtomicUsize>) -> Pipe {
+    let seen = Arc::clone(seen);
+    let armed = Arc::clone(armed);
+    Pipe::new(kind, move |pf: &mut Pipeflow| {
+        fail_if_armed(Some(&armed), pf.token());
+        seen.fetch_add(1, Ordering::Relaxed);
+    })
+}
+
+/// Panics with `"x"` if `armed` holds `1` and `token` is the one to fail on.
+///
+/// A bare `panic!` of a literal rather than an `assert!`, so that the
+/// payload is the `&str` [`assert_panicked_with`] reads back.
+fn fail_if_armed(armed: Option<&Arc<AtomicUsize>>, token: usize) {
+    if token == FAILS_AT && armed.is_some_and(|armed| armed.load(Ordering::SeqCst) == 1) {
+        panic!("x");
+    }
+}
+
+/// Runs `taskflow` and asserts the armed pipe's panic is what the run
+/// reports.
+fn assert_the_armed_pipe_failed_the_run(executor: &Executor, taskflow: &Taskflow) {
+    let error = executor
+        .run(taskflow)
+        .wait()
+        .expect_err("a pipe callable panicked, so the run failed");
+    assert_panicked_with(error, "x");
+}
+
+/// Asserts `reset` put a failed run's pipeline back to its just-built
+/// progress, which is the half of that claim no second run is needed for:
+/// the token counter is what a caller can read of it.
+fn assert_the_reset_cleared_the_token_count(pipeline: &Pipeline) {
+    pipeline.reset();
+    assert_eq!(pipeline.num_tokens(), 0, "the reset gave the counter back");
+}
+
+/// Disarms the failing pipe, resets `pipeline` and runs `taskflow` again,
+/// asserting the whole token stream got through this time: every counter in
+/// `seen` is [`TOKENS`], as is the pipeline's own token count.
+fn assert_it_runs_again_after_reset(
+    executor: &Executor,
+    taskflow: &Taskflow,
+    pipeline: &Pipeline,
+    armed: &Arc<AtomicUsize>,
+    seen: &[&Arc<AtomicUsize>],
+) {
+    armed.store(0, Ordering::SeqCst);
+    for counter in seen {
+        counter.store(0, Ordering::Relaxed);
+    }
+    pipeline.reset();
+    assert_eq!(pipeline.num_tokens(), 0, "the reset gave the counter back");
+
+    executor
+        .run(taskflow)
+        .wait()
+        .expect("nothing panics once the pipe is disarmed");
+
+    assert_eq!(pipeline.num_tokens(), TOKENS);
+    for counter in seen {
+        assert_eq!(counter.load(Ordering::Relaxed), TOKENS);
+    }
+}
+
+/// Runs a one-task taskflow on `executor` and asserts it ran: the third
+/// claim of each case in this section, that a failed run left the executor
+/// usable.
+fn assert_executor_is_reusable(executor: &Executor) {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&ran);
+    let mut taskflow = Taskflow::new();
+    taskflow.emplace(move || {
+        counted.fetch_add(1, Ordering::Relaxed);
+    });
+    executor
+        .run(&taskflow)
+        .wait()
+        .expect("the executor is reusable after a failed run");
+    assert_eq!(ran.load(Ordering::Relaxed), 1);
+}
+
+/// A panic in the *first* serial pipe -- the one that generates tokens --
+/// fails the composing run, and the token counter stops exactly where the
+/// panic did: a serial first pipe runs one token at a time, so the two
+/// tokens before the failing one are the whole of what was generated.
+#[test]
+fn a_panicking_first_serial_pipe_fails_the_composing_run() {
+    serialized(|| {
+        let executor = Executor::new(LINES);
+        let armed = Arc::new(AtomicUsize::new(1));
+        let seen = Arc::new(AtomicUsize::new(0));
+
+        let pipeline = Pipeline::new(LINES, vec![stopping_source(&seen, Some(&armed))]);
+        let mut taskflow = Taskflow::new();
+        compose_module(&mut taskflow, &pipeline, "module_of_pipeline");
+
+        assert_the_armed_pipe_failed_the_run(&executor, &taskflow);
+        assert_eq!(
+            pipeline.num_tokens(),
+            FAILS_AT,
+            "the tokens before the failing one were generated and no more"
+        );
+        assert_eq!(seen.load(Ordering::Relaxed), FAILS_AT);
+
+        assert_the_reset_cleared_the_token_count(&pipeline);
+        assert_executor_is_reusable(&executor);
+    });
+}
+
+/// A panic in a serial pipe *after* the source fails the run too, and that
+/// pipe has seen exactly the tokens before the failing one: a serial pipe
+/// takes its tokens in order whatever line each arrives on.
+///
+/// What the source had generated by then is deliberately not asserted --
+/// it runs ahead of the chain by as many tokens as there are lines, so the
+/// number is a race rather than a claim.
+#[test]
+fn a_panicking_inner_serial_pipe_fails_the_composing_run() {
+    serialized(|| {
+        let executor = Executor::new(LINES);
+        let armed = Arc::new(AtomicUsize::new(1));
+        let generated = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(AtomicUsize::new(0));
+
+        let pipeline = Pipeline::new(
+            LINES,
+            vec![
+                stopping_source(&generated, None),
+                failing_pipe(PipeType::Serial, &seen, &armed),
+            ],
+        );
+        let mut taskflow = Taskflow::new();
+        compose_module(&mut taskflow, &pipeline, "module_of_pipeline");
+
+        assert_the_armed_pipe_failed_the_run(&executor, &taskflow);
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            FAILS_AT,
+            "a serial pipe had the tokens before the failing one and no more"
+        );
+
+        assert_the_reset_cleared_the_token_count(&pipeline);
+        assert_executor_is_reusable(&executor);
+    });
+}
+
+/// A panic in a parallel pipe fails the run the same way, which is the case
+/// where the failing token is one of several of that pipe in flight at once.
+///
+/// Nothing is asserted about how many tokens that pipe had seen when it
+/// failed: a parallel pipe has no order of its own, so the tokens that got
+/// through before the failing one are not a number this case can name. What
+/// the run returning at all says instead is that none of those in-flight
+/// tokens is still owed anything.
+#[test]
+fn a_panicking_parallel_pipe_fails_the_composing_run() {
+    serialized(|| {
+        let executor = Executor::new(LINES);
+        let armed = Arc::new(AtomicUsize::new(1));
+        let generated = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(AtomicUsize::new(0));
+
+        let pipeline = Pipeline::new(
+            LINES,
+            vec![
+                stopping_source(&generated, None),
+                failing_pipe(PipeType::Parallel, &seen, &armed),
+            ],
+        );
+        let mut taskflow = Taskflow::new();
+        compose_module(&mut taskflow, &pipeline, "module_of_pipeline");
+
+        assert_the_armed_pipe_failed_the_run(&executor, &taskflow);
+
+        assert_the_reset_cleared_the_token_count(&pipeline);
+        assert_executor_is_reusable(&executor);
+    });
+}
+
+/// A pipeline whose pipe panicked, `reset` and run a second time, takes the
+/// whole token stream through -- which is the rest of the row the three
+/// cases above cover: the tokens in flight are not merely dropped, the
+/// pipeline is runnable again afterwards.
+///
+/// `#[ignore]` for #320, the defect this cell found and the reason it is one
+/// case rather than three. A line task is bypass-scheduled
+/// (`Runtime::schedule`), and every line but the one the conditioner selects
+/// is reachable *only* that way, so a panic that leaves another line queued
+/// and then skipped by the cancellation leaves that line's node claimed for
+/// ever: the next run's bypass of it queues nothing, having already told the
+/// parent to expect it, and the run never finishes. The chain here is the
+/// parallel one because it is the shape that reproduces most readily, but
+/// all three chains above hang on the same window when they are rerun, and
+/// one fix retires all of it.
+#[test]
+#[ignore = "hangs until #320 stops a cancelled run leaking a dispatch claim"]
+fn a_reset_pipeline_runs_again_after_a_panicking_pipe() {
+    serialized(|| {
+        let executor = Executor::new(LINES);
+        let armed = Arc::new(AtomicUsize::new(1));
+        let generated = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(AtomicUsize::new(0));
+
+        let pipeline = Pipeline::new(
+            LINES,
+            vec![
+                stopping_source(&generated, None),
+                failing_pipe(PipeType::Parallel, &seen, &armed),
+            ],
+        );
+        let mut taskflow = Taskflow::new();
+        compose_module(&mut taskflow, &pipeline, "module_of_pipeline");
+
+        assert_the_armed_pipe_failed_the_run(&executor, &taskflow);
+
+        assert_it_runs_again_after_reset(
+            &executor,
+            &taskflow,
+            &pipeline,
+            &armed,
+            &[&generated, &seen],
+        );
+        assert_executor_is_reusable(&executor);
+    });
 }
