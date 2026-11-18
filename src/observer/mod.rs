@@ -30,6 +30,32 @@
 //! `queue_size` joined it and `queue_capacity` still has not), the second
 //! under "Decisions taken in M7".
 //!
+//! **A hook may panic, and the run reports it rather than the worker dying
+//! of it.** [`Observer::on_entry`] and [`Observer::on_exit`] are called
+//! under a `catch_unwind` in `WorkerThread::observer_prologue` and
+//! `WorkerThread::observer_epilogue`, and a payload goes to
+//! `Job::record_panic` -- the same channel a panicking task body uses, so
+//! the run fails with [`RunError::Panicked`](crate::RunError::Panicked)
+//! carrying the hook's own payload and the executor stays usable. The
+//! alternative was to forbid a panicking hook in the obligations this
+//! trait's docs already carry and leave the behaviour alone, and it was
+//! rejected on what the violation costs: the hook calls bracket the
+//! dispatch inside the worker's scheduling loop, so an escaping payload
+//! kills the worker thread with the job in flight unfinished, which leaves
+//! the run's join counter short and `RunHandle::wait` blocked for ever --
+//! an unenforceable rule whose breach is a silent hang, against a rule the
+//! scheduler can simply keep. Upstream has the same hang and is departed
+//! from knowingly: its `_observer_prologue` and `_observer_epilogue` calls
+//! sit *outside* the `TF_EXECUTOR_EXCEPTION_HANDLER` that wraps each body,
+//! so a throwing hook unwinds into the `catch(...)` around its `_spawn`
+//! loop and that worker exits. The catch is per observer rather than around
+//! the loop over them, so one failing hook does not cost the observers
+//! after it their callback, and every payload is offered to the run, which
+//! keeps the first. The third hook, [`Observer::set_up`], needs none of
+//! this: `Executor::make_observer` calls it on the registering thread
+//! before the observer is inserted, so its panic propagates to that caller
+//! and the observer is simply not registered.
+//!
 //! **`TaskView` borrows a node and the graph it lives in, not a node and the
 //! index that names it.** Upstream's holds a `const Node&` alone; a
 //! predecessor here is a [`Task`](crate::Task) index, so answering "is this
@@ -62,9 +88,18 @@ use crate::task::{TaskType, task_type_of};
 pub trait Observer: Send + Sync {
     /// Called once, when this observer is registered: upstream's
     /// constructor-like `set_up`, told how many workers the executor has.
+    ///
+    /// Runs on the thread that registers the observer, before it is
+    /// inserted, so a panic here is raised to that caller and leaves nothing
+    /// registered.
     fn set_up(&self, num_workers: usize);
 
     /// Called on the worker about to run `task`'s work, before it does.
+    ///
+    /// A panic out of this hook fails the run the call belongs to, through
+    /// the channel a panicking task body uses; it does not stop the task
+    /// from running, the dispatch this brackets being already under way. The
+    /// module docs' "Design" section has why it is caught at all.
     fn on_entry(&self, worker: WorkerView<'_>, task: TaskView<'_>);
 
     /// Called on the worker that just ran `task`'s work, right after.
@@ -73,6 +108,10 @@ pub trait Observer: Send + Sync {
     /// nested graph: the scheduling loop's `observer_epilogue` seam runs on
     /// every return out of the dispatch, whether or not it finished the
     /// node.
+    ///
+    /// A panic here fails the run as one out of
+    /// [`on_entry`](Self::on_entry) does, and the node's own tear-down --
+    /// the semaphores it holds, the successors it releases -- still runs.
     fn on_exit(&self, worker: WorkerView<'_>, task: TaskView<'_>);
 }
 

@@ -721,6 +721,12 @@ impl Observer for Panicking {
 
 /// Runs a one-task taskflow on `executor` and asserts it ran, which is this
 /// section's third claim: the executor is still usable.
+///
+/// The two hook cases below withdraw the failing observer first, and that is
+/// the claim being made rather than a weakening of it. A hook that panics
+/// panics on every dispatch it is called on, so a run made while it is still
+/// registered fails by construction; what is in question is whether the
+/// worker that called it survived to run anything at all.
 fn still_runs(executor: &Executor) {
     let ran = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&ran);
@@ -768,19 +774,17 @@ fn a_panicking_set_up_hook_is_reported_to_the_registering_caller() {
 /// A panicking `on_entry` fails the run it was called from and leaves the
 /// executor usable.
 ///
-/// `#[ignore]` for #304, which this case was written against: the hook is
-/// called outside any `catch_unwind`, so today the panic unwinds out of the
-/// worker's scheduling loop, the job in flight is dropped without being
-/// finished and the `wait` below never returns. Un-ignoring this is that
-/// issue's acceptance, and it is written to the first of the two answers
-/// that issue puts -- the worker surviving the hook -- so the other answer,
-/// forbidding a hook to panic at all, retires this case rather than fixing
-/// it.
+/// The bar #304 set, which took the first of its two answers: the hook is
+/// called under a `catch_unwind` and its payload goes to the run, where
+/// before it unwound out of the worker's scheduling loop, dropped the job in
+/// flight without finishing it and hung the `wait` below for ever. What the
+/// case pins is all three halves of that answer -- the error, the payload
+/// being the *hook's* rather than the task's, and the executor still being
+/// usable afterwards.
 #[test]
-#[ignore = "hangs until #304 decides what a panicking hook does"]
 fn a_panicking_on_entry_hook_fails_the_run_and_leaves_the_executor_usable() {
     let executor = Executor::new(2);
-    let _observer = executor.make_observer(Panicking(Hook::OnEntry));
+    let observer = executor.make_observer(Panicking(Hook::OnEntry));
 
     let mut taskflow = Taskflow::new();
     taskflow.emplace(|| {});
@@ -789,19 +793,22 @@ fn a_panicking_on_entry_hook_fails_the_run_and_leaves_the_executor_usable() {
         .wait()
         .expect_err("`on_entry` panicked, so the run failed");
 
+    // The payload is the hook's own and not a task's: the one task of the
+    // graph above is an empty body that cannot panic.
     assert_panicked_with(error, "x");
+
+    executor.remove_observer(&observer);
     still_runs(&executor);
 }
 
 /// The same for `on_exit`, which is the hook after the dispatch rather than
-/// the one before it: also `#[ignore]` for #304, and also a hang today --
-/// the unwind skips the node's own tear-down, so neither the semaphores it
-/// holds nor its successors are released.
+/// the one before it: #304's fix covers both, where before the unwind from
+/// here skipped the node's own tear-down, so neither the semaphores it held
+/// nor its successors were released.
 #[test]
-#[ignore = "hangs until #304 decides what a panicking hook does"]
 fn a_panicking_on_exit_hook_fails_the_run_and_leaves_the_executor_usable() {
     let executor = Executor::new(2);
-    let _observer = executor.make_observer(Panicking(Hook::OnExit));
+    let observer = executor.make_observer(Panicking(Hook::OnExit));
 
     let mut taskflow = Taskflow::new();
     taskflow.emplace(|| {});
@@ -810,6 +817,10 @@ fn a_panicking_on_exit_hook_fails_the_run_and_leaves_the_executor_usable() {
         .wait()
         .expect_err("`on_exit` panicked, so the run failed");
 
+    // The payload is the hook's own and not a task's: the one task of the
+    // graph above is an empty body that cannot panic.
     assert_panicked_with(error, "x");
+
+    executor.remove_observer(&observer);
     still_runs(&executor);
 }

@@ -768,7 +768,8 @@ impl WorkerThread {
     ///
     /// The empty-list check is the one thing this does with no observers
     /// registered: see the [`observer`](crate::observer) module docs' "Design"
-    /// section for why that is lock-free and allocates nothing.
+    /// section for why that is lock-free and allocates nothing, and for why a
+    /// hook that panics is recorded against `job` rather than left to unwind.
     fn observer_prologue(&self, job: &Job) {
         if self.shared.observers.is_empty() {
             return;
@@ -777,7 +778,19 @@ impl WorkerThread {
         let worker = WorkerView::new(self.worker());
         let task = TaskView::new(node, graph);
         for observer in self.shared.observers.snapshot() {
-            observer.on_entry(worker, task);
+            // `AssertUnwindSafe` is the honest annotation, for
+            // `Handle::Static`'s reason narrowed to a hook: the views are
+            // immutable, so the only state a failing hook can leave
+            // half-written is the observer's own, behind the
+            // synchronisation `Observer`'s docs require of it, and the
+            // scheduler reads none of it. One `catch_unwind` per observer
+            // rather than one around the loop, so a failing hook does not
+            // rob the observers after it of the callback.
+            if let Err(payload) =
+                panic::catch_unwind(AssertUnwindSafe(|| observer.on_entry(worker, task)))
+            {
+                job.record_panic(payload);
+            }
         }
     }
 
@@ -796,7 +809,10 @@ impl WorkerThread {
     /// `match`, which is what stops that match's generic call from running a
     /// second time. `pub(crate)` for exactly that: every other dispatch arm
     /// reports [`Epilogue::Pending`] and is finished by that generic call
-    /// instead, and has no reason to call this directly.
+    /// instead, and has no reason to call this directly. Wherever it is
+    /// called from, a hook that panics is recorded against `job` and never
+    /// unwinds out of here, which is what every caller's own bookkeeping
+    /// after the call depends on.
     pub(crate) fn observer_epilogue(&self, job: &Job) {
         if self.shared.observers.is_empty() {
             return;
@@ -805,7 +821,12 @@ impl WorkerThread {
         let worker = WorkerView::new(self.worker());
         let task = TaskView::new(node, graph);
         for observer in self.shared.observers.snapshot() {
-            observer.on_exit(worker, task);
+            // The prologue's `catch_unwind`, for its reasons.
+            if let Err(payload) =
+                panic::catch_unwind(AssertUnwindSafe(|| observer.on_exit(worker, task)))
+            {
+                job.record_panic(payload);
+            }
         }
     }
 
