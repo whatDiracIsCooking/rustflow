@@ -26,8 +26,10 @@ fn main() {
     // create asynchronous tasks from the executor (using the executor as a
     // thread pool).
     //
-    // Upstream names this task `"async1"`; a free node carries no name to
-    // give one to in this port -- see the PR's "Friction" section.
+    // Upstream names this task `"async1"`. The name goes on here through the
+    // `_named` twin of any submitting form -- `spawn_named` for this one --
+    // and an observer is what reads it back; this example registers none, so
+    // it takes the unnamed twin.
     let fu1 = executor.spawn(|| {
         println!("async task returns 1");
         1
