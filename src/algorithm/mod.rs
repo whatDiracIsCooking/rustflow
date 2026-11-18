@@ -77,12 +77,15 @@ use crate::algorithm::partitioner::{
     RandomPartitioner, StaticLoop, StaticPartitioner,
 };
 
+pub mod fill;
 pub mod for_each;
 pub mod for_each_index;
+pub mod generate;
 pub mod index_range;
 pub mod merge;
 pub mod module;
 pub mod partitioner;
+pub mod transform;
 
 /// Closes [`SlicePartitioner`] against implementations outside this crate --
 /// this module's `# Design` section says why, and
