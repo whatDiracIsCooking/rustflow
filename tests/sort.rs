@@ -1,11 +1,12 @@
 //! Translated from the parallel-sort sections of `unittests/test_sort.cpp`
 //! (Taskflow v4.1.0): `ParallelSort.int.*`, `.ldouble.*` (`.float` here, since
-//! Rust has no 80-bit extended type), `.object.*`, `.MoveOnlyObject.*` and
-//! `.Async.*`. The `.DependentAsync.*`/`.SilentAsync.*`/
-//! `.SilentDependentAsync.*` cases are not a separate port: they wrap the
-//! identical `make_sort_task` closure in a different async-submission
-//! flavour, which is what `tests/dependent_asyncs.rs` and `tests/asyncs.rs`
-//! already exercise for every task shape, sort included.
+//! Rust has no 80-bit extended type), `.object.*`, `.MoveOnlyObject.*`,
+//! `.Async.*` and the two cases that submit the factory itself,
+//! `.DependentAsync.*` and `.SilentDependentAsync.*`. `.SilentAsync.*` is
+//! not a separate port: it wraps the identical `make_sort_task` closure in
+//! one more async-submission flavour, which is what
+//! `tests/dependent_asyncs.rs` and `tests/asyncs.rs` already exercise for
+//! every task shape, sort included.
 //!
 //! One adaptation, forced by cost rather than chosen: upstream sweeps every
 //! case at `N = 100_000` (`1_000_000` for the move-only case). [`SIZES`]
@@ -23,6 +24,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use rustflow::algorithm::{make_sort_by_task, make_sort_task};
 use rustflow::prelude::*;
 use rustflow::{Executor, Runtime};
 
@@ -273,11 +275,11 @@ worker_matrix! {
 // ----------------------------------------------------------------------------
 
 /// Upstream's `async`: `Runtime::sort` reached through
-/// [`Executor::spawn_runtime`] rather than a graph task at all -- the
-/// direct equivalent of wrapping `make_sort_task` in `executor.async`, since
-/// there is no free-standing `make_sort_task` to hand an async submission
-/// here (`src/algorithm/sort.rs`'s own module docs say why `Runtime::sort`
-/// is called directly instead).
+/// [`Executor::spawn_runtime`] rather than a graph task at all. Upstream
+/// hands `executor.async` a `make_sort_task`; this case stays on the
+/// borrowed-slice primitive the factory is built over, and the two
+/// dependent-async cases below submit the factory itself, so every layer is
+/// submitted from outside a graph somewhere in this file.
 fn parallel_sort_async(workers: usize) {
     let executor = Executor::new(workers);
     for &n in &SIZES {
@@ -307,6 +309,54 @@ worker_matrix! {
         parallel_sort_async_2_threads(2),
         parallel_sort_async_3_threads(3),
         parallel_sort_async_4_threads(4),
+    }
+}
+
+// ----------------------------------------------------------------------------
+// ParallelSort.DependentAsync / ParallelSort.SilentDependentAsync
+// ----------------------------------------------------------------------------
+
+/// Upstream's `dependent_async`: `make_sort_task` handed straight to
+/// [`Executor::dependent_async_runtime`] and waited for through the pair's
+/// own handle. One worker count rather than upstream's matrix, since what
+/// this case adds over `parallel_sort_async` is the submission form, not the
+/// sort -- the matrix above already sweeps the sort itself.
+#[test]
+fn make_sort_task_runs_from_a_dependent_async_body() {
+    let executor = Executor::new(3);
+    for &n in &SIZES {
+        let data = scattered(n, 1000);
+        let mut expected = data.clone();
+        expected.sort_unstable();
+
+        let data = Arc::new(Mutex::new(data));
+        let (_task, done) = executor.dependent_async_runtime(make_sort_task(Arc::clone(&data)), []);
+        done.wait().expect("no task panicked");
+
+        assert_eq!(*data.lock().expect("uncontended"), expected, "n = {n}");
+    }
+}
+
+/// Upstream's `silent_dependent_async`, over the comparator overload:
+/// `make_sort_by_task` submitted with no handle of its own and waited for
+/// through [`Executor::wait_for_all`], which is how upstream waits for that
+/// flavour too.
+#[test]
+fn make_sort_by_task_runs_from_a_silent_dependent_async_body() {
+    let executor = Executor::new(3);
+    for &n in &SIZES {
+        let data = scattered(n, 1000);
+        let mut expected = data.clone();
+        expected.sort_unstable_by(|a, b| b.cmp(a));
+
+        let data = Arc::new(Mutex::new(data));
+        let _task = executor.silent_dependent_async_runtime(
+            make_sort_by_task(Arc::clone(&data), |a: &i64, b: &i64| b.cmp(a)),
+            [],
+        );
+        executor.wait_for_all();
+
+        assert_eq!(*data.lock().expect("uncontended"), expected, "n = {n}");
     }
 }
 

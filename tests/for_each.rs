@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rustflow::algorithm::SlicePartitioner;
+use rustflow::algorithm::make_for_each_task;
 use rustflow::algorithm::partitioner::{
     DefaultClosureWrapper, DynamicPartitioner, GuidedPartitioner, RandomPartitioner,
     StaticPartitioner,
@@ -438,5 +439,44 @@ fn closure_wrapper_for_each_dynamic() {
             wrapper_called.load(Ordering::Relaxed) <= tc,
             "tc={tc}: the dynamic family is not obliged to use every worker"
         );
+    }
+}
+
+// ----------------------------------------------------------------------------
+// ParallelFor.DependentAsync
+// ----------------------------------------------------------------------------
+
+/// Upstream's `dependent_async`: `make_for_each_task` handed straight to
+/// [`Executor::dependent_async_runtime`], the submission neither
+/// [`Runtime::for_each`] nor the `AlgorithmBuilder` wrapper reaches.
+///
+/// Two adaptations. Upstream splits one `vector` between a
+/// `make_for_each_task` over its first half and a
+/// `make_for_each_index_task` over its second; the index half is
+/// `for_each_index`'s port, not this file's, and the factory here owns a
+/// share of the whole `Vec` rather than a pair of iterators into part of
+/// one, so the case runs as one submission over all of `data`. And it is
+/// waited for through the pair's own handle rather than
+/// `wait_for_all`, which is what `tests/sort.rs` covers for the silent
+/// flavour.
+#[test]
+fn make_for_each_task_runs_from_a_dependent_async_body() {
+    let executor = Executor::new(3);
+
+    for &n in &[0usize, 1, 7, 150, 65_536] {
+        let data = Arc::new(Mutex::new(vec![0u32; n]));
+        let (_task, done) = executor.dependent_async_runtime(
+            make_for_each_task(
+                Arc::clone(&data),
+                |d: &mut u32| *d = 10,
+                GuidedPartitioner::<DefaultClosureWrapper>::default(),
+            ),
+            [],
+        );
+        done.wait().expect("no task panicked");
+
+        let guard = data.lock().expect("uncontended");
+        assert_eq!(guard.len(), n);
+        assert!(guard.iter().all(|&v| v == 10), "n = {n}");
     }
 }

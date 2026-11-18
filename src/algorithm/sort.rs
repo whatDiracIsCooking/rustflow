@@ -1,11 +1,13 @@
 //! Translated from `taskflow/algorithm/sort.hpp` (Taskflow v4.1.0).
 //!
-//! [`Runtime::sort_by`] is upstream's `make_sort_task(b, e, cmp)`, called
-//! directly rather than building a second closure -- [`for_each`]'s own
-//! module docs give the reason, and it holds here unchanged. [`Runtime::sort`]
-//! is the `T: Ord` overload upstream spells with no `cmp` argument at all,
-//! and [`AlgorithmBuilder::sort_by`]/[`AlgorithmBuilder::sort`] are the
-//! owned-data wrappers over both: upstream's `FlowBuilder::sort` overloads.
+//! [`Runtime::sort_by`] is upstream's `make_sort_task(b, e, cmp)` over a
+//! borrowed slice, called directly rather than building a second closure --
+//! [`for_each`]'s own module docs give the reason, and it holds here
+//! unchanged. [`Runtime::sort`] is the `T: Ord` overload upstream spells
+//! with no `cmp` argument at all; [`make_sort_by_task`] and
+//! [`make_sort_task`] are those same two overloads over owned data; and
+//! [`AlgorithmBuilder::sort_by`]/[`AlgorithmBuilder::sort`] are the one
+//! line over each: upstream's `FlowBuilder::sort` overloads.
 //!
 //! [`for_each`]: crate::algorithm::for_each
 //! [`AlgorithmBuilder::sort`]: crate::algorithm::AlgorithmBuilder::sort
@@ -49,6 +51,7 @@
 
 use std::cmp::Ordering;
 use std::mem::size_of;
+use std::sync::{Arc, Mutex};
 
 use crate::Scope;
 use crate::runtime::Runtime;
@@ -308,6 +311,83 @@ impl<'rt> Runtime<'rt> {
     {
         self.sort_by(data, T::cmp);
     }
+}
+
+/// Builds the runtime body of a [`Runtime::sort_by`] task over owned `data`:
+/// upstream's `make_sort_task(b, e, cmp)`. `data` is locked once per run of
+/// the body and sorted in place through that one guard.
+///
+/// `cmp` is cloned on every run of the body -- relevant only for a task a
+/// cycle revisits -- matching upstream copying `cmp` into its own closure by
+/// value.
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+///
+/// use rustflow::algorithm::sort::make_sort_by_task;
+/// use rustflow::prelude::*;
+/// use rustflow::Executor;
+///
+/// let data = Arc::new(Mutex::new(vec![5i32, 3, 1, 4, 1, 5, 9, 2, 6]));
+///
+/// let mut taskflow = Taskflow::new();
+/// // Descending, to show `cmp` rather than `T`'s own order decides it.
+/// taskflow.emplace_runtime(make_sort_by_task(Arc::clone(&data), |a: &i32, b: &i32| {
+///     b.cmp(a)
+/// }));
+///
+/// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
+/// assert_eq!(
+///     *data.lock().expect("uncontended"),
+///     vec![9, 6, 5, 5, 4, 3, 2, 1, 1]
+/// );
+/// ```
+pub fn make_sort_by_task<T, C>(
+    data: Arc<Mutex<Vec<T>>>,
+    cmp: C,
+) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static
+where
+    T: Send + 'static,
+    C: Fn(&T, &T) -> Ordering + Sync + Clone + Send + 'static,
+{
+    move |rt: &mut Runtime<'_>| {
+        let mut guard = data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        rt.sort_by(&mut guard, cmp.clone());
+    }
+}
+
+/// Builds the runtime body of a [`Runtime::sort`] task over owned `data`:
+/// upstream's `make_sort_task(beg, end)`, which plugs
+/// `std::less<value_type>{}` into the comparator overload -- [`Ord::cmp`]
+/// into [`make_sort_by_task`], here.
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+///
+/// use rustflow::algorithm::sort::make_sort_task;
+/// use rustflow::prelude::*;
+/// use rustflow::Executor;
+///
+/// let data = Arc::new(Mutex::new(vec![5i32, 3, 1, 4, 1, 5, 9, 2, 6]));
+///
+/// let mut taskflow = Taskflow::new();
+/// taskflow.emplace_runtime(make_sort_task(Arc::clone(&data)));
+///
+/// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
+/// assert_eq!(
+///     *data.lock().expect("uncontended"),
+///     vec![1, 1, 2, 3, 4, 5, 5, 6, 9]
+/// );
+/// ```
+pub fn make_sort_task<T>(
+    data: Arc<Mutex<Vec<T>>>,
+) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static
+where
+    T: Ord + Send + 'static,
+{
+    make_sort_by_task(data, T::cmp)
 }
 
 #[cfg(test)]
