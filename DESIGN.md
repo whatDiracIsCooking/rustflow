@@ -934,24 +934,60 @@ entry above does.
 
 ## Decisions taken in M8
 
-- **A pipeline's lines are ordinary runtime tasks, so no eleventh `Handle`
-  variant** (issue #180). Upstream hands each line's pipe callable a
-  `NonpreemptiveRuntime&` -- a second runtime shape next to its ordinary
+- **A pipeline's lines need the eleventh `Handle` variant after all**
+  (issues #180, #181, #230). The premise M8 was planned on was that a
+  pipeline's lines could be ordinary runtime tasks, so that no eleventh
+  `Handle` variant was needed: issue #180 read upstream's
+  `NonpreemptiveRuntime&` -- the second runtime shape next to its ordinary
   `Runtime`, whose one method, `schedule`, stores a dependency count rather
-  than decrementing one, exactly the port's own `Runtime::schedule`
-  contract. Issue #181 read that contract against the port's own machinery
-  first and found the one refusal that could have mattered, "already
-  preempted itself" on an entered target, unreachable for a line task: a
-  line task never spawns a child of its own graph, so it never preempts
-  and never reaches that check, which is why `Runtime::schedule`'s own doc
-  now names the pipeline as a safe caller. A pipeline line is therefore an
-  ordinary runtime task on the port's `Runtime`, which already has
-  upstream's `NonpreemptiveRuntime::schedule` semantics for the join
-  counter, and the family needs no eleventh `Handle` variant to get them.
-  Upstream's second pipe-callable shape, `(Pipeflow&, NonpreemptiveRuntime&)`,
-  is therefore not ported either: `NonpreemptiveRuntime` is unported by the
-  same reasoning, and its one method is a shape `Runtime::schedule` already
-  covers.
+  than decrementing one -- as exactly the port's own `Runtime::schedule`
+  contract, and issue #181 checked that contract against the port's own
+  machinery and found the one refusal that could have mattered, "already
+  preempted itself" on an entered target, looking unreachable for a line
+  task: a line task never spawns a child of its own graph, so -- #181's
+  reasoning went -- it never preempts and never reaches that check.
+  `Runtime::schedule`'s own doc said so, naming the pipeline as a safe
+  caller.
+
+  **That premise is false, and issue #230 is the implementation hitting
+  it.** `Runtime::schedule`'s guard does not ask "has this node spawned a
+  child"; it asks `is_entered`, which for an ordinary `Handle::Runtime` task
+  is simply "has the first entry's `enter` set `PREEMPTED`" -- and `enter`
+  sets that bit **before the body runs, unconditionally**, whether or not
+  the body ever spawns anything. #181's reading checked the refusal's
+  *intent* correctly and missed this: a line task's body does not need to
+  spawn a child to be seen as "already entered", it only needs to still be
+  running, and two lines with two workers reach that in the plain course of
+  scheduling. `tests/pipelines.rs`'s multi-line, multi-worker cases hit the
+  assert for exactly this reason once #182 tried to build the pipeline on
+  top of an ordinary runtime task.
+
+  **The guard itself is correct and was never the bug.** During `enter`,
+  the node's join counter holds the body's own reference; storing zero over
+  it from a sibling's `schedule` call would make the body's own closing
+  decrement wrap and leave the node `PREEMPTED` with nothing left to
+  resume it. Narrowing or removing the assert to let a line task through
+  would trade that loud panic for a silent hang, which is strictly worse.
+
+  **The fix is the eleventh `Handle` variant upstream always had two of.**
+  `Handle::NonpreemptiveRuntime` ports upstream's `NonpreemptiveRuntime`
+  class on its own terms: its dispatch arm never sets `PREEMPTED` and takes
+  no reference on the join counter, so it always finishes on its first
+  entry and `preempts_itself` answers `false` for it unconditionally --
+  `is_entered` is therefore `false` for the whole of its body's run, with
+  no dependence on whether the body has "finished" in any sense `schedule`
+  needs to ask about. The body is handed a restricted handle rather than
+  the full `Runtime`, because a node with no preemption protocol has no way
+  to resume itself if its body tried to spawn nested work on it; making
+  that unrepresentable in the type was preferred over documenting it as a
+  hazard. `FlowBuilder::emplace_nonpreemptive_runtime` builds one.
+
+  The trap worth marking for the next reader: `enter`'s bit is a property
+  of the *dispatch arm*, set the instant the first entry begins and cleared
+  only once the node is done, not a property of what the body happened to
+  do on a given run. Reading `Runtime::schedule`'s refusal as being about
+  spawned children -- rather than about which `Handle` variant the target
+  is -- is the reading that looked right here and was not.
 - **A pipe callable is `Fn + Send + Sync`, and a pipeline's own mutable
   state lives behind an `Arc` of atomics** (issue #180). Upstream's line
   task captures `this` -- the `Pipeline` or `ScalablePipeline` object

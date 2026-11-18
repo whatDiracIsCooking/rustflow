@@ -14,7 +14,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::graph::{Graph, Handle, RuntimeWork, SubflowWork, Task, Work};
+use crate::executor::runtime::NonpreemptiveRuntime;
+use crate::graph::{Graph, Handle, NonpreemptiveRuntimeWork, RuntimeWork, SubflowWork, Task, Work};
 use crate::runtime::Runtime;
 use crate::subflow::Subflow;
 use crate::task::{TaskMut, TaskRef};
@@ -194,7 +195,9 @@ pub trait FlowBuilder {
     /// body is handed the [`Runtime`] it runs on, so it can schedule a task
     /// of its own graph, spawn work under its own node and wait for it.
     /// Upstream's second runtime shape, over `tf::NonpreemptiveRuntime&`, is
-    /// not ported.
+    /// [`FlowBuilder::emplace_nonpreemptive_runtime`] rather than a second
+    /// overload of this method, with no SFINAE here to pick between them by
+    /// the callable's own signature.
     ///
     /// ```
     /// use rustflow::prelude::*;
@@ -212,6 +215,46 @@ pub trait FlowBuilder {
     {
         self.graph_mut()
             .add_node(Handle::Runtime(RuntimeWork::new(callable)))
+    }
+
+    /// Creates a nonpreemptive runtime task running `callable`, and returns
+    /// its handle.
+    ///
+    /// Upstream's `emplace` overload for a callable over `tf::NonpreemptiveRuntime&`.
+    /// The body is handed a restricted scheduler handle rather than the full
+    /// [`Runtime`]: it can [`schedule`](crate::Runtime::schedule) a task of
+    /// this task's own graph, exactly as a full [`Runtime`] can, but it has
+    /// no `silent_async`, no `scope` and no `corun_until` -- there is no
+    /// protocol under this node for any of those to resume it with, so the
+    /// type gives a body nothing that would need one. `DESIGN.md`'s
+    /// "Decisions taken in M8" has why this node kind exists at all, and
+    /// [`Handle::NonpreemptiveRuntime`] has the dispatch it runs under.
+    ///
+    /// The restricted handle's own type is not part of this crate's public
+    /// surface, which is why no doctest here can name it in a type
+    /// annotation the way [`FlowBuilder::emplace_runtime`]'s does: `callable`
+    /// is written with its parameter's type inferred instead, which compiles
+    /// against the bound below the same way a closure handed to any other
+    /// generic `Fn` bound does.
+    ///
+    /// ```
+    /// use rustflow::prelude::*;
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// let task = taskflow.emplace_nonpreemptive_runtime(|line| {
+    ///     let _ = line.worker_id();
+    /// });
+    ///
+    /// assert!(taskflow.graph().node(task).handle().is_nonpreemptive_runtime());
+    /// ```
+    fn emplace_nonpreemptive_runtime<C>(&mut self, callable: C) -> Task
+    where
+        C: for<'a> FnMut(&mut NonpreemptiveRuntime<'a>) + Send + 'static,
+    {
+        self.graph_mut()
+            .add_node(Handle::NonpreemptiveRuntime(NonpreemptiveRuntimeWork::new(
+                callable,
+            )))
     }
 
     /// Creates a module task standing for `target`, and returns its handle.

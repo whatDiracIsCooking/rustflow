@@ -153,7 +153,7 @@ fn task_type_of(handle: &Handle) -> TaskType {
         // tells the two apart; see [`Handle::is_multi_condition`].
         Handle::Condition(_) | Handle::MultiCondition(_) => TaskType::Condition,
         Handle::Subflow { .. } => TaskType::Subflow,
-        Handle::Runtime(_) => TaskType::Runtime,
+        Handle::Runtime(_) | Handle::NonpreemptiveRuntime(_) => TaskType::Runtime,
         // And both module forms fold together the same way, for the same
         // reason: upstream's `TaskType` has no name for the adopted one, so
         // `ADOPTED_MODULE` reports `MODULE` there too.

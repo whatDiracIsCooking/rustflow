@@ -577,6 +577,7 @@ fn dump_node(
         | Handle::Condition(_)
         | Handle::MultiCondition(_)
         | Handle::Runtime(_)
+        | Handle::NonpreemptiveRuntime(_)
         | Handle::Module(_)
         | Handle::Async(_)
         | Handle::DependentAsync(_) => {}
@@ -671,6 +672,7 @@ fn node_shape(handle: &Handle) -> &'static str {
         | Handle::Static(_)
         | Handle::Subflow { .. }
         | Handle::Runtime(_)
+        | Handle::NonpreemptiveRuntime(_)
         | Handle::Module(_)
         | Handle::AdoptedModule(_)
         | Handle::Async(_)
@@ -695,6 +697,7 @@ fn edge_attributes(handle: &Handle, position: usize) -> String {
         | Handle::Static(_)
         | Handle::Subflow { .. }
         | Handle::Runtime(_)
+        | Handle::NonpreemptiveRuntime(_)
         | Handle::Module(_)
         | Handle::AdoptedModule(_)
         | Handle::Async(_)

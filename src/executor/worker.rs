@@ -372,7 +372,7 @@ impl WorkerThread {
     /// Upstream's `_invoke` body, from `begin_invoke:` to the
     /// `TF_INVOKE_CONTINUATION()` at the end of it; the `goto` itself is
     /// [`WorkerThread::invoke`]. The four kinds it runs itself are static,
-    /// placeholder and the two conditioners; the four dynamic-tasking kinds each get
+    /// placeholder and the two conditioners; the five dynamic-tasking kinds each get
     /// one line into the module that owns them, and the two async kinds have arms
     /// that refuse a handle somebody built into a taskflow. The `match` is
     /// exhaustive over [`Handle`], so a new kind arrives as a compile error rather
@@ -462,17 +462,30 @@ impl WorkerThread {
                     .map_err(|payload| job.record_panic(payload))
                     .unwrap_or_default(),
             ))),
-            // The four dynamic-tasking handles, each upstream's
+            // The five dynamic-tasking handles, each upstream's
             // `_invoke_*_task` and each one line into the module that owns it.
-            // Every one may preempt this node rather than finish it, which the
-            // `None` under the match is about, and the two module arms hand
-            // over what their handle *owns* rather than a `Graph&`. None of
-            // the four signals a waiter from inside its own tear-down, so the
-            // generic call after this match is still the one that runs it.
+            // Four of them may preempt this node rather than finish it, which
+            // the `None` under the match is about, and the two module arms
+            // hand over what their handle *owns* rather than a `Graph&`. The
+            // fifth, `Handle::NonpreemptiveRuntime`, always finishes -- see
+            // its own arm below for why. None of the five signals a waiter
+            // from inside its own tear-down, so the generic call after this
+            // match is still the one that runs it.
             Handle::Subflow { work, subgraph } => {
                 Epilogue::Pending(subflow::invoke(self, &job, work, subgraph))
             }
             Handle::Runtime(work) => Epilogue::Pending(runtime::invoke(self, &job, work)),
+            // Upstream's `_invoke_nonpreemptive_runtime_task`: no preemption
+            // protocol at all, so this always finishes the node on this one
+            // call and the release is never `None`. `Epilogue::Pending`
+            // rather than `Epilogue::AlreadyRun` all the same, because
+            // nothing about this arm's own tear-down signals a waiter before
+            // the generic call after this `match` does -- it is this node's
+            // own release that would, and that is exactly what the generic
+            // call is for.
+            Handle::NonpreemptiveRuntime(work) => {
+                Epilogue::Pending(Some(runtime::invoke_nonpreemptive(self, &job, work)))
+            }
             Handle::Module(target) => Epilogue::Pending(module::invoke(self, &job, target)),
             Handle::AdoptedModule(adopted) => {
                 Epilogue::Pending(module::invoke_adopted(self, &job, adopted))
@@ -911,9 +924,10 @@ pub(crate) fn is_entered(node: &Node) -> bool {
 }
 
 /// Whether a node of this kind is one the scheduler may leave `PREEMPTED`: the
-/// four dynamic-tasking handles, which are the four arms of the dispatch that
-/// can answer `None`. Exhaustive rather than one arm and a wildcard, for
-/// [`WorkerThread::invoke_one`]'s own reason.
+/// four dynamic-tasking handles whose dispatch arm can answer `None` --
+/// [`Handle::NonpreemptiveRuntime`] deliberately makes a fifth dynamic-tasking
+/// handle without joining them, since its arm never does. Exhaustive rather
+/// than one arm and a wildcard, for [`WorkerThread::invoke_one`]'s own reason.
 fn preempts_itself(handle: &Handle) -> bool {
     match handle {
         Handle::Subflow { .. }
@@ -924,6 +938,12 @@ fn preempts_itself(handle: &Handle) -> bool {
         | Handle::Placeholder
         | Handle::Condition(_)
         | Handle::MultiCondition(_)
+        // The whole reason this variant exists: no protocol ever sets
+        // `PREEMPTED` for it, so this answers `false` unconditionally rather
+        // than depending on whether the body has spawned anything --
+        // `DESIGN.md`'s "Decisions taken in M8" has the failure that made
+        // this arm necessary.
+        | Handle::NonpreemptiveRuntime(_)
         | Handle::Async(_)
         | Handle::DependentAsync(_) => false,
     }

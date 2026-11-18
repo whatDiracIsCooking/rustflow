@@ -8,6 +8,13 @@
 //! below. The shell of [`Runtime`] is `src/runtime.rs`, which says what the
 //! handle holds and why it cannot hand back an executor.
 //!
+//! Upstream's second class, `NonpreemptiveRuntime`, is also here, in full:
+//! [`invoke_nonpreemptive`] is `_invoke_nonpreemptive_runtime_task`, and
+//! `NonpreemptiveRuntime` itself -- the restricted handle, not part of this
+//! crate's public surface -- is this module's own, with no shell in
+//! `src/runtime.rs` to split it from. `DESIGN.md`'s "Decisions taken in M8"
+//! has why it took a second milestone to arrive rather than the first.
+//!
 //! # Design
 //!
 //! Three body shapes share one protocol. A runtime task of a graph is one of
@@ -71,7 +78,16 @@
 //! is waiting for the node's own graph -- the run, for a runtime task of a
 //! graph -- or leaves it on the node to be dropped with it, for a free silent
 //! one whose chain roots at the sentinel.
+//!
+//! [`invoke_nonpreemptive`] shares none of this. It sets no bit, takes no
+//! reference, and never returns `None`, so it is not a fourth shape of the
+//! protocol above but the deliberate absence of one -- upstream's own
+//! `NonpreemptiveRuntime` is built the same way, for the same reason: a node
+//! with no protocol to resume it can be the target of
+//! [`Runtime::schedule`] at any point in its body's run, which is what the
+//! family above cannot promise.
 
+use core::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -82,7 +98,7 @@ use crate::executor::r#async::{AsyncHandle, Spawn, Submission};
 use crate::executor::run_handle::RunError;
 use crate::executor::topology::{Cancellable, Job};
 use crate::executor::worker::{Release, Worker, WorkerThread, is_entered};
-use crate::graph::{AsyncWork, Node, OnceWork, RuntimeWork, Task};
+use crate::graph::{AsyncWork, Node, NonpreemptiveRuntimeWork, OnceWork, RuntimeWork, Task};
 
 /// The two bits a runtime task holds while its own work is outstanding:
 /// upstream's `NSTATE::PREEMPTED | NSTATE::IMPLICITLY_ANCHORED`, which it
@@ -406,50 +422,25 @@ impl Runtime<'_> {
     /// [`Graph::node`](crate::Graph::node)'s.
     ///
     /// Panics if `task` names a node that has already preempted itself, which
-    /// is the refusal above. A pipeline line task is one caller this is safe
-    /// for: it schedules a sibling line task of its own graph and spawns no
-    /// children of its own, so neither the caller nor the target ever carries
-    /// outstanding work for this call to find.
+    /// is the refusal above. [`Handle::NonpreemptiveRuntime`] is the one
+    /// callee this is always safe against, whatever its body is doing:
+    /// `preempts_itself` answers `false` for that handle kind, so
+    /// `is_entered` reads `false` for the whole of its body's run and this
+    /// call never mistakes "still running" for "already preempted". An
+    /// *ordinary* `Handle::Runtime` task is not safe against this call for
+    /// as long as its body merely runs, with no child spawned at all: `enter`
+    /// sets the bit before the body runs regardless of whether the body ever
+    /// spawns one, so the refusal above can fire against a node that was
+    /// never preempted -- only still inside its own first entry.
+    /// `DESIGN.md`'s "Decisions taken in M8" has the failure that reading led
+    /// to and the design this module settled on instead.
     ///
     /// Either reaches the caller as the failure of this runtime task, since
     /// it happens inside the body.
+    ///
+    /// [`Handle::NonpreemptiveRuntime`]: crate::graph::Handle::NonpreemptiveRuntime
     pub fn schedule(&mut self, task: Task) {
-        // Upstream's comment, and the invariant it names: "when scheduling a
-        // task, the task must have zero dependency (join counter is 0) or we
-        // can encounter bug when inserting a nested flow (e.g., module
-        // task)". A stored zero rather than an arithmetic one, for the reason
-        // a conditioner's selected successor gets one: the count the target
-        // is carrying is exactly what this call means to bypass.
-        let target = self.job.graph().node(task);
-
-        // The one case this call can see for itself: the store below would
-        // wipe a count that is not a dependency count at all -- a preempted
-        // node's counter holds one reference per piece of nested work still
-        // outstanding, and work that finished against a zeroed counter would
-        // drive it past zero rather than resume the node. Refused before
-        // anything is written, so a body that schedules a node it should not
-        // have fails *as a body* rather than leaving the hang the store would
-        // have. `is_entered` is the same question the successor arm asks
-        // before its own decrement.
-        assert!(
-            !is_entered(target),
-            "a task that is already running cannot be scheduled: a bypassed \
-             dependency may not re-enter a task the run has already entered"
-        );
-
-        target.join_counter().store(0, Ordering::Relaxed);
-
-        // Before the push, as every other count of a queued job is: the job
-        // may run and finish before this call returns, and a parent that had
-        // not been told about it could reach zero with the job still in
-        // flight.
-        self.job.parent().count_queued(self.job.topology(), 1);
-
-        // Upstream's `_executor._schedule(_worker, node)`: this worker's own
-        // queue. `Job::successor` is the job of a task of the same graph,
-        // same run and same parent -- which is what a sibling is, whatever
-        // the edges say.
-        self.thread.schedule(self.job.successor(task));
+        schedule_bypassing(self.job, self.thread, task);
     }
 
     /// Waits for everything this runtime task has spawned, reporting a
@@ -608,6 +599,186 @@ impl Runtime<'_> {
     pub fn corun_until(&mut self, predicate: impl FnMut() -> bool) {
         self.thread.corun_until(predicate);
     }
+}
+
+/// The shared half of [`Runtime::schedule`] and [`NonpreemptiveRuntime::schedule`]:
+/// upstream keeps two copies of this body, one on each class, and this port
+/// keeps one function both call instead, so the assert's wording and the
+/// accounting cannot drift between the two callers.
+fn schedule_bypassing(job: &Job, thread: &mut WorkerThread, task: Task) {
+    // Upstream's comment, and the invariant it names: "when scheduling a
+    // task, the task must have zero dependency (join counter is 0) or we
+    // can encounter bug when inserting a nested flow (e.g., module task)". A
+    // stored zero rather than an arithmetic one, for the reason a
+    // conditioner's selected successor gets one: the count the target is
+    // carrying is exactly what this call means to bypass.
+    let target = job.graph().node(task);
+
+    // The one case this call can see for itself: the store below would wipe
+    // a count that is not a dependency count at all -- a preempted node's
+    // counter holds one reference per piece of nested work still
+    // outstanding, and work that finished against a zeroed counter would
+    // drive it past zero rather than resume the node. Refused before
+    // anything is written, so a body that schedules a node it should not
+    // have fails *as a body* rather than leaving the hang the store would
+    // have. `is_entered` is the same question the successor arm asks before
+    // its own decrement, and it answers `false` unconditionally for a
+    // nonpreemptive target, which is the whole reason this function has two
+    // callers now rather than one.
+    assert!(
+        !is_entered(target),
+        "a task that is already running cannot be scheduled: a bypassed \
+         dependency may not re-enter a task the run has already entered"
+    );
+
+    target.join_counter().store(0, Ordering::Relaxed);
+
+    // Before the push, as every other count of a queued job is: the job may
+    // run and finish before this call returns, and a parent that had not
+    // been told about it could reach zero with the job still in flight.
+    job.parent().count_queued(job.topology(), 1);
+
+    // Upstream's `_executor._schedule(_worker, node)`: this worker's own
+    // queue. `Job::successor` is the job of a task of the same graph, same
+    // run and same parent -- which is what a sibling is, whatever the edges
+    // say.
+    thread.schedule(job.successor(task));
+}
+
+/// The scheduler, as a nonpreemptive runtime task's body sees it: upstream's
+/// `NonpreemptiveRuntime`.
+///
+/// [`Runtime`] minus everything that could spawn work under this node --
+/// `silent_async`, `scope`, `corun_until` and the rest of
+/// [`crate::executor::runtime_async`]'s family -- which this type has no
+/// inherent `impl` block borrowing from, so a body cannot reach them: there
+/// is no protocol here to resume a node this handle preempted, because
+/// nothing ever sets this node `PREEMPTED` in the first place. What is left
+/// is [`NonpreemptiveRuntime::schedule`] and the read-only accessors a body
+/// needs to tell which of a pool's workers it is running on.
+///
+/// Not nameable from outside the crate even though the keyword below is
+/// `pub`: `executor::runtime` is `pub(crate)`, so this struct's real
+/// reachability is the module's. The keyword is `pub` anyway, rather than
+/// `pub(crate)` to match, because [`FlowBuilder::emplace_nonpreemptive_runtime`](crate::FlowBuilder::emplace_nonpreemptive_runtime)
+/// is a genuinely public method whose bound names this type -- `rustc`'s
+/// `private_bounds` lint checks a bound's own declared visibility against
+/// its caller's, not the full path's reachability, and a body closure never
+/// needs to write this type's path to satisfy that bound regardless, the
+/// same way a closure passed to a bound of `Fn(&mut SomeType)` never has to
+/// spell `SomeType` to compile against it.
+pub struct NonpreemptiveRuntime<'a> {
+    /// The worker running the body, upstream's `_worker`.
+    worker: &'a Worker,
+    /// The job the node was dequeued as: what [`NonpreemptiveRuntime::schedule`]
+    /// reaches the graph, the parent and the topology through, exactly as
+    /// [`Runtime::schedule`] does.
+    job: &'a Job,
+    /// The scheduling loop of the worker running the body, for
+    /// [`NonpreemptiveRuntime::schedule`]'s one push onto it.
+    thread: &'a mut WorkerThread,
+}
+
+impl<'a> NonpreemptiveRuntime<'a> {
+    /// Builds the handle for a nonpreemptive runtime task running on the node
+    /// `job` is for.
+    pub(crate) fn new(worker: &'a Worker, job: &'a Job, thread: &'a mut WorkerThread) -> Self {
+        Self {
+            worker,
+            job,
+            thread,
+        }
+    }
+
+    /// Returns the worker running this task's body, upstream's `_worker`
+    /// read back: [`Runtime::worker`]'s read-only half, with no `executor()`
+    /// for the same reason that method has none.
+    #[must_use]
+    pub fn worker(&self) -> &'a Worker {
+        self.worker
+    }
+
+    /// Returns the id of the worker running this task's body:
+    /// [`NonpreemptiveRuntime::worker`]`().id()` in one hop, as
+    /// [`Runtime::worker_id`] is for the full handle.
+    #[must_use]
+    pub fn worker_id(&self) -> usize {
+        self.worker.id()
+    }
+
+    /// How many workers the executor running this task has, as
+    /// [`Runtime::num_workers`] answers for the full handle.
+    #[must_use]
+    pub fn num_workers(&self) -> usize {
+        self.thread.shared.workers.len()
+    }
+
+    /// Schedules `task` onto this worker's queue at once, bypassing the
+    /// graph's dependencies: upstream's `NonpreemptiveRuntime::schedule`,
+    /// which is [`Runtime::schedule`]'s body under a second name. Every word
+    /// of that method's doc applies here unchanged -- `task` must be an
+    /// active task of this runtime task's own graph -- with one difference
+    /// in what makes the call safe: this node is never `PREEMPTED` in the
+    /// first place, so a caller never needs to reason about whether this
+    /// node's own body has spawned anything before scheduling it.
+    ///
+    /// # Panics
+    ///
+    /// The same two panics [`Runtime::schedule`] has: [`Graph::node`](crate::Graph::node)'s,
+    /// if `task` is not a live task of this graph, and the refusal if `task`
+    /// names a node that has already preempted itself -- which a
+    /// nonpreemptive node itself can never be, but whatever `task` names
+    /// instead still can.
+    pub fn schedule(&mut self, task: Task) {
+        schedule_bypassing(self.job, self.thread, task);
+    }
+}
+
+impl fmt::Debug for NonpreemptiveRuntime<'_> {
+    /// Names the worker, which is the whole of this handle's identity: unlike
+    /// [`Runtime`], it holds no node of its own to name -- upstream's class
+    /// holds no `Node*` either, only the executor and the worker.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NonpreemptiveRuntime")
+            .field("worker", &self.worker.id())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Runs the nonpreemptive-runtime task `job` is for: upstream's
+/// `_invoke_nonpreemptive_runtime_task`.
+///
+/// Unlike [`invoke`], there is no preemption protocol here at all: the body
+/// is simply called, with no bit set before it and no reference taken on the
+/// join counter, so this call always finishes the node on this one entry.
+/// `Release::Strong` always, which is why this returns the value rather than
+/// the `Option<Release>` [`invoke`] and [`invoke_async`] do -- there is no
+/// `None` case for the dispatch arm to fold in.
+///
+/// A panic out of the body is recorded exactly as a static task's is,
+/// through [`Job::record_panic`].
+pub(crate) fn invoke_nonpreemptive(
+    worker: &mut WorkerThread,
+    job: &Job,
+    work: &NonpreemptiveRuntimeWork,
+) -> Release {
+    // The same construction `run_body` gives a full `Runtime`, over the
+    // restricted handle instead: the mutable borrow of the worker's
+    // scheduling loop still has to end where the body does, which is a
+    // promise this function keeps on its own since there is no `enter`
+    // wrapping it to keep it for.
+    let shared = Arc::clone(&worker.shared);
+    let record: &Worker = &shared.workers[worker.id];
+    let mut line = NonpreemptiveRuntime::new(record, job, worker);
+
+    // `AssertUnwindSafe` for the reason `run_body` takes it: what a panic
+    // here can leave half-written is reachable only through what the
+    // closure captured.
+    if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| work.invoke(&mut line))) {
+        job.record_panic(payload);
+    }
+
+    Release::Strong
 }
 
 #[cfg(test)]
@@ -1800,5 +1971,69 @@ mod tests {
             "the counters the submission raised came back down on that entry"
         );
         assert!(worker.pop().is_none(), "so nothing was left queued");
+    }
+
+    /// A nonpreemptive runtime task's body finishes on its first entry and
+    /// leaves no `PREEMPTED` bit behind, which is the whole of what
+    /// distinguishes [`Handle::NonpreemptiveRuntime`] from
+    /// [`Handle::Runtime`]: there is no second branch to take here, unlike
+    /// `a_body_that_spawns_nothing_clears_its_bits_and_releases_once` above,
+    /// because no entry of this dispatch arm ever sets the bit in the first
+    /// place.
+    ///
+    /// Driven by hand, one job at a time, for
+    /// `a_body_that_spawns_nothing_clears_its_bits_and_releases_once`'s
+    /// reason: the order is fixed rather than raced for, and a regression
+    /// fails an assertion instead of wedging the suite.
+    #[test]
+    fn a_nonpreemptive_body_finishes_on_its_first_entry_with_no_bit_set() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicUsize::new(0));
+        let mut taskflow = Taskflow::new();
+        let line = {
+            let runs = Arc::clone(&runs);
+            taskflow.emplace_nonpreemptive_runtime(move |_| {
+                runs.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        let after = {
+            let released = Arc::clone(&released);
+            taskflow.emplace(move || {
+                released.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        taskflow.task(line).precede([after]);
+
+        let executor = Executor::new(1);
+        let mut worker = test_worker(&executor);
+        let topology = run_of(&taskflow, || {});
+        worker.invoke(source_job(&taskflow, &topology));
+
+        assert_eq!(runs.load(Ordering::Relaxed), 1, "the body ran once");
+        assert_eq!(
+            entered(&taskflow, line),
+            0,
+            "no bit was ever set, so there is none to clear"
+        );
+        assert_eq!(
+            taskflow
+                .graph()
+                .node(line)
+                .join_counter()
+                .load(Ordering::Relaxed),
+            0,
+            "the node was re-armed to its own dependency count, having taken \
+             no reference on it the way a preempting kind's first entry does"
+        );
+        assert_eq!(
+            released.load(Ordering::Relaxed),
+            1,
+            "the one successor was released, and released once"
+        );
+        assert!(
+            worker.pop().is_none(),
+            "and nothing was left queued: the successor ran here, as this \
+             worker's continuation"
+        );
     }
 }
