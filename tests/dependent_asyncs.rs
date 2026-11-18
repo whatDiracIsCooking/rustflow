@@ -65,10 +65,12 @@
 //! unit tests; what these add is the scale at which the race actually
 //! happens.
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
+use rustflow::observer::{Observer, TaskView, WorkerView};
 use rustflow::prelude::*;
 use rustflow::{AsyncTask, Executor};
 
@@ -292,13 +294,20 @@ fn null_dependency() {
 /// already draining the buffers. The handles of the second half are
 /// **dropped**, which detaches -- the task still runs -- exactly as upstream
 /// discards the `std::pair` its `dependent_async` returns.
+///
+/// The silent half is **named**, as upstream's
+/// `TaskParams{std::to_string(i)}` names it, and the other half is left
+/// unnamed, which is its `DefaultTaskParams{}`. Nothing here reads a name
+/// back -- [`names_reach_an_observer`] is what does -- so what the two halves
+/// pin at this scale is that naming a submission costs it nothing else.
 fn embarrassing_parallelism(workers: usize) {
     let executor = Executor::new(workers);
     let counter = Arc::new(AtomicUsize::new(0));
 
-    for _ in 0..TASKS / 2 {
+    for task in 0..TASKS / 2 {
         let counter = Arc::clone(&counter);
-        executor.silent_dependent_async(
+        executor.silent_dependent_async_named(
+            task.to_string(),
             move || {
                 counter.fetch_add(1, Ordering::Relaxed);
             },
@@ -1333,4 +1342,121 @@ worker_matrix! {
         dependent_async_from_runtime_3_threads(3, true),
         dependent_async_from_runtime_4_threads(4, true),
     }
+}
+
+/// Records the name of every task a worker enters, as a *set*.
+///
+/// `tests/asyncs.rs` carries the same observer for the free forms, and for
+/// its reason: which names were seen rather than how many times each was,
+/// a runtime-shaped node being entered a second time to report its outcome.
+#[derive(Default)]
+struct Names(Mutex<BTreeSet<String>>);
+
+impl Observer for Names {
+    fn set_up(&self, _num_workers: usize) {}
+
+    fn on_entry(&self, _worker: WorkerView<'_>, task: TaskView<'_>) {
+        self.0
+            .lock()
+            .expect("an observer's own lock is never held across a body")
+            .insert(task.name().to_string());
+    }
+
+    fn on_exit(&self, _worker: WorkerView<'_>, _task: TaskView<'_>) {}
+}
+
+/// Invented: the name a dependent submission gives its node, read back the
+/// one way a caller can read it -- an observer's `on_entry` -- over all four
+/// of the executor's dependent forms, against a submission that names
+/// nothing.
+///
+/// Issue #258's bar, and the dependent half of `tests/asyncs.rs`'s case of
+/// the same name. Each receiver's four named links are a *chain*, so three of
+/// every four names is read off a node that was queued by the tear-down of
+/// its predecessor rather than by the submitting thread: the name is set at
+/// construction, before any dependency can release the node, which is the one
+/// ordering question the dependent path adds. One worker, because the question
+/// is which name is on which node rather than who ran it.
+#[test]
+fn names_reach_an_observer() {
+    /// The four dependent forms of one receiver, as a chain of four names.
+    ///
+    /// A macro rather than a function because the four methods are the same
+    /// four names on three unrelated types -- `Executor`, `Runtime` and
+    /// `TaskGroup` -- and nothing in the crate's public surface relates them.
+    macro_rules! chain {
+        ($receiver:expr, $who:literal) => {{
+            let first = $receiver.silent_dependent_async_named(concat!($who, "silent"), || {}, []);
+            let (second, value) =
+                $receiver.dependent_async_named(concat!($who, "handled"), || {}, [&first]);
+            let third = $receiver.silent_dependent_async_runtime_named(
+                concat!($who, "silent runtime"),
+                |_: &mut Runtime<'_>| {},
+                [&second],
+            );
+            let (_fourth, done) = $receiver.dependent_async_runtime_named(
+                concat!($who, "runtime"),
+                |_: &mut Runtime<'_>| {},
+                [&third],
+            );
+            (value, done)
+        }};
+    }
+
+    let executor = Arc::new(Executor::new(1));
+    let seen = executor.make_observer(Names::default());
+
+    // The executor's own four, parented to nothing.
+    let (value, done) = chain!(executor, "");
+
+    // The default, which this issue did not change: upstream's
+    // `DefaultTaskParams{}` leaves `_name` default-constructed.
+    let _unnamed = executor.silent_dependent_async(|| {}, []);
+
+    value.wait().expect("no body panicked");
+    done.wait().expect("nothing under the last link failed");
+
+    // A runtime body's four, counted against the node the body is of and
+    // waited for by its implicit join.
+    executor
+        .spawn_runtime(|runtime: &mut Runtime<'_>| {
+            let _handles = chain!(runtime, "runtime's ");
+        })
+        .wait()
+        .expect("nothing under the body panicked");
+
+    // And a task group's four, counted against the group's anchor. A group
+    // whose outstanding children are a dependent chain is corun to the end of
+    // it rather than left, for the reason `src/task_group.rs` gives.
+    executor
+        .spawn({
+            let executor = Arc::clone(&executor);
+            move || {
+                let group = executor.task_group().expect("a worker may open a group");
+                let _handles = chain!(group, "group's ");
+                group.corun();
+            }
+        })
+        .wait()
+        .expect("no task of the group panicked");
+
+    executor.wait_for_all();
+    assert_eq!(
+        *seen.0.lock().expect("no body panicked"),
+        BTreeSet::from([
+            String::new(),
+            "group's handled".to_string(),
+            "group's runtime".to_string(),
+            "group's silent".to_string(),
+            "group's silent runtime".to_string(),
+            "handled".to_string(),
+            "runtime".to_string(),
+            "runtime's handled".to_string(),
+            "runtime's runtime".to_string(),
+            "runtime's silent".to_string(),
+            "runtime's silent runtime".to_string(),
+            "silent".to_string(),
+            "silent runtime".to_string(),
+        ])
+    );
 }

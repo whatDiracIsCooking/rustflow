@@ -11,17 +11,18 @@
 //!
 //! # Design
 //!
-//! The eight spawning forms below are one delegation each onto the submission
-//! core in `executor::async`, under a `Submission` built from the group's own
-//! anchor. `DESIGN.md` has the anchor's `Arc` shape and the `Drop` this type
-//! does not have, where a child is queued and the stack-depth ceiling that
-//! follows from it, which anchor a child's failure reaches depending on
-//! which of the eight forms raised it, and the naming of the eight forms
-//! over upstream's four templates -- all under "Rationale moved out", which
-//! also has the one limit this port adds under cancellation: a cancelled
-//! group whose outstanding children are dependent-async tasks should be
-//! corun to completion rather than cancelled mid-chain if any of them still
-//! has a successor to release.
+//! The sixteen spawning forms below are one delegation each onto the
+//! submission core in `executor::async`, under a `Submission` built from the
+//! group's own anchor -- eight body-and-handle shapes, each with a `_named`
+//! twin that adds one `Spawn::named` step. `DESIGN.md` has the anchor's `Arc`
+//! shape and the `Drop` this type does not have, where a child is queued and
+//! the stack-depth ceiling that follows from it, which anchor a child's
+//! failure reaches depending on which of the eight forms raised it, and the
+//! naming of the eight forms over upstream's four templates -- all under
+//! "Rationale moved out", which also has the one limit this port adds under
+//! cancellation: a cancelled group whose outstanding children are
+//! dependent-async tasks should be corun to completion rather than cancelled
+//! mid-chain if any of them still has a successor to release.
 
 use std::any::Any;
 use std::fmt;
@@ -224,6 +225,21 @@ impl<'a> TaskGroup<'a> {
         )
     }
 
+    /// [`TaskGroup::spawn`] with the free node this task is named `name`:
+    /// upstream's `TaskGroup::async(params, f)`.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn spawn_named<R, F>(&self, name: impl Into<String>, body: F) -> AsyncHandle<R>
+    where
+        R: Send + 'static,
+        F: FnOnce() -> R + Send + 'static,
+    {
+        self.executor.shared.schedule_async_task(
+            Spawn::handled(body).named(name),
+            &Submission::under_anchor(&self.anchor),
+        )
+    }
+
     /// Runs `body` as a task of this group, with no handle on it at all.
     ///
     /// Upstream's `TaskGroup::silent_async`, and the cheaper half of the
@@ -284,6 +300,20 @@ impl<'a> TaskGroup<'a> {
             .schedule_async_task(Spawn::silent(body), &Submission::under_anchor(&self.anchor));
     }
 
+    /// [`TaskGroup::silent_async`] with the free node this task is named
+    /// `name`: upstream's `TaskGroup::silent_async(params, f)`.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn silent_async_named<F>(&self, name: impl Into<String>, body: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.executor.shared.schedule_async_task(
+            Spawn::silent(body).named(name),
+            &Submission::under_anchor(&self.anchor),
+        );
+    }
+
     /// Runs `body` as a task of this group, handing it the scheduler, and
     /// hands back a handle on its completion.
     ///
@@ -328,6 +358,21 @@ impl<'a> TaskGroup<'a> {
         )
     }
 
+    /// [`TaskGroup::spawn_runtime`] with the free node this task is named
+    /// `name`: upstream's `TaskGroup::async(params, f)` over a
+    /// `[](tf::Runtime&){}` body.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn spawn_runtime_named<F>(&self, name: impl Into<String>, body: F) -> AsyncHandle<()>
+    where
+        F: for<'r> FnOnce(&mut Runtime<'r>) + Send + 'static,
+    {
+        self.executor.shared.schedule_async_task(
+            Spawn::handled_runtime(body).named(name),
+            &Submission::under_anchor(&self.anchor),
+        )
+    }
+
     /// Runs `body` as a task of this group, handing it the scheduler, with no
     /// handle on it at all.
     ///
@@ -343,6 +388,21 @@ impl<'a> TaskGroup<'a> {
     {
         self.executor.shared.schedule_async_task(
             Spawn::silent_runtime(body),
+            &Submission::under_anchor(&self.anchor),
+        );
+    }
+
+    /// [`TaskGroup::silent_async_runtime`] with the free node this task is
+    /// named `name`: upstream's `TaskGroup::silent_async(params, f)` over a
+    /// `[](tf::Runtime&){}` body.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn silent_async_runtime_named<F>(&self, name: impl Into<String>, body: F)
+    where
+        F: for<'r> FnOnce(&mut Runtime<'r>) + Send + 'static,
+    {
+        self.executor.shared.schedule_async_task(
+            Spawn::silent_runtime(body).named(name),
             &Submission::under_anchor(&self.anchor),
         );
     }
@@ -392,6 +452,27 @@ impl<'a> TaskGroup<'a> {
     {
         self.executor.shared.schedule_dependent_async_task(
             Spawn::handled(body),
+            &Submission::under_anchor(&self.anchor),
+            dependencies,
+        )
+    }
+
+    /// [`TaskGroup::dependent_async`] with the free node this task is named
+    /// `name`: upstream's `TaskGroup::dependent_async(params, f, tasks...)`.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn dependent_async_named<'t, R, F>(
+        &self,
+        name: impl Into<String>,
+        body: F,
+        dependencies: impl IntoIterator<Item = &'t AsyncTask>,
+    ) -> (AsyncTask, AsyncHandle<R>)
+    where
+        R: Send + 'static,
+        F: FnOnce() -> R + Send + 'static,
+    {
+        self.executor.shared.schedule_dependent_async_task(
+            Spawn::handled(body).named(name),
             &Submission::under_anchor(&self.anchor),
             dependencies,
         )
@@ -459,6 +540,30 @@ impl<'a> TaskGroup<'a> {
             .0
     }
 
+    /// [`TaskGroup::silent_dependent_async`] with the free node this task is
+    /// named `name`: upstream's
+    /// `TaskGroup::silent_dependent_async(params, f, tasks...)`.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn silent_dependent_async_named<'t, F>(
+        &self,
+        name: impl Into<String>,
+        body: F,
+        dependencies: impl IntoIterator<Item = &'t AsyncTask>,
+    ) -> AsyncTask
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.executor
+            .shared
+            .schedule_dependent_async_task(
+                Spawn::silent(body).named(name),
+                &Submission::under_anchor(&self.anchor),
+                dependencies,
+            )
+            .0
+    }
+
     /// Runs `body` as a task of this group once every task in `dependencies`
     /// has finished, handing it the scheduler, and hands back a handle on the
     /// task and one on its completion.
@@ -483,12 +588,35 @@ impl<'a> TaskGroup<'a> {
         )
     }
 
+    /// [`TaskGroup::dependent_async_runtime`] with the free node this task is
+    /// named `name`: upstream's
+    /// `TaskGroup::dependent_async(params, f, tasks...)` over a
+    /// `[](tf::Runtime&){}` body.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn dependent_async_runtime_named<'t, F>(
+        &self,
+        name: impl Into<String>,
+        body: F,
+        dependencies: impl IntoIterator<Item = &'t AsyncTask>,
+    ) -> (AsyncTask, AsyncHandle<()>)
+    where
+        F: for<'r> FnOnce(&mut Runtime<'r>) + Send + 'static,
+    {
+        self.executor.shared.schedule_dependent_async_task(
+            Spawn::handled_runtime(body).named(name),
+            &Submission::under_anchor(&self.anchor),
+            dependencies,
+        )
+    }
+
     /// Runs `body` as a task of this group once every task in `dependencies`
     /// has finished, handing it the scheduler, with no handle on its result.
     ///
     /// The runtime-shaped half of [`TaskGroup::silent_dependent_async`], and
-    /// the last of the eight. A panic out of `body` or out of anything it
-    /// spawned reaches the group's anchor, as the other silent forms' does.
+    /// the last of the eight unnamed forms. A panic out of `body` or out of
+    /// anything it spawned reaches the group's anchor, as the other silent
+    /// forms' does.
     pub fn silent_dependent_async_runtime<'t, F>(
         &self,
         body: F,
@@ -501,6 +629,31 @@ impl<'a> TaskGroup<'a> {
             .shared
             .schedule_dependent_async_task(
                 Spawn::silent_runtime(body),
+                &Submission::under_anchor(&self.anchor),
+                dependencies,
+            )
+            .0
+    }
+
+    /// [`TaskGroup::silent_dependent_async_runtime`] with the free node this
+    /// task is named `name`: upstream's
+    /// `TaskGroup::silent_dependent_async(params, f, tasks...)` over a
+    /// `[](tf::Runtime&){}` body, and the last of the sixteen.
+    ///
+    /// [`Executor::spawn_named`] says what the name is and what reads it.
+    pub fn silent_dependent_async_runtime_named<'t, F>(
+        &self,
+        name: impl Into<String>,
+        body: F,
+        dependencies: impl IntoIterator<Item = &'t AsyncTask>,
+    ) -> AsyncTask
+    where
+        F: for<'r> FnOnce(&mut Runtime<'r>) + Send + 'static,
+    {
+        self.executor
+            .shared
+            .schedule_dependent_async_task(
+                Spawn::silent_runtime(body).named(name),
                 &Submission::under_anchor(&self.anchor),
                 dependencies,
             )

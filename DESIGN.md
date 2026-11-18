@@ -1557,3 +1557,53 @@ entry above does.
   the eight prelude lines with one; the factories are *not* prelude names,
   which is #256's boundary applied unchanged -- a program importing a
   free-function form is choosing it, and chooses it by name.
+
+- **A free async task is named by a `_named` twin of its submitting method,
+  and the name rides in `Spawn`** (issue #258).
+
+  Upstream's shape at the pin is an *optional leading argument*, not a second
+  verb: `async(f)` forwards to `async(DefaultTaskParams{}, f)`, and
+  `TaskParamsLike` admits `TaskParams`, `DefaultTaskParams` or anything
+  `StringLike`, so `executor.async("async1", f)` and
+  `rt.async("my task", f)` are one overload of the same four names. C++
+  spells "optional" as an overload and Rust has no overloading, so the
+  rendering is a second method name: `spawn_named`, `silent_async_named`,
+  `dependent_async_named` and their `_runtime` twins, on each of the three
+  receivers, which is twenty-four new methods beside the twenty-four already
+  there. Each is its unnamed twin plus one step, because the name travels in
+  `Spawn<H>` rather than as a parameter of `Shared::schedule_async_task` --
+  which makes that value upstream's leading `(params, f)` pair exactly as
+  `Submission` is its trailing `(tpg, parent)` pair, and leaves the unnamed
+  twenty-four, the submission core's signature and every existing call site
+  untouched. This supersedes the last sentence of the entry above on `async`
+  being `spawn` (#88): the `TaskParams` overloads no longer collapse onto the
+  unnamed forms, because the observers it deferred them to arrived in M7 and
+  `TaskView::name` is now something to read a name back with.
+
+  The alternative was a submission builder, `executor.named("a").spawn(f)`,
+  with one `named` step on each receiver that every existing method is
+  reached through. By method count it is the smaller surface and that is the
+  one thing it wins: a single public builder holding a private three-variant
+  target -- parentless, under a node, under an anchor -- carries eight
+  methods where the twins carry twenty-four. Three things decide against it.
+  It adds a **public type no program using the crate ever writes**, which is
+  precisely the test the entry above on root re-exports applies to earn a
+  root line, so the builder would need a root line to be documented at all
+  while failing the rule that hands them out; a `_named` method adds no type
+  and no name to place. It **separates the name from the call it is an
+  argument of**: `spawn`/`spawn_named` and
+  `spawn_runtime`/`spawn_runtime_named` sort next to each other on the same
+  rustdoc page, so a reader who found the unnamed form has found the name,
+  where a builder puts the named forms on a page reached only through a verb
+  that sorts nowhere near them. And the thing a builder is actually for --
+  more than one optional parameter -- **is not there**: `TaskParams` has two
+  fields, and the second, `void* data`, does not survive translation at all,
+  user data in Rust travelling in the closure. If a second parameter ever
+  does arrive, a builder is the shape to revisit and these twins are its
+  front end rather than an obstacle.
+
+  The default is deliberately unchanged: an unnamed submission names its node
+  the empty string, which is what `DefaultTaskParams` leaves `Node::_name`
+  as upstream, and `Graph::add_named_node` already took the name a free
+  node's one-node arena is built with -- nothing in `src/graph/` moved for
+  this.
