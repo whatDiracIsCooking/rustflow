@@ -91,11 +91,12 @@ coverage script says so and names this command).
 
 Two more reports need nothing from the image, being POSIX `sh`, and both
 measure the documentation contract in [`DESIGN.md`](../DESIGN.md) rather than
-the code: `devtools/doc-ratio.sh` prints the prose, example and code lines of
-each production file with the ratio between the first and the last, and
-`devtools/test-names.sh` snapshots and compares the set of test names, which
-is how a documentation pass shows it renamed no test. Like the two above they
-are reports: each exits 0 whatever it finds, and no CI job reads either.
+the code: `devtools/doc-ratio.sh` prints, per production file, how many of its
+lines are prose, doc example, `# Design` rationale and code, with the ratio of
+the first to the last, and `devtools/test-names.sh` snapshots and compares the
+set of test names, which is how a documentation pass shows it renamed no test.
+Like the two above they are reports: each exits 0 whatever it finds, and no CI
+job reads either.
 
 ### Credentials
 
