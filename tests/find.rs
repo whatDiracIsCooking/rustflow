@@ -1,12 +1,15 @@
 //! Translated from the `find_if`, `find_if_not`, `min_element` and
 //! `max_element` sections of `unittests/test_find.cpp` (Taskflow v4.1.0):
 //! `find_if.*`, `find_if_not.*`, `min_element.*`, `max_element.*` and their
-//! `ClosureWrapper.*` cases. The `silent_async`/`silent_dependent_async`
-//! sections at the end of that file are not ported: this crate's
-//! `Runtime::find_if` and friends have no free-function `make_find_if_task`
-//! counterpart to hand an async spawner the way upstream's does, so there is
-//! nothing those cases exercise beyond what `tests/asyncs.rs` and
-//! `tests/dependent_asyncs.rs` already cover for `silent_async` itself.
+//! `ClosureWrapper.*` cases, together with the `silent_dependent_async`
+//! section at the end of that file, which
+//! `make_find_if_task_runs_from_a_silent_dependent_async_body` ports over
+//! [`make_find_if_task`] -- the one form neither a `Runtime::` call nor an
+//! [`AlgorithmBuilder`](rustflow::algorithm::AlgorithmBuilder) wrapper
+//! reaches, since a dependent-async task is never queued into a `Taskflow`
+//! for `emplace_runtime` to call. The `silent_async` section just before it
+//! is not ported: it differs from that one in the spawning method alone,
+//! which `tests/asyncs.rs` already covers for every body shape.
 //!
 //! Two adaptations, each forced by the port rather than chosen:
 //!
@@ -30,9 +33,10 @@
 //!   an input built to guarantee more than one match at known positions.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rustflow::Xorshift64;
-use rustflow::algorithm::find::FindPartitioner;
+use rustflow::algorithm::find::{FindPartitioner, make_find_if_task};
 use rustflow::algorithm::partitioner::{
     DefaultClosureWrapper, DynamicPartitioner, GuidedPartitioner, RandomPartitioner,
     StaticPartitioner,
@@ -750,5 +754,64 @@ fn closure_wrapper_max_element_dynamic() {
             .wait()
             .expect("no task panicked");
         assert!(wrapper_called.load(Ordering::Relaxed) <= tc, "tc={tc}");
+    }
+}
+
+// ----------------------------------------------------------------------------
+// silent dependent async
+// ----------------------------------------------------------------------------
+
+/// Upstream's `silent_dependent_async(W)`: two `make_find_if_task` bodies
+/// handed straight to an executor, the second waiting on the first, with
+/// `wait_for_all` the only handle on either -- the submitting form no
+/// `Runtime::find_if` call and no `AlgorithmBuilder::find_if` wrapper can
+/// reach.
+///
+/// Narrowed the two ways this file's own docs describe for every case above:
+/// one deterministic input per `n` in `LENGTHS` rather than a `rand()`-seeded
+/// sweep to `65536`, and two worker counts rather than eight, since what is
+/// new here is the submitting form and not the search.
+#[test]
+fn make_find_if_task_runs_from_a_silent_dependent_async_body() {
+    for workers in [1, 4] {
+        let executor = Executor::new(workers);
+
+        for n in LENGTHS {
+            let input = Arc::new(random_input(n, 0xF1D0_0295 ^ u64::try_from(n).unwrap_or(0)));
+            let expected_hit = input.iter().position(|&x| x == 5);
+            let hit = Arc::new(Mutex::new(None));
+            let miss = Arc::new(Mutex::new(None));
+
+            let first = executor.silent_dependent_async_runtime(
+                make_find_if_task(
+                    Arc::clone(&input),
+                    Arc::clone(&hit),
+                    |&x: &i64| x == 5,
+                    GuidedPartitioner::<DefaultClosureWrapper>::default(),
+                ),
+                [],
+            );
+            executor.silent_dependent_async_runtime(
+                make_find_if_task(
+                    Arc::clone(&input),
+                    Arc::clone(&miss),
+                    |&x: &i64| x == 0,
+                    GuidedPartitioner::<DefaultClosureWrapper>::default(),
+                ),
+                [&first],
+            );
+            executor.wait_for_all();
+
+            assert_eq!(
+                *hit.lock().expect("uncontended"),
+                expected_hit,
+                "workers={workers} n={n}"
+            );
+            assert_eq!(
+                *miss.lock().expect("uncontended"),
+                None,
+                "workers={workers} n={n}: 0 never appears in random_input"
+            );
+        }
     }
 }

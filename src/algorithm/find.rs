@@ -1,13 +1,16 @@
 //! Translated from `taskflow/algorithm/find.hpp` (Taskflow v4.1.0).
 //!
-//! [`Runtime::find_if`] and [`Runtime::find_if_not`] are upstream's
-//! `make_find_if_task`/`make_find_if_not_task`, run directly rather than
-//! building a second closure, as [`crate::algorithm::for_each`] already does
-//! for the same reason. [`Runtime::min_element`] and [`Runtime::max_element`]
-//! are their `make_min_element_task`/`make_max_element_task`.
-//! The owned-data wrappers over all four are on [`AlgorithmBuilder`], the
-//! one extension trait the whole algorithm family shares, in
-//! [`crate::prelude`] alongside [`FlowBuilder`].
+//! [`Runtime::find_if`] and [`Runtime::find_if_not`] are the body of
+//! upstream's `make_find_if_task`/`make_find_if_not_task`, run directly over
+//! a borrowed slice rather than building a second closure, as
+//! [`crate::algorithm::for_each`] already does for the same reason.
+//! [`Runtime::min_element`] and [`Runtime::max_element`] are their
+//! `make_min_element_task`/`make_max_element_task`.
+//! Each of the four also has a `make_*_task` free function of upstream's own
+//! name building the owned-data runtime body `emplace_runtime` wants, and a
+//! method on [`AlgorithmBuilder`] -- the one extension trait the whole
+//! algorithm family shares, in [`crate::prelude`] alongside [`FlowBuilder`]
+//! -- queuing that body as a task.
 //!
 //! [`AlgorithmBuilder`]: crate::algorithm::AlgorithmBuilder
 //! [`FlowBuilder`]: crate::FlowBuilder
@@ -71,7 +74,7 @@
 //! element under `cmp`".
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::Scope;
 use crate::algorithm::partitioner::{
@@ -685,6 +688,190 @@ impl<'rt> Runtime<'rt> {
         P: FindPartitioner,
     {
         *result = reduce_impl(self, data, move |a: &T, b: &T| cmp(b, a), part);
+    }
+}
+
+/// Builds the runtime body of a [`Runtime::find_if`] task over data it owns
+/// a share of: upstream's `make_find_if_task`.
+///
+/// The search runs into a local [`Option<usize>`] and `result` is locked
+/// once, afterwards, only to publish it: the lock is never held across the
+/// parallel scan. `data` is read without locking, since nothing here writes
+/// to it.
+///
+/// `predicate` and `part` are cloned on every run of the body -- relevant
+/// only for a task revisited by a cycle -- matching upstream copying both
+/// into its closure by value.
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+///
+/// use rustflow::algorithm::find::make_find_if_task;
+/// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
+/// use rustflow::prelude::*;
+/// use rustflow::Executor;
+///
+/// let data = Arc::new((0..100).collect::<Vec<i32>>());
+/// let result = Arc::new(Mutex::new(None));
+///
+/// let mut taskflow = Taskflow::new();
+/// taskflow.emplace_runtime(make_find_if_task(
+///     Arc::clone(&data),
+///     Arc::clone(&result),
+///     |&x| x == 42,
+///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
+/// ));
+///
+/// Executor::new(4).run(&taskflow).wait().expect("no task panicked");
+/// assert_eq!(*result.lock().expect("uncontended"), Some(42));
+/// ```
+pub fn make_find_if_task<T, F, P>(
+    data: Arc<Vec<T>>,
+    result: Arc<Mutex<Option<usize>>>,
+    predicate: F,
+    part: P,
+) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static
+where
+    T: Sync + Send + 'static,
+    F: Fn(&T) -> bool + Sync + Clone + Send + 'static,
+    P: FindPartitioner + Clone + Send + 'static,
+{
+    move |rt: &mut Runtime<'_>| {
+        let mut found = None;
+        rt.find_if(&data, &mut found, predicate.clone(), part.clone());
+        *result.lock().unwrap_or_else(PoisonError::into_inner) = found;
+    }
+}
+
+/// Builds the runtime body of a [`Runtime::find_if_not`] task: upstream's
+/// `make_find_if_not_task`, the `find_if_not` half of the pair
+/// [`make_find_if_task`] documents.
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+///
+/// use rustflow::algorithm::find::make_find_if_not_task;
+/// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
+/// use rustflow::prelude::*;
+/// use rustflow::Executor;
+///
+/// let data = Arc::new(vec![5; 50]);
+/// let result = Arc::new(Mutex::new(None));
+///
+/// let mut taskflow = Taskflow::new();
+/// taskflow.emplace_runtime(make_find_if_not_task(
+///     Arc::clone(&data),
+///     Arc::clone(&result),
+///     |&x: &i32| x == 5,
+///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
+/// ));
+///
+/// Executor::new(4).run(&taskflow).wait().expect("no task panicked");
+/// assert_eq!(*result.lock().expect("uncontended"), None);
+/// ```
+pub fn make_find_if_not_task<T, F, P>(
+    data: Arc<Vec<T>>,
+    result: Arc<Mutex<Option<usize>>>,
+    predicate: F,
+    part: P,
+) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static
+where
+    T: Sync + Send + 'static,
+    F: Fn(&T) -> bool + Sync + Clone + Send + 'static,
+    P: FindPartitioner + Clone + Send + 'static,
+{
+    move |rt: &mut Runtime<'_>| {
+        let mut found = None;
+        rt.find_if_not(&data, &mut found, predicate.clone(), part.clone());
+        *result.lock().unwrap_or_else(PoisonError::into_inner) = found;
+    }
+}
+
+/// Builds the runtime body of a [`Runtime::min_element`] task: upstream's
+/// `make_min_element_task`. `result` is locked once to publish the index the
+/// fold settled on, never across it, as [`make_find_if_task`] says.
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+///
+/// use rustflow::algorithm::find::make_min_element_task;
+/// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
+/// use rustflow::prelude::*;
+/// use rustflow::Executor;
+///
+/// let data = Arc::new(vec![4, 1, 7, 9]);
+/// let result = Arc::new(Mutex::new(None));
+///
+/// let mut taskflow = Taskflow::new();
+/// taskflow.emplace_runtime(make_min_element_task(
+///     Arc::clone(&data),
+///     Arc::clone(&result),
+///     |a: &i32, b: &i32| a < b,
+///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
+/// ));
+///
+/// Executor::new(4).run(&taskflow).wait().expect("no task panicked");
+/// assert_eq!(*result.lock().expect("uncontended"), Some(1));
+/// ```
+pub fn make_min_element_task<T, C, P>(
+    data: Arc<Vec<T>>,
+    result: Arc<Mutex<Option<usize>>>,
+    cmp: C,
+    part: P,
+) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static
+where
+    T: Sync + Send + 'static,
+    C: Fn(&T, &T) -> bool + Sync + Clone + Send + 'static,
+    P: FindPartitioner + Clone + Send + 'static,
+{
+    move |rt: &mut Runtime<'_>| {
+        let mut found = None;
+        rt.min_element(&data, &mut found, cmp.clone(), part.clone());
+        *result.lock().unwrap_or_else(PoisonError::into_inner) = found;
+    }
+}
+
+/// Builds the runtime body of a [`Runtime::max_element`] task: upstream's
+/// `make_max_element_task`, the `max_element` half of the pair
+/// [`make_min_element_task`] documents.
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+///
+/// use rustflow::algorithm::find::make_max_element_task;
+/// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
+/// use rustflow::prelude::*;
+/// use rustflow::Executor;
+///
+/// let data = Arc::new(vec![4, 1, 7, 9]);
+/// let result = Arc::new(Mutex::new(None));
+///
+/// let mut taskflow = Taskflow::new();
+/// taskflow.emplace_runtime(make_max_element_task(
+///     Arc::clone(&data),
+///     Arc::clone(&result),
+///     |a: &i32, b: &i32| a < b,
+///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
+/// ));
+///
+/// Executor::new(4).run(&taskflow).wait().expect("no task panicked");
+/// assert_eq!(*result.lock().expect("uncontended"), Some(3));
+/// ```
+pub fn make_max_element_task<T, C, P>(
+    data: Arc<Vec<T>>,
+    result: Arc<Mutex<Option<usize>>>,
+    cmp: C,
+    part: P,
+) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static
+where
+    T: Sync + Send + 'static,
+    C: Fn(&T, &T) -> bool + Sync + Clone + Send + 'static,
+    P: FindPartitioner + Clone + Send + 'static,
+{
+    move |rt: &mut Runtime<'_>| {
+        let mut found = None;
+        rt.max_element(&data, &mut found, cmp.clone(), part.clone());
+        *result.lock().unwrap_or_else(PoisonError::into_inner) = found;
     }
 }
 
