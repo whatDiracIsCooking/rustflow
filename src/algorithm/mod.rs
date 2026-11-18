@@ -78,6 +78,7 @@ use crate::algorithm::partitioner::{
 };
 
 pub mod fill;
+pub mod find;
 pub mod for_each;
 pub mod for_each_index;
 pub mod generate;
