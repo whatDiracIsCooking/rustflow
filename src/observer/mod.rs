@@ -37,13 +37,6 @@
 //! needs -- means resolving that index back into a node, which takes the
 //! graph too.
 //!
-//! **`task_type_of` here is not [`TaskRef`](crate::TaskRef)'s.** Upstream's
-//! `TaskView::type()` and `Task::type()` share one switch; the port's
-//! equivalent is `task.rs`'s private helper of the same name, which this
-//! module cannot call. The copy below is kept exhaustive over [`Handle`] for
-//! the same reason that one is: a new variant is a compile error here too,
-//! not a silent [`TaskType::Async`].
-
 pub mod chrome;
 pub mod tfprof;
 
@@ -53,8 +46,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::executor::worker::Worker;
-use crate::graph::{Graph, Handle, Node};
-use crate::task::TaskType;
+use crate::graph::{Graph, Node};
+use crate::task::{TaskType, task_type_of};
 
 /// A hook an [`Executor`](crate::Executor) calls around every task a worker
 /// runs, upstream's `ObserverInterface`.
@@ -235,23 +228,6 @@ impl<'a> TaskView<'a> {
         let mut hasher = DefaultHasher::new();
         std::ptr::from_ref(self.node).hash(&mut hasher);
         hasher.finish()
-    }
-}
-
-/// What kind of task `handle` is, as the flat [`TaskType`] enumeration.
-///
-/// The module docs' "Design" section says why this is not a call to
-/// `task.rs`'s own copy of the same mapping. Exhaustive over [`Handle`] on
-/// purpose, for the reason that one is.
-fn task_type_of(handle: &Handle) -> TaskType {
-    match handle {
-        Handle::Placeholder => TaskType::Placeholder,
-        Handle::Static(_) => TaskType::Static,
-        Handle::Condition(_) | Handle::MultiCondition(_) => TaskType::Condition,
-        Handle::Subflow { .. } => TaskType::Subflow,
-        Handle::Runtime(_) | Handle::NonpreemptiveRuntime(_) => TaskType::Runtime,
-        Handle::Module(_) | Handle::AdoptedModule(_) => TaskType::Module,
-        Handle::Async(_) | Handle::DependentAsync(_) => TaskType::Async,
     }
 }
 

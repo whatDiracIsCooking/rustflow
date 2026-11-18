@@ -143,8 +143,10 @@ impl fmt::Display for TaskType {
 /// Upstream switches over `_handle.index()` and ends in `default: UNDEFINED`;
 /// the match here is exhaustive on purpose, so that a new [`Handle`] variant
 /// stops the compiler rather than being reported as
-/// [`TaskType::Undefined`] by a wildcard arm.
-fn task_type_of(handle: &Handle) -> TaskType {
+/// [`TaskType::Undefined`] by a wildcard arm. `pub(crate)` so that
+/// [`crate::observer`]'s `TaskView::task_type` calls this one rather than
+/// keeping a second copy that the exhaustiveness check cannot see across.
+pub(crate) fn task_type_of(handle: &Handle) -> TaskType {
     match handle {
         Handle::Placeholder => TaskType::Placeholder,
         Handle::Static(_) => TaskType::Static,
