@@ -118,6 +118,9 @@ pub mod scan;
 pub mod sort;
 pub mod transform;
 
+pub use crate::algorithm::find::{
+    make_find_if_not_task, make_find_if_task, make_max_element_task, make_min_element_task,
+};
 pub use crate::algorithm::for_each::make_for_each_task;
 pub use crate::algorithm::for_each_index::{
     make_for_each_by_index_nd_task, make_for_each_by_index_task, make_for_each_index_task,
@@ -677,11 +680,7 @@ pub trait AlgorithmBuilder: FlowBuilder {
         F: Fn(&T) -> bool + Sync + Clone + Send + 'static,
         P: FindPartitioner + Clone + Send + 'static,
     {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut found = None;
-            runtime.find_if(&data, &mut found, predicate.clone(), part.clone());
-            *result.lock().unwrap_or_else(PoisonError::into_inner) = found;
-        })
+        self.emplace_runtime(make_find_if_task(data, result, predicate, part))
     }
 
     /// The `find_if_not` half of the pair: see [`AlgorithmBuilder::find_if`].
@@ -697,11 +696,7 @@ pub trait AlgorithmBuilder: FlowBuilder {
         F: Fn(&T) -> bool + Sync + Clone + Send + 'static,
         P: FindPartitioner + Clone + Send + 'static,
     {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut found = None;
-            runtime.find_if_not(&data, &mut found, predicate.clone(), part.clone());
-            *result.lock().unwrap_or_else(PoisonError::into_inner) = found;
-        })
+        self.emplace_runtime(make_find_if_not_task(data, result, predicate, part))
     }
 
     /// The owned-data half of [`Runtime::min_element`]: see
@@ -718,11 +713,7 @@ pub trait AlgorithmBuilder: FlowBuilder {
         C: Fn(&T, &T) -> bool + Sync + Clone + Send + 'static,
         P: FindPartitioner + Clone + Send + 'static,
     {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut found = None;
-            runtime.min_element(&data, &mut found, cmp.clone(), part.clone());
-            *result.lock().unwrap_or_else(PoisonError::into_inner) = found;
-        })
+        self.emplace_runtime(make_min_element_task(data, result, cmp, part))
     }
 
     /// The `max_element` half of the pair: see
@@ -739,11 +730,7 @@ pub trait AlgorithmBuilder: FlowBuilder {
         C: Fn(&T, &T) -> bool + Sync + Clone + Send + 'static,
         P: FindPartitioner + Clone + Send + 'static,
     {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut found = None;
-            runtime.max_element(&data, &mut found, cmp.clone(), part.clone());
-            *result.lock().unwrap_or_else(PoisonError::into_inner) = found;
-        })
+        self.emplace_runtime(make_max_element_task(data, result, cmp, part))
     }
 
     /// Creates a runtime task that locks `out` and runs
