@@ -9,6 +9,8 @@
 //!   integer range and an [`index_range::IndexRange`] respectively.
 //! - [`index_range`] the one-dimensional index range an algorithm walks and
 //!   partitions, `[begin, end)` in steps of `step_size`.
+//! - [`merge`] a parallel merge of two sorted slices into a third, by
+//!   co-rank chunking over [`Runtime::scope`](crate::Runtime::scope).
 //! - [`partitioner`] the strategies that split `[0, n)` into chunks for a
 //!   parallel loop -- static, guided, dynamic and random -- and the closure
 //!   wrapper a caller can run around every chunk's body.
@@ -78,6 +80,7 @@ use crate::algorithm::partitioner::{
 pub mod for_each;
 pub mod for_each_index;
 pub mod index_range;
+pub mod merge;
 pub mod module;
 pub mod partitioner;
 

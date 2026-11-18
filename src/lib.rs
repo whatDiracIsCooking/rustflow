@@ -163,6 +163,7 @@ pub use crate::taskflow::Taskflow;
 pub mod prelude {
     pub use crate::algorithm::for_each::ForEachBuilder;
     pub use crate::algorithm::for_each_index::ForEachIndexBuilder;
+    pub use crate::algorithm::merge::MergeBuilder;
     pub use crate::flow_builder::FlowBuilder;
     pub use crate::graph::{Graph, Handle, Task, Work};
     pub use crate::runtime::Runtime;
