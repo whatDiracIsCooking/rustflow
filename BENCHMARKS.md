@@ -1,12 +1,13 @@
 # Benchmarks
 
-Six of upstream's benchmarks, ported to criterion with a rayon baseline in the
-role TBB's flow graph plays upstream: `linear_chain`, `binary_tree`,
+Seven of upstream's benchmarks, ported to criterion with a rayon baseline in
+the role TBB's flow graph plays upstream: `linear_chain`, `binary_tree`,
 `graph_traversal` and `embarrassing_parallelism` from #18, then `async_task`
-and `fibonacci` from #96, each translated from the matching directory under
-Taskflow v4.1.0's `benchmarks/`. The shapes and the measured regions are
-upstream's; what the sizes, the baseline and the harness are is set out below,
-because a number whose provenance is unstated is not a result.
+and `fibonacci` from #96, then `sort` from #174, each translated from the
+matching directory under Taskflow v4.1.0's `benchmarks/`. The shapes and the
+measured regions are upstream's; what the sizes, the baseline and the
+harness are is set out below, because a number whose provenance is unstated
+is not a result.
 
 The two shapes #96 added are the two with **no graph in them at all** --
 `silent_async` submissions and a recursive spawn -- so the construction
@@ -19,9 +20,10 @@ count* across all six shapes, which changed no shipped code and is the reason
 the count is still `bit_width(num_workers)`. The last section is a fifth run,
 #125's, which changed no shipped code either: it takes the per-task cost of
 the `async_task` shape's external submission apart with counters and
-ablations, and records what it is. The sixth and last is #144's, which makes
-the one change that run named and could not reach: a free async node's arena
-sized to the one node it will ever hold.
+ablations, and records what it is. The sixth is #144's, which makes the one
+change that run named and could not reach: a free async node's arena sized
+to the one node it will ever hold. The seventh and last is #174's, which adds
+the seventh shape, `sort`, and measures it in a run of its own.
 
 ```sh
 devtools/devcontainer.sh bench                        # the whole suite
@@ -1757,3 +1759,63 @@ added to a dispatch that was already reading several others does not have a
 mechanism to cost 9% of a 2 ms run, and this file's standing rule is not to
 chase a number by re-running until the load looks better -- so both numbers
 are reported as measured, with the caveat that earns them.
+
+## sort
+
+`N` random `f64`s, sorted once: upstream's `measure_time_taskflow` builds a
+fresh `tf::Taskflow`, calls `taskflow.sort(vec.begin(), vec.end())` and runs
+it, timing both -- "ours includes building the graph" from this file's own
+header applies here too. `rayon::par_sort_unstable_by` is the baseline, in
+the role TBB's `parallel_sort` plays upstream. Sizes are two points off
+upstream's `N = 10..=1e8` sweep: one inside `src/algorithm/sort.rs`'s own
+cutoff for `f64` (`4096`, under the `< 16` byte bucket), one two orders of
+magnitude past it.
+
+Unlike the six shapes above, this one mutates its input in place, so a plain
+`Bencher::iter` would sort already-sorted data on every sample after the
+first. Each sample here is `Bencher::iter_batched` instead: a fresh shuffle
+in the untimed setup, consumed by the timed sort -- `benches/sort.rs`'s own
+module docs say so, and it is why this table carries no "construction-only"
+column the way `embarrassing_parallelism`'s does: the untimed setup already
+isolates the one cost this shape has that rayon's does not.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id |
+| Date | 2026-11-18 |
+| **Load average** | **11.3 falling to 8.3 over the run** |
+
+Three sibling agents' `cargo` builds were running on this box throughout, so
+this is not a quiet machine -- "The machine, and what it was doing" above has
+the same caveat for the original four shapes, and it applies here unchanged:
+read the within-row comparison, not the absolute figure.
+
+| size | workers | rustflow | rayon | upstream C++ |
+|---|---|---|---|---|
+| 1000 | 1 | 21.61 µs ±1.9% | 12.85 µs ±0.5% | not published |
+| 1000 | 24 | 23.14 µs ±1.7% | 16.87 µs ±1.4% | not published |
+| 1000000 | 1 | 37.12 ms ±0.2% | 25.28 ms ±0.3% | not published |
+| 1000000 | 24 | 10.82 ms ±1.4% | 3.428 ms ±1.0% | not published |
+
+At 1000 elements -- below this type's parallel cutoff on every worker count --
+both columns take their serial path, so the gap is construction and dispatch
+rather than sorting: our run builds a `Taskflow`, hands it to an `Executor`
+and tears both down, where rayon's `install` has no graph to build at all.
+24 workers cost both columns a little at this size, for the reason
+`linear_chain`'s own table gives -- there is nothing here for the other 23 to
+do.
+
+At 1000000 elements the parallel path runs on both sides, and the gap widens
+rather than closes: rayon is 3.6x faster at one worker and 3.2x at 24. Two
+differences compound rather than one. `Runtime::sort_by`'s own partition is a
+single-pivot, three-way split per level against `par_sort_unstable`'s own
+pattern-defeating quicksort, so this crate does strictly more comparisons and
+swaps for the same input; and every spawned half goes through this crate's
+own node machinery -- `Scope::spawn_runtime`, a fresh arena, a join -- where
+rayon's split is a `join` of two closures with one atomic. Both gaps are the
+ones `binary_tree`'s own table already found for a plain increment; sorting
+does not change which one dominates, only how much larger the constant is
+that it is multiplying.
