@@ -36,6 +36,41 @@
 //! reassigning the pointer the loop walks rather than the task that is
 //! walking it. `run_line` below is that function; `active` is upstream's
 //! `pf->_line`.
+//!
+//! **[`Pipeline::reset_pipes`] and [`Pipeline::reset_lines`] rebuild the
+//! whole of [`Pipeline::taskflow`] and the `State` behind it, rather than
+//! mutating the one already built.** Upstream's two `reset` overloads
+//! -- `reset(first, last)`, `reset(num_lines, first, last)` -- read and
+//! write `_pipes`, `_lines` and, for the second, `_graph`/`_tasks` straight
+//! through the `this` pointer every already-built line task's lambda
+//! captures, so a reset upstream performs is visible to a module task that
+//! composed this same object *before* the reset ran, with no rebuild of
+//! that module task needed. A line task's closure here instead captures an
+//! `Arc<State>` by value, and [`FlowBuilder::composed_of`]
+//! hands out a clone of [`Pipeline::taskflow`]'s `Arc` that outlives the
+//! call -- so there is no single allocation this port could mutate in place
+//! that both forms could reach through every already-composed module task
+//! the way upstream's `this` does, not without `unsafe` aliasing of exactly
+//! the kind `DESIGN.md`'s porting posture asks a port to design around
+//! rather than reproduce.
+//!
+//! The safe shape both methods take instead: build a fresh graph and a
+//! fresh `State` -- [`Pipeline::new`]'s own construction, factored out as
+//! `Pipeline::build` -- and replace `self.taskflow`/`self.state` with them.
+//! `reset_pipes` passes the current [`Pipeline::num_lines`] through
+//! unchanged; `reset_lines` passes the new one. Composing this pipeline
+//! (`taskflow.composed_of(&pipeline)`) *before* calling either keeps that
+//! composition pointing at the pre-reset graph, which keeps running exactly
+//! as it did; compose again afterwards to run the new shape. Every call site
+//! in upstream's own `test_scalable_pipelines.cpp` resets before its one
+//! `composed_of` of a given object, never after, so this is not a loss
+//! against how upstream is actually used -- `tests/scalable_pipelines.rs`'s
+//! own module doc says so again, for the tests that exercise it.
+//!
+//! This also settles what a resized line count does to `State::line_tasks`:
+//! nothing, because `reset_lines` never reuses the `State` that field is
+//! on. Each call to `Pipeline::build` makes its own `OnceLock`, set exactly
+//! once during that call, same as [`Pipeline::new`]'s always has been.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -203,9 +238,12 @@ fn lock_pipeflow(slot: &Mutex<Pipeflow>) -> MutexGuard<'_, Pipeflow> {
 }
 
 impl Pipeline {
-    /// Builds a pipeline of up to `num_lines` parallel lines over `pipes`:
-    /// upstream's two constructors, collapsed into one since a `Vec<Pipe>`
-    /// already covers both a fixed list and a runtime-sized one.
+    /// Builds a fresh graph and [`State`] of `num_lines` parallel lines over
+    /// `pipes`: the shared substance of [`Pipeline::new`],
+    /// [`Pipeline::reset_pipes`] and [`Pipeline::reset_lines`], none of which
+    /// differ in anything below this -- only in whether `num_lines` is the
+    /// caller's own [`Pipeline::num_lines`] or a new one, and in what they do
+    /// with the pair this returns.
     ///
     /// # Panics
     ///
@@ -215,8 +253,7 @@ impl Pipeline {
     /// the chain's length is no longer known at compile time), or if the
     /// first pipe is not [`PipeType::Serial`] ("first pipe must be
     /// serial").
-    #[must_use]
-    pub fn new(num_lines: usize, pipes: Vec<Pipe>) -> Self {
+    fn build(num_lines: usize, pipes: Vec<Pipe>) -> (Arc<Taskflow>, Arc<State>) {
         assert!(num_lines > 0, "must have at least one line");
         assert!(!pipes.is_empty(), "must have at least one pipe");
         assert!(
@@ -267,10 +304,25 @@ impl Pipeline {
             .set(line_tasks)
             .expect("a pipeline's line tasks are set exactly once, during construction");
 
-        Self {
-            taskflow: Arc::new(taskflow),
-            state,
-        }
+        (Arc::new(taskflow), state)
+    }
+
+    /// Builds a pipeline of up to `num_lines` parallel lines over `pipes`:
+    /// upstream's two constructors, collapsed into one since a `Vec<Pipe>`
+    /// already covers both a fixed list and a runtime-sized one.
+    ///
+    /// # Panics
+    ///
+    /// Panics with upstream's own messages: if `num_lines` is `0` ("must
+    /// have at least one line"), if `pipes` is empty ("must have at least
+    /// one pipe" -- upstream's `static_assert`, a runtime check here since
+    /// the chain's length is no longer known at compile time), or if the
+    /// first pipe is not [`PipeType::Serial`] ("first pipe must be
+    /// serial").
+    #[must_use]
+    pub fn new(num_lines: usize, pipes: Vec<Pipe>) -> Self {
+        let (taskflow, state) = Self::build(num_lines, pipes);
+        Self { taskflow, state }
     }
 
     /// The number of parallel lines this pipeline was built with: upstream's
@@ -303,6 +355,57 @@ impl Pipeline {
     /// against either.
     pub fn reset(&self) {
         self.state.reset();
+    }
+
+    /// Rebuilds this pipeline over a new chain of pipes, keeping its number
+    /// of lines: upstream's `reset(first, last)`, folded with its sibling
+    /// `ScalablePipeline(num_lines, first, last)` constructor the way
+    /// [`Pipeline::new`] already folds upstream's two. `pipes` is upstream's
+    /// `[first, last)`, already collected -- the port owns its pipes rather
+    /// than aliasing a caller's range, so there is no separate "assign a new
+    /// range" step for this method to need. Every line starts again at pipe
+    /// `0` and the token counter returns to `0`, as a fresh [`Pipeline::new`]
+    /// would report.
+    ///
+    /// Composing this pipeline into a graph (`taskflow.composed_of(&pipeline)`)
+    /// before calling this method leaves that composition pointing at the
+    /// pre-reset graph; this module's `# Design` section says why and what
+    /// to do about it.
+    ///
+    /// # Panics
+    ///
+    /// Panics with upstream's own messages: if `pipes` is empty ("must have
+    /// at least one pipe") or if the first pipe is not [`PipeType::Serial`]
+    /// ("first pipe must be serial"). [`Pipeline::num_lines`] is not
+    /// re-checked, already having been checked nonzero by whichever call
+    /// established it.
+    pub fn reset_pipes(&mut self, pipes: Vec<Pipe>) {
+        let (taskflow, state) = Self::build(self.state.num_lines, pipes);
+        self.taskflow = taskflow;
+        self.state = state;
+    }
+
+    /// Rebuilds this pipeline over a new number of lines and a new chain of
+    /// pipes, as if it had just been built: upstream's
+    /// `reset(num_lines, first, last)`. `pipes` is upstream's `[first,
+    /// last)`, already collected, for the same reason
+    /// [`Pipeline::reset_pipes`]'s is.
+    ///
+    /// Composing this pipeline into a graph (`taskflow.composed_of(&pipeline)`)
+    /// before calling this method leaves that composition pointing at the
+    /// pre-reset graph; this module's `# Design` section says why and what
+    /// to do about it.
+    ///
+    /// # Panics
+    ///
+    /// Panics with upstream's own messages: if `num_lines` is `0` ("must
+    /// have at least one line"), if `pipes` is empty ("must have at least
+    /// one pipe"), or if the first pipe is not [`PipeType::Serial`] ("first
+    /// pipe must be serial").
+    pub fn reset_lines(&mut self, num_lines: usize, pipes: Vec<Pipe>) {
+        let (taskflow, state) = Self::build(num_lines, pipes);
+        self.taskflow = taskflow;
+        self.state = state;
     }
 
     /// Returns a share of the taskflow this pipeline composes into a module
@@ -493,5 +596,138 @@ mod tests {
         executor.run(&taskflow).wait().expect("no task panicked");
         assert_eq!(pipeline.num_tokens(), 4);
         assert_eq!(seen.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "must have at least one pipe")]
+    fn reset_pipes_on_an_empty_list_panics() {
+        let mut pipeline =
+            Pipeline::new(1, vec![Pipe::new(PipeType::Serial, |_: &mut Pipeflow| {})]);
+        pipeline.reset_pipes(vec![]);
+    }
+
+    #[test]
+    #[should_panic(expected = "first pipe must be serial")]
+    fn reset_pipes_onto_a_parallel_first_pipe_panics() {
+        let mut pipeline =
+            Pipeline::new(1, vec![Pipe::new(PipeType::Serial, |_: &mut Pipeflow| {})]);
+        pipeline.reset_pipes(vec![Pipe::new(PipeType::Parallel, |_: &mut Pipeflow| {})]);
+    }
+
+    #[test]
+    #[should_panic(expected = "must have at least one line")]
+    fn reset_lines_to_zero_panics() {
+        let mut pipeline =
+            Pipeline::new(1, vec![Pipe::new(PipeType::Serial, |_: &mut Pipeflow| {})]);
+        pipeline.reset_lines(0, vec![Pipe::new(PipeType::Serial, |_: &mut Pipeflow| {})]);
+    }
+
+    /// [`Pipeline::reset_pipes`] replaces the chain a pipeline runs while
+    /// keeping its line count: the new chain's shape is what
+    /// [`Pipeline::num_pipes`] reports, and composing *after* the call runs
+    /// the new chain, not the one the pipeline was built with.
+    #[test]
+    fn reset_pipes_keeps_the_line_count_and_runs_the_new_chain() {
+        let seen = Arc::new(AtomicUsize::new(0));
+
+        let mut pipeline =
+            Pipeline::new(3, vec![Pipe::new(PipeType::Serial, |_: &mut Pipeflow| {})]);
+        assert_eq!(pipeline.num_lines(), 3);
+        assert_eq!(pipeline.num_pipes(), 1);
+
+        let counted = Arc::clone(&seen);
+        let stop_after_six = Pipe::new(PipeType::Serial, move |pf: &mut Pipeflow| {
+            if pf.token() == 6 {
+                pf.stop();
+                return;
+            }
+            counted.fetch_add(1, Ordering::Relaxed);
+        });
+        let double = Pipe::new(PipeType::Serial, |_: &mut Pipeflow| {});
+        pipeline.reset_pipes(vec![stop_after_six, double]);
+
+        assert_eq!(pipeline.num_lines(), 3);
+        assert_eq!(pipeline.num_pipes(), 2);
+        assert_eq!(pipeline.num_tokens(), 0);
+
+        let mut taskflow = Taskflow::new();
+        let module = taskflow.composed_of(&pipeline);
+        taskflow.task(module).name("module_of_pipeline");
+
+        let executor = Executor::new(2);
+        executor.run(&taskflow).wait().expect("no task panicked");
+
+        assert_eq!(pipeline.num_tokens(), 6);
+        assert_eq!(seen.load(Ordering::Relaxed), 6);
+    }
+
+    /// [`Pipeline::reset_lines`] replaces both the line count and the chain:
+    /// the rebuilt pipeline's accessors report the new shape, and a module
+    /// composed from it after the call runs across the new number of lines.
+    #[test]
+    fn reset_lines_changes_both_the_line_count_and_the_chain() {
+        let seen = Arc::new(AtomicUsize::new(0));
+
+        let mut pipeline =
+            Pipeline::new(1, vec![Pipe::new(PipeType::Serial, |_: &mut Pipeflow| {})]);
+        assert_eq!(pipeline.num_lines(), 1);
+
+        let counted = Arc::clone(&seen);
+        let stop_after_nine = Pipe::new(PipeType::Serial, move |pf: &mut Pipeflow| {
+            if pf.token() == 9 {
+                pf.stop();
+                return;
+            }
+            assert_eq!(pf.token() % 5, pf.line());
+            counted.fetch_add(1, Ordering::Relaxed);
+        });
+        pipeline.reset_lines(5, vec![stop_after_nine]);
+
+        assert_eq!(pipeline.num_lines(), 5);
+        assert_eq!(pipeline.num_pipes(), 1);
+        assert_eq!(pipeline.num_tokens(), 0);
+
+        let mut taskflow = Taskflow::new();
+        let module = taskflow.composed_of(&pipeline);
+        taskflow.task(module).name("module_of_pipeline");
+
+        let executor = Executor::new(3);
+        executor.run(&taskflow).wait().expect("no task panicked");
+
+        assert_eq!(pipeline.num_tokens(), 9);
+        assert_eq!(seen.load(Ordering::Relaxed), 9);
+    }
+
+    /// A pipeline composed into a graph before [`Pipeline::reset_lines`] is
+    /// called leaves that composition running the pre-reset graph, exactly
+    /// as the module doc says: this is the one place that claim is checked
+    /// directly, with the second run's lines and token count coming out
+    /// unchanged by a reset the already-composed module never sees.
+    #[test]
+    fn reset_lines_after_composing_does_not_affect_the_existing_composition() {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&seen);
+        let pipe = Pipe::new(PipeType::Serial, move |pf: &mut Pipeflow| {
+            if pf.token() == 3 {
+                pf.stop();
+                return;
+            }
+            counted.fetch_add(1, Ordering::Relaxed);
+        });
+        let mut pipeline = Pipeline::new(2, vec![pipe]);
+
+        let mut taskflow = Taskflow::new();
+        let module = taskflow.composed_of(&pipeline);
+        taskflow.task(module).name("module_of_pipeline");
+
+        // Reset *after* composing: the module above keeps the taskflow it
+        // was handed at compose time, not whatever `pipeline` points to now.
+        pipeline.reset_lines(4, vec![Pipe::new(PipeType::Serial, |_: &mut Pipeflow| {})]);
+        assert_eq!(pipeline.num_lines(), 4);
+
+        let executor = Executor::new(2);
+        executor.run(&taskflow).wait().expect("no task panicked");
+
+        assert_eq!(seen.load(Ordering::Relaxed), 3);
     }
 }
