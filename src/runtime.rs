@@ -8,21 +8,13 @@
 //!
 //! # Design
 //!
-//! There is no `executor()`, where upstream's `Runtime` holds an `Executor&`
-//! and hands it back: a worker thread holds the executor's shared state
-//! rather than the `Executor` value, and `DESIGN.md` has why a runtime or
-//! subflow handle therefore cannot reproduce the member.
-//! [`Runtime::num_workers`] stands in its place, and a body that genuinely
-//! needs the executor captures an `Arc<Executor>` as this crate's
-//! [`corun`](crate::Executor::corun) doctests do.
+//! There is no `executor()`; `DESIGN.md` has why a runtime or subflow handle
+//! cannot reproduce upstream's member, and [`Runtime::num_workers`] stands
+//! in its place.
 //!
-//! Which nodes are handed one -- a runtime task of a graph, or a free node
-//! whose body is runtime-shaped -- is `executor::runtime`, and the eight
-//! forms a body has for spawning work *under* its own node are
-//! `executor::runtime_async`. Such a child is the only work a
-//! [`Runtime::corun`] waits for; a task the body
-//! [`schedule`](Runtime::schedule)s is a sibling, counted against this
-//! node's parent instead. Upstream's `NonpreemptiveRuntime` is not ported.
+//! Which nodes are handed one is `executor::runtime`, and the eight forms a
+//! body has for spawning work under its own node are `executor::runtime_async`.
+//! Upstream's `NonpreemptiveRuntime` is not ported.
 
 use core::fmt;
 
@@ -42,30 +34,24 @@ pub struct Runtime<'a> {
     /// The worker running the body, upstream's `_worker`.
     pub(crate) worker: &'a Worker,
     /// The node the body is running on, upstream's `_node`: the anchor a
-    /// `corun` waits on, and the node whose join counter work spawned by the
-    /// body counts down. It is `job`'s own node, resolved once by whoever
-    /// builds the handle rather than on each access, a job of a nested graph
-    /// resolving its task index along a path of owners.
+    /// `corun` waits on and the node whose join counter spawned work counts
+    /// down. `job`'s own node, resolved once by whoever builds the handle.
     pub(crate) node: &'a Node,
     /// The job the node was dequeued as, which is what upstream reaches
-    /// through `_node->_parent` and `_node->_topology`: the run this task is
-    /// part of, the graph its siblings live in, and the parent a task this
-    /// body schedules is counted against. `executor::topology` says why all
-    /// of that travels with the job rather than sitting on the node.
+    /// through `_node->_parent` and `_node->_topology`: the run, the graph
+    /// its siblings live in, and the parent a scheduled task is counted
+    /// against.
     pub(crate) job: &'a Job,
     /// The scheduling loop of the worker running the body: upstream's
     /// `Worker&` wherever it hands one to `_schedule` or `_corun_until`, held
-    /// mutably because a corun re-enters that loop and the owning end of a
-    /// worker's queue is the one thing a shared [`Worker`] cannot lend out --
-    /// `executor::worker` says why a worker is two types here.
+    /// mutably because a corun re-enters that loop.
     pub(crate) thread: &'a mut WorkerThread,
 }
 
 impl<'a> Runtime<'a> {
     /// Builds the handle for a runtime task running on `node`, the node
     /// `job` is for. `pub(crate)` where upstream's constructor is private
-    /// with `friend class Executor`: the job and the worker's scheduling loop
-    /// are crate-private types a public constructor would leak.
+    /// with `friend class Executor`.
     pub(crate) fn new(
         worker: &'a Worker,
         node: &'a Node,
@@ -88,11 +74,8 @@ impl<'a> Runtime<'a> {
     }
 
     /// Returns the id of the worker running this runtime task's body, an
-    /// index in `0..`[`Runtime::num_workers`].
-    ///
-    /// [`Runtime::worker`]`().id()` in one hop, for a body that wants only
-    /// the number -- to seed a per-worker random number generator, say, as a
-    /// parallel algorithm's own partitioner may.
+    /// index in `0..`[`Runtime::num_workers`]: [`Runtime::worker`]`().id()`
+    /// in one hop.
     ///
     /// ```
     /// use rustflow::prelude::*;
@@ -112,10 +95,7 @@ impl<'a> Runtime<'a> {
     }
 
     /// How many workers the executor running this task has: the part of
-    /// upstream's `executor()` that a runtime body can see, written
-    /// `rt.executor().num_workers()` there. The same answer
-    /// [`Executor::num_workers`](crate::Executor::num_workers) gives, read
-    /// out of the state the worker shares with it.
+    /// upstream's `rt.executor().num_workers()` a runtime body can see.
     #[must_use]
     pub fn num_workers(&self) -> usize {
         self.thread.shared.workers.len()

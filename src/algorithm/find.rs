@@ -17,8 +17,8 @@
 //! match". [`FindPartitioner::drive_find`] is the `bool`-returning shape
 //! instead, built on [`crate::algorithm::partitioner::StaticLoop::loop_static_until`]
 //! and [`crate::algorithm::partitioner::DynamicLoop::loop_dynamic_until`] --
-//! the two methods #165 already added for exactly this -- the same sealed,
-//! four-times-implemented shape `SlicePartitioner` uses, duplicated here
+//! the two methods the partitioners already added for exactly this -- the
+//! same sealed, four-times-implemented shape `SlicePartitioner` uses, duplicated here
 //! rather than shared, since the two traits answer different questions over
 //! different element types (`&mut [T]` there, `&[T]` here) and a single
 //! trait trying to cover both would need the same `if constexpr` Rust has

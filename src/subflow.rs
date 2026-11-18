@@ -12,23 +12,14 @@
 //!
 //! # Design
 //!
-//! Two of `DESIGN.md`'s decisions shape this file. The subgraph carries its
-//! own `Mutex` (see [`crate::Handle::Subflow`]) where upstream's handle holds
-//! a `Graph&` it reaches through a `Node*`, and running the subgraph
-//! **leases** it, moving the graph out of that `Mutex` for the length of the
-//! nested run -- which is why the guard here is an [`Option`]: taking the
-//! lease needs `&mut Graph`, so the guard goes first. A `join` hands it over,
-//! coruns the graph and takes a fresh guard before returning, where the
-//! implicit join the dispatch arm performs takes the guard for good.
-//!
-//! What the lock does *not* do is keep one node to one entry. A graph out on
-//! lease leaves the node's slot empty and *unlocked*, so a second entry to a
-//! node whose subgraph is still running finds the lock free; refusing that
-//! entry -- a taskflow composing itself re-arms a node the run has preempted
-//! -- is `executor::module`'s, that being what knows a node is mid-entry. Nor
-//! can the lock deadlock a body, the only graph a body locks being its own
-//! node's. There is no `executor()` accessor either, for the reason
-//! `DESIGN.md` gives, and [`Subflow::num_workers`] stands in its place.
+//! `DESIGN.md` has the subgraph's `Mutex<Graph>` and the lease that moves it
+//! out for the length of a run, the module task that refuses to re-enter a
+//! node its own run is already inside of, and why there is no `executor()`
+//! accessor, [`Subflow::num_workers`] standing in its place. The `Option`
+//! guard here is the lease's shape on this side: taking it needs
+//! `&mut Graph`, so the guard goes first, and a `join` takes a fresh one
+//! before returning while the implicit join the dispatch arm performs takes
+//! it for good.
 
 use core::fmt;
 use std::mem;
@@ -69,17 +60,13 @@ use crate::graph::{Graph, Node};
 /// assert!(taskflow.graph().node(b).handle().is_subflow());
 /// ```
 pub struct Subflow<'a> {
-    /// The worker running the body, upstream's `_worker` -- the thread-side
-    /// state of it rather than the record every thread shares, that being
-    /// what a corun loop needs. The `&mut` is the whole of "only the worker
-    /// that spawns this subflow can join it": the one frame that can lend it
-    /// is the dispatch arm on this worker's own stack.
+    /// The worker running the body, upstream's `_worker`: the thread-side
+    /// state a corun loop needs. The `&mut` is the whole of "only the
+    /// worker that spawns this subflow can join it".
     pub(crate) worker: &'a mut WorkerThread,
     /// The job the worker dequeued to run this subflow task, which owns the
     /// run, the graph the node lives in and the parent chain above it.
-    ///
-    /// Upstream needs nothing here, reaching both through its `Node*`;
-    /// neither link is on a node in this port -- see `executor::topology`.
+    /// Upstream needs nothing here, reaching both through its `Node*`.
     pub(crate) job: &'a Job,
     /// The node the body is running on, upstream's `_node`. The two subflow
     /// state bits live in its `nstate` word.
@@ -90,10 +77,8 @@ pub struct Subflow<'a> {
     pub(crate) slot: &'a Mutex<Graph>,
     /// The subgraph, locked for as long as the body is building it:
     /// upstream's `FlowBuilder::_graph`, which it gets by inheritance.
-    ///
-    /// `None` only while the graph is out on lease -- inside a `join`, and
-    /// after the arm has taken it to schedule -- which is why every accessor
-    /// below expects it to be there: no user code runs in either window.
+    /// `None` only while the graph is out on lease, which is why every
+    /// accessor below expects it to be there: no user code runs then.
     pub(crate) subgraph: Option<MutexGuard<'a, Graph>>,
 }
 
@@ -103,14 +88,10 @@ impl<'a> Subflow<'a> {
     ///
     /// Upstream's constructor does three things and so does this one: take
     /// the subgraph, clear `JOINED_SUBFLOW | RETAIN_SUBFLOW` and empty the
-    /// graph -- all three because "there could have iterative control flow",
-    /// in upstream's words: a conditioner can send the run back round to this
-    /// node, and the second entry must not inherit the first one's answers
+    /// graph, because a conditioner can send the run back round to this node
+    /// and the second entry must not inherit the first one's answers
     /// (upstream's `Subflow.BitState`, ported in `tests/subflows.rs`).
-    ///
-    /// `pub(crate)` where upstream's is private with `friend class Executor`:
-    /// the job and the worker thread it takes are not types a caller outside
-    /// the crate can name.
+    /// `pub(crate)` where upstream's is private with `friend class Executor`.
     ///
     /// # Panics
     ///
@@ -159,15 +140,9 @@ impl<'a> Subflow<'a> {
     }
 
     /// Returns `true` if this subflow's graph will survive the join,
-    /// upstream's `retain()`.
-    ///
-    /// Reads [`Node::RETAIN_SUBFLOW`], and the default is `false`: the
-    /// runtime clears a subflow's graph once it has been joined, so that a
-    /// recursive subflow does not accumulate every generation of children it
-    /// ever spawned. Set it to keep the graph for something that wants to
-    /// look at it afterwards, a DOT dump above all -- what it answers is what
-    /// the *node* says, keeping the graph being best-effort as
-    /// [`Subflow::set_retain`] sets out.
+    /// upstream's `retain()`. Reads [`Node::RETAIN_SUBFLOW`]; the default is
+    /// `false`, so a recursive subflow does not accumulate every generation
+    /// of children it ever spawned. [`Subflow::set_retain`] sets it.
     #[must_use]
     pub fn retain(&self) -> bool {
         self.node.nstate().load(Ordering::Relaxed) & Node::RETAIN_SUBFLOW != 0
@@ -177,24 +152,11 @@ impl<'a> Subflow<'a> {
     /// `retain(bool)`.
     ///
     /// Renamed where upstream overloads one name for getter and setter, as
-    /// [`crate::TaskRef::name`] and [`crate::TaskMut::name`] are. Two rules
-    /// come with it, both out of the lease and both argued in `DESIGN.md`.
-    ///
-    /// **Set it before the join it is meant to keep.** Whoever releases the
-    /// lease reads this bit, and in the one case the lease does not come home
-    /// with the `join` -- a straggling job of a graph nested in the subgraph
-    /// still holding a share -- that reader is the job rather than the body's
-    /// own frame. A `set_retain(true)` after the join is therefore honoured
-    /// almost always and not reliably.
-    ///
-    /// **Keeping the graph is best-effort.** The lease goes back under
-    /// [`Mutex::try_lock`], never a blocking lock, because the thread
-    /// releasing it is a worker the rest of the run needs; a node locked at
-    /// that moment -- a concurrent [`crate::Taskflow::dump`] reading the
-    /// cluster is the realistic case -- costs the graph, which is dropped as
-    /// an unretained one would be and reported nowhere. So a dump that has to
-    /// see a subgraph is one taken when the taskflow is idle, which is
-    /// upstream's own advice.
+    /// [`crate::TaskRef::name`] and [`crate::TaskMut::name`] are. `DESIGN.md`
+    /// has the two rules that come with it -- set before the join it is
+    /// meant to keep, and best-effort since the lease goes back under
+    /// [`Mutex::try_lock`] -- under "A subgraph is leased for the length of
+    /// its run".
     pub fn set_retain(&mut self, retain: bool) {
         if retain {
             self.node
@@ -237,11 +199,10 @@ impl<'a> Subflow<'a> {
             .expect("a subflow body always holds its subgraph")
     }
 
-    /// Takes the graph the body has built out of the node, leaving the node's
-    /// slot empty and this handle without a guard: the **lease**, and the one
-    /// operation it needs from this file. A missing guard is tolerated, that
-    /// being the state a body which unwound out of a `join` leaves behind --
-    /// the graph is in the slot either way, so this takes the lock itself.
+    /// Takes the graph the body has built out of the node, leaving the
+    /// node's slot empty and this handle without a guard: the **lease**. A
+    /// missing guard is tolerated -- a body unwound out of a `join` leaves
+    /// one -- by taking the lock itself.
     pub(crate) fn take_subgraph(&mut self) -> Graph {
         let mut subgraph = match self.subgraph.take() {
             Some(subgraph) => subgraph,
@@ -251,16 +212,12 @@ impl<'a> Subflow<'a> {
     }
 
     /// Takes a guard on the node's subgraph again, putting `graph` back in
-    /// the node's slot if the lease came home with it -- which is what
-    /// `Subflow::join` does on its way out: `Some` is the lease it took back
-    /// itself, `None` the rare case where a straggling job of a nested graph
-    /// still held a share and will apply the clear-unless-retain policy
-    /// through its own `Drop`, leaving the body an empty graph.
-    ///
-    /// Blocking rather than [`Mutex::try_lock`], the opposite of
-    /// [`Subflow::new`]'s choice and right for the opposite reason: a
-    /// contended lock here is a [`crate::Taskflow::dump`] or a previous
-    /// entry's lease going home, neither of which can wait on this worker.
+    /// the node's slot if the lease came home with it: `Some` is `join`
+    /// taking its own lease back, `None` a straggling job's `Drop` leaving
+    /// the body an empty graph instead. Blocking rather than
+    /// [`Mutex::try_lock`], the opposite of [`Subflow::new`]'s choice: a
+    /// contended lock here is a dump or a previous lease going home,
+    /// neither of which can wait on this worker.
     pub(crate) fn relock(&mut self, graph: Option<Graph>) {
         let mut subgraph = lock_subgraph(self.slot);
         if let Some(graph) = graph {
@@ -308,10 +265,9 @@ impl fmt::Debug for Subflow<'_> {
     }
 }
 
-/// Locks a subflow node's subgraph, taking a poisoned lock's contents rather
-/// than failing on them: poison means some body panicked, not that the graph
-/// is unreadable, as [`Subflow::new`] and [`crate::Taskflow::dump`] read it
-/// too.
+/// Locks a subflow node's subgraph, taking a poisoned lock's contents
+/// rather than failing on them: poison means some body panicked, not that
+/// the graph is unreadable.
 fn lock_subgraph(slot: &Mutex<Graph>) -> MutexGuard<'_, Graph> {
     slot.lock().unwrap_or_else(PoisonError::into_inner)
 }

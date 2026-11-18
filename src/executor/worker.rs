@@ -13,17 +13,13 @@
 //!
 //! **A worker is two types here and one upstream.** Upstream's `Worker` holds
 //! the id, the sticky victim, the generator, the queue, the thread handle and
-//! the `done` flag in one struct, because C++ lets the executor reach into a
-//! worker from any thread and leaves "only the owner pops its own queue" as a
-//! comment. Here the compiler asks which fields are shared: [`Worker`] is the
-//! part other threads touch and is `Sync`, and `WorkerThread` is the part only
-//! the worker's own thread touches, created inside the spawned thread and
-//! moving nowhere -- so that rule is a property of where the value lives. A
-//! corun loop starts inside a task body, itself inside the `WorkerThread`
-//! frame already running that worker's loop, which the code it calls cannot
-//! name, so it gets a second view: `LocalQueue`. Upstream's `_thread` has no
-//! equivalent, a `JoinHandle` being owned by whoever will join it, which costs
-//! the port its trick of setting thread affinity from the prologue.
+//! the `done` flag in one struct, leaving "only the owner pops its own queue"
+//! as a comment. Here the compiler asks which fields are shared: [`Worker`]
+//! is the part other threads touch and is `Sync`, and `WorkerThread` is the
+//! part only the worker's own thread touches, created inside the spawned
+//! thread and moving nowhere. A corun loop starts inside a task body, itself
+//! inside the `WorkerThread` frame already running that worker's loop, which
+//! the code it calls cannot name, so it gets a second view: `LocalQueue`.
 //!
 //! **Conditional scheduling.** A conditioner -- [`Handle::Condition`] or
 //! [`Handle::MultiCondition`] -- is the one node kind that picks its own
@@ -39,18 +35,16 @@
 //!
 //! A selected successor has its join counter *stored to zero* rather than
 //! decremented: upstream's "zeroing the join counter for invariant", the
-//! invariant being that a counter reads zero exactly when the node is ready to
-//! run, which a node entered through a weak edge cannot reach by arithmetic --
-//! a cycle may re-enter it before its strong predecessors run again. Hence
-//! upstream's one rule for writing a conditional graph (its
-//! `ConditionalTasking` page): **a task reached through a condition must be
-//! reachable only through that condition.** A weak successor with a strong
-//! predecessor can start before that predecessor has run, and one two
-//! conditioners both select may start twice at once, which
-//! [`Work::invoke`](crate::Work::invoke) reports as a violated
-//! one-worker-per-node promise; neither is diagnosed when the graph is built,
-//! as upstream does not diagnose them either. None of this state outlives a
-//! run, every node being re-armed before the next run's sources are queued.
+//! invariant being that a counter reads zero exactly when the node is ready
+//! to run, which a node entered through a weak edge cannot reach by
+//! arithmetic. Hence upstream's one rule for writing a conditional graph:
+//! **a task reached through a condition must be reachable only through that
+//! condition** -- violating it is undiagnosed when the graph is built, as
+//! upstream does not diagnose it either, and surfaces as
+//! [`Work::invoke`](crate::Work::invoke)'s one-worker-per-node report if two
+//! conditioners both select the same node at once. None of this state
+//! outlives a run, every node being re-armed before the next run's sources
+//! are queued.
 
 use std::any::Any;
 use std::hash::{DefaultHasher, Hash, Hasher};

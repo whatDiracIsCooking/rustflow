@@ -17,59 +17,29 @@
 //! # Design
 //!
 //! **`make_observer` takes a built value, not constructor arguments.**
-//! Upstream's is a variadic template, `make_observer<Observer, ArgsT...>`,
-//! which forwards `args` into `std::make_shared<Observer>(args...)`: the
-//! executor builds the observer. Rust generics are not variadic, so the
-//! natural shape is the other half of that call -- the caller builds an `O`
-//! and hands it over, and
+//! Upstream's is a variadic template; the natural Rust shape is the other
+//! half of that call -- the caller builds an `O` and hands it over, and
 //! [`Executor::make_observer`](crate::Executor::make_observer) does the
 //! `Arc::new` and the `set_up` upstream's does.
 //!
 //! **A worker's queue answers only `is_queue_empty`, not `queue_size` or
-//! `queue_capacity`.** This is not a choice this module makes: it inherits
-//! [`Worker::is_queue_empty`](crate::executor::worker::Worker::is_queue_empty)'s
-//! own, upstream's bounded `wsq_type` reporting a size and a capacity that a
-//! `crossbeam_deque::Worker` -- unbounded, and read only from the stealing
-//! side here -- cannot answer the same way. [`WorkerView`] is a thin wrapper
-//! over [`Worker`] and repeats exactly what it already exposes rather than
-//! a second, inconsistent answer to the same question.
+//! `queue_capacity`,** and **the registered list is one atomic check on the
+//! path with no observers, and a mutex only when there is work to do** --
+//! `DESIGN.md` has both, under "Decisions taken in M7".
 //!
 //! **`TaskView` borrows a node and the graph it lives in, not a node and the
-//! index that names it.** Upstream's holds a `const Node&` alone, because a
-//! predecessor or successor is itself a `Node*` in its edge list; a
+//! index that names it.** Upstream's holds a `const Node&` alone; a
 //! predecessor here is a [`Task`](crate::Task) index, so answering "is this
-//! predecessor a conditioner" -- what
-//! [`TaskView::num_weak_dependencies`] needs -- means resolving that index
-//! back into a node, which takes the graph too. Nothing it answers needs
-//! *this* node's own index, so the two scheduling seams in
-//! `executor::worker` -- `observer_prologue` and `observer_epilogue`, both
-//! private to that module -- never have to name it either.
-//!
-//! **The registered list is one atomic check on the path with no observers,
-//! and a mutex only when there is work to do.** Upstream's own
-//! `_observer_prologue`/`_observer_epilogue` iterate `_observers` -- an
-//! `unordered_set` -- under no lock at all, relying on nothing ever mutating
-//! it while a run is in flight, which upstream's own docs do not promise and
-//! this port will not assume. The crate-private `ObserverList` instead keeps
-//! a plain `AtomicUsize` count beside the list: the empty check both seams
-//! open with is one relaxed load, the common case this module exists to
-//! keep cheap, and `ObserverList::insert` and `ObserverList::remove` --
-//! called rarely, never from a worker's hot path -- are the only two callers
-//! that take the list's mutex to write it. A non-empty seam takes that same
-//! mutex once, to clone the `Arc`s it is about to call into a `Vec` of its
-//! own, and
-//! releases it before calling anything: an observer that itself calls back
-//! into [`Executor::make_observer`](crate::Executor::make_observer) or
-//! [`Executor::remove_observer`](crate::Executor::remove_observer) --
-//! unusual, but nothing stops it -- cannot deadlock against the seam that is
-//! visiting it.
+//! predecessor a conditioner" -- what [`TaskView::num_weak_dependencies`]
+//! needs -- means resolving that index back into a node, which takes the
+//! graph too.
 //!
 //! **`task_type_of` here is not [`TaskRef`](crate::TaskRef)'s.** Upstream's
-//! `TaskView::type()` and `Task::type()` share one `Node::_handle.index()`
-//! switch; the port's equivalent is `task.rs`'s private helper of the same
-//! name, which this module cannot call. The copy below is kept exhaustive
-//! over [`Handle`] for the same reason that one is: a new variant is a
-//! compile error here too, not a silent [`TaskType::Async`].
+//! `TaskView::type()` and `Task::type()` share one switch; the port's
+//! equivalent is `task.rs`'s private helper of the same name, which this
+//! module cannot call. The copy below is kept exhaustive over [`Handle`] for
+//! the same reason that one is: a new variant is a compile error here too,
+//! not a silent [`TaskType::Async`].
 
 pub mod chrome;
 pub mod tfprof;
