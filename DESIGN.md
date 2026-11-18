@@ -768,3 +768,31 @@ entry above does.
   each other the way one starves itself. Every blocking wait on a nested graph
   in the crate is this loop: `Subflow::join` (#50), `Runtime::corun` (#51) and
   `TaskGroup::corun` (#93) as much as `Executor::corun` itself.
+
+## Decisions taken in M7
+
+- **A scoped spawn, and the crate's second `unsafe` module** (issue #164).
+  `Runtime::scope` is this port's own addition -- upstream has nothing to
+  translate -- because the existing async family
+  (`executor::runtime_async`) only ever hands a body `Send + 'static` work,
+  so a runtime task that wants a handful of children to write into a slice
+  it already owns has had to put that slice behind an `Arc` for no reason
+  but the bound. The alternative that stayed on the table was *nothing*:
+  keep every body `'static`, as the crate has since M1, and leave a caller
+  to reach for `Arc` itself. That is declined because the cost then falls on
+  every caller of the pattern rather than on the one place that removes it,
+  and because Rayon's `scope` is exactly this shape, already proven in the
+  ecosystem it was borrowed from.
+
+  The erasure that makes a borrowed child sound to hand to
+  `Runtime::silent_async` is one `unsafe` transmute, in a module of its own
+  (`src/executor/scope.rs`) rather than folded into `executor::runtime`, so
+  that "no `unsafe` outside N modules" stays a short, auditable list rather
+  than a search through every module that touches a `Runtime`. The module's
+  own `# Design` section has the argument for why the erasure is sound here
+  specifically -- a `RefCell` rather than `Sync` closes off the one
+  cross-thread attack `std::thread::scope`'s identical invariant marker
+  defends against, so nothing spawned through `Scope` can ever reach the
+  same scope a sibling is borrowing from -- and `tests/loom_scope.rs` is the
+  model, checked against the mutation of skipping the join `scope` performs
+  on every path out of it.
