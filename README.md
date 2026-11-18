@@ -26,15 +26,19 @@ module and write their worker matrices through a macro. The decisions are in
 [`DESIGN.md`](DESIGN.md) under "Decisions taken in M6", one entry each, and
 "Order of work" below records where the milestone sits.
 
-All of that is written with **no `unsafe` outside one module**: every `unsafe`
-block in the crate is in `src/executor/notifier.rs`, where a worker about to
-park publishes its thread handle into the lock-free waiter stack and the
-notifier that pops it reads it back. The scheduler itself has none — it was
-the ownership discipline described under "A run owns the graph it walks" in
-[`DESIGN.md`](DESIGN.md) that removed the last one, and every slice of dynamic
-tasking and of the async family since has stayed inside it, which is worth
-saying out loud because a work-stealing scheduler is not where a reader
-expects to find that.
+All of that is written with **no `unsafe` outside two modules**: one is
+`src/executor/notifier.rs`, where a worker about to park publishes its thread
+handle into the lock-free waiter stack and the notifier that pops it reads it
+back; the other is `src/executor/scope.rs`, added in M7, where
+`Runtime::scope` erases a borrowed child closure's lifetime to the `'static`
+bound `Runtime::silent_async` needs, sound only because `scope` joins every
+child — run to completion, panicked, or dropped unstarted — before it
+returns. The scheduler itself has none — it was the ownership discipline
+described under "A run owns the graph it walks" in [`DESIGN.md`](DESIGN.md)
+that removed the last one, and every slice of dynamic tasking and of the
+async family since has stayed inside it, which is worth saying out loud
+because a work-stealing scheduler is not where a reader expects to find
+that.
 
 ## Getting a toolchain
 

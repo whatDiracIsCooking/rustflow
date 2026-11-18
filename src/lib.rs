@@ -132,6 +132,7 @@ pub use crate::executor::corun::CorunError;
 pub use crate::executor::queue::{Buffers, Thief, WorkerQueue};
 pub use crate::executor::rng::{Xorshift32, Xorshift64};
 pub use crate::executor::run_handle::{Canceller, RunError, RunHandle};
+pub use crate::executor::scope::Scope;
 pub use crate::executor::subflow::JoinError;
 pub use crate::executor::worker::{Worker, WorkerInterface};
 pub use crate::flow_builder::{Callables, FlowBuilder};
