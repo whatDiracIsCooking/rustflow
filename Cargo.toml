@@ -49,10 +49,10 @@ loom = "=0.7.3"
 
 # Dev-only, and that distinction is the dependency policy's: a dev dependency
 # "need only be useful", while a runtime one has to replace something upstream
-# hand-wrote. Neither of these is in the library -- `cargo bench --no-run` is
-# the only thing that builds them -- so the shipped crate is still the two
-# crossbeam crates and nothing else. Pinned exactly, like every other
-# dependency here.
+# hand-wrote. None of these is in the library -- `cargo bench --no-run` and
+# `cargo test` are the only things that build them -- so the shipped crate is
+# still the two crossbeam crates and nothing else. Pinned exactly, like every
+# other dependency here.
 #
 # `criterion` with no default features: the default set is
 # `rayon + plotters + cargo_bench_support`, and `plotters` only draws the SVGs
@@ -61,11 +61,21 @@ loom = "=0.7.3"
 # `cargo_bench_support` is what lets a criterion harness run under plain
 # `cargo bench` at all, and `rayon` is criterion's own analysis parallelism,
 # free here because the benchmarks depend on rayon anyway.
+#
+# `proptest` with no default features either, for `tests/properties.rs`: it
+# generates the inputs the algorithm family is checked against `std` over, and
+# the one feature kept, `std`, is what the generated case needs to run a real
+# executor at all. Dropped with the default set are `fork` and `timeout`, which
+# run each case in a subprocess under a wall-clock limit (`rusty-fork`,
+# `wait-timeout`, `tempfile`) -- a case here is a graph run, not something that
+# may abort the harness -- and `bit-set`, which only swaps in a denser bitset
+# for shrinking than the fallback proptest ships.
 [dev-dependencies]
 criterion = { version = "=0.8.2", default-features = false, features = [
     "cargo_bench_support",
     "rayon",
 ] }
+proptest = { version = "=1.12.0", default-features = false, features = ["std"] }
 rayon = "=1.12.0"
 
 # `harness = false` on each: criterion brings its own `main`, and libtest's
