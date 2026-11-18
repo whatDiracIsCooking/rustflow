@@ -16,6 +16,16 @@ open on follow-ups rather than on the feature — the performance ones are named
 under "Performance", below. The toolchain, container setup and CI gate all of
 it rides on were in place and verified first.
 
+A **consolidation milestone** then ran between steps 5 and 6, and it changed
+no public API: what it changed is what a reader of the source meets. The async
+family's 24 public methods are one-line delegations onto a single core over
+two carriers; `executor::topology`, which was one 2,352-line file, is a module
+tree split by what owns what; every doc comment in the crate is held to a
+written documentation contract, and the integration suites share one test
+module and write their worker matrices through a macro. The decisions are in
+[`DESIGN.md`](DESIGN.md) under "Decisions taken in M6", one entry each, and
+"Order of work" below records where the milestone sits.
+
 All of that is written with **no `unsafe` outside one module**: every `unsafe`
 block in the crate is in `src/executor/notifier.rs`, where a worker about to
 park publishes its thread handle into the lock-free waiter stack and the
@@ -230,7 +240,9 @@ the same split:
   `crossbeam-epoch`, which `crossbeam-deque` pulls in itself. Anything optional
   goes behind a Cargo feature so the default build stays at those two.
 - **Dev** dependencies need only be useful: `loom` for the lock-free parts
-  and the wake-ordering protocol (`tests/loom_*.rs`),
+  and for the two orderings a machine-checked model states better than a
+  paragraph — the wake-after-last-release rule and the delivery of a failure
+  under a runtime task (`tests/loom_*.rs`, one model each),
   `criterion` for the ported benchmarks, `rayon` as the baseline those
   benchmarks compare against, in the role TBB plays upstream.
 
@@ -277,7 +289,8 @@ that happen to look good:
   it allocates (#125), and that too is the design rather than a tuning gap.
   The one part of it that *was* a tuning gap is gone: the node's one-node
   arena no longer carries a `Vec`'s spare capacity, which was 528 of the 848
-  bytes a task and 6% of the path (#144).
+  bytes a task, 6 to 7% of this path and five times that on the one a *worker*
+  submits from (#144).
 - **The continuation optimisation** (issue #62). Upstream's `_update_cache` /
   `TF_INVOKE_CONTINUATION` keeps one ready successor out of the queue and
   resumes it on the worker that just finished its predecessor, so a chain runs
@@ -300,3 +313,16 @@ Each step is a milestone of PR-sized issues; the upstream unit tests under
 5. **Async** — async and dependent-async tasks, task groups, semaphores.
 6. **Observers and algorithms** — partitioners, `for_each`, `reduce`, `sort`.
 7. **Pipelines** — the one family with no Rust equivalent.
+
+One milestone has no step number: a **consolidation** ran between 5 and 6,
+named in "Status" above and with its decisions in [`DESIGN.md`](DESIGN.md).
+What it was for is what five steps had left behind — five milestones' worth of
+rationale collected in doc comments, an async family written three times over
+its three receivers, and the run's machinery one 2,352-line file over a dozen
+types, six of the previous milestone's seven post-merge bugs having been
+counter or share-lifecycle errors in it. So the step-to-milestone mapping is
+one-to-one with that milestone skipped: step 6 is the sixth step and the
+seventh milestone. A later step may do the same, and if one does it belongs in
+this list the same way, named here rather than renumbering the steps, since
+the numbers are what every issue and every `DESIGN.md` entry has been written
+against.

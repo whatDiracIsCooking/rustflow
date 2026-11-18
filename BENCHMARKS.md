@@ -470,8 +470,9 @@ What that says:
 
 Against that, the cost is concrete rather than stylistic. When this was
 measured the crate had exactly one sanctioned `unsafe` boundary in the
-scheduler (`Job`, in `src/executor/topology.rs`) and this would have been the
-second; #40 has since removed that one, so the only `unsafe` left anywhere in
+scheduler (`Job`, in what is now `src/executor/topology/job.rs`) and this
+would have been the second; #40 has since removed that one, so the only
+`unsafe` left anywhere in
 the crate is the notifier's `ThreadSlot`, and an `UnsafeCell` in `Work` would
 now be *reintroducing* a boundary rather than adding to one. It needs two of
 them, besides -- the `unsafe` deref in `invoke` and an

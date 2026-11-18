@@ -4,8 +4,9 @@ Why this port is shaped the way it is. Two kinds of thing live in this file,
 and nothing else does:
 
 - **The documentation contract** — what a doc comment in this crate says and
-  what it must not say. It is stated here and in `.claude/agents/rust.md`,
-  because that rule set is what every PR is reviewed against.
+  what it must not say. It is stated here and summarised in
+  `.claude/agents/rust.md`, because that rule set is what every PR is reviewed
+  against; this file is the authority where the two read differently.
 - **The design decisions already taken** — one entry per decision, each
   naming the issue that took it. This is the one place in the repo where an
   issue number belongs in prose that ships; the source comments carry none.
@@ -28,24 +29,65 @@ under a `# Design` heading, or in this file when more than one module shares
 it, and a field or type doc may point at it in half a line but does not retell
 it. **History** — "before #109 this was an `Arc<Flow>`", "found by #93" —
 belongs to the PR trail and the git log, so there are **zero `#NNN` citations
-in doc comments**; the entries below name their issue, and that is the one
-place. A **trait impl** (`Hash`, `Debug`, `Drop`, `Display`) gets one line on
+in the doc comments of production text**; the entries below name their issue,
+and that is the one place, with the one exception the bullets below settle.
+A **trait impl** (`Hash`, `Debug`, `Drop`, `Display`) gets one line on
 what is non-obvious about it, or nothing. An **inline `//` comment** explains a
 line a reader would otherwise question — an `Ordering`, a deliberate leak, a
 lock taken out of order — rather than narrating what the line does. The
 provenance `//!` line on a translated module is untouched by all of this and
-stays. The target is a file's comment lines at or under **1.2× its code
-lines**.
+stays. The target is a file's **prose** lines at or under **1.2× its code
+lines**, prose being every comment line that is not part of a doc example.
 
 `devtools/doc-ratio.sh` measures that last part: one row per production file
-(`src/**/*.rs`, counting the text above the test module) with its comment
-lines, code lines, ratio and `#NNN`-in-doc-comment count, then a tree total.
-It is a **report and not a gate** — it always exits 0 — because which
+(`src/**/*.rs`, counting the text above the test module) with its prose lines,
+example lines, code lines, ratio and `#NNN`-in-doc-comment count, then a tree
+total. It is a **report and not a gate** — it always exits 0 — because which
 comments go is a reviewer's judgement, and a ratio cannot make it. The tree
-stood at **2.2× overall** when this contract was written (#126), with 2.6× in
-`src/executor/topology.rs`, 4.8× in `src/executor/runtime.rs` and 210 issue
-citations in doc comments across 26 files; the documentation passes that
-follow are measured against those numbers.
+stood at **2.2× overall** when this contract was written (#126) — examples
+counted as prose, as they then were — with 2.6× in the single
+`executor::topology` file #131 has since split, 4.8× in
+`src/executor/runtime.rs` and 210 issue citations in doc comments across 26
+files. It closed the consolidation at **1.2× over 29 files** with zero
+citations in production text, and the measurement of the same tree the old way
+is 1.4×.
+
+Three questions the documentation passes ran into are settled here, so that
+the next pass does not answer them a fourth way (issues #129, #130, #133,
+#134):
+
+- **The 1.2× target is a guide for prose-heavy implementation files, not a
+  gate, and doc examples are not prose.** The examples a public API carries
+  are required by this contract, so counting them against a file's budget
+  charged it for obeying the rule the ratio exists to serve — and made the
+  figure arithmetically unreachable rather than merely hard, `runtime_async`'s
+  frozen examples being 189 lines against a budget of 165. They are therefore
+  measured in their own column, and a crate root — whose code lines are a
+  `pub mod` and `pub use` list — is reported but not held to the figure at
+  all. What is left after both exemptions is judgement, not arithmetic: 14 of
+  the 28 files that are held to it are over, four of them by under 3% and the
+  rest being modules whose rationale is the `# Design` section this contract
+  puts there and nowhere else (`src/executor/runtime.rs` at 2.7×,
+  `src/task_group.rs`, `src/executor/corun.rs` and
+  `src/executor/dependent_async.rs` at 1.9×). Buying the number by cutting a
+  `# Design` section or deleting a doctest is refused, since that trades the
+  thing the contract is for against the measurement of it; a file over 1.2×
+  is one a reviewer looks at, and a reason stated in its PR is an answer.
+- **A `#NNN` in a *test's* doc comment is the one allowed citation.** The
+  zero above is a rule about the text a reader of the public docs or of the
+  production source meets. A test case whose doc says which issue set its bar
+  is naming its acceptance rather than telling a story about the past, which
+  is the one place that history is load-bearing — 53 of them on 48 lines in
+  11 files, and the reason `doc-ratio.sh` deliberately stops at the first
+  column-0 `#[cfg(test)]` instead of reading past it.
+- **"The same set of test names before and after" means the same set of item
+  paths.** A doctest's generated name embeds the line its example starts on
+  (`src/task.rs - task::TaskMut (line 349)` today, a different number as soon
+  as anything above it is reworded), so moving one paragraph renames every
+  doctest below it in the file and a literal comparison of two `--list` outputs
+  can never hold for a docs pass. An issue that asks for an unchanged
+  test-name set is asking for the item paths with ` (line N)` stripped, and a
+  PR that claims one says which it compared.
 
 ## Design decisions already taken
 
@@ -565,13 +607,56 @@ follow are measured against those numbers.
   how all three became bugs. No behaviour changed: the identical test-name
   set, the identical `pub fn` list over the five files and the suite are what
   says so.
+- **The suites share one test module, and the worker matrices are a macro**
+  (issues #127, #132). The suites under `tests/` carried one hand-written
+  `fn starvation_loop_4_threads() { starvation_loop(4) }` per worker count per
+  family, six private copies of `spin_until` and five each of a counter and a
+  body-maker; 489 of their `#[test]` functions across 13 suites now come out
+  of 89 `worker_matrix!` blocks, and each helper is defined once under
+  `tests/common/`. The test names do not change, which is the constraint the
+  shape is built around and the rule every pass after this one inherits: a
+  suite's names are upstream's `TEST_CASE` names, so renaming one edits the
+  acceptance oracle rather than tidying a file. Why the helpers are topic
+  files a suite pulls by path, and why a macro beats a single `#[test]` over
+  a loop, are argued once where they are implemented — `tests/common/mod.rs`'s
+  own docs — because the reason is that module's own (every file under
+  `tests/` is a separate crate) rather than something the port shares.
+- **The documentation contract, and the three questions applying it asked**
+  (issues #126, #129, #130, #134). The contract is the section at the top of
+  this file, written at the start of the milestone against a tree measured at
+  2.2× carrying 210 issue citations in its doc comments (#126). Two passes
+  applied it, to the graph side (#129, ten files) and to the executor's
+  periphery (#130, nine files, plus the `unsafe` audit that left all 15 sites
+  in `src/executor/notifier.rs` carrying a `// SAFETY:` and promoted
+  `clippy::undocumented_unsafe_blocks` to `deny`); both met the same three
+  questions about the ratio, the citations below a test module and what an
+  unchanged test-name set can mean, and the closing pass settled all three
+  inside the contract itself (#134) rather than letting three issues answer
+  them three ways. One of those answers is a rule about documentation passes
+  in general and belongs with the others here: **a pass may not buy the number
+  by cutting a `# Design` section or deleting a doctest**, so what moved to
+  fit the contract was the measurement.
+
+The milestone ran 17 issues against the 11 it opened with, and the rest of its
+decisions extended an entry above rather than adding one here. Where each is:
+the anchor window and the companion walk in `enter` (#157) under "A failure
+inside a nested graph is delivered to whoever is waiting for that graph"; the
+one-node arena and why three heap blocks cannot be two (#144) under "An async
+task is one `Arc`-owned free-standing node"; the debug assertion and the loom
+model that replaced a paragraph (#138, #141) under "A run's waiter is released
+by the last share of its storage hold"; and a task body's own queue (#119) and
+naming a task in two statements (#120) in entries of their own. Two issues
+deliberately left none: #128 and #151 are the weekly loom workflow, whose own
+file and the README say what it runs, and #146 was two module docs still
+calling the async family a later milestone.
 
 ## Rationale moved out of the executor's periphery
 
 The contract at the top of this file keeps a rationale in one place, and for a
 module that is a dozen lines of dispatch over machinery somebody else owns,
-that place cannot be the module itself. These entries are that place, and each
-names the issue whose decision it records, as every entry above does.
+that place cannot be the module itself. These entries are that place, moved
+there by #130, and each names the issue whose decision it records, as every
+entry above does.
 
 - **A module task reaches its target through whatever owns it** (issues #49,
   #74). Upstream's three module functions are two forwarders onto one `_impl`
