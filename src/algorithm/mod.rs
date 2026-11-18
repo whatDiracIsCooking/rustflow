@@ -89,10 +89,51 @@
 //! [`std::sync::Mutex`]-guarded queue: the chunk *boundaries* are decided
 //! before any worker runs, same as upstream's, but which worker is handed
 //! which chunk is still resolved at run time.
+//!
+//! **A factory's read parameter is one sealed source trait, not a concrete
+//! `Arc`.** Every `make_*_task` factory whose body only *reads* a vector
+//! takes [`SliceSource`] -- implemented for `Arc<Vec<T>>`,
+//! `Arc<Mutex<Vec<T>>>` and `Vec<T>` -- where `DESIGN.md`'s ownership rule
+//! once named `Arc<Vec<T>>` alone. A locked vector is what every *writing*
+//! factory is handed, so with a plain `Arc` on the read side a factory could
+//! not consume what another factory produced: the two `Arc`s are not
+//! interconvertible without copying the data, which left for-each/sort into
+//! for-each/sort as the longest chain the family could express and no way to
+//! end a chain in a reduce. The rejected alternative is a second `_locked`
+//! factory per read parameter: that doubles eleven factories and fifteen
+//! parameters into two families a caller picks between by name, and the
+//! duplicate would still not be what the [`AlgorithmBuilder`] wrappers call,
+//! since their signatures pass an unlocked `Arc<Vec<T>>` and do not change.
+//! The trait is taken as `impl SliceSource<Item = T>` in argument position
+//! rather than as a named type parameter, which is what keeps every existing
+//! call site inferring exactly as it did, a turbofished one included: the
+//! generic parameters a caller can spell are the ones that were already
+//! there.
+//!
+//! **One guard per source, in parameter order, dropped before the body
+//! returns.** [`SliceSource::read_slice`] locks a locked source and hands
+//! back the [`std::sync::MutexGuard`]; a factory body takes one such guard
+//! per source, in the order its own signature lists them, and holds each
+//! only for the single run of that body. The find family and
+//! [`make_merge_task_by`] drop their read guards before taking the lock they
+//! publish into, so a read guard is never held across a write lock the read
+//! itself does not need. Two stages joined by a dependency edge therefore
+//! cannot deadlock over a lock they share, in either lock order: the earlier
+//! body has returned, and dropped every guard, before the later one is
+//! scheduled at all. Two stages that share a lock and are *not* joined by an
+//! edge are a caller error, and the reason is the corun inside
+//! [`Runtime::scope`](crate::Runtime::scope) -- a body holds its guard while
+//! the chunk loop under it waits, and that wait runs other ready work on the
+//! same worker, so a worker that picks up the unordered second stage blocks
+//! on a guard only its own stack could release. Handing one
+//! `Arc<Mutex<Vec<T>>>` to two parameters of a single factory -- two read
+//! sources, or a read source and the write target -- is that same error
+//! inside one call.
 
 use std::cmp::Ordering;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::ops::Deref;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::Scope;
 use crate::algorithm::find::FindPartitioner;
@@ -959,12 +1000,91 @@ pub trait AlgorithmBuilder: FlowBuilder {
 
 impl<B: FlowBuilder + ?Sized> AlgorithmBuilder for B {}
 
-/// Closes [`SlicePartitioner`] against implementations outside this crate --
-/// this module's `# Design` section says why, and
+/// Closes [`SlicePartitioner`] and [`SliceSource`] against implementations
+/// outside this crate -- this module's `# Design` section says why, and
 /// [`index_range::IndexInt`]'s own `sealed` module is the identical pattern.
 mod sealed {
-    /// Marker a type must carry to implement [`super::SlicePartitioner`].
+    /// Marker a type must carry to implement [`super::SlicePartitioner`] or
+    /// [`super::SliceSource`].
     pub trait Sealed {}
+}
+
+/// The read side of the `make_*_task` family: owned data a factory's body
+/// borrows one slice out of, per run, whether or not a lock stands between
+/// the two.
+///
+/// Implemented for `Arc<Vec<T>>` (shared and never locked), for
+/// `Arc<Mutex<Vec<T>>>` (what every *writing* factory is handed, so one
+/// stage's product is the next stage's input) and for `Vec<T>` (owned
+/// outright, the form [`AlgorithmBuilder::merge`] passes), and sealed
+/// against anything else. This module's `# Design` section says why the read
+/// side is one trait rather than a second factory per parameter, and states
+/// the locking discipline in full.
+pub trait SliceSource: sealed::Sealed {
+    /// The element type of the slice a body reads.
+    type Item;
+
+    /// What [`SliceSource::read_slice`] hands back: a plain borrow for an
+    /// unlocked source, a [`MutexGuard`] for a locked one.
+    type Guard<'a>: Deref<Target = Vec<Self::Item>>
+    where
+        Self: 'a;
+
+    /// Borrows this source's vector, locking it first if it is locked.
+    ///
+    /// The guard is released when the caller drops it, which for every
+    /// factory in this module is the end of one run of its body: no factory
+    /// holds a guard across its own return, and none locks the same source
+    /// twice. A caller that hands one `Arc<Mutex<Vec<T>>>` to two parameters
+    /// of a single factory deadlocks on the second lock, [`Mutex`] not being
+    /// reentrant.
+    fn read_slice(&self) -> Self::Guard<'_>;
+}
+
+impl<T> sealed::Sealed for Arc<Vec<T>> {}
+
+impl<T> SliceSource for Arc<Vec<T>> {
+    type Item = T;
+    type Guard<'a>
+        = &'a Vec<T>
+    where
+        Self: 'a;
+
+    fn read_slice(&self) -> Self::Guard<'_> {
+        self
+    }
+}
+
+impl<T> sealed::Sealed for Arc<Mutex<Vec<T>>> {}
+
+impl<T> SliceSource for Arc<Mutex<Vec<T>>> {
+    type Item = T;
+    type Guard<'a>
+        = MutexGuard<'a, Vec<T>>
+    where
+        Self: 'a;
+
+    /// A poisoned lock is read through anyway, the whole family's
+    /// [`PoisonError::into_inner`] rule: a panicked task of a cancelled run
+    /// must not turn every later read of the same vector into a second
+    /// panic.
+    fn read_slice(&self) -> Self::Guard<'_> {
+        self.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl<T> sealed::Sealed for Vec<T> {}
+
+impl<T> SliceSource for Vec<T> {
+    type Item = T;
+    type Guard<'a>
+        = &'a Vec<T>
+    where
+        Self: 'a;
+
+    fn read_slice(&self) -> Self::Guard<'_> {
+        self
+    }
 }
 
 /// Drives a parallel loop over a mutable slice, the shape every one of

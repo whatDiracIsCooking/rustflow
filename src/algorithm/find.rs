@@ -77,6 +77,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::Scope;
+use crate::algorithm::SliceSource;
 use crate::algorithm::partitioner::{
     ClosureWrapper, DynamicLoop, DynamicPartitioner, GuidedPartitioner, Partitioner,
     RandomPartitioner, StaticLoop, StaticPartitioner,
@@ -696,8 +697,10 @@ impl<'rt> Runtime<'rt> {
 ///
 /// The search runs into a local [`Option<usize>`] and `result` is locked
 /// once, afterwards, only to publish it: the lock is never held across the
-/// parallel scan. `data` is read without locking, since nothing here writes
-/// to it.
+/// parallel scan. `data` is any [`SliceSource`], so the locked vector an
+/// earlier factory wrote can be searched here; its read guard covers the
+/// scan and is dropped before `result` is locked, so no read guard is ever
+/// held across that write.
 ///
 /// `predicate` and `part` are cloned on every run of the body -- relevant
 /// only for a task revisited by a cycle -- matching upstream copying both
@@ -726,7 +729,7 @@ impl<'rt> Runtime<'rt> {
 /// assert_eq!(*result.lock().expect("uncontended"), Some(42));
 /// ```
 pub fn make_find_if_task<T, F, P>(
-    data: Arc<Vec<T>>,
+    data: impl SliceSource<Item = T> + Send + 'static,
     result: Arc<Mutex<Option<usize>>>,
     predicate: F,
     part: P,
@@ -737,8 +740,15 @@ where
     P: FindPartitioner + Clone + Send + 'static,
 {
     move |rt: &mut Runtime<'_>| {
-        let mut found = None;
-        rt.find_if(&data, &mut found, predicate.clone(), part.clone());
+        // The read guard ends with this block, so `result` below is locked
+        // with no other lock held: the find family's half of the locking
+        // discipline in `algorithm`'s own `# Design` section.
+        let found = {
+            let source = data.read_slice();
+            let mut found = None;
+            rt.find_if(&source, &mut found, predicate.clone(), part.clone());
+            found
+        };
         *result.lock().unwrap_or_else(PoisonError::into_inner) = found;
     }
 }
@@ -770,7 +780,7 @@ where
 /// assert_eq!(*result.lock().expect("uncontended"), None);
 /// ```
 pub fn make_find_if_not_task<T, F, P>(
-    data: Arc<Vec<T>>,
+    data: impl SliceSource<Item = T> + Send + 'static,
     result: Arc<Mutex<Option<usize>>>,
     predicate: F,
     part: P,
@@ -781,8 +791,15 @@ where
     P: FindPartitioner + Clone + Send + 'static,
 {
     move |rt: &mut Runtime<'_>| {
-        let mut found = None;
-        rt.find_if_not(&data, &mut found, predicate.clone(), part.clone());
+        // The read guard ends with this block, so `result` below is locked
+        // with no other lock held: the find family's half of the locking
+        // discipline in `algorithm`'s own `# Design` section.
+        let found = {
+            let source = data.read_slice();
+            let mut found = None;
+            rt.find_if_not(&source, &mut found, predicate.clone(), part.clone());
+            found
+        };
         *result.lock().unwrap_or_else(PoisonError::into_inner) = found;
     }
 }
@@ -814,7 +831,7 @@ where
 /// assert_eq!(*result.lock().expect("uncontended"), Some(1));
 /// ```
 pub fn make_min_element_task<T, C, P>(
-    data: Arc<Vec<T>>,
+    data: impl SliceSource<Item = T> + Send + 'static,
     result: Arc<Mutex<Option<usize>>>,
     cmp: C,
     part: P,
@@ -825,8 +842,15 @@ where
     P: FindPartitioner + Clone + Send + 'static,
 {
     move |rt: &mut Runtime<'_>| {
-        let mut found = None;
-        rt.min_element(&data, &mut found, cmp.clone(), part.clone());
+        // The read guard ends with this block, so `result` below is locked
+        // with no other lock held: the find family's half of the locking
+        // discipline in `algorithm`'s own `# Design` section.
+        let found = {
+            let source = data.read_slice();
+            let mut found = None;
+            rt.min_element(&source, &mut found, cmp.clone(), part.clone());
+            found
+        };
         *result.lock().unwrap_or_else(PoisonError::into_inner) = found;
     }
 }
@@ -858,7 +882,7 @@ where
 /// assert_eq!(*result.lock().expect("uncontended"), Some(3));
 /// ```
 pub fn make_max_element_task<T, C, P>(
-    data: Arc<Vec<T>>,
+    data: impl SliceSource<Item = T> + Send + 'static,
     result: Arc<Mutex<Option<usize>>>,
     cmp: C,
     part: P,
@@ -869,8 +893,15 @@ where
     P: FindPartitioner + Clone + Send + 'static,
 {
     move |rt: &mut Runtime<'_>| {
-        let mut found = None;
-        rt.max_element(&data, &mut found, cmp.clone(), part.clone());
+        // The read guard ends with this block, so `result` below is locked
+        // with no other lock held: the find family's half of the locking
+        // discipline in `algorithm`'s own `# Design` section.
+        let found = {
+            let source = data.read_slice();
+            let mut found = None;
+            rt.max_element(&source, &mut found, cmp.clone(), part.clone());
+            found
+        };
         *result.lock().unwrap_or_else(PoisonError::into_inner) = found;
     }
 }
@@ -880,6 +911,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use super::{make_find_if_task, make_max_element_task};
+    use crate::algorithm::for_each::make_for_each_task;
     use crate::algorithm::partitioner::{
         DefaultClosureWrapper, DynamicPartitioner, GuidedPartitioner, StaticPartitioner,
     };
@@ -1093,5 +1126,46 @@ mod tests {
         Executor::new(3).run(&taskflow).wait().expect("no panic");
 
         assert_eq!(*result.lock().expect("uncontended"), Some(40));
+    }
+
+    /// A find factory reads locked data, so it can terminate a chain: both
+    /// searches here run over the `Arc<Mutex<Vec<i32>>>` the `for_each`
+    /// factory ahead of them wrote.
+    ///
+    /// The three nodes are linearized rather than fanned out, which is the
+    /// discipline `algorithm`'s `# Design` section states: a read guard is
+    /// held across the parallel scan under it, and `Mutex` has no shared
+    /// mode, so two *readers* of one lock need an edge between them as much
+    /// as a reader and a writer do.
+    #[test]
+    fn a_find_factory_reads_a_locked_source() {
+        let data = Arc::new(Mutex::new((0..64).collect::<Vec<i32>>()));
+        let first = Arc::new(Mutex::new(None));
+        let largest = Arc::new(Mutex::new(None));
+
+        let mut taskflow = Taskflow::new();
+        let doubled = taskflow.emplace_runtime(make_for_each_task(
+            Arc::clone(&data),
+            |x: &mut i32| *x *= 2,
+            GuidedPartitioner::<DefaultClosureWrapper>::default(),
+        ));
+        let searched = taskflow.emplace_runtime(make_find_if_task(
+            Arc::clone(&data),
+            Arc::clone(&first),
+            |&x| x == 80,
+            GuidedPartitioner::<DefaultClosureWrapper>::default(),
+        ));
+        let maxed = taskflow.emplace_runtime(make_max_element_task(
+            Arc::clone(&data),
+            Arc::clone(&largest),
+            |a: &i32, b: &i32| a < b,
+            GuidedPartitioner::<DefaultClosureWrapper>::default(),
+        ));
+        taskflow.linearize([doubled, searched, maxed]);
+
+        Executor::new(3).run(&taskflow).wait().expect("no panic");
+
+        assert_eq!(*first.lock().expect("uncontended"), Some(40));
+        assert_eq!(*largest.lock().expect("uncontended"), Some(63));
     }
 }

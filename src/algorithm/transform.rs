@@ -46,7 +46,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::algorithm::SlicePartitioner;
+use crate::algorithm::{SlicePartitioner, SliceSource};
 use crate::runtime::Runtime;
 
 impl<'rt> Runtime<'rt> {
@@ -204,8 +204,11 @@ impl<'rt> Runtime<'rt> {
 
 /// Builds the runtime body of a [`Runtime::transform`] task over owned
 /// `input` and `out`: upstream's one-input `make_transform_task`. `out` is
-/// locked once per run of the body, not once per element, and `input` is
-/// read without locking, since nothing here ever writes to it.
+/// locked once per run of the body, not once per element. `input` is any
+/// [`SliceSource`], so the locked vector an earlier factory wrote can feed
+/// this one; its guard is taken ahead of `out`'s and dropped with it when the
+/// body returns, the lock order the parent module's `# Design` section
+/// requires.
 ///
 /// `f` and `part` are cloned on every run of the body -- relevant only for a
 /// task a cycle revisits -- matching upstream copying `c` and `part` into its
@@ -234,7 +237,7 @@ impl<'rt> Runtime<'rt> {
 /// assert_eq!(*out.lock().expect("uncontended"), vec![10, 20, 30, 40]);
 /// ```
 pub fn make_transform_task<A, B, F, P>(
-    input: Arc<Vec<A>>,
+    input: impl SliceSource<Item = A> + Send + 'static,
     out: Arc<Mutex<Vec<B>>>,
     f: F,
     part: P,
@@ -246,17 +249,19 @@ where
     P: SlicePartitioner + Clone + Send + 'static,
 {
     move |rt: &mut Runtime<'_>| {
+        let source = input.read_slice();
         let mut guard = out
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        rt.transform(&input, &mut guard, f.clone(), part.clone());
+        rt.transform(&source, &mut guard, f.clone(), part.clone());
     }
 }
 
 /// Builds the runtime body of a [`Runtime::transform2`] task over owned `a`,
 /// `b` and `out`: upstream's two-input `make_transform_task` overload, named
 /// `make_transform2_task` for the reason [`Runtime::transform2`]'s own doc
-/// gives.
+/// gives. `a` and `b` are [`SliceSource`]s, read under guards taken in that
+/// order ahead of `out`'s lock.
 ///
 /// ```
 /// use std::sync::{Arc, Mutex};
@@ -283,8 +288,8 @@ where
 /// assert_eq!(*out.lock().expect("uncontended"), vec![101, 202, 303]);
 /// ```
 pub fn make_transform2_task<A, B, C, F, P>(
-    a: Arc<Vec<A>>,
-    b: Arc<Vec<B>>,
+    a: impl SliceSource<Item = A> + Send + 'static,
+    b: impl SliceSource<Item = B> + Send + 'static,
     out: Arc<Mutex<Vec<C>>>,
     f: F,
     part: P,
@@ -297,10 +302,12 @@ where
     P: SlicePartitioner + Clone + Send + 'static,
 {
     move |rt: &mut Runtime<'_>| {
+        let first = a.read_slice();
+        let second = b.read_slice();
         let mut guard = out
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        rt.transform2(&a, &b, &mut guard, f.clone(), part.clone());
+        rt.transform2(&first, &second, &mut guard, f.clone(), part.clone());
     }
 }
 

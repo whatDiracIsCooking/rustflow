@@ -452,6 +452,24 @@ run both forms side by side on the same algorithm.
   ownership-shape rule the 17 factories follow so the family reads as one
   vocabulary. The in-place `transform` constraint in the fourth bullet is
   unchanged by all of it.
+- **Outcome: the ownership rule's read side is a sealed trait, so the
+  factories chain** (#318, found while writing #296). Completing the family
+  exposed a second edge in the rule itself: every producing factory writes
+  into an `Arc<Mutex<Vec<T>>>` while every consuming one read an
+  `Arc<Vec<T>>`, and the two do not convert without copying -- so the longest
+  chain the family could express was for-each/sort into for-each/sort, and no
+  factory could end a chain by reducing what an earlier stage wrote. The
+  three-stage program this entry's third bullet asked for therefore still did
+  not compile: stage A did, stages B and C failed with `expected
+  &Arc<Vec<_>>, found &Arc<Mutex<Vec<i32>>>`. The fix is one sealed
+  `SliceSource` trait -- implemented for `Arc<Vec<T>>`,
+  `Arc<Mutex<Vec<T>>>` and an owned `Vec<T>` -- taken by all fifteen
+  read-only parameters of the eleven factories that have one, in argument
+  position so every existing call site and all 28 wrapper signatures are
+  untouched. What it costs is a discipline rather than a copy, and
+  `DESIGN.md`'s M10 entry states it: guards in parameter order, none held
+  past the body's return, and two stages over one lock need an edge between
+  them even when both only read, `Mutex` having no shared mode.
 - **Reported in:** PR #241 (#198).
 
 ## Pipelines (step 7)
