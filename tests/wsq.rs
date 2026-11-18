@@ -163,6 +163,55 @@ fn unbounded_wsq_value_type() {
     both_ends([&gold[0], &gold[1], &gold[2], &gold[3]]);
 }
 
+/// Emptiness is the queue's, not each end's own: `WorkerQueue::is_empty` and
+/// `Thief::is_empty` answer for the same deque whichever end pushed or took
+/// the last item, and `Buffers::is_empty` answers for all of the buffers at
+/// once.
+///
+/// Upstream asserts `empty()` on its own queues only in passing, at the top
+/// of every sweep above. What has no upstream counterpart is the claim about
+/// the *thief's* end: a crossbeam `Stealer` is a separate handle, and whether
+/// it sees the owner's push is the question an executor answers before it
+/// parks a worker. `Buffers::is_empty` is held to no more than its own doc
+/// promises -- `first_nonempty().is_none()`, restated.
+#[test]
+fn emptiness_is_the_queues_own_from_either_end() {
+    let queue: WorkerQueue<usize> = WorkerQueue::new();
+    let thief = queue.thief();
+    assert!(queue.is_empty());
+    assert!(thief.is_empty(), "both ends of a fresh queue are empty");
+
+    queue.push(1);
+    assert!(!queue.is_empty());
+    assert!(!thief.is_empty(), "the thief's end sees the owner's push");
+    assert_eq!(thief.len(), 1);
+
+    assert_eq!(queue.pop(), Some(1));
+    assert!(queue.is_empty());
+    assert!(thief.is_empty(), "and sees the owner's pop");
+
+    queue.push(2);
+    assert_eq!(thief.steal(), Some(2));
+    assert!(queue.is_empty(), "as the owner's end sees the steal");
+    assert!(thief.is_empty());
+
+    let buffers: Buffers<usize> = Buffers::new(4);
+    assert!(buffers.is_empty());
+    assert_eq!(buffers.first_nonempty(), None, "the hint it asks");
+
+    let item = 7;
+    buffers.push(item);
+    let index = buffers.buffer_of(&item);
+    assert!(
+        !buffers.is_empty(),
+        "one buffer with an item in it is enough"
+    );
+    assert_eq!(buffers.first_nonempty(), Some(index));
+
+    assert_eq!(buffers.steal_from(index), Some(item));
+    assert!(buffers.is_empty());
+}
+
 // ============================================================================
 // Thieves against the owner
 // ============================================================================

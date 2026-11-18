@@ -1467,6 +1467,146 @@ fn names_reach_an_observer() {
     );
 }
 
+/// Pushes `label` onto a chain's shared order log, which is what every link
+/// of [`an_unnamed_dependent_chain_joins_each_link_with_what_it_spawned`]
+/// records in place of asserting where it runs.
+fn push(order: &Arc<Mutex<Vec<&'static str>>>, label: &'static str) {
+    order
+        .lock()
+        .expect("the order log's lock is never held across a body")
+        .push(label);
+}
+
+/// Invented, as the unnamed counterpart of [`names_reach_an_observer`]'s
+/// chain: the four dependent forms a *nested* receiver has without the name
+/// parameter -- a `Runtime` body's and a `TaskGroup`'s, the unnamed forms on
+/// the `Executor` itself being driven all over this file.
+///
+/// Upstream's `FromRuntime` cases are the chain this translates, and
+/// [`chain_from_runtime`] above is their bulk form. What this adds is the one
+/// claim that form cannot make, its runtime-shaped links never using the
+/// `Runtime` they are handed: a runtime-shaped dependent link is joined with
+/// everything *it* spawned before the next link is released, so each child
+/// below lands between its own link and the one after it. Both chains record
+/// into a log rather than asserting in place, for the reason this file's own
+/// docs give -- a silent body's panic stays on its node, so an assertion
+/// inside one is not a failing test.
+#[test]
+fn an_unnamed_dependent_chain_joins_each_link_with_what_it_spawned() {
+    /// What one receiver's chain records, in order.
+    const EXPECTED: [&str; 6] = [
+        "silent",
+        "handled",
+        "silent runtime",
+        "silent runtime's child",
+        "runtime",
+        "runtime's child",
+    ];
+
+    /// One receiver's four unnamed dependent forms as a chain, of which the
+    /// last two spawn a child each out of the `Runtime` they are handed.
+    ///
+    /// A macro for [`names_reach_an_observer`]'s reason: the same four names
+    /// on two unrelated types, with nothing in the public surface relating
+    /// them.
+    macro_rules! unnamed_chain {
+        ($nested:expr, $order:expr) => {{
+            let first = $nested.silent_dependent_async(
+                {
+                    let order = Arc::clone($order);
+                    move || push(&order, "silent")
+                },
+                [],
+            );
+            let (second, value) = $nested.dependent_async(
+                {
+                    let order = Arc::clone($order);
+                    move || {
+                        push(&order, "handled");
+                        7_usize
+                    }
+                },
+                [&first],
+            );
+            let third = $nested.silent_dependent_async_runtime(
+                {
+                    let order = Arc::clone($order);
+                    move |spawner: &mut Runtime<'_>| {
+                        push(&order, "silent runtime");
+                        let order = Arc::clone(&order);
+                        spawner.silent_async(move || push(&order, "silent runtime's child"));
+                    }
+                },
+                [&second],
+            );
+            let (_fourth, done) = $nested.dependent_async_runtime(
+                {
+                    let order = Arc::clone($order);
+                    move |spawner: &mut Runtime<'_>| {
+                        push(&order, "runtime");
+                        let order = Arc::clone(&order);
+                        spawner.silent_async(move || push(&order, "runtime's child"));
+                    }
+                },
+                [&third],
+            );
+            (value, done)
+        }};
+    }
+
+    let executor = Arc::new(Executor::new(4));
+
+    // A runtime body's four, counted against the node the body is of.
+    let from_runtime = Arc::new(Mutex::new(Vec::new()));
+    executor
+        .spawn_runtime({
+            let from_runtime = Arc::clone(&from_runtime);
+            move |runtime: &mut Runtime<'_>| {
+                let (value, done) = unnamed_chain!(runtime, &from_runtime);
+                // Every link and both children are done once this returns,
+                // so neither handle below has anything left to wait for.
+                runtime.corun();
+                assert_eq!(value.wait().expect("no link panicked"), 7);
+                done.wait().expect("nothing under the last link failed");
+            }
+        })
+        .wait()
+        .expect("nothing under the body failed");
+
+    // And a task group's four, counted against the group's anchor and corun
+    // to the end for the reason `src/task_group.rs` gives.
+    let from_group = Arc::new(Mutex::new(Vec::new()));
+    executor
+        .spawn({
+            let executor = Arc::clone(&executor);
+            let from_group = Arc::clone(&from_group);
+            move || {
+                let group = executor.task_group().expect("a worker may open a group");
+                let (value, done) = unnamed_chain!(group, &from_group);
+                group.corun();
+                assert_eq!(value.wait().expect("no link panicked"), 7);
+                done.wait().expect("nothing under the last link failed");
+            }
+        })
+        .wait()
+        .expect("no task of the group panicked");
+
+    assert_eq!(
+        *from_runtime
+            .lock()
+            .expect("the body that wrote it has returned"),
+        EXPECTED,
+        "the chain built from a runtime body ran in order"
+    );
+    assert_eq!(
+        *from_group
+            .lock()
+            .expect("the body that wrote it has returned"),
+        EXPECTED,
+        "and so did the one built from a task group"
+    );
+}
+
 // ----------------------------------------------------------------------------
 // The panic-path cell: a module task submitted as a dependent-async task
 // ----------------------------------------------------------------------------

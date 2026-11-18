@@ -505,3 +505,54 @@ fn index_ranges_nd_discrete_domain_covers_partition_3d() {
     }
     assert!(visited.iter().all(|&v| v == 1));
 }
+
+// A rank-1 `IndexRanges`, with its rank in a return type: `from_ranges` reads
+// that off the length of the array literal handed to it, and nothing in a
+// call of it says which rank a case is about.
+fn rank_1(line: IndexRange<i32>) -> IndexRanges<i32, 1> {
+    IndexRanges::from_ranges([line])
+}
+
+// At `N == 1` the narrowing is `IndexRange::discrete_domain`'s own: the inner
+// volume of a one-dimensional range is the empty product, so dimension 0 is
+// narrowed by the positions themselves with nothing divided out of them.
+// That agreement is what makes upstream's aliasing of the two types
+// defensible even though this port keeps them apart.
+#[test]
+fn index_ranges_nd_discrete_domain_at_rank_one_is_the_1d_narrowing() {
+    let line = IndexRange::new(0, 10, 2);
+    let flat = rank_1(line);
+    assert_eq!(flat.size(), line.size());
+
+    for (beg, end) in [(0, 5), (1, 4), (2, 2), (0, 0)] {
+        let sub = flat.discrete_domain(beg, end);
+        let expected = line.discrete_domain(beg, end);
+        assert_eq!(
+            sub.dim(0),
+            (expected.begin(), expected.end(), expected.step_size()),
+            "positions [{beg}, {end})"
+        );
+        assert_eq!(sub.size(), expected.size(), "positions [{beg}, {end})");
+    }
+}
+
+// A dimension with no elements in it makes the inner volume zero, which the
+// narrowing divides by nothing rather than at all: dimension 0 comes back
+// narrowed to nothing, so the sub-range enumerates as little as the range it
+// was taken from.
+#[test]
+fn index_ranges_nd_discrete_domain_of_an_empty_dimension_is_empty() {
+    let grid: IndexRanges<i32, 2> =
+        IndexRanges::from_ranges([IndexRange::new(0, 4, 1), IndexRange::new(3, 3, 1)]);
+    assert_eq!(grid.dim_size(1), 0, "the inner dimension holds nothing");
+    assert_eq!(grid.size(), 0);
+
+    let sub = grid.discrete_domain(0, 0);
+    assert_eq!(sub.dim(0), (0, 0, 1), "dimension 0 is narrowed to nothing");
+    assert_eq!(
+        sub.dim(1),
+        (3, 3, 1),
+        "and the empty dimension is copied through"
+    );
+    assert_eq!(sub.size(), 0);
+}

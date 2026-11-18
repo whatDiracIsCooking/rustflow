@@ -813,3 +813,66 @@ fn a_reset_data_pipeline_runs_again_after_a_panicking_pipe() {
         assert_executor_is_reusable(&executor);
     });
 }
+
+/// `DataPipeline::taskflow` hands back the share its inner [`Pipeline`]
+/// does: upstream's `graph()`, widened to the [`Taskflow`] that owns it.
+///
+/// `the_taskflow_a_pipeline_hands_back_is_its_own_live_graph` in
+/// `tests/pipelines.rs` is the same three claims for the untyped pipeline;
+/// what this adds is the one that is `DataPipeline`'s own -- the graph it
+/// hands back carries the typed chain's slots too, so a run of it moves the
+/// values between the pipes and not only the token count.
+#[test]
+fn the_taskflow_a_data_pipeline_hands_back_runs_the_typed_chain() {
+    /// Lines, so that `cond` has a choice of line task to make.
+    const LINES: usize = 2;
+    /// Tokens the source lets through before it stops.
+    const TOKENS: usize = 5;
+
+    serialized(|| {
+        let produced = Arc::new(AtomicUsize::new(0));
+        let source = {
+            let produced = Arc::clone(&produced);
+            serial_pipe_with_flow::<(), usize>(move |(), pf| {
+                let token = produced.load(Ordering::Relaxed);
+                if token == TOKENS {
+                    pf.stop();
+                    return 0;
+                }
+                produced.fetch_add(1, Ordering::Relaxed);
+                token * 10
+            })
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let seen = Arc::clone(&seen);
+            serial_pipe_with_flow::<usize, ()>(move |value, _pf| {
+                seen.lock().expect("no pipe panicked").push(value);
+            })
+        };
+        let pipeline = DataPipeline::builder(LINES).pipe(source).pipe(sink).build();
+
+        let handed = pipeline.taskflow();
+        assert!(
+            Arc::ptr_eq(&handed, &pipeline.taskflow()),
+            "two calls name one taskflow"
+        );
+        assert_eq!(
+            handed.graph().len(),
+            LINES + 1,
+            "one conditioner over one line task per line"
+        );
+
+        Executor::new(2)
+            .run(&handed)
+            .wait()
+            .expect("no task panicked");
+
+        assert_eq!(pipeline.num_tokens(), TOKENS);
+        assert_eq!(
+            *seen.lock().expect("the run is over"),
+            vec![0, 10, 20, 30, 40],
+            "every token's value reached the second pipe through the slots"
+        );
+    });
+}

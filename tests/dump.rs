@@ -64,6 +64,7 @@
 //! subflow task until #50, and a dump never looks at the body anyway.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use rustflow::{Graph, Handle, SubflowWork, Task, Taskflow, Work};
@@ -293,6 +294,56 @@ fn a_graph_dumps_only_the_cluster_body() {
     // And it is literally the document minus the wrapper.
     assert!(taskflow.dump().contains(&body));
     assert_unique_node_ids(&taskflow.dump());
+}
+
+/// A writer that refuses everything, for the error path of a dump.
+struct Refusing;
+
+impl fmt::Write for Refusing {
+    fn write_str(&mut self, _s: &str) -> fmt::Result {
+        Err(fmt::Error)
+    }
+}
+
+/// `Taskflow::dump_into` is the entry point `dump` and `Display` are both
+/// built on: it writes the whole document into a writer the caller already
+/// holds, appending to what is there rather than replacing it, and hands
+/// back whatever the writer refused.
+///
+/// Upstream's `Taskflow::dump(std::ostream&)` is the same entry point. The
+/// error is this port's own: a `fmt::Write` reports a refused write, where
+/// an `ostream` sets a bit upstream never reads.
+#[test]
+fn dump_into_appends_the_document_and_reports_the_writers_error() {
+    let mut taskflow = Taskflow::with_name("into");
+    let graph = taskflow.graph_mut();
+    let a = graph.add_named_node("a", Handle::Placeholder);
+    let b = graph.add_named_node("b", Handle::Placeholder);
+    graph.add_edge(a, b);
+
+    let document = taskflow.dump();
+
+    let mut out = String::from("before\n");
+    taskflow
+        .dump_into(&mut out)
+        .expect("writing to a String cannot fail");
+    assert_eq!(
+        out,
+        format!("before\n{document}"),
+        "the document went after what the writer already held"
+    );
+
+    // The same writer again: two documents, one after the other, which is
+    // what makes this the form a caller streams several graphs into.
+    taskflow
+        .dump_into(&mut out)
+        .expect("writing to a String cannot fail");
+    assert_eq!(out, format!("before\n{document}{document}"));
+
+    assert!(
+        taskflow.dump_into(&mut Refusing).is_err(),
+        "the writer's own refusal comes back to the caller"
+    );
 }
 
 /// Upstream:

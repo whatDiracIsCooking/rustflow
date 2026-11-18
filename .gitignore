@@ -16,5 +16,9 @@ docker/.env
 .claude/settings.local.json
 .claude/*.lock
 
+# What `python3 -m py_compile devtools/<script>.py` -- the check this repo's
+# rules ask for on a Python instrument -- leaves beside the script.
+__pycache__/
+
 *.swp
 .DS_Store

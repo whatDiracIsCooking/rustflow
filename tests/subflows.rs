@@ -1208,3 +1208,76 @@ fn subflow_work_replaces_the_body_and_starts_from_a_fresh_subgraph() {
         "the graph the first body retained went with it: {dot}"
     );
 }
+
+/// The three read-only accessors a subflow body is handed: the subgraph it is
+/// building, how many workers the executor running it has, and which of those
+/// workers is running the body.
+///
+/// Upstream has one of the three, and only as `sf.executor().num_workers()`;
+/// `graph()` is upstream's own name for the first and `_worker` is private
+/// there. So what is asserted is that each answers about *this* subflow's own
+/// run: `graph()` is the subgraph the builder calls have been filling rather
+/// than the taskflow's graph the subflow task itself sits in, `num_workers()`
+/// is the running executor's count, and `worker()` is the one worker that may
+/// join -- the same one [`Executor::this_worker_id`] names from inside the
+/// body.
+#[test]
+fn a_subflow_body_reads_its_subgraph_and_the_worker_running_it() {
+    const WORKERS: usize = 3;
+
+    let executor = Arc::new(Executor::new(WORKERS));
+    let counted = seq_counter();
+    let mut taskflow = Taskflow::with_name("accessors");
+
+    taskflow.emplace_subflow({
+        let executor = Arc::clone(&executor);
+        let counted = Arc::clone(&counted);
+        move |subflow: &mut Subflow<'_>| {
+            assert_eq!(
+                subflow.num_workers(),
+                WORKERS,
+                "the executor running this subflow has three workers"
+            );
+            let running = subflow.worker().id();
+            assert_eq!(
+                Some(running),
+                executor.this_worker_id(),
+                "the worker reported is the one running this body"
+            );
+
+            let first = subflow.emplace({
+                let counted = Arc::clone(&counted);
+                move || {
+                    seq_bump(&counted);
+                }
+            });
+            let second = subflow.emplace({
+                let counted = Arc::clone(&counted);
+                move || {
+                    seq_bump(&counted);
+                }
+            });
+            subflow.task(first).name("first");
+            subflow.task(second).name("second").succeed([first]);
+
+            let subgraph = subflow.graph();
+            assert_eq!(subgraph.len(), 2, "the subgraph is what this body built");
+            assert_eq!(subgraph.successors(first).to_vec(), vec![second]);
+            assert_eq!(subgraph.node(second).name(), "second");
+            assert_eq!(
+                subflow.worker().id(),
+                running,
+                "and the worker does not change under the body's feet"
+            );
+        }
+    });
+
+    executor.run(&taskflow).wait().expect("no body panicked");
+
+    assert_eq!(seq_count(&counted), 2, "both children ran");
+    assert_eq!(
+        taskflow.graph().len(),
+        1,
+        "the graph the body read was the subgraph, not this one"
+    );
+}

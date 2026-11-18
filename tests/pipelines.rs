@@ -956,3 +956,68 @@ fn set_callable_replaces_the_body_a_pipe_runs() {
         );
     });
 }
+
+/// `Pipeline::taskflow` hands back a share of the taskflow this pipeline
+/// composes into a module task: upstream's `graph()`, widened from a
+/// `Graph&` to the [`Taskflow`] that owns it.
+///
+/// Three claims. It is a *share*, so two calls name one taskflow rather than
+/// a copy of it. It is this pipeline's own scheduling graph, which is one
+/// conditioner picking a line over one line task per line, under the names
+/// the constructor gave them. And it is live rather than a snapshot: run
+/// directly, with no module task in between, it moves this pipeline's own
+/// tokens exactly as composing it does -- which is what makes the handle
+/// worth having to a caller who is not implementing [`Composable`].
+#[test]
+fn the_taskflow_a_pipeline_hands_back_is_its_own_live_graph() {
+    /// Lines, so that the line tasks are more than one and `cond` has a
+    /// choice to make.
+    const LINES: usize = 3;
+    /// Tokens the pipe lets through before it stops.
+    const TOKENS: usize = 7;
+
+    serialized(|| {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let pipe = {
+            let seen = Arc::clone(&seen);
+            Pipe::new(PipeType::Serial, move |pf: &mut Pipeflow| {
+                if seen.load(Ordering::Relaxed) == TOKENS {
+                    pf.stop();
+                    return;
+                }
+                seen.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        let pipeline = Pipeline::new(LINES, vec![pipe]);
+
+        let handed = pipeline.taskflow();
+        assert!(
+            Arc::ptr_eq(&handed, &pipeline.taskflow()),
+            "two calls name one taskflow"
+        );
+
+        assert_eq!(
+            handed.graph().len(),
+            LINES + 1,
+            "one conditioner over one line task per line"
+        );
+        let names: Vec<&str> = handed
+            .graph()
+            .tasks()
+            .map(|task| handed.task_ref(task).name())
+            .collect();
+        assert_eq!(names, vec!["cond", "rt-0", "rt-1", "rt-2"]);
+
+        Executor::new(2)
+            .run(&handed)
+            .wait()
+            .expect("no task panicked");
+
+        assert_eq!(seen.load(Ordering::Relaxed), TOKENS);
+        assert_eq!(
+            pipeline.num_tokens(),
+            TOKENS,
+            "the run moved this pipeline's own token count"
+        );
+    });
+}
