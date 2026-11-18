@@ -1615,3 +1615,51 @@ fn a_multi_condition_can_select_every_successor() {
         }
     }
 }
+
+/// A placeholder wired to its branches first and given single-condition work
+/// afterwards is a conditioner, and the index it returns picks the branch.
+///
+/// `multiple_branches` above is upstream's `A.work(..)` on an
+/// already-connected task for the *multi*-condition arm; this is the same
+/// shape for the single-condition one, which is the arm upstream's
+/// `Cond.Types` reaches by return type instead. Giving the work twice is what
+/// says the arm replaces whatever was there: the second index selects the
+/// other branch, on a graph whose edges never moved.
+#[test]
+fn a_placeholder_given_condition_work_is_a_conditioner() {
+    for workers in 1..=4 {
+        let executor = Executor::new(workers);
+        let mut taskflow = Taskflow::new();
+
+        let cond = taskflow.placeholder();
+        let branches: [Counter; 2] = [counter(), counter()];
+        let yes = counted(&mut taskflow, &branches[0]);
+        let no = counted(&mut taskflow, &branches[1]);
+        taskflow.task(cond).precede([yes, no]);
+
+        assert_eq!(taskflow.task_ref(cond).task_type(), TaskType::Placeholder);
+        taskflow.task(cond).condition_work(|| 0);
+        assert_eq!(
+            taskflow.task_ref(cond).task_type(),
+            TaskType::Condition,
+            "{workers} worker(s): the work is what makes the task a conditioner"
+        );
+
+        run(&executor, &taskflow);
+        assert_eq!(
+            [count(&branches[0]), count(&branches[1])],
+            [1, 0],
+            "{workers} worker(s): index 0 selects the first successor"
+        );
+
+        // The same task, told to select the other branch: a conditioner's work
+        // is replaceable like any other task's.
+        taskflow.task(cond).condition_work(|| 1);
+        run(&executor, &taskflow);
+        assert_eq!(
+            [count(&branches[0]), count(&branches[1])],
+            [1, 1],
+            "{workers} worker(s): the replaced body selects the second"
+        );
+    }
+}

@@ -42,7 +42,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustflow::prelude::*;
-use rustflow::{AsyncWork, Executor, Node, RunError, RunHandle, TaskType};
+use rustflow::{AsyncWork, Executor, Node, OnceWork, RunError, RunHandle, TaskType};
 
 // The topics this file calls every item of: the matrix macro, the counting
 // body its `emplace` calls attach, and the spin its two leaked-handle cases
@@ -655,6 +655,213 @@ fn handle_mut_replaces_the_work_the_node_holds() {
 
     *graph.node_mut(task).handle_mut() = Handle::Static(Work::new(|| {}));
     assert!(graph.node(task).handle().is_static());
+}
+
+/// Every `Handle` predicate answers `true` for exactly the variants it names,
+/// over all eleven of them.
+///
+/// `Testcase: Type` above covers what upstream's own tests ask of a node's
+/// handle, which is `tf::Task::type()`; these predicates are what the port
+/// gives a caller instead of upstream's private `std::holds_alternative`
+/// checks, and two of the distinctions they draw are ones `TaskType` flattens
+/// away on purpose: `is_conditioner` is true of *both* condition kinds,
+/// `is_module` of both module kinds, and `is_async`/`is_dependent_async` keep
+/// the two async kinds apart where `TaskType` folds them together.
+#[test]
+fn every_handle_predicate_answers_for_exactly_its_own_variant() {
+    // One `Handle` predicate under the name this case reports it by.
+    type Predicate = (&'static str, fn(&Handle) -> bool);
+
+    let predicates: [Predicate; 11] = [
+        ("placeholder", Handle::is_placeholder),
+        ("static", Handle::is_static),
+        ("condition", Handle::is_condition),
+        ("multi_condition", Handle::is_multi_condition),
+        ("subflow", Handle::is_subflow),
+        ("runtime", Handle::is_runtime),
+        ("nonpreemptive_runtime", Handle::is_nonpreemptive_runtime),
+        ("module", Handle::is_module),
+        ("async", Handle::is_async),
+        ("dependent_async", Handle::is_dependent_async),
+        ("conditioner", Handle::is_conditioner),
+    ];
+    let answers = |handle: &Handle| -> Vec<&str> {
+        predicates
+            .iter()
+            .filter(|(_, predicate)| predicate(handle))
+            .map(|(name, _)| *name)
+            .collect()
+    };
+
+    // The nine kinds a builder produces, each named by the method that makes
+    // it and the predicates that must answer for it.
+    let mut taskflow = Taskflow::new();
+    let rows = [
+        ("placeholder", taskflow.placeholder(), vec!["placeholder"]),
+        ("emplace", taskflow.emplace(|| {}), vec!["static"]),
+        (
+            "emplace_condition",
+            taskflow.emplace_condition(|| 0),
+            vec!["condition", "conditioner"],
+        ),
+        (
+            "emplace_multi_condition",
+            taskflow.emplace_multi_condition(Vec::new),
+            vec!["multi_condition", "conditioner"],
+        ),
+        (
+            "emplace_subflow",
+            taskflow.emplace_subflow(|_| {}),
+            vec!["subflow"],
+        ),
+        (
+            "emplace_runtime",
+            taskflow.emplace_runtime(|_| {}),
+            vec!["runtime"],
+        ),
+        (
+            "emplace_nonpreemptive_runtime",
+            taskflow.emplace_nonpreemptive_runtime(|_| {}),
+            vec!["nonpreemptive_runtime"],
+        ),
+        (
+            "composed_of",
+            taskflow.composed_of(Arc::new(Taskflow::new())),
+            vec!["module"],
+        ),
+        ("adopt", taskflow.adopt(Graph::new()), vec!["module"]),
+    ];
+
+    let graph = taskflow.graph();
+    for (built_by, task, expected) in rows {
+        assert_eq!(answers(graph.node(task).handle()), expected, "{built_by}");
+    }
+
+    // The two async kinds, which no builder makes: their nodes live outside a
+    // taskflow's arena, so the handles are put in a graph of their own here.
+    let mut free = Graph::new();
+    let spawned = free.add_node(Handle::Async(AsyncWork::plain(|| {})));
+    let dependent = free.add_node(Handle::DependentAsync(AsyncWork::plain(|| {})));
+    assert_eq!(answers(free.node(spawned).handle()), vec!["async"]);
+    assert_eq!(
+        answers(free.node(dependent).handle()),
+        vec!["dependent_async"],
+        "a dependent-async handle is not an `is_async` one",
+    );
+}
+
+/// A `OnceWork` slot holds its body until somebody takes it, and exactly one
+/// caller can.
+///
+/// Upstream needs no equivalent -- its async node is recycled by the worker
+/// that ran it -- so this is the port's own: the node here lives as long as
+/// the last handle on it, and the slot being emptied by the first taker is
+/// what keeps a body from being run twice. `is_spent` is the question a second
+/// would-be runner asks, and the predicate a node's `Debug` prints.
+#[test]
+fn a_once_work_slot_hands_its_body_to_one_taker() {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let slot: OnceWork<dyn FnOnce() + Send + 'static> = OnceWork::new(Box::new({
+        let ran = Arc::clone(&ran);
+        move || {
+            ran.fetch_add(1, Ordering::Relaxed);
+        }
+    }));
+
+    assert!(!slot.is_spent(), "an untaken body is still in the slot");
+    let body = slot.take().expect("the first taker gets the body");
+    assert!(
+        slot.is_spent(),
+        "the slot is empty the instant the body is out"
+    );
+    assert!(slot.take().is_none(), "no second taker gets anything");
+
+    assert_eq!(
+        ran.load(Ordering::Relaxed),
+        0,
+        "taking a body does not run it"
+    );
+    body();
+    assert_eq!(ran.load(Ordering::Relaxed), 1);
+}
+
+/// `Graph::remove_edge` removes *every* copy of a duplicated edge and returns
+/// how many it removed, which is the half of it `taskflow_remove_dependency`
+/// above cannot see: `Taskflow::remove_dependency` discards the count.
+#[test]
+fn remove_edge_removes_every_copy_of_an_edge_and_counts_them() {
+    let mut graph = Graph::new();
+    let a = graph.add_node(Handle::Placeholder);
+    let b = graph.add_node(Handle::Placeholder);
+    let c = graph.add_node(Handle::Placeholder);
+
+    graph.add_edge(a, b);
+    graph.add_edge(a, b);
+    graph.add_edge(a, c);
+    assert_eq!(graph.successors(a).to_vec(), vec![b, b, c]);
+    assert_eq!(graph.predecessors(b).to_vec(), vec![a, a]);
+
+    assert_eq!(
+        graph.remove_edge(a, b),
+        2,
+        "a task preceded twice loses both edges at once"
+    );
+    assert_eq!(graph.successors(a).to_vec(), vec![c]);
+    assert!(graph.predecessors(b).is_empty());
+
+    assert_eq!(
+        graph.remove_edge(a, b),
+        0,
+        "an edge that is not there removes nothing"
+    );
+    assert_eq!(
+        graph.remove_edge(c, a),
+        0,
+        "and an edge is directed: `c -> a` is not `a -> c`"
+    );
+    assert_eq!(
+        graph.successors(a).to_vec(),
+        vec![c],
+        "neither no-op touched the edges that are there"
+    );
+}
+
+// --------------------------------------------------------
+// Testcase: the reborrow between the two task handles (not upstream's)
+//
+// Upstream's `tf::Task` is one type for both reading a task and editing it,
+// so the seam between `TaskMut` and `TaskRef` is the port's own and has no
+// upstream case to translate.
+// --------------------------------------------------------
+
+/// `TaskMut::to_ref` reborrows the mutable handle as the read-only one, over
+/// the same task, and sees every edit already made through it.
+///
+/// What a caller needs of it is those two things: that it answers about *this*
+/// task rather than about the graph's first, and that it answers as of now
+/// rather than as of when the mutable handle was taken.
+#[test]
+fn to_ref_reads_the_task_the_mutable_handle_holds() {
+    let mut taskflow = Taskflow::new();
+    let first = taskflow.placeholder();
+    let second = taskflow.placeholder();
+
+    let mut handle = taskflow.task(second);
+    assert_eq!(handle.to_ref().name(), "");
+    assert_eq!(handle.to_ref().task_type(), TaskType::Placeholder);
+    assert_eq!(handle.to_ref().num_successors(), 0);
+
+    handle.name("second").work(|| {}).succeed([first]);
+
+    assert_eq!(handle.to_ref().name(), "second", "the edits are visible");
+    assert_eq!(handle.to_ref().task_type(), TaskType::Static);
+    assert_eq!(handle.to_ref().num_predecessors(), 1);
+
+    assert_eq!(
+        taskflow.task(first).to_ref().name(),
+        "",
+        "the reborrow answered about the task its own handle holds"
+    );
 }
 
 /// A node's `Debug` names the work it holds and the state words a run writes.

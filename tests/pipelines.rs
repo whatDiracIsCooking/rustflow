@@ -51,6 +51,10 @@
 //!   while every worker *inside* that one case's own `Executor` still runs
 //!   fully concurrently, which is the only concurrency a pipeline's own
 //!   correctness is actually about.
+//!
+//! The file's last section is not upstream's: `Pipe::set_callable` is the one
+//! member of the pipe's own surface whose effect only a run can show, so the
+//! case that names it is here rather than in a doc example.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -884,5 +888,70 @@ fn a_reset_pipeline_runs_again_after_a_panicking_pipe() {
             &[&generated, &seen],
         );
         assert_executor_is_reusable(&executor);
+    });
+}
+
+// ----------------------------------------------------------------------------
+// The pipe's own setter (not upstream's)
+// ----------------------------------------------------------------------------
+
+/// `Pipe::set_callable` -- upstream's `Pipe::callable(U&&)` -- replaces the
+/// body the scheduler runs for every token that reaches the pipe, and leaves
+/// the pipe's direction where it was.
+///
+/// Upstream's suite calls neither setter. `Pipe::set_type` is observable
+/// without running anything and its doc example asserts it there; a replaced
+/// *callable* is observable only through a run, so the case for it is here,
+/// and it is this file's smallest pipeline: one serial pipe over two lines,
+/// stopping after four tokens the way `pipeline_1p_s` does.
+#[test]
+fn set_callable_replaces_the_body_a_pipe_runs() {
+    /// Tokens the replaced body lets through before it stops the pipeline.
+    const REPLACED_TOKENS: usize = 4;
+
+    serialized(|| {
+        let original = Arc::new(AtomicUsize::new(0));
+        let replaced = Arc::new(AtomicUsize::new(0));
+
+        let mut pipe = {
+            let original = Arc::clone(&original);
+            Pipe::new(PipeType::Serial, move |pf: &mut Pipeflow| {
+                original.fetch_add(1, Ordering::Relaxed);
+                pf.stop();
+            })
+        };
+        assert_eq!(pipe.pipe_type(), PipeType::Serial);
+
+        pipe.set_callable({
+            let replaced = Arc::clone(&replaced);
+            move |pf: &mut Pipeflow| {
+                if replaced.load(Ordering::Relaxed) == REPLACED_TOKENS {
+                    pf.stop();
+                    return;
+                }
+                replaced.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        assert_eq!(
+            pipe.pipe_type(),
+            PipeType::Serial,
+            "a replaced callable leaves the direction alone"
+        );
+
+        let pipeline = Pipeline::new(2, vec![pipe]);
+        let mut taskflow = Taskflow::new();
+        compose_module(&mut taskflow, &pipeline, "module_of_pipeline");
+        Executor::new(2)
+            .run(&taskflow)
+            .wait()
+            .expect("no task panicked");
+
+        assert_eq!(replaced.load(Ordering::Relaxed), REPLACED_TOKENS);
+        assert_eq!(pipeline.num_tokens(), REPLACED_TOKENS);
+        assert_eq!(
+            original.load(Ordering::Relaxed),
+            0,
+            "the body that was replaced never ran, so it never stopped the run"
+        );
     });
 }

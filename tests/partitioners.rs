@@ -340,6 +340,59 @@ fn a_closure_wrapper_that_skips_the_body_suppresses_the_chunk() {
     assert_eq!(ran, 2);
 }
 
+/// `RandomPartitioner::with_alpha_beta_and_closure_wrapper` -- upstream's
+/// `RandomPartitioner(float, float, C&&)` -- sets both halves at once: the
+/// fractions a chunk size is drawn between, and the wrapper every chunk runs
+/// under.
+///
+/// Each half on its own is asserted elsewhere in this file, by
+/// `random_chunk_sizes_are_drawn_from_the_whole_range_and_follow_the_seed` and
+/// by the two cases above. What this adds is that neither argument is dropped
+/// when both are given, and that the chunk sizes are still the drawn ones
+/// rather than the `0` chunk size the constructor stores.
+#[test]
+fn a_random_partitioner_takes_its_fractions_and_its_wrapper_together() {
+    const N: usize = 1000;
+    const W: usize = 4;
+
+    let wrapped = std::cell::Cell::new(0_usize);
+    let counting = |body: &mut dyn FnMut()| {
+        wrapped.set(wrapped.get() + 1);
+        body();
+    };
+
+    // `alpha * N * W` is 4 and `beta * N * W` is 8, as in the seeded case
+    // below: the draws come from [4, 8].
+    let mut p = RandomPartitioner::with_alpha_beta_and_closure_wrapper(0.001, 0.002, counting);
+    p.set_seed(0xC0FF_EE42);
+    assert_eq!(p.alpha(), 0.001);
+    assert_eq!(p.beta(), 0.002);
+    assert_eq!(p.chunk_size_range(N, W), (4, 8), "the fractions were kept");
+
+    let next = AtomicUsize::new(0);
+    let mut chunks = 0;
+    let mut covered = 0;
+    p.loop_dynamic(N, W, &next, |b, e| {
+        p.call(|| {
+            chunks += 1;
+            covered += e - b;
+        });
+    });
+
+    assert_eq!(covered, N, "every index was handed out exactly once");
+    assert!(
+        chunks >= N / 8,
+        "a chunk is at most eight indices wide, so a thousand take at least \
+         {} chunks: {chunks}",
+        N / 8
+    );
+    assert_eq!(
+        wrapped.get(),
+        chunks,
+        "the wrapper given to the constructor ran around every chunk"
+    );
+}
+
 // ============================================================================
 // The cut itself
 //

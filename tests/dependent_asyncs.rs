@@ -1552,3 +1552,58 @@ fn a_panic_in_a_module_task_submitted_as_a_dependent_async_reaches_its_handle() 
         .expect("the executor is reusable after a failed submission");
     assert_eq!(ran.load(Ordering::Relaxed), 1);
 }
+
+// ----------------------------------------------------------------------------
+// The handle's own share count
+// ----------------------------------------------------------------------------
+
+/// `AsyncTask::use_count` counts the shares of one task, and is `0` for an
+/// empty handle -- upstream's own documented example, `tf::AsyncTask task;
+/// assert(task.use_count() == 0);`, which its suite has no case for.
+///
+/// What the port adds to that claim is in the accessor's own docs: a task the
+/// scheduler still names is counted too, so the count is read here once with
+/// the pool still up, where the only safe claim is "at least the handle", and
+/// once after the pool has come down, where the handles are the only owners
+/// left and the arithmetic of a clone and a reset is exact.
+#[test]
+fn use_count_counts_the_shares_of_one_task() {
+    let mut empty = AsyncTask::default();
+    assert_eq!(empty.use_count(), 0, "upstream's own example");
+    empty.reset();
+    assert_eq!(empty.use_count(), 0, "a reset empty handle manages nothing");
+    assert!(empty.empty());
+
+    let mut task = {
+        let executor = Executor::new(2);
+        let (task, done) = executor.dependent_async(|| {}, []);
+        done.wait().expect("the body did not panic");
+        assert!(
+            task.use_count() >= 1,
+            "the handle is itself a share, and the scheduler may still hold one"
+        );
+        executor.wait_for_all();
+        task
+    };
+
+    // The pool is down, so every share the scheduler held went with it.
+    assert_eq!(task.use_count(), 1, "one handle, and nothing else");
+
+    let clone = task.clone();
+    assert_eq!(
+        task.use_count(),
+        2,
+        "a clone takes a share of the same task"
+    );
+    assert_eq!(
+        clone.use_count(),
+        task.use_count(),
+        "which both handles read the same way"
+    );
+    drop(clone);
+    assert_eq!(task.use_count(), 1, "and gives it back when it is dropped");
+
+    task.reset();
+    assert_eq!(task.use_count(), 0, "a reset handle manages nothing");
+    assert!(task.empty());
+}
