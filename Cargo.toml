@@ -144,3 +144,7 @@ harness = false
 [[bench]]
 name = "matrix_multiplication"
 harness = false
+
+[[bench]]
+name = "wavefront"
+harness = false

@@ -2366,3 +2366,79 @@ order cannot change the answer.
 
 **The figures and the load this section's run saw come from #352**, for the
 reason the `primes` section above gives.
+
+## wavefront
+
+An `MB × NB` grid of block tasks, each preceding its right and its down
+neighbour: one source at the top left, one sink at the bottom right, a join at
+every interior node, and a ready frontier that sweeps the grid as an
+anti-diagonal whose length grows and then shrinks again. The body is
+upstream's `block_computation(i, j)` -- a `B × B` block update whose every
+cell reads the cell above it and the cell to its left -- which is what those
+two edges per node are for: a block's top row needs the block above it and its
+left column needs the block to its left, and nothing else.
+
+**That body is the one upstream has commented out**, and the section says so
+rather than leaving the provenance line to imply otherwise: at the pin,
+`matrix.hpp`'s `block_computation` is `return i + j;` with the `B × B` update
+sitting in comments directly below it, so the published benchmark times a
+grid whose nodes do nothing. `i + j` is also not a body this port could keep
+-- nothing reads the result, so it compiles to nothing at all -- and it is
+the only version of this shape whose answer can be checked. The commented
+update is what the grid's two edges per node exist for, so that is what runs
+here.
+
+**This is the first shape here built with `placeholder` and `work` rather
+than `emplace`**, and that is upstream's own construction rather than a
+translation choice. The grid's edges are known before its bodies are: the
+backwards walk reaches node `(i, j)` and declares edges to `(i, j + 1)` and
+`(i + 1, j)`, which is only possible because every node of the grid already
+exists as a placeholder with no work attached. The graph shapes above either
+build each node and its body in one `emplace` call or, as `black_scholes`
+does, leave a `placeholder` a placeholder -- upstream's `init` node, which
+never has work attached at all -- so none of them exercises the two-step
+form, and this one does nothing else.
+
+**No rayon baseline, and the baseline column is a sequential sweep.** A
+wavefront is a dependency pattern rather than a data decomposition -- the set
+of blocks that may run at once changes every step and is not a collection
+known up front -- so `par_iter`, `join` and `scope` have nothing to say about
+it, and driving the anti-diagonals by hand over `par_iter` would measure the
+hand-written sweep and its barriers rather than a baseline's scheduler. That
+is `linear_chain`'s reason for an empty rayon column, reached from the other
+direction: the chain has no parallelism for rayon to express, and this shape
+has parallelism no rayon primitive describes. Upstream compares against a TBB
+flow graph, which we have no equivalent of. What stands in its place is
+upstream's own `seq.cpp`, labelled `sequential`: the same blocks in row-major
+order, which respects every edge of the grid without declaring one. It has no
+worker axis -- it is one thread by construction -- so it is measured once per
+size and its figure is read against both rows of that size, the way
+`pipeline`'s `mpsc` baseline is. It also has no graph to build, which is this
+file's standing asymmetry: ours includes constructing `MB × NB` placeholders,
+bodies and edges.
+
+Sizes are two points off upstream's `main.cpp` sweep of the matrix dimension
+`S` over the powers of two from `8` to `1 << 14`, at its fixed block size
+`B = 8`: `S = 256`, a 32 × 32 grid of 1024 blocks where the fixed cost of a
+run still shows, and `S = 1024`, a 128 × 128 grid of 16384 blocks where the
+per-block cost dominates it. The size column is `MB · NB`, the block count,
+which is what upstream reports. The six ids are therefore
+`wavefront/sequential/{1024, 16384}` and
+`wavefront/rustflow/{1w, 24w}/{1024, 16384}`.
+
+**The figures for this section come from #352**, the one quiet-box pass that
+measures every section this milestone adds at full width; the machine and load
+table belongs to that run and is recorded there with them. Nothing was timed
+for this section, deliberately: three agents were building and testing on this
+box while it was written, and a number measured under that load would describe
+the load rather than the shape.
+
+What the benchmark does assert, with no timing involved, is the answer. The
+sweep's result is a deterministic function of the grid, so
+`benches/wavefront.rs` runs the graph once on a fresh matrix and compares
+every cell against the sequential sweep's, at each worker count, before
+criterion measures anything -- a block that runs before the block above it or
+to its left reads a cell still holding its initial value and writes one the
+reference never produces. Deleting either edge of the grid makes that
+comparison fail at the parallel worker count, which is what the check is
+there for.
