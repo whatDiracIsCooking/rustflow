@@ -68,14 +68,16 @@
 //! if the cliff moves, these move with it.
 
 use std::hint::black_box;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread::available_parallelism;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rustflow::{Executor, Runtime};
+
+#[path = "common/baseline.rs"]
+mod baseline;
+mod common;
 
 /// The two `n` this shape is measured at, both inside the stack-depth cliff
 /// the module header describes -- which since #119 is `rustflow-group`'s
@@ -92,16 +94,6 @@ const SAMPLES: usize = 20;
 const WARM_UP: Duration = Duration::from_secs(1);
 /// Measurement time per measurement. See [`SAMPLES`].
 const MEASUREMENT: Duration = Duration::from_secs(3);
-
-/// The worker counts every shape is measured at: one, and the machine's own.
-fn worker_counts() -> Vec<usize> {
-    let parallel = available_parallelism().map_or(1, NonZeroUsize::get);
-    if parallel > 1 {
-        vec![1, parallel]
-    } else {
-        vec![1]
-    }
-}
 
 /// The answer, iteratively, so that every variant's result can be checked.
 ///
@@ -242,16 +234,12 @@ fn bench_fibonacci(c: &mut Criterion) {
         .warm_up_time(WARM_UP)
         .measurement_time(MEASUREMENT);
 
-    for workers in worker_counts() {
+    for workers in common::worker_counts() {
         // An `Arc` because the group recursion reaches the executor from a
         // `'static` closure; the runtime id borrows it through the same
         // handle, so both measure one pool.
-        let executor = Arc::new(Executor::new(workers));
-        // rayon's answer to TBB's `global_control(max_allowed_parallelism)`.
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(workers)
-            .build()
-            .expect("a rayon pool of the requested size");
+        let executor = Arc::new(common::executor(workers));
+        let pool = baseline::rayon_pool(workers);
 
         for n in SIZES {
             group.bench_function(

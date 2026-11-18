@@ -78,6 +78,13 @@ noise is between runs rather than within one.
   `-t` option, which defaults to 1. rayon is held to the same count with a
   `ThreadPoolBuilder::num_threads` pool, which is what upstream's
   `global_control(max_allowed_parallelism, n)` does for TBB.
+- **What every target shares is `benches/common/`.** That worker pair, the
+  executor a row is measured on, the rayon pool holding the baseline to the
+  same count and upstream's `dummy` body are each defined there once -- so a
+  section below saying "the shared body" names one function -- while every
+  target keeps its own sizes, its own criterion sample settings and its own
+  one-off setup, which are what its table reports rather than what its
+  neighbours share.
 
 ## The upstream C++ column is empty, and that is the finding
 

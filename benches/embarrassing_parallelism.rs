@@ -11,14 +11,18 @@
 //! does, while rayon's parallel iterator has no graph to build.
 
 use std::hint::black_box;
-use std::num::NonZeroUsize;
-use std::thread::available_parallelism;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rustflow::Executor;
 use rustflow::prelude::*;
+
+#[path = "common/baseline.rs"]
+mod baseline;
+#[path = "common/body.rs"]
+mod body;
+mod common;
 
 /// Task counts, two points off upstream's sweep (`1..=1 << 20`, doubling).
 const SIZES: [usize; 2] = [1 << 12, 1 << 16];
@@ -30,36 +34,6 @@ const SAMPLES: usize = 20;
 const WARM_UP: Duration = Duration::from_secs(1);
 /// Measurement time per measurement. See [`SAMPLES`].
 const MEASUREMENT: Duration = Duration::from_secs(3);
-
-/// The worker counts every shape is measured at: one, and the machine's own.
-fn worker_counts() -> Vec<usize> {
-    let parallel = available_parallelism().map_or(1, NonZeroUsize::get);
-    if parallel > 1 {
-        vec![1, parallel]
-    } else {
-        vec![1]
-    }
-}
-
-/// Upstream's `dummy`: a small, non-foldable amount of FP work per task.
-///
-/// The `volatile double sink` upstream uses to keep the compiler honest is a
-/// [`black_box`] here -- the loop is 32 transcendental calls whose result
-/// nothing reads, which both compilers are entitled to delete outright.
-fn dummy(i: u64) -> f64 {
-    // Upstream's mix, including its wrap: `i * 1315423911u` on a `size_t`.
-    // The `as f64` loses nothing a benchmark needs -- the value exists only so
-    // that the loop below cannot be constant-folded.
-    let mut x = (i.wrapping_mul(1_315_423_911) ^ (i >> 3)) as f64 + 1.0;
-    let mut sink = 0.0_f64;
-
-    for _ in 0..32 {
-        x = x.sin() * 1.000_000_1 + x.cos();
-        sink = black_box(sink + x);
-    }
-
-    sink
-}
 
 /// `num_tasks` independent tasks in one taskflow, run once. Upstream's
 /// `embarrassing_parallelism_taskflow`.
@@ -80,7 +54,7 @@ fn build_rustflow(num_tasks: u64) -> Taskflow {
     let mut taskflow = Taskflow::new();
     for i in 0..num_tasks {
         taskflow.emplace(move || {
-            black_box(dummy(i));
+            black_box(body::dummy(i));
         });
     }
     taskflow
@@ -91,7 +65,7 @@ fn build_rustflow(num_tasks: u64) -> Taskflow {
 fn flat_rayon(num_tasks: u64, pool: &rayon::ThreadPool) {
     pool.install(|| {
         (0..num_tasks).into_par_iter().for_each(|i| {
-            black_box(dummy(i));
+            black_box(body::dummy(i));
         });
     });
 }
@@ -116,13 +90,9 @@ fn bench_embarrassing_parallelism(c: &mut Criterion) {
         });
     }
 
-    for workers in worker_counts() {
-        let executor = Executor::new(workers);
-        // rayon's answer to TBB's `global_control(max_allowed_parallelism)`.
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(workers)
-            .build()
-            .expect("a rayon pool of the requested size");
+    for workers in common::worker_counts() {
+        let executor = common::executor(workers);
+        let pool = baseline::rayon_pool(workers);
 
         for size in SIZES {
             let num_tasks = u64::try_from(size).expect("a task count fits a u64");

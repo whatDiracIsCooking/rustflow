@@ -2,11 +2,10 @@
 //! (`Mutex<Option<Box<dyn Any + Send>>>`, 24 bytes on a 64-bit target --
 //! `src/pipeline/data_pipeline.rs`'s own module docs give the layout), timed
 //! against a [`Pipeline`] of the same shape carrying its value through a
-//! user-owned buffer instead of a typed chain. `benches/pipeline.rs`'s own
-//! `S, P, S, P` chain and [`dummy`] body are duplicated here rather than
-//! shared: this crate's benches do not share a module, the same way
-//! `benches/pipeline.rs` itself duplicates `embarrassing_parallelism.rs`'s
-//! copy of `dummy` rather than importing it.
+//! user-owned buffer instead of a typed chain. The chain is
+//! `benches/pipeline.rs`'s own `S, P, S, P` and the per-token work is the
+//! shared [`body::dummy`], so the one thing the two variants differ in is
+//! where a pipe's output goes.
 //!
 //! **The allocation count is stated, not measured by a counting allocator.**
 //! A `#[global_allocator]` wrapping `std::alloc::System` is the only way to
@@ -27,10 +26,8 @@
 //! allocated once, outside the measured loop.
 
 use std::hint::black_box;
-use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::available_parallelism;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -41,6 +38,10 @@ use rustflow::pipeline::data_pipeline::{
 use rustflow::pipeline::pipe::{Pipe, PipeType, Pipeflow};
 use rustflow::pipeline::scheduler::Pipeline;
 use rustflow::prelude::*;
+
+#[path = "common/body.rs"]
+mod body;
+mod common;
 
 /// The number of pipes in the chain both variants measure: serial first,
 /// then alternating serial/parallel -- `benches/pipeline.rs`'s own shape,
@@ -64,33 +65,6 @@ const SAMPLES: usize = 20;
 const WARM_UP: Duration = Duration::from_secs(1);
 /// Measurement time per measurement. See [`SAMPLES`].
 const MEASUREMENT: Duration = Duration::from_secs(3);
-
-/// The worker counts both variants are measured at: one, and the machine's
-/// own -- `benches/pipeline.rs`'s own `worker_counts`, duplicated here.
-fn worker_counts() -> Vec<usize> {
-    let parallel = available_parallelism().map_or(1, NonZeroUsize::get);
-    if parallel > 1 {
-        vec![1, parallel]
-    } else {
-        vec![1]
-    }
-}
-
-/// Upstream's `dummy`, duplicated unchanged from `benches/pipeline.rs`: a
-/// small, non-foldable amount of FP work per token, run once per pipe so
-/// that both variants pay the same per-token cost on top of whatever the
-/// slot itself costs.
-fn dummy(i: u64) -> f64 {
-    let mut x = (i.wrapping_mul(1_315_423_911) ^ (i >> 3)) as f64 + 1.0;
-    let mut sink = 0.0_f64;
-
-    for _ in 0..32 {
-        x = x.sin() * 1.000_000_1 + x.cos();
-        sink = black_box(sink + x);
-    }
-
-    sink
-}
 
 /// Runs `num_tokens` through a freshly built [`DataPipeline`] of `num_lines`
 /// lines, carrying an `f64` through its typed per-line slot from one pipe to
@@ -146,11 +120,11 @@ fn run_typed(num_lines: usize, num_tokens: usize, executor: &Executor) {
     );
 }
 
-/// [`dummy`]'s cost folded into a running value, so the typed variant's slot
-/// carries something that depends on every pipe's own work rather than a
-/// constant the optimizer could hoist out of the chain.
+/// [`body::dummy`]'s cost folded into a running value, so the typed
+/// variant's slot carries something that depends on every pipe's own work
+/// rather than a constant the optimizer could hoist out of the chain.
 fn value_after(value: f64, token: u64) -> f64 {
-    value + black_box(dummy(token))
+    value + black_box(body::dummy(token))
 }
 
 /// A pipeline's `lines * pipes` scratch buffer: `tests/pipelines_compose.rs`'s
@@ -184,7 +158,7 @@ impl Buffer {
 /// Runs `num_tokens` through a freshly built untyped [`Pipeline`] of
 /// `num_lines` lines, carrying its value through a user-owned [`Buffer`]
 /// rather than the typed slot [`run_typed`] measures: the same `S, P, S, P`
-/// shape and the same per-token [`dummy`] cost.
+/// shape and the same per-token [`body::dummy`] cost.
 fn run_buffered(num_lines: usize, num_tokens: usize, executor: &Executor) {
     let processed = Arc::new(AtomicUsize::new(0));
     let buffer = Buffer::new(num_lines);
@@ -247,8 +221,8 @@ fn bench_data_pipeline_slot(c: &mut Criterion) {
         .warm_up_time(WARM_UP)
         .measurement_time(MEASUREMENT);
 
-    for workers in worker_counts() {
-        let executor = Executor::new(workers);
+    for workers in common::worker_counts() {
+        let executor = common::executor(workers);
 
         for lines in LINES {
             for size in SIZES {

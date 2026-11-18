@@ -16,15 +16,17 @@
 //! which neither of these measures.
 
 use std::hint::black_box;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread::available_parallelism;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rustflow::Executor;
 use rustflow::prelude::*;
+
+#[path = "common/baseline.rs"]
+mod baseline;
+mod common;
 
 /// Tree sizes, as upstream's layer counts: `N = 1 << layers` slots, of which
 /// `N - 1` are tasks.
@@ -40,16 +42,6 @@ const SAMPLES: usize = 20;
 const WARM_UP: Duration = Duration::from_secs(1);
 /// Measurement time per measurement. See [`SAMPLES`].
 const MEASUREMENT: Duration = Duration::from_secs(3);
-
-/// The worker counts every shape is measured at: one, and the machine's own.
-fn worker_counts() -> Vec<usize> {
-    let parallel = available_parallelism().map_or(1, NonZeroUsize::get);
-    if parallel > 1 {
-        vec![1, parallel]
-    } else {
-        vec![1]
-    }
-}
 
 /// Builds the tree as a taskflow and runs it once. Upstream's
 /// `binary_tree_taskflow`.
@@ -131,15 +123,9 @@ fn bench_binary_tree(c: &mut Criterion) {
         .warm_up_time(WARM_UP)
         .measurement_time(MEASUREMENT);
 
-    for workers in worker_counts() {
-        let executor = Executor::new(workers);
-        // rayon's answer to TBB's `global_control(max_allowed_parallelism)`:
-        // a pool of exactly this many threads, so both variants are measured
-        // with the same hardware to work with.
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(workers)
-            .build()
-            .expect("a rayon pool of the requested size");
+    for workers in common::worker_counts() {
+        let executor = common::executor(workers);
+        let pool = baseline::rayon_pool(workers);
 
         for layers in LAYERS {
             let size = 1usize << layers;

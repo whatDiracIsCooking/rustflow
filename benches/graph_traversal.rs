@@ -22,7 +22,10 @@
 //!   `threshold` at its default `0.0f` -- on top of which upstream's draw,
 //!   `std::rand()/(RAND_MAX + 1u)`, is integer division and so always 0. No
 //!   node is ever chosen in the benchmark as published, so the BFS is dead
-//!   code there and absent here.
+//!   code there and absent here. What is left of `mark()` is its
+//!   floating-point loop, which upstream carries a second time as
+//!   `embarrassing_parallelism.hpp`'s `dummy` and this file reads from
+//!   `common/body.rs`.
 //!
 //! **The rayon variant is level-synchronous**, which is what rayon has for
 //! this shape: `par_iter` over a row, then the next row. It respects every
@@ -35,16 +38,20 @@
 //! `TF` struct inside `measure_time_taskflow`.
 
 use std::hint::black_box;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread::available_parallelism;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rustflow::prelude::*;
 use rustflow::{Executor, Xorshift64};
+
+#[path = "common/baseline.rs"]
+mod baseline;
+#[path = "common/body.rs"]
+mod body;
+mod common;
 
 /// Graph dimensions, as upstream's `LevelGraph(i, i)`: `i` rows of `i` nodes.
 ///
@@ -66,33 +73,6 @@ const SAMPLES: usize = 20;
 const WARM_UP: Duration = Duration::from_secs(1);
 /// Measurement time per measurement. See [`SAMPLES`].
 const MEASUREMENT: Duration = Duration::from_secs(3);
-
-/// The worker counts every shape is measured at: one, and the machine's own.
-fn worker_counts() -> Vec<usize> {
-    let parallel = available_parallelism().map_or(1, NonZeroUsize::get);
-    if parallel > 1 {
-        vec![1, parallel]
-    } else {
-        vec![1]
-    }
-}
-
-/// Upstream's `mark()` minus the BFS: a small, non-foldable amount of FP work,
-/// keyed on the node's index within its row as upstream keys it on `_idx`.
-///
-/// Identical to `embarrassing_parallelism.rs`'s `dummy`, which is upstream's
-/// arrangement too -- the two files hold the same loop.
-fn mark(i: u64) -> f64 {
-    let mut x = (i.wrapping_mul(1_315_423_911) ^ (i >> 3)) as f64 + 1.0;
-    let mut sink = 0.0_f64;
-
-    for _ in 0..32 {
-        x = x.sin() * 1.000_000_1 + x.cos();
-        sink = black_box(sink + x);
-    }
-
-    sink
-}
 
 /// Upstream's `LevelGraph`, reduced to the only thing either variant reads:
 /// `out_edges[level][node]`, the indices in row `level + 1` that this node
@@ -180,14 +160,16 @@ fn shuffle(items: &mut [usize], rng: &mut Xorshift64) {
     }
 }
 
-/// Emplaces one row of marking tasks and hands back their handles.
+/// Emplaces one row of marking tasks -- upstream's `mark()`, which is
+/// [`body::dummy`] keyed on the node's index within its row as upstream
+/// keys it on `_idx` -- and hands back their handles.
 fn emplace_row(taskflow: &mut Taskflow, length: usize, counter: &Arc<AtomicUsize>) -> Vec<Task> {
     (0..length)
         .map(|i| {
             let counter = Arc::clone(counter);
             let index = u64::try_from(i).expect("a node index fits a u64");
             taskflow.emplace(move || {
-                black_box(mark(index));
+                black_box(body::dummy(index));
                 counter.fetch_add(1, Ordering::Relaxed);
             })
         })
@@ -233,7 +215,7 @@ fn traverse_rayon(graph: &LevelGraph, pool: &rayon::ThreadPool) {
     pool.install(|| {
         for _ in 0..graph.levels() {
             (0..length).into_par_iter().for_each(|i| {
-                black_box(mark(i));
+                black_box(body::dummy(i));
                 counter.fetch_add(1, Ordering::Relaxed);
             });
         }
@@ -254,13 +236,9 @@ fn bench_graph_traversal(c: &mut Criterion) {
         .warm_up_time(WARM_UP)
         .measurement_time(MEASUREMENT);
 
-    for workers in worker_counts() {
-        let executor = Executor::new(workers);
-        // rayon's answer to TBB's `global_control(max_allowed_parallelism)`.
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(workers)
-            .build()
-            .expect("a rayon pool of the requested size");
+    for workers in common::worker_counts() {
+        let executor = common::executor(workers);
+        let pool = baseline::rayon_pool(workers);
 
         for dimension in DIMENSIONS {
             let graph = LevelGraph::new(dimension, dimension);

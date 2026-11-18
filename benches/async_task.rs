@@ -48,14 +48,16 @@
 //! closures may borrow the frame the scope is on.
 
 use std::hint::black_box;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread::available_parallelism;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rustflow::Executor;
+
+#[path = "common/baseline.rs"]
+mod baseline;
+mod common;
 
 /// Task counts, two points off upstream's sweep (`S = 1..=2097152`, doubling).
 ///
@@ -72,16 +74,6 @@ const SAMPLES: usize = 20;
 const WARM_UP: Duration = Duration::from_secs(1);
 /// Measurement time per measurement. See [`SAMPLES`].
 const MEASUREMENT: Duration = Duration::from_secs(3);
-
-/// The worker counts every shape is measured at: one, and the machine's own.
-fn worker_counts() -> Vec<usize> {
-    let parallel = available_parallelism().map_or(1, NonZeroUsize::get);
-    if parallel > 1 {
-        vec![1, parallel]
-    } else {
-        vec![1]
-    }
-}
 
 /// Upstream's `func`: one relaxed increment, so that the measured region is
 /// the submission and not the work.
@@ -181,16 +173,12 @@ fn bench_async_task(c: &mut Criterion) {
         .warm_up_time(WARM_UP)
         .measurement_time(MEASUREMENT);
 
-    for workers in worker_counts() {
+    for workers in common::worker_counts() {
         // An `Arc` because `group_rustflow`'s body has to reach the executor
         // from a `'static` closure; the other id borrows it through the same
         // handle, so both measure one pool.
-        let executor = Arc::new(Executor::new(workers));
-        // rayon's answer to TBB's `global_control(max_allowed_parallelism)`.
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(workers)
-            .build()
-            .expect("a rayon pool of the requested size");
+        let executor = Arc::new(common::executor(workers));
+        let pool = baseline::rayon_pool(workers);
 
         for size in SIZES {
             group.bench_function(
