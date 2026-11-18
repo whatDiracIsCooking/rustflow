@@ -82,6 +82,26 @@ only `RUSTFLAGS` sets — so
 [`.github/workflows/loom.yml`](.github/workflows/loom.yml) runs them weekly and
 on `workflow_dispatch` instead of per PR.
 
+## Examples
+
+[`examples/`](examples/) is upstream's own directory, one file per example
+there, each ported here under the same name: `cargo run --example simple` and
+`cargo run --example run` build and run them directly. They are the first
+code in this crate shaped the way a caller writes it rather than the way a
+translated module does, which is also what they are *for*: upstream's
+examples only print, so the port's **print and assert** — every line upstream
+shows is checked with `assert!` or `assert_eq!`, making a non-zero exit the
+test. `devtools/run-examples.sh` runs every `examples/*.rs` this way, by
+glob rather than by a list it would need editing on each addition, and the
+`examples` job of [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs
+that script on every PR.
+
+Because an example is the whole public surface at once, each example PR
+records what it found awkward getting there under a "Friction" heading in
+its own PR body — an import that had to be spelled out, a turbofish a type
+inference could not close, anything that rubbed — for the milestone's closing
+issue to collect.
+
 ## Working inside the container
 
 The image carries the agent tooling as well as the toolchain, pinned the same
