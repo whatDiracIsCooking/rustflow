@@ -1819,3 +1819,98 @@ rayon's split is a `join` of two closures with one atomic. Both gaps are the
 ones `binary_tree`'s own table already found for a plain increment; sorting
 does not change which one dominates, only how much larger the constant is
 that it is multiplying.
+
+## pipeline
+
+A chain of `P = 4` pipes, serial first then alternating serial/parallel
+(`S, P, S, P`), over `L` lines passing `N` tokens -- upstream's
+`linear_pipeline`, which sweeps its own default eight-pipe, all-serial chain
+over a token count it confusingly also spells `L`. `benches/pipeline.rs`
+keeps `L` for lines and `N` for tokens instead. There is no rayon baseline:
+rayon has no pipeline primitive, so the comparison is against `P` OS threads
+chained by `std::sync::mpsc`, in the role TBB's `tbb::parallel_pipeline`
+plays upstream's own `tbb.cpp`. Both sides pay the same per-token cost --
+the 32-iteration floating-point body `embarrassing_parallelism.rs` and
+`graph_traversal.rs` use, in place of upstream's 10 microsecond `sleep_for`,
+so the suite finishes in seconds rather than minutes once `L` and the worker
+count multiply it -- and the same number of hops, `P` pipes against `P`
+channel sends.
+
+**What the two sides do not share is a `lines`/`workers` axis on the mpsc
+side.** `L` is a knob the `Pipeline` has and the mpsc chain does not: a
+`PipeType::Parallel` pipe may run several lines' tokens through it at once,
+up to `L`, while an mpsc stage is always exactly one `std::thread`,
+whatever `PipeType` the pipe it stands in for would have been. So `mpsc` is
+measured once per size below, not once per `(lines, workers)` row, and the
+same figure is read against every row of that size -- `benches/pipeline.rs`'s
+own module docs say so again next to the code.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id |
+| Date | 2026-11-18 |
+| **Load average** | **49.2 rising to 58.7 over the run** |
+
+**This box was not quiet.** Three sibling agents' own `cargo` builds and test
+suites were running throughout, at a load average several times anything
+else recorded in this file -- "The machine, and what it was doing" above puts
+the absolute figures at ±25% on a load of 7 to 11; a load in the 50s is
+outside anything this file has had to caveat before, so read the absolute
+numbers as indicative at best. What that section's own rule still protects is
+the comparison *within* a row: every `mpsc` and `rustflow` id below came from
+one criterion process, ids seconds to minutes apart, so a row's own ratio is
+far more trustworthy than either of its figures on its own.
+
+| lines | size | workers | rustflow | mpsc | upstream C++ |
+|---|---|---|---|---|---|
+| 1 | 1024 | 1 | 3.142 ms ±11.3% | 2.489 ms ±8.5% | not published |
+| 1 | 1024 | 24 | 2.524 ms ±2.0% | 2.489 ms ±8.5% | not published |
+| 1 | 16384 | 1 | 38.95 ms ±0.8% | 28.08 ms ±15.8% | not published |
+| 1 | 16384 | 24 | 40.37 ms ±1.6% | 28.08 ms ±15.8% | not published |
+| 4 | 1024 | 1 | 2.765 ms ±4.9% | 2.489 ms ±8.5% | not published |
+| 4 | 1024 | 24 | 1.878 ms ±4.5% | 2.489 ms ±8.5% | not published |
+| 4 | 16384 | 1 | 41.05 ms ±1.0% | 28.08 ms ±15.8% | not published |
+| 4 | 16384 | 24 | 27.87 ms ±2.8% | 28.08 ms ±15.8% | not published |
+| 8 | 1024 | 1 | 2.748 ms ±4.1% | 2.489 ms ±8.5% | not published |
+| 8 | 1024 | 24 | 1.735 ms ±4.8% | 2.489 ms ±8.5% | not published |
+| 8 | 16384 | 1 | 43.43 ms ±2.8% | 28.08 ms ±15.8% | not published |
+| 8 | 16384 | 24 | 28.47 ms ±4.2% | 28.08 ms ±15.8% | not published |
+
+**`L = 1` is the degenerate case the module docs promise to call out, and the
+pipeline loses it plainly at the larger size.** With one line there is no
+pipeline parallelism at all -- `run_line` advances one token through all four
+pipes before the next token starts -- so `1l_1w/16384` and `1l_24w/16384` cost
+39 and 44% more than the mpsc chain's 28.08 ms, which keeps four threads busy
+regardless of `L`. At 1024 tokens the gap is present but smaller and, at 24
+workers, inside the two ids' own noise (2.524 ms against 2.489 ms): the fixed
+cost of building a `Pipeline` and composing it into a `Taskflow` is a bigger
+share of a 1024-token run, which blurs the per-token comparison the larger
+size makes plainly. Neither row is a bug in the comparison -- it is this
+crate's per-pipe dispatch cost against a baseline with nothing else to do,
+exactly as the module docs predict.
+
+**At `L = 4` and `L = 8` with 24 workers, the pipeline catches up and passes
+the baseline at the smaller size, and roughly ties it at the larger one.**
+`4l_24w/1024` and `8l_24w/1024` are 1.878 ms and 1.735 ms against mpsc's
+2.489 ms -- 25% and 30% faster -- because a `Parallel` pipe with idle workers
+to hand lines to actually overlaps several tokens' work the way the mpsc
+chain's one-thread-per-stage design cannot. At 16384 tokens the same two rows
+read 27.87 ms and 28.47 ms against 28.08 ms, a tie inside the ids' own ±2.8%
+and ±4.2%: the pipeline's per-token machinery (lock a line's `Mutex`, two
+`fetch_sub`s, a possible `rt.schedule`) costs enough more than a channel send
+that the extra concurrency only closes the gap rather than opening one in its
+favour at this size.
+
+**At one worker, more lines buy nothing**, which is the other side of the
+same mechanism: one worker thread can run exactly one line task at a time no
+matter how many lines the `Pipeline` was built with, so `4l_1w` and `8l_1w`
+read within a few percent of `1l_1w` at both sizes (2.77 and 2.75 ms against
+3.14 ms at 1024; 41.05 and 43.43 ms against 38.95 ms at 16384 -- the small
+rise with more lines at this worker count is the extra `Mutex` and join-
+counter traffic `L` adds without a second thread to spend it on). A
+`PipeType::Parallel` pipe's extra concurrency is a property of the worker
+pool, not of the pipe count or the line count on their own, and this row is
+where that shows most directly.
