@@ -160,3 +160,11 @@ harness = false
 [[bench]]
 name = "graph_pipeline"
 harness = false
+
+[[bench]]
+name = "merge_sort"
+harness = false
+
+[[bench]]
+name = "integrate"
+harness = false
