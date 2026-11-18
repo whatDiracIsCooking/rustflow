@@ -70,6 +70,52 @@
 //! task that cannot have every count it asked for is parked rather than run,
 //! to be rescheduled by whoever releases.
 //!
+//! Nothing so far watches the run itself, and [`observer`] is where a caller
+//! does: an [`Observer`](observer::Observer) is a hook the executor calls on
+//! the worker about to run a task and again on the one that has just run it,
+//! [`Executor::make_observer`] registers one and hands back the share the
+//! executor keeps, and the callbacks are given a
+//! [`WorkerView`](observer::WorkerView) and a
+//! [`TaskView`](observer::TaskView) rather than the worker and the node
+//! themselves, so an observer cannot reach into a run under way. Two are
+//! built in over one shared timeline:
+//! [`ChromeObserver`](observer::chrome::ChromeObserver) writes the
+//! trace-event JSON `about://tracing` loads directly, and
+//! [`TfProfObserver`](observer::tfprof::TfProfObserver) the binary block
+//! upstream's own profiler viewer reads, plus a text summary of the same
+//! timeline.
+//!
+//! [`algorithm`] is the parallel algorithm family -- `for_each`,
+//! `for_each_index`, `transform`, `fill`, `generate`, `reduce`, `find_if`,
+//! `min_element`, `sort`, the inclusive and exclusive scans, and `merge` --
+//! and it reaches a caller in layers rather than in one shape. A method on
+//! [`Runtime`] is the borrowed form, called from a body that already holds
+//! the `&mut [T]`; a wrapper on [`FlowBuilder`], in one of eight extension
+//! traits, makes a task of the same algorithm over data it owns; and a
+//! `make_*_task` factory hands back the `'static` callable upstream treats
+//! as the primitive, for a submission with no builder behind it such as a
+//! dependent-async task. All of them carve `[0, n)` into chunks through a
+//! [`Partitioner`](algorithm::partitioner::Partitioner) -- static, guided,
+//! dynamic or random -- and spawn those chunks under a [`Scope`] rather than
+//! handing out aliasing indices into one `&mut`, which is where this port
+//! and upstream's raw iterators part company; an index-driven one walks an
+//! [`IndexRange`](algorithm::index_range::IndexRange) in place of a slice.
+//! `DESIGN.md`'s "Decisions taken in M10" entry on the family's three layers
+//! has why each layer stays.
+//!
+//! [`pipeline`] is the family with no Rust equivalent to lean on. A
+//! [`Pipeline`](pipeline::Pipeline) is a fixed chain of
+//! [`Pipe`](pipeline::Pipe)s, each serial or parallel, run over a bounded
+//! number of lines: a token enters at the first pipe and travels the chain,
+//! every pipe callable is handed a [`Pipeflow`](pipeline::Pipeflow) naming
+//! the token, the pipe and the line it is on, and the first pipe ends the
+//! stream by calling [`stop`](pipeline::Pipeflow::stop) on it.
+//! [`DataPipeline`](pipeline::DataPipeline) is a typed builder over the same
+//! scheduler for pipes that pass data from each to the next instead of only
+//! a token. Neither runs itself: both compose into a graph as a module task
+//! through [`Composable`], which is also how one pipeline nests inside
+//! another.
+//!
 //! # Where the names live
 //!
 //! Every name here has a module that owns it, and the crate root re-exports
@@ -88,20 +134,29 @@
 //!
 //! # Status
 //!
-//! Steps 1 to 5 of the README's "Order of work" are in: everything above is
-//! built and tested against the upstream unit tests it was translated from.
-//! The consolidation milestone that ran next changed nothing a caller can
-//! see and three things a reader of the source meets -- the 24 public methods
-//! of the async family are one-line delegations onto a single core on the
-//! executor's shared state, the run's machinery is the `executor::topology`
-//! module tree rather than one file, and every doc comment in the crate is
-//! held to the documentation contract in `DESIGN.md`. Steps 6 and 7 --
-//! observers and algorithms, then pipelines -- are not started.
+//! All seven steps of the README's "Order of work" are in: everything above
+//! is built and tested against the upstream unit tests it was translated
+//! from, the observers, the algorithm family and the pipelines included. The
+//! port is at parity with upstream's user-facing surface at the pin -- every
+//! public class, free function and example `taskflow/` ships there has a
+//! counterpart here or a recorded reason it does not, which the README
+//! lists. Two consolidation milestones punctuate the steps, one between
+//! steps 5 and 6 and one after the parity pass, and most of what they change
+//! is what a reader of the source meets: the async family's public methods
+//! are one-line delegations onto a single core on the executor's shared
+//! state, the run's machinery is the `executor::topology` module tree rather
+//! than one file, the graph is the [`graph`] module tree, and every doc
+//! comment in the crate is held to the documentation contract in
+//! `DESIGN.md`. The second also settles this crate root's own namespace,
+//! which "Where the names live" above states as a rule.
 //!
-//! The crate's only `unsafe` blocks are in
-//! [`notifier`](executor::notifier), in the lock-free waiter stack.
-//! `DESIGN.md` is why the port is shaped the way it is, and its "Decisions
-//! taken in M6" section is the consolidation's record.
+//! The crate's `unsafe` blocks live in two modules and nowhere else:
+//! [`notifier`](executor::notifier), in the lock-free waiter stack, and
+//! [`scope`](executor::scope), where [`Runtime::scope`] erases a borrowed
+//! child closure's lifetime and is sound only because it joins every child
+//! before returning. The scheduler itself has none. `DESIGN.md` is why the
+//! port is shaped the way it is, and its "Decisions taken in M6" and
+//! "Decisions taken in M10" sections are the two consolidations' record.
 //!
 //! The port follows **Taskflow v4.1.0** (commit `45366fe5`, 2026-06-19). See
 //! the README's "Upstream pin" section before translating anything.
