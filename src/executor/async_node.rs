@@ -24,6 +24,11 @@
 //! scheduled under that lock, a woken job being free to run before the call
 //! that woke it returns; upstream releases successors under its spin bit,
 //! which it can afford, its scheduling path being lock-free.
+//!
+//! A free node is **two heap blocks beyond its body**, the `Arc` and the
+//! arena inside it, sized to the one node it holds ([`Graph::with_capacity`])
+//! rather than to a `Vec`'s first guess; `DESIGN.md` says why the two cannot
+//! be one block.
 
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,8 +42,8 @@ use crate::graph::{Graph, Handle, Node, Task};
 /// class Executor` -- so a caller reaches one only through
 /// [`AsyncTask`](crate::AsyncTask).
 pub(crate) struct AsyncNode {
-    /// The arena the node lives in, with one live node in it --
-    /// [`AsyncNode::TASK`] -- never edited after the constructor: a
+    /// The arena the node lives in, sized to the one live node it holds --
+    /// [`AsyncNode::TASK`] -- and never edited after the constructor: a
     /// dependent-async task's dependencies are the successor list below, not
     /// edges, a dependency of a free node being free itself.
     graph: Graph,
@@ -75,7 +80,7 @@ impl AsyncNode {
             "a free-standing node carries an async handle, not {handle:?}"
         );
 
-        let mut graph = Graph::new();
+        let mut graph = Graph::with_capacity(1);
         let task = graph.add_named_node(name, handle);
         debug_assert_eq!(task, Self::TASK, "the one node of a fresh arena is 0");
 
@@ -184,6 +189,11 @@ mod tests {
         let free = node();
 
         assert_eq!(free.graph().len(), 1);
+        assert_eq!(
+            free.graph().capacity(),
+            1,
+            "and the arena is sized to it, not left at a `Vec`'s first capacity"
+        );
         assert_eq!(free.node().name(), "task");
         assert!(free.node().handle().is_dependent_async());
         assert_eq!(free.node().num_predecessors(), 0, "a free node is a source");

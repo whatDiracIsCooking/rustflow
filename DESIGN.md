@@ -253,10 +253,18 @@ follow are measured against those numbers.
   never returned.
 
   What the shape costs was measured rather than argued: an externally
-  submitted async task is ~440 ns, of which 87% is the three heap blocks the
-  node is. [`BENCHMARKS.md`](BENCHMARKS.md) has the ablations under "The #125
-  attribution", including the one that would get 3% of it back and why that is
-  not this design's bill.
+  submitted async task is ~415 ns, of which 87% is the three heap blocks the
+  node is -- the `Arc`, the arena inside it and the body's box.
+  [`BENCHMARKS.md`](BENCHMARKS.md) has the ablations under "The #125
+  attribution" and, in the section after it, the one change they named: the
+  arena is sized to the single node it holds (issue #144), which is 528 of
+  the 848 bytes a task and 6% of the submission path. That it is three blocks
+  and not two is `Graph`'s doing rather than this entry's — nodes live in a
+  `Vec`, so folding the arena into the `Arc` would take either a graph that
+  can hold one node inline, which is a discriminant and a branch on every
+  resolution by index in every graph in the crate for the one case that needs
+  it, or an async path that does not resolve a job through a `&Graph` at all.
+  The three are therefore the bill, for the reason this entry gives.
 - **`AsyncTask` is that `Arc`, so `use_count` counts the executor's shares
   too** (issues #86, #91). Upstream's handle is a `Node*` plus `_incref` and
   `_decref` on every copy, move and destruction; here it is an

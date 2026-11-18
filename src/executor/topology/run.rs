@@ -241,8 +241,10 @@ impl Topology {
     /// nothing to disagree about.
     pub(crate) fn free_standing() -> &'static Arc<Self> {
         /// The sentinel itself, built on the first async task of the process
-        /// and never dropped. One allocation, which is what keeps an async
-        /// task at upstream's one-allocation cost.
+        /// and never dropped: one allocation for the whole process, so naming
+        /// a run costs a free async task nothing. What such a task does cost
+        /// is two blocks plus its body, which is `executor::async_node`'s
+        /// shape and not this one's.
         static FREE_STANDING: OnceLock<Arc<Topology>> = OnceLock::new();
 
         FREE_STANDING.get_or_init(|| {
