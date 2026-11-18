@@ -130,10 +130,11 @@ Rough order of the work overall: static graph -> executor -> control flow
 
 ## What a doc comment says, and what it does not
 
-The crate's docs are held to a contract, repeated in one paragraph at the top
-of `DESIGN.md` so a reader of the repo meets it too. It is a rule about where
-each kind of sentence goes, which is what keeps the same explanation from
-landing in four places:
+The crate's docs are held to a contract. `DESIGN.md`'s "Documentation
+contract" section is the long form of it and the authority wherever the two
+read differently; this is the summary agents are reviewed against. It is a
+rule about where each kind of sentence goes, which is what keeps the same
+explanation from landing in four places:
 
 - **An item doc (`///`)** states what the item is, the upstream name it
   translates (upstream's `Topology::_join_counter`), and any invariant a
@@ -145,8 +146,11 @@ landing in four places:
   type doc may point at it in half a line; it does not retell it.
 - **History** -- "before #109 this was an `Arc<Flow>`", "found by #93" --
   belongs to the PR trail and the git log, not the source. Zero `#NNN`
-  citations in doc comments. A `DESIGN.md` entry names its issue, and that is
-  the one place that does.
+  citations in the doc comments of production text, with one exception: **a
+  `#NNN` in a *test's* doc comment is allowed**, naming the issue that set
+  that case's bar, which is why `doc-ratio.sh` deliberately stops at the first
+  column-0 `#[cfg(test)]` rather than reading past it. A `DESIGN.md` entry
+  names its issue, and outside a test module that is the one place that does.
 - **Trait impls** (`Hash`, `Debug`, `Drop`, `Display`) get one line on what is
   non-obvious, or nothing.
 - **Inline `//` comments** explain a line a reader would otherwise question:
@@ -154,16 +158,29 @@ landing in four places:
 - The provenance `//!` line of the section above is untouched by all of this.
   It stays, first line of the module docs, version and all.
 
-The target is a file's comment lines at or under **1.2x its code lines**,
-measured by `devtools/doc-ratio.sh` -- one row per `src/**/*.rs` file, then a
-tree total. It is a report, not a gate: it always exits 0, no CI step reads
-it, and a file whose subtlety earns its prose can argue past 1.2x in review.
-What it is for is the opposite case, the file that restates its own
-signatures, and for that the number is usually enough on its own.
+The figure is a file's **prose** lines at or under **1.2x its code lines**,
+and **a doc example is not prose**: the examples a public API carries are
+required by this contract, so charging them to the budget they obey would
+charge a file for obeying the rule. `devtools/doc-ratio.sh` measures it, one
+row per production file (`src/**/*.rs`, the text above the test module) with
+columns `prose`, `examples`, `code`, `ratio` and `#NNN`, then a tree total;
+`ratio` is prose over code with examples held out, and a crate root is
+reported as `(crate root)` and never flagged. It is a report, not a gate: it
+always exits 0, no CI step reads it, and **1.2x is a guide for prose-heavy
+implementation files rather than a bar** -- a file over it is one a reviewer
+looks at, and a reason stated in its PR is an answer. What it is for is the
+opposite case, the file that restates its own signatures, and for that the
+number is usually enough on its own. Buying the number by cutting a
+`# Design` section or deleting a doctest is refused, since that trades the
+thing the contract is for against the measurement of it.
 
 When you add a doc comment, write it to this contract. Do *not* rewrite
 neighbouring docs to it in a PR about something else -- a documentation pass
-is its own change, file by file, so that it can be reviewed as one.
+is its own change, file by file, so that it can be reviewed as one. Such a
+pass renames doctests, because a doctest's generated name embeds the line its
+example starts on (`src/task.rs - task::TaskMut (line 349)`), so **"the same
+set of test names before and after" means the same set of item paths with
+` (line N)` stripped** -- and a PR that claims one says which it compared.
 
 ## Conventions
 
