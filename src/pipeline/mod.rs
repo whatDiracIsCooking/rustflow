@@ -7,5 +7,6 @@
 //! it translates. [`scheduler`] is the scheduler that drives tokens through
 //! a sequence of pipes, built on these shapes.
 
+pub mod data_pipeline;
 pub mod pipe;
 pub mod scheduler;
