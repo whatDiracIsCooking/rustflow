@@ -49,6 +49,27 @@ async family since has stayed inside it, which is worth saying out loud
 because a work-stealing scheduler is not where a reader expects to find
 that.
 
+M9 closed the remaining gap between the seven steps above and upstream's own
+surface: the port is now at **parity with upstream's user-facing surface at
+v4.1.0** — every public class, free function and example `taskflow/` ships
+at the pin has a counterpart here, or a recorded reason it does not. What is
+deliberately absent:
+
+- `cuda/` and `3rd-party/`, out of scope from the start — see "Upstream pin",
+  below.
+- Deferred pipelines, since `pipeline.hpp` at the pin has no `defer` (see
+  step 7 of "Order of work", below).
+- `NonpreemptiveRuntime` as a user-facing type. The port keeps an internal
+  nonpreemptive node kind a pipeline's line task dispatches through instead
+  of a type a caller names directly — [`DESIGN.md`](DESIGN.md)'s M8 entry on
+  the eleventh `Handle` variant has why.
+- `TFProfManager`. A library has no business installing a process-global
+  singleton whose destructor writes a file to a path an environment variable
+  names — [`DESIGN.md`](DESIGN.md)'s M9 entry has the decision and what is
+  kept as documentation instead.
+- The serializer and the rest of upstream's `utility/` directory that `std`
+  already covers without a port.
+
 ## Getting a toolchain
 
 There is no host toolchain requirement — Rust lives in the container, pinned by
@@ -108,8 +129,26 @@ that script on every PR.
 Because an example is the whole public surface at once, each example PR
 records what it found awkward getting there under a "Friction" heading in
 its own PR body — an import that had to be spelled out, a turbofish a type
-inference could not close, anything that rubbed — for the milestone's closing
-issue to collect.
+inference could not close, anything that rubbed. M9's closing issue
+collected those into [`docs/api-friction.md`](docs/api-friction.md), one
+entry per distinct item, as the input to the consolidation milestone that
+follows it.
+
+The directory's 44 files, by the step that ported them: step 1's static
+graph has `simple`, `run` and `visualization`; step 3's control flow has
+`condition`, `if_else`, `nested_if_else`, `multi_condition`, `switch_case`,
+`while_loop`, `do_while_loop`, `cancel` and `exception`; step 4's dynamic
+tasking has `subflow`, `subflow_exception`, `runtime`, `composition`,
+`async_module`, `task_visitor`, `attach_data` and `corun`; step 5's async
+family has `asyncs`, `dependent_async`, `runtime_async`, `fibonacci`,
+`limited_concurrency` and `tsp`; step 6's observers and algorithms have
+`observer`, `chrome_trace`, `worker_interface`, `parallel_for`, `for_loop`,
+`parallel_reduce`, `parallel_sort`, `inclusive_scan`, `exclusive_scan` and
+`dependent_async_algorithm`; and step 7's pipelines have `pipeline`,
+`scalable_pipeline`, `taskflow_pipeline`, `parallel_data_pipeline`,
+`parallel_graph_pipeline`, `data_scalable_parallel_pipeline` and
+`text_pipeline`. `tfprof` stands alone, for M9's own profiler decision
+above.
 
 ## Working inside the container
 

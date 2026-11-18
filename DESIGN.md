@@ -1244,6 +1244,53 @@ entry above does.
 
 ## Decisions taken in M9
 
+- **`Task::data` is a typed slot, and `for_each_subflow_task` is ported
+  because a retained subflow's graph survives its join** (issue #191).
+  Upstream's `Node::_data` is `void* {nullptr}`, read and written through
+  `Task::data()`/`data(void*)` with no check that a caller's cast matches
+  what was stored. The port's slot is `Option<Box<dyn Any + Send + Sync>>`
+  on `Node` instead -- `Send + Sync` because a node is reachable from any
+  worker, where upstream's bare pointer needs neither -- and
+  `TaskMut::set_data`, `TaskMut::data_mut` and `TaskMut::take_data` write it
+  while `TaskRef::data::<T>()` reads it typed, a failed downcast answering
+  `None` rather than trusting whatever bytes happen to be there. The type
+  change does not rescue upstream's own premise that a task body can read
+  its own attached data back through a `tf::Task` that still aliases the
+  live graph while the body runs: a body here is `'static` and owns nothing
+  of the taskflow holding it, so `examples/attach_data.rs` sets the value
+  with `TaskMut::set_data` before a run and reads it back with
+  `TaskRef::data` after `wait()` returns, rather than inside the body itself
+  -- the one example in #194's batch where the ownership model forces a
+  different program shape rather than a different spelling of the same one
+  (`docs/api-friction.md` records it as a "keep").
+
+  `for_each_subflow_task` is ported on `TaskRef`, not left absent: a
+  subflow's subgraph lives in the node's `Mutex<Graph>` (see `src/subflow.rs`
+  and the entry above on leasing a subgraph), and after a join that retained
+  it (`Subflow::set_retain(true)`) the graph is still there for the method to
+  walk, exactly as upstream's is. Its visitor hands back a `TaskRef` scoped
+  to that subgraph's own lock rather than a bare `Task`, because the index
+  space a subflow's tasks live in is not the composing taskflow's own --
+  which is also where the trap `docs/api-friction.md` records from #194's own
+  example lives: calling `for_each_subflow_task` again from inside the first
+  call's own visitor, to resolve a successor's name, re-enters the same
+  `Mutex` on the same thread and hangs rather than panics.
+- **`IndexRanges<T, N>` extends the one-dimensional range to `N` dimensions,
+  and `discrete_domain` only ever narrows the outermost one** (issue #192).
+  `src/algorithm/index_range.rs`'s own `# Design` section has the full
+  argument -- why `IndexRanges<T, N>` is its own const-generic struct rather
+  than `IndexRange<T>` aliased to `N == 1` (Rust has no `if constexpr`-shaped
+  gate inside one generic-over-`N` `impl` block, so a method only the `N == 1`
+  case has cannot live in a block that type-checks for every `N`), and why
+  narrowing a flattened `[part_beg, part_end)` chunk back to a rectangular
+  sub-range only ever touches dimension 0 (any other split produces a
+  staircase, not a box). `for_each_by_index_nd` is `for_each_by_index`'s own
+  N-dimensional counterpart, dispatching over that same outermost dimension
+  so every worker's chunk stays one hyper-rectangle rather than a scattered
+  set of cells; `src/algorithm/for_each_index.rs`'s own module docs have the
+  rest. Recorded here only because this issue's own acceptance names an
+  entry for it -- the rationale itself stays in the two modules that need it,
+  per the documentation contract's rule that it lives once.
 - **`TFProfManager` is not ported** (issue #193). `tfprof.hpp` at the pinned
   v4.1.0 tag builds a process-global singleton around `TfProfObserver`,
   constructed with `_fpath{get_env(TF_ENABLE_PROFILER)}`; its destructor
@@ -1284,3 +1331,20 @@ entry above does.
   not be inventing a number: a hard-coded constant, `usize::MAX`, or the
   current `queue_size` would each look plausible and each be meaningless,
   which is worse than the method staying absent.
+- **The four files M9 itself pushed over 1.2x stay over it, reviewed rather
+  than cut** (issue #201). #192's N-dimensional extension, #191's
+  `Task::data` slot and #206's `queue_size` left
+  `src/algorithm/index_range.rs` (1.4x), `src/graph.rs` (1.2x),
+  `src/executor/queue.rs` (1.2x) and `src/executor/worker.rs` (1.2x) over
+  the contract's guide -- the same four issue #228 counts among the tree's
+  21 (#228 has the rest, almost all predating M9). None is a
+  `src/pipeline/mod.rs`-shaped case: that file's whole purpose is a
+  module-tree pointer with nothing to move, where these four carry ordinary
+  item docs plus, for `index_range.rs`, a `# Design` section arguing a real
+  question (why `IndexRanges<T, N>` is its own type, why `discrete_domain`
+  narrows one dimension). Cutting either to buy the number is exactly what
+  the documentation contract above refuses, so none of the four were cut.
+  They stand in the same bucket the contract already names for
+  `src/executor/runtime.rs`, `src/task_group.rs`, `src/executor/corun.rs`
+  and `src/executor/dependent_async.rs` -- a file a reviewer looks at, with
+  the reason given once here rather than reinvented per PR.

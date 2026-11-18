@@ -1,0 +1,500 @@
+# API friction, collected from M9's example PRs
+
+This is the friction log issue #201 asks for: every "Friction" section from
+the eight example PRs that ported `examples/` (#190, #194–#200), collected
+into one document, one entry per **distinct** item, grouped by the module it
+touches. It is the input to the consolidation milestone that follows M9 —
+nothing here is fixed in this document, and nothing here is a complaint
+report: a few entries below are findings that nothing is wrong at all, kept
+because they bound what the problem actually is.
+
+Each entry states what upstream writes, what the port makes the user write,
+the Rust reason for the difference when there is one, and either a proposed
+change or "keep, because …". **Status** says where the entry already stands:
+*open* (nothing has decided it yet), *keep* (a divergence or a cost this port
+accepts, with the reason), or *tracked by #NNN* (an issue already owns it).
+
+A note on sourcing: the themes digest prepared ahead of this document
+mis-cited three items to the wrong PR, and double-cited a fourth to a PR
+whose own Friction section does not mention it. Both are corrected below,
+each at the entry it affects, because an uncorrected citation is worse than
+no citation at all for a reader checking the source.
+
+## Prelude
+
+### What is the prelude for?
+
+Three independent examples hit a gap in `rustflow::prelude`, each a
+different kind of name:
+
+- `rustflow::Xorshift32`, needed by `switch_case.rs` to stand in for
+  upstream's `rand()` (PR #232, closing #195 — the digest attributes this to
+  PR #239, which is about the observer example and never mentions
+  `Xorshift32`; the corpus supports only #232).
+- `Executor` itself, which every example needs and none of the two batches
+  that tried first (#190, #194) found in the prelude, alongside `RunError`
+  (#194) and `TaskMut`/`TaskRef`/`TaskType` (#194), also absent.
+- The per-algorithm `*Builder` extension traits, which are in the prelude —
+  but only because the orchestrator required it mid-milestone after one PR
+  (#171) came close to shipping `ForEachIndexBuilder` without its prelude
+  re-export, which would have made `for_each_index` uncallable through
+  `use rustflow::prelude::*;` alone.
+
+Three agents reaching the same gap independently, plus a near-miss that
+needed a human to catch it, is one signal rather than three: the prelude's
+membership today is accidental, built by "this trait needs to be callable"
+rather than by any stated rule. Counter-evidence worth keeping beside it —
+`Subflow` and `Runtime` *are* in the prelude and read fine (PR #233, closing
+#196) — so the fix is not "add everything public"; it's deciding what the
+prelude is actually for. The two readings that would answer differently:
+*only the builder traits a `use rustflow::prelude::*;` needs to make
+`FlowBuilder`'s algorithm methods callable*, which is what is there today by
+accident, or *the names a caller writes on the first page of a program*,
+which would add `Executor`, `RunError` and the task handle types too.
+
+- **Status: open.** This is the actionable design question for the
+  consolidation milestone, not three small gaps to patch independently.
+- **Reported in:** PR #225 (#190), PR #232 (#195), PR #233 (#196, counter-evidence), PR #235 (#194).
+
+## FlowBuilder and task-building ergonomics
+
+### `emplace_n` only emplaces statics
+
+Upstream's `if_else.cpp`, `nested_if_else.cpp`, `switch_case.cpp` and
+`while_loop.cpp` each destructure one `auto [a, b, c, ...] = taskflow.emplace(...)`
+call whose closures mix static and condition-task signatures, picked apart by
+upstream's overloaded `emplace`. `FlowBuilder::emplace_n` requires every
+element to be `FnMut()` (the `Callables` bound), so all four examples needed
+one `emplace`/`emplace_condition` call per task instead of upstream's single
+destructuring statement — the one place the port reads noticeably more
+verbose than upstream line for line.
+
+- **Why:** Rust has no variadics, and the per-kind `emplace_*` methods make a
+  mixed-arity `emplace_n` family (one trait per possible arity-and-kind
+  combination) an awkward thing to write for a single convenience method.
+- **Status: open.** The PR's own read ("probably the right design") is a
+  reasonable default, but it is a call this document defers rather than
+  makes; nothing currently tracks whether a macro-based mixed-tuple `emplace!`
+  is worth the complexity against the four call sites it would have saved.
+- **Reported in:** PR #232 (#195).
+
+### `composed_of` returns a bare `Task`, not a chainable handle
+
+Upstream's `f2.composed_of(f1).name("module_of_f1");` chains the name onto
+the same statement, because `composed_of` there returns `tf::Task` with its
+own setter. The port's `composed_of` returns the same index type every other
+`emplace_*` does, so naming a module task is always its own follow-up
+statement: `let m = taskflow.composed_of(target); taskflow.task(m).name(...);`.
+Reported independently, by two different example batches, as the one place a
+module-composing example reads flatter than upstream everywhere it composes
+*and* names a task.
+
+- **Why:** the same reason naming any task is two statements rather than one
+  (`DESIGN.md`'s entry on it) — `emplace` returning a borrow instead of a
+  value would leave the taskflow borrowed across every later statement.
+  `composed_of` is not a special case of that rule; it is the same rule,
+  independently rediscovered by two examples that happened to compose *and*
+  name in the same breath.
+- **Status: open.** Two independent reports of the same shape is a stronger
+  signal than either alone; nothing currently tracks it as its own issue.
+- **Reported in:** PR #235 (#194), PR #252 (#199, confirming — "same as
+  #190's examples already reported for other module tasks").
+
+### A single dependency is always `[&task]`, never a bare reference
+
+Upstream overloads `dependent_async`/`silent_dependent_async` over a
+variadic-plus-iterator pack, so `silent_dependent_async(f, A)` passes one
+task directly. The port's single `IntoIterator<Item = &AsyncTask>` form means
+every call site wraps even a single dependency in a one-element array
+literal. Harmless once the signature is known, but the first attempt without
+brackets fails with a trait-bound error naming `IntoIterator` rather than
+`AsyncTask`, which took a moment to place.
+
+- **Why:** one uniform signature over "a dependency or several" beats a
+  second overload for the one-element case, and Rust has no variadic pack to
+  give upstream's overload set a literal counterpart.
+- **Status: keep, because** the uniform signature is the right call; the
+  friction is a diagnostic-quality issue (the error names the wrong trait)
+  rather than an API-shape one. No change proposed to the signature itself.
+- **Reported in:** PR #236 (#197).
+
+### A closure that must be `FnMut + Send + 'static` forces an `Arc`-wrapped clone
+
+Every subflow/runtime closure is `FnMut + Send + 'static`, so anything
+upstream captures by `&`/`&mut` has to become an `Arc`-wrapped value cloned
+into each closure (PR #233: `cap` in `subflow.rs`, `res1`/`res2` in
+`fibonacci.rs`, four of six files touched). The same root cause shows up from
+the owned-data algorithm side too: `emplace_runtime` wanting `FnMut`, not
+`FnOnce`, means `let mut local = owned_value;` inside its body does not
+compile — moving a captured upvar out of an `FnMut` closure's `&mut self`
+receiver is rejected outright rather than silently downgraded — so the fix is
+always `.clone()` (PR #241: `for_loop.rs`'s `total_body`/`grid_body`,
+`parallel_sort.rs`'s `strings`; three examples hit this the same way).
+
+- **Why:** a condition task's body can run many times per run, so the
+  scheduler invokes it `FnMut`, not `FnOnce` — this is the right bound for a
+  body that may be revisited by a cycle, not a tuning gap.
+- **Status: keep, because** the bound is correct. `ForEachBuilder`'s own doc
+  comment already says so for the one wrapper that owns `f`/`part`; the gap
+  is that the note does not extend to `emplace_runtime` or to the subflow
+  closures in general, where a caller hits the same wall with no forward
+  pointer to the explanation. Proposed change: extend that one module's note
+  to a short mention on `FlowBuilder::emplace_runtime` and
+  `FlowBuilder::emplace_subflow` themselves.
+- **Reported in:** PR #233 (#196), PR #241 (#198).
+
+### `clippy::ptr_arg` forces a closure literal over a named `fn` for a `String` `bop`/`uop`
+
+Every scan/reduce `bop`/`uop` in this crate is `Fn(&T, &T) -> T`, so for
+`T = String` the bound is exactly `Fn(&String, &String) -> String` — the one
+signature `clippy::ptr_arg` always wants rewritten to `&str`. A
+`fn(&str, &str) -> String` item does not implement
+`Fn(&String, &String) -> String` (no coercion through a generic `Fn` bound),
+so the fix is a closure literal rather than a named `fn` — `ptr_arg` does not
+fire on closures, only on `fn` items.
+
+- **Why:** this is a lint-shaped trap rather than an API gap — the crate's
+  own bound is correct, and the workaround is ordinary Rust.
+- **Status: keep, because** nothing in the API needs to change. Proposed
+  change: a one-line mention on the scan/reduce modules' own docs, since this
+  is exactly the shape every associative-but-non-commutative `String`
+  example will hit.
+- **Reported in:** PR #241 (#198).
+
+## Task introspection and subflows
+
+### `for_each_subflow_task`'s `TaskRef` cannot resolve a second index from inside its own visitor
+
+`for_each_subflow_task` hands a visitor a `TaskRef` scoped to a lock on the
+subgraph the call itself holds. Calling `TaskRef::for_each_successor` or
+`for_each_predecessor` from inside that visitor gets a bare `Task` index
+back, as every such visitor does — but turning that index into a name
+requires calling `for_each_subflow_task` again, and doing so from inside the
+first call's own visitor locks the same `Mutex` on the same thread, which
+hangs rather than panics. The workaround is two passes: one call builds a
+`HashMap<Task, String>` of the subflow's own task names, a second resolves
+against it.
+
+- **Why:** a subflow's subgraph lives in a `Mutex<Graph>` on the node
+  (`DESIGN.md`'s entry on it), so a nested call from inside the body that
+  already holds the lock is a self-deadlock, not a borrow error the type
+  system catches.
+- **Status: open.** The module docs on `for_each_successor` already name the
+  general "collect, then resolve" pattern, but not this specific
+  lock-reentrancy trap, which fails differently (hang, not panic) from what a
+  reader expects. Proposed change: a doc note on `for_each_subflow_task`
+  itself naming the trap by name.
+- **Reported in:** PR #235 (#194).
+
+### `attach_data`'s premise does not survive the port unchanged
+
+Upstream's task body reads `A.data()` back through a captured `tf::Task`
+that still aliases the live graph while the body runs. A task body here is
+`'static` and owns nothing of the taskflow holding it, so it cannot look
+itself up mid-run. `examples/attach_data.rs` sets the value with
+`TaskMut::set_data` before the run and reads it back with `TaskRef::data`
+after `wait()` returns instead of inside the body — every method's own
+behaviour is still on display, but who reads the value and when has to
+change.
+
+- **Status: keep, because** this is the Rust ownership model forcing a
+  different program shape, not a smaller substitute for upstream's. Recorded
+  as a decision in `DESIGN.md`'s "Decisions taken in M9" entry on
+  `Task::data` (#191).
+- **Reported in:** PR #235 (#194).
+
+### `fibonacci` is `TaskGroup` upstream, not a subflow
+
+Upstream's `fibonacci.cpp` recurses through `tf::TaskGroup`, with no taskflow
+graph at all; the port's example instead demonstrates the subflow surface.
+The two are different enough designs that "translated from" needed a
+paragraph in the module doc rather than the one-line comment the issue
+originally anticipated for a difference this size.
+
+- **Status: keep, because** this is an honest divergence in what the example
+  demonstrates, not a smaller or incorrect port of upstream's. No change
+  proposed.
+- **Reported in:** PR #233 (#196).
+
+## Accessors upstream has and the port does not
+
+### No `Runtime::executor()`
+
+There is no way to ask a `Runtime` for the executor it runs on, only
+`Runtime::num_workers()`; a body that genuinely wants the executor (to open a
+`TaskGroup`, say) has nothing to call. This is the live candidate issue #196
+flagged in advance, and it came up exactly as expected in `runtime_async.rs`.
+
+The themes digest prepared ahead of this document cites this twice, against
+PR #233 and PR #241; the corpus text for PR #241 does not mention
+`Runtime::executor()` anywhere, so only the PR #233 citation is substantiated
+here.
+
+- **Status: keep, because — deliberate, tracked by #202.** `Runtime` holds
+  `Arc<Shared>` and no `&Executor`, for the reason `DESIGN.md`'s entry on it
+  gives; a body that needs the executor captures an `Arc<Executor>` instead.
+- **Reported in:** PR #233 (#196).
+
+### `Worker` has no `thread()` accessor
+
+`worker_interface.rs` cannot reproduce upstream's CPU-affinity demonstration
+at all — not a smaller substitute, a different example. `src/executor/worker.rs`'s
+module docs explain the `Worker`/`WorkerThread` split and why `Worker` cannot
+lend out a thread handle; this was simply the first example that wanted to
+use one.
+
+- **Status: open.** No issue currently tracks whether a read-only
+  `Worker::thread_id()` (or similar) is worth adding, or whether the existing
+  module-doc explanation is the right permanent answer.
+- **Reported in:** PR #233 (#196).
+
+### A free async node cannot be named
+
+Upstream's `executor.async("async1", [](){...})` and
+`.silent_async("async2", ...)` give the submitted task a name a printed graph
+or a profiler trace can use later. `Executor::spawn`/`silent_async` here take
+only the body — there is no parameter to put a name into, not even one to
+ignore.
+
+- **Status: open.** No issue currently tracks adding an optional name to the
+  async submission methods, symmetrical with `TaskMut::name` on a graph task.
+- **Reported in:** PR #236 (#197).
+
+## Error handling and run lifecycle
+
+### `RunError` is `#[non_exhaustive]`
+
+Both `exception.rs` and `subflow_exception.rs` match on
+`Err(RunError::Panicked(payload))` and need a trailing wildcard arm even
+though `Panicked` is today the type's only variant — correct, given the
+type's own docs say later milestones will add more, but a first-time reader
+hits `E0004` before learning why, since the non-exhaustiveness is not visible
+at the call site that fails.
+
+- **Status: keep, because** the attribute is correct for a type that will
+  grow variants. No change proposed to the type; the friction is purely "a
+  reader meets the consequence before the reason."
+- **Reported in:** PR #235 (#194).
+
+### `RunHandle::drop` blocks, where upstream's discarded future does not
+
+`limited_concurrency.cpp` is `executor.run(taskflow);` (fire and forget)
+followed by a separate `executor.wait_for_all();`. Writing that literally
+here still compiles, but reads as a bug: dropping the `RunHandle` from
+`executor.run(&taskflow)` already blocks until that run is over, by design,
+so the two-call shape no longer buys anything and a reader has to already
+know the drop blocks to see it is not a race.
+
+- **Status: keep, because** the blocking drop is the documented design. No
+  change proposed; the example itself resolved it with
+  `executor.run(&taskflow).wait().expect(...)` plus a comment at the spot.
+- **Reported in:** PR #236 (#197).
+
+## Tooling and lint interactions
+
+### An intra-doc link needs its target named in code, not just in prose
+
+Writing a module doc with `` [`TaskGroup::corun`] `` and importing
+`TaskGroup` solely to make the link resolve gets the import flagged
+`unused_imports` under `clippy --all-targets -D warnings`, even though
+`cargo doc` itself never touches `examples/*.rs` (confirmed by a clean
+`cargo doc` run with the import still present) — nothing in the example ever
+names the type directly, since the group's type is inferred from
+`executor.task_group()?`. The fix was to drop the import and write the name
+in plain backticks instead of an intra-doc link.
+
+- **Status: keep, because** clippy is correct — the import genuinely has no
+  runtime use in an example, where it would have one in `src/`. Proposed
+  change: a one-line convention note (in this document or `CLAUDE.md`'s
+  agent-facing rules) that an example's module doc names an unused type in
+  backticks, not an intra-doc link.
+- **Reported in:** PR #236 (#197).
+
+### `&str` from a local array needs an explicit copy to satisfy a `'static` closure bound
+
+`let names = ["A", "B", ...]; names.iter().map(|name| { ... move || { ...
+println!("{name}"); } })` fails to borrow-check: `name: &&'static str`
+borrows `names`, and the `move` closure needs `'static`. The fix is
+`|&name|`, copying the `&'static str` out of the iterator item instead of
+holding a reference to the array — easy once the error is seen, but the
+message ("`names` does not live long enough") does not point at the
+array-literal-vs-`'static` distinction directly.
+
+- **Status:** informational. This is an ordinary Rust ownership rule, not a
+  port API gap; no change proposed.
+- **Reported in:** PR #236 (#197).
+
+## Observers
+
+### `Executor::make_observer` takes an already-built value, not a variadic constructor call
+
+Upstream's `make_observer<MyObserver>("MyObserver")` constructs the observer
+in place; the port's split (build the value, then hand it to
+`make_observer`) is a clean design once the reason for it is read, but it
+does mean `observer.rs` needs a second statement — `MyObserver::new(..)`
+before `make_observer(..)` — where upstream had one.
+
+- **Status: keep, because** a documented design note already exists for the
+  split. Recorded here because, per the PR, every future translated example
+  touching an observer or similar factory will hit the same second call.
+- **Reported in:** PR #239 (#200).
+
+## Algorithms (step 6): two forms where upstream has one
+
+This is the biggest API-shape finding in the corpus, and the one the
+issue's own brief asked to probe directly: every M7 algorithm has a
+slice-borrowing `Runtime::` method *and* an owned-data `FlowBuilder::`
+wrapper, where upstream has one shape. Five of the seven algorithm examples
+run both forms side by side on the same algorithm.
+
+- **The owned-data wrapper reads closest to upstream when the caller already
+  owns an `Arc`-friendly value, and noticeably worse otherwise.**
+  `taskflow.sort(Arc::clone(&data))` reads almost exactly like upstream's
+  `taskflow.sort(beg, end)`, the only ceremony being one `Arc::new(Mutex::new(..))`
+  up front. That stops being free the moment the caller's data is not
+  theirs alone: `for_loop.rs`'s stateful-range case has no port-side
+  equivalent to upstream's `std::ref(range)`, because the wrapper's shape is
+  always `Arc<Mutex<_>>` with no reference-wrapper vocabulary standing in for
+  it. `Runtime::for_each_by_index_nd`'s own `# Design` section already names
+  this gap from the implementation side; this is the same gap felt
+  independently from the call-site side.
+- **The `Runtime::` methods read better than upstream once inside a runtime
+  body already, and that half has no upstream shape to be unfaithful to.**
+  `runtime.sort_by(&mut local, cmp)` on a `&mut [T]` the body already owns is
+  genuinely nicer than anything upstream can write — upstream's `tf::Runtime`
+  has no loop/sort/reduce/scan methods at all, so there is no 1:1 line to
+  translate against.
+- **Neither form reaches a dependent-async task body — a third, uncovered
+  case.** `ForEachBuilder`/`ElementwiseBuilder`/`ReduceBuilder` all build
+  through `FlowBuilder::emplace_runtime`, and a dependent-async task
+  submitted through `Executor::silent_dependent_async_runtime` is never
+  queued into any `Taskflow` for that to call. `dependent_async_algorithm.rs`
+  drops straight to the `Runtime::` methods and hand-locks its own
+  `Arc<Mutex<Vec<i32>>>` at each of its three stages — exactly what the
+  owned-data wrapper would have done, with none of its convenience, since
+  the wrapper is unreachable here. Upstream's own version needs no locks at
+  all: its three `tf::make_*_task` factories alias the same `std::vector`
+  across all three stages, trusted entirely to the dependency edges. This is
+  the widest gap the batch found — not between the port's two existing
+  forms, but a third case neither covers.
+- **`Runtime::transform` always writes into a second slice, where upstream
+  transforms in place.** `transform(input: &[A], out: &mut [B], f, part)`
+  cannot alias `input` and `out` (an overlapping `&[T]`/`&mut [T]` does not
+  borrow-check), so the doubled-value case writes into a second `Vec`.
+  `src/algorithm/transform.rs`'s own `# Design` section already gives the
+  reason; this is the same constraint confirmed from the call-site side, on
+  the simpler one-input case.
+
+- **Status: open — tracked by #216**, which already has the question of
+  whether the per-algorithm extension traits should collapse into one. This
+  entry is the evidence for the wider question #216 does not yet ask: not
+  just "one trait or several" but "one shape or two" for the owned/borrowed
+  split itself, and the dependent-async gap neither shape covers.
+- **Reported in:** PR #241 (#198).
+
+## Pipelines (step 7)
+
+### The pipeline module path reads oddly, and nothing re-exports it flatter
+
+Importing `rustflow::pipeline::scheduler::Pipeline` at a call site that also
+names `rustflow::pipeline::pipe::{Pipe, PipeType, Pipeflow}` reads oddly the
+first time — the type doing the scheduling is spelled
+`pipeline::scheduler::Pipeline`, not the `pipeline::pipeline::Pipeline` the
+obvious nesting would suggest. Once #244's `clippy::module_inception` rename
+is known it makes sense, but a `pub use` re-export of `Pipeline` and
+`DataPipeline` at `rustflow::pipeline::{Pipeline, DataPipeline}` would read
+closer to upstream's flat `tf::` namespace, and closer to how these examples
+otherwise just open `rustflow::prelude::*`.
+
+- **Status: open.** No issue currently tracks the re-export.
+- **Reported in:** PR #252 (#199).
+
+### Composing before `reset_pipes`/`reset_lines` is a sharp edge a faithful translation runs straight into
+
+Upstream's own `scalable_pipeline.cpp` composes once, runs, calls
+`pl.reset(pipes.begin(), pipes.end())`, then runs the *same* composed task
+expecting the new chain. The port's `reset_pipes` rebuilds a fresh
+`Arc<Taskflow>` rather than mutating the one already composed, so the
+already-composed task keeps running the old chain. This is documented in
+`src/pipeline/scheduler.rs`'s own `# Design` section and pinned by a test
+there — but translating upstream's *example* (rather than its test suite,
+which already composes after resetting) is the first place this shows up as
+"the upstream example program does not literally port." The example resolves
+it by composing a second time into a second `Taskflow` after the reset, with
+a comment at the spot.
+
+- **Status: keep, because** the rebuild-rather-than-mutate design is a
+  recorded decision (issue #185). Proposed change: a doc example on
+  `Pipeline::reset_pipes` itself, next to its existing test, showing the
+  compose-again pattern — the PR that found this suggests exactly that.
+- **Reported in:** PR #252 (#199).
+
+### `DataPipeline` has no `reset_pipes`/`reset_lines`
+
+`Pipeline` exposes both scalable reset forms (#185); `DataPipeline` wraps a
+private `Pipeline` and exposes only `reset()`. There is no way to replace a
+`DataPipeline`'s chain or line count in place, so demonstrating the typed
+equivalent of `scalable_pipeline` meant building a second `DataPipeline` from
+scratch rather than resetting one object twice.
+
+- **Status: open.** Proposed change: thread `reset_pipes`/`reset_lines`
+  through to the inner `Pipeline` the same way `reset()` already delegates.
+- **Reported in:** PR #252 (#199).
+
+### Upstream's own data-pipeline example has a live type bug the port's typed builder rejects
+
+Upstream's `data_scalable_parallel_pipeline.cpp` appends two pipes of type
+`void -> int` into slots declared `int -> float` and `float -> int`.
+`DataPipelineBuilder::pipe` checks exactly this at compile time, so there is
+no way to write a faithful port of that chain: any attempt either fails to
+compile or silently becomes a differently-typed chain. The example instead
+writes a consistently-typed five-stage chain of its own, with a comment
+saying so.
+
+- **Status: keep, because** the port's compile-time type checking is correct
+  and upstream's own example is the one with the bug. No change proposed;
+  the divergence is already documented at the point it occurs.
+- **Reported in:** PR #252 (#199).
+
+## Negative findings
+
+Kept deliberately, because a log of only complaints would misrepresent the
+port — these bound the problem as much as the entries above describe it:
+
+- **No turbofish needed anywhere**, across four independent batches: every
+  closure's bound inferred cleanly from the call site, including `i32::from(bool)`
+  and `i32::try_from(usize)` conversions (PR #232), every
+  `for<'a> FnMut(&mut Subflow<'a>)` body (PR #233), every `data::<T>()`/
+  `take_data::<T>()` call (PR #235), and the five async examples (PR #236).
+- **Naming reads right next to upstream's**: `emplace`/`emplace_condition`/
+  `precede`/`succeed`/`.task(..).name(..)` all read as the natural
+  translation of upstream's own names (PR #233).
+- **No `SmallVector`-equivalent, and no friction from its absence.**
+  `multi_condition.cpp` returns `tf::SmallVector<int>`; the port's
+  `emplace_multi_condition` just wants `Vec<i32>`, a strictly simpler surface
+  for the same job (PR #232 — the themes digest prepared ahead of this
+  document mis-cites this to PR #233, whose own Friction section does not
+  mention `SmallVector`; the corpus supports only #232).
+- **`Subflow`/`Runtime` are already in the prelude**, and no example needed
+  an explicit `use` for either (PR #233) — the counter-evidence behind the
+  prelude entry above.
+- **`WorkerView`/`TaskView` matched upstream's `WorkerView`/`TaskView`
+  closely enough that the translation of `observer.cpp` was closer to
+  mechanical than most of its siblings'** (PR #239).
+- **No new friction calling `Executor::corun` from inside a pipe callable
+  running on a `NonpreemptiveRuntime` line task** — it behaves exactly like
+  calling it from an ordinary task's body, with no special case needed for
+  the line task's restricted handle (PR #252).
+
+## Cross-check: every example PR's Friction section against this document
+
+| PR (closes) | Entries drawn from it |
+|---|---|
+| #225 (#190) | Prelude: `Executor` missing |
+| #232 (#195) | Prelude: `Xorshift32` missing; `emplace_n` statics-only; negative: no `SmallVector` equivalent, no turbofish |
+| #233 (#196) | Prelude: `Subflow`/`Runtime` present (counter-evidence); `FnMut`-forced clone; `fibonacci` is `TaskGroup` upstream; no `Runtime::executor()`; `Worker` has no `thread()`; negative: no turbofish, naming reads right, prelude counter-evidence |
+| #235 (#194) | Prelude: `TaskMut`/`TaskRef`/`TaskType`, `Executor`/`RunError` missing; `composed_of` returns bare `Task`; `for_each_subflow_task` lock-reentrancy; `attach_data`'s premise; `RunError` non-exhaustive; negative: no turbofish |
+| #236 (#197) | Single dependency needs `[&task]`; free async node cannot be named; `RunHandle::drop` blocks; intra-doc link vs. `unused_imports`; `&str`/`'static` array copy; negative: no turbofish |
+| #239 (#200) | `make_observer` needs a second statement; negative: `WorkerView`/`TaskView` match closely |
+| #241 (#198) | `FnMut`-forced clone (`emplace_runtime`); `clippy::ptr_arg` vs. named `fn`; two forms where upstream has one (and its three sub-findings) |
+| #252 (#199) | `composed_of` returns bare `Task` (confirming #194); pipeline module path; compose-before-reset sharp edge; `DataPipeline` has no scalable reset; upstream's own example type bug; negative: no new `corun` friction |
