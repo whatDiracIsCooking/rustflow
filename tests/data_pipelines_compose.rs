@@ -40,7 +40,7 @@
 //!   sub-pipe checks the sub-pipeline's own index consistently instead.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use rustflow::Executor;
 use rustflow::pipeline::data_pipeline::{
@@ -50,33 +50,27 @@ use rustflow::prelude::*;
 
 #[macro_use]
 mod common;
+#[path = "common/compose.rs"]
+mod compose;
+#[path = "common/data_pipeline.rs"]
+mod data_pipeline;
+#[path = "common/looping.rs"]
+mod looping;
+#[path = "common/pipeline_answers.rs"]
+mod pipeline_answers;
+#[path = "common/serialized.rs"]
+mod serialized;
+#[path = "common/tokens.rs"]
+mod tokens;
 
-/// Upstream's `maxN` for every family but `Ifelse.DataPipelines` and
-/// `PipelineinPipeline.DataPipelines`, which each sweep a range of their own.
-const MAX_N: usize = 100;
-
-/// Runs `body` with every other case in this suite held back:
-/// `tests/pipelines.rs`'s own `serialized` and its doc comment's reasoning,
-/// duplicated here because each file under `tests/` is its own crate.
-fn serialized<R>(body: impl FnOnce() -> R) -> R {
-    static GATE: Mutex<()> = Mutex::new(());
-    let _guard = GATE.lock().unwrap_or_else(PoisonError::into_inner);
-    body()
-}
-
-/// Asserts that `collected` holds exactly `n` values and, once sorted, is
-/// `start, start + 1, ..., start + n - 1`: `tests/pipelines.rs`'s own helper
-/// of the same name -- a parallel pipe's tokens have no order among
-/// themselves, so the check is the right *set*, not the right sequence.
-fn assert_consecutive_from(collected: &Mutex<Vec<i32>>, start: i32, n: usize) {
-    let mut values = collected.lock().expect("uncontended");
-    assert_eq!(values.len(), n);
-    values.sort_unstable();
-    for (index, &value) in values.iter().enumerate() {
-        let offset = i32::try_from(index).expect("a case's token count fits in an i32");
-        assert_eq!(value, start + offset);
-    }
-}
+use compose::compose_module;
+use data_pipeline::{collecting_pipe, counting_source, propagating_pipe};
+use looping::{advance_round, wire_loop};
+use pipeline_answers::{assert_ifelse_answers, partial_sum, sub_pipeline_sum};
+use serialized::serialized;
+// `MAX_N` is the sweep for every family here but `Ifelse.DataPipelines` and
+// `PipelineinPipeline.DataPipelines`, which each sweep a range of their own.
+use tokens::{MAX_N, assert_consecutive_from};
 
 // ----------------------------------------------------------------------------
 // Three.Parallel.DataPipelines / Three.Concatenated.DataPipelines
@@ -110,19 +104,7 @@ impl DataPipelineTail {
         let j2_3 = Arc::new(AtomicUsize::new(0));
         let collection2: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
 
-        let pipe2_0 = {
-            let j2_1 = Arc::clone(&j2_1);
-            serial_pipe_with_flow::<(), i32>(move |(), pf| {
-                let current = j2_1.load(Ordering::Relaxed);
-                if current == n {
-                    pf.stop();
-                    return 0;
-                }
-                assert_eq!(pf.token() % num_lines, pf.line());
-                j2_1.fetch_add(1, Ordering::Relaxed);
-                i32::try_from(current + 1).expect("a token count fits in an i32")
-            })
-        };
+        let pipe2_0 = counting_source(num_lines, move || n, &j2_1);
         let pipe2_1 = {
             let j2_2 = Arc::clone(&j2_2);
             serial_pipe_with_flow::<i32, i32>(move |value, pf| {
@@ -135,57 +117,25 @@ impl DataPipelineTail {
                 value
             })
         };
-        let pipe2_2 = {
-            let j2_3 = Arc::clone(&j2_3);
-            let collection2 = Arc::clone(&collection2);
-            parallel_pipe_with_flow::<i32, ()>(move |value, pf| {
-                let ticket = j2_3.fetch_add(1, Ordering::Relaxed);
-                assert!(ticket < n);
-                assert_eq!(pf.token() % num_lines, pf.line());
-                collection2.lock().expect("uncontended").push(value);
-            })
-        };
+        let pipe2_2 = collecting_pipe(num_lines, move || n, &j2_3, &collection2);
         let pl2 = DataPipeline::builder(num_lines)
             .pipe(pipe2_0)
             .pipe(pipe2_1)
             .pipe(pipe2_2)
             .build();
-        let module2 = taskflow.composed_of(&pl2);
-        taskflow.task(module2).name("module_of_data_pipeline2");
+        let module2 = compose_module(taskflow, &pl2, "module_of_data_pipeline2");
 
         let j3_1 = Arc::new(AtomicUsize::new(0));
         let j3_2 = Arc::new(AtomicUsize::new(0));
         let collection3: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
 
-        let pipe3_0 = {
-            let j3_1 = Arc::clone(&j3_1);
-            serial_pipe_with_flow::<(), i32>(move |(), pf| {
-                let current = j3_1.load(Ordering::Relaxed);
-                if current == n {
-                    pf.stop();
-                    return 0;
-                }
-                assert_eq!(pf.token() % num_lines, pf.line());
-                j3_1.fetch_add(1, Ordering::Relaxed);
-                i32::try_from(current + 1).expect("a token count fits in an i32")
-            })
-        };
-        let pipe3_1 = {
-            let j3_2 = Arc::clone(&j3_2);
-            let collection3 = Arc::clone(&collection3);
-            parallel_pipe_with_flow::<i32, ()>(move |value, pf| {
-                let ticket = j3_2.fetch_add(1, Ordering::Relaxed);
-                assert!(ticket < n);
-                assert_eq!(pf.token() % num_lines, pf.line());
-                collection3.lock().expect("uncontended").push(value);
-            })
-        };
+        let pipe3_0 = counting_source(num_lines, move || n, &j3_1);
+        let pipe3_1 = collecting_pipe(num_lines, move || n, &j3_2, &collection3);
         let pl3 = DataPipeline::builder(num_lines)
             .pipe(pipe3_0)
             .pipe(pipe3_1)
             .build();
-        let module3 = taskflow.composed_of(&pl3);
-        taskflow.task(module3).name("module_of_data_pipeline3");
+        let module3 = compose_module(taskflow, &pl3, "module_of_data_pipeline3");
 
         Self {
             pl2,
@@ -248,19 +198,7 @@ fn build_pl1_int(
     let j1_3 = Arc::new(AtomicUsize::new(0));
     let j1_4 = Arc::new(AtomicUsize::new(0));
 
-    let pipe1_0 = {
-        let j1_1 = Arc::clone(&j1_1);
-        serial_pipe_with_flow::<(), i32>(move |(), pf| {
-            let current = j1_1.load(Ordering::Relaxed);
-            if current == n {
-                pf.stop();
-                return 0;
-            }
-            assert_eq!(pf.token() % num_lines, pf.line());
-            j1_1.fetch_add(1, Ordering::Relaxed);
-            i32::try_from(current + 1).expect("a token count fits in an i32")
-        })
-    };
+    let pipe1_0 = counting_source(num_lines, move || n, &j1_1);
     let pipe1_1 = {
         let j1_2 = Arc::clone(&j1_2);
         serial_pipe_with_flow::<i32, i32>(move |value, pf| {
@@ -303,8 +241,7 @@ fn build_pl1_int(
         .pipe(pipe1_2)
         .pipe(pipe1_3)
         .build();
-    let module1 = taskflow.composed_of(&pl1);
-    taskflow.task(module1).name("module_of_data_pipeline1");
+    let module1 = compose_module(taskflow, &pl1, "module_of_data_pipeline1");
 
     (pl1, module1, [j1_1, j1_2, j1_3, j1_4])
 }
@@ -323,19 +260,7 @@ fn build_pl1_string_roundtrip(
     let j1_3 = Arc::new(AtomicUsize::new(0));
     let j1_4 = Arc::new(AtomicUsize::new(0));
 
-    let pipe1_0 = {
-        let j1_1 = Arc::clone(&j1_1);
-        serial_pipe_with_flow::<(), i32>(move |(), pf| {
-            let current = j1_1.load(Ordering::Relaxed);
-            if current == n {
-                pf.stop();
-                return 0;
-            }
-            assert_eq!(pf.token() % num_lines, pf.line());
-            j1_1.fetch_add(1, Ordering::Relaxed);
-            i32::try_from(current + 1).expect("a token count fits in an i32")
-        })
-    };
+    let pipe1_0 = counting_source(num_lines, move || n, &j1_1);
     let pipe1_1 = {
         let j1_2 = Arc::clone(&j1_2);
         serial_pipe_with_flow::<i32, String>(move |value, pf| {
@@ -381,8 +306,7 @@ fn build_pl1_string_roundtrip(
         .pipe(pipe1_2)
         .pipe(pipe1_3)
         .build();
-    let module1 = taskflow.composed_of(&pl1);
-    taskflow.task(module1).name("module_of_data_pipeline1");
+    let module1 = compose_module(taskflow, &pl1, "module_of_data_pipeline1");
 
     (pl1, module1, [j1_1, j1_2, j1_3, j1_4])
 }
@@ -643,33 +567,16 @@ fn looping_data_pipelines(num_lines: usize, num_workers: usize) {
         let collection2: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
         let collection4: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
 
-        let pipe0 = {
+        // Every pipe reads the round's own token count rather than a fixed
+        // `n`, which is what the builders' closure argument is for.
+        let this_round = {
             let round = Arc::clone(&round);
-            let j1 = Arc::clone(&j1);
-            serial_pipe_with_flow::<(), i32>(move |(), pf| {
-                let current = j1.load(Ordering::Relaxed);
-                if current == round.load(Ordering::Relaxed) {
-                    pf.stop();
-                    return 0;
-                }
-                assert_eq!(pf.token() % num_lines, pf.line());
-                j1.fetch_add(1, Ordering::Relaxed);
-                i32::try_from(current + 1).expect("a token count fits in an i32")
-            })
+            move || round.load(Ordering::Relaxed)
         };
 
-        let pipe1 = {
-            let round = Arc::clone(&round);
-            let j2 = Arc::clone(&j2);
-            let collection2 = Arc::clone(&collection2);
-            parallel_pipe_with_flow::<i32, i32>(move |value, pf| {
-                let ticket = j2.fetch_add(1, Ordering::Relaxed);
-                assert!(ticket < round.load(Ordering::Relaxed));
-                assert_eq!(pf.token() % num_lines, pf.line());
-                collection2.lock().expect("uncontended").push(value);
-                value + 1
-            })
-        };
+        let pipe0 = counting_source(num_lines, this_round.clone(), &j1);
+
+        let pipe1 = propagating_pipe(num_lines, this_round.clone(), &j2, &collection2);
 
         let pipe2 = {
             let round = Arc::clone(&round);
@@ -685,17 +592,7 @@ fn looping_data_pipelines(num_lines: usize, num_workers: usize) {
             })
         };
 
-        let pipe3 = {
-            let round = Arc::clone(&round);
-            let j4 = Arc::clone(&j4);
-            let collection4 = Arc::clone(&collection4);
-            parallel_pipe_with_flow::<i32, ()>(move |value, pf| {
-                let ticket = j4.fetch_add(1, Ordering::Relaxed);
-                assert!(ticket < round.load(Ordering::Relaxed));
-                assert_eq!(pf.token() % num_lines, pf.line());
-                collection4.lock().expect("uncontended").push(value);
-            })
-        };
+        let pipe3 = collecting_pipe(num_lines, this_round, &j4, &collection4);
 
         let pipeline = Arc::new(
             DataPipeline::builder(num_lines)
@@ -705,14 +602,7 @@ fn looping_data_pipelines(num_lines: usize, num_workers: usize) {
                 .pipe(pipe3)
                 .build(),
         );
-        let module = taskflow.composed_of(&*pipeline);
-        taskflow.task(module).name("module_of_data_pipeline");
-
-        let initial = taskflow.emplace(|| {});
-        taskflow.task(initial).name("initial").precede([module]);
-
-        let terminal = taskflow.emplace(|| {});
-        taskflow.task(terminal).name("terminal");
+        let module = compose_module(&mut taskflow, &*pipeline, "module_of_data_pipeline");
 
         let cond = {
             let round = Arc::clone(&round);
@@ -736,25 +626,16 @@ fn looping_data_pipelines(num_lines: usize, num_workers: usize) {
                 assert_consecutive_from(&collection4, 3, this_round);
                 assert_eq!(pipeline.num_tokens(), cnt);
 
-                j1.store(0, Ordering::Relaxed);
-                j2.store(0, Ordering::Relaxed);
-                j3.store(0, Ordering::Relaxed);
-                j4.store(0, Ordering::Relaxed);
-                collection2.lock().expect("uncontended").clear();
-                collection4.lock().expect("uncontended").clear();
-
-                let next_round = this_round + 1;
-                round.store(next_round, Ordering::Relaxed);
-                cnt += next_round;
-
-                i32::from(next_round >= MAX_N)
+                advance_round(
+                    &round,
+                    [&j1, &j2, &j3, &j4],
+                    [&collection2, &collection4],
+                    &mut cnt,
+                    MAX_N,
+                )
             })
         };
-        taskflow
-            .task(cond)
-            .name("cond")
-            .succeed([module])
-            .precede([module, terminal]);
+        wire_loop(&mut taskflow, module, cond);
 
         executor.run(&taskflow).wait().expect("no task panicked");
     });
@@ -852,29 +733,6 @@ fn pseudo_random_sources(n: usize) -> Vec<i32> {
         .collect()
 }
 
-/// Upstream's `ifelse_pipe_ans`: the value [`ifelse_data_pipelines`]'s own
-/// three pipes produce for one source value, recomputed independently of the
-/// pipeline so that the test's own assertion is on the *branch* each pipe
-/// actually took -- the output differs depending on which arm of each `if`
-/// ran -- rather than merely on the run finishing without a panic.
-fn ifelse_pipe_ans(value: i32) -> i32 {
-    let mut a = value;
-    if a / 2 != 0 {
-        a += 8;
-    }
-    if a > 4897 {
-        a -= 1834;
-    } else {
-        a += 3;
-    }
-    if (a + 9) / 4 < 50 {
-        a += 1;
-    } else {
-        a += 17;
-    }
-    a
-}
-
 /// Upstream's `ifelse_data_pipeline(L, w)`: a serial pipe that branches on
 /// its own source value, a parallel pipe that branches on what the first
 /// just produced, and a serial pipe that branches on what the second
@@ -929,19 +787,11 @@ fn ifelse_data_pipelines(num_lines: usize, num_workers: usize) {
                 .pipe(pipe2)
                 .build();
 
-            let module = taskflow.composed_of(&pipeline);
-            taskflow.task(module).name("module_of_data_pipeline");
+            compose_module(&mut taskflow, &pipeline, "module_of_data_pipeline");
 
             executor.run(&taskflow).wait().expect("no task panicked");
 
-            // Pipe 2 is serial, so collection order is token order: this is
-            // the n-th pipeline's own collected value, checked against the
-            // branch-sensitive answer for that same token's source value.
-            let collected = collection.lock().expect("uncontended");
-            assert_eq!(collected.len(), n);
-            for (token, &value) in collected.iter().enumerate() {
-                assert_eq!(value, ifelse_pipe_ans(source[token]));
-            }
+            assert_ifelse_answers(&collection, &source, n);
         }
     });
 }
@@ -972,17 +822,6 @@ worker_matrix! {
 // whose first three pipes each build, run and tear down a fresh 3-pipe
 // (`SPS`) inner data pipeline of their own, through `Executor::corun`.
 // ----------------------------------------------------------------------------
-
-/// `0 + 1 + ... + (sub_n - 1)`: the same closed form
-/// `tests/pipelines_nested.rs`'s own `partial_sum` uses for the untyped
-/// `Pipeline` version of this family. Upstream's `source[token]` is
-/// `std::iota(..., 0)` on every row regardless of which outer token it
-/// belongs to, so [`run_subpipeline`] needs no source data of its own to
-/// reproduce it -- `0, 1, 2, ...` already is that row.
-fn partial_sum(sub_n: usize) -> i32 {
-    let sub_n = i32::try_from(sub_n).expect("a sub-token count fits in an i32");
-    sub_n * (sub_n - 1) / 2
-}
 
 /// Builds, runs through `executor.corun` and tears down one `SPS` sub-data
 /// pipeline of `sub_n` tokens, checking every value a sub-pipe reads is
@@ -1051,19 +890,13 @@ fn run_subpipeline(executor: &Executor, sub_lines: usize, sub_n: usize, third_of
         .build();
 
     let mut inner_taskflow = Taskflow::new();
-    let module = inner_taskflow.composed_of(&subpipeline);
-    inner_taskflow.task(module).name("module_of_subpipeline");
+    compose_module(&mut inner_taskflow, &subpipeline, "module_of_subpipeline");
 
     executor
         .corun(&inner_taskflow)
         .expect("a worker of this executor may corun the sub-pipeline");
 
-    assert_eq!(subj1.load(Ordering::Relaxed), sub_n);
-    assert_eq!(subj2.load(Ordering::Relaxed), sub_n);
-    assert_eq!(subj3.load(Ordering::Relaxed), sub_n);
-    let collected = subcollection.lock().expect("uncontended");
-    assert_eq!(collected.len(), sub_n);
-    collected.iter().sum()
+    sub_pipeline_sum([&subj1, &subj2, &subj3], &subcollection, sub_n)
 }
 
 /// Upstream's `pipeline_in_pipeline(L, w, subL)`: an outer `SPSS` data
@@ -1146,8 +979,7 @@ fn pipeline_in_pipeline(num_lines: usize, num_workers: usize, sub_lines: usize) 
                     .build();
 
                 let mut taskflow = Taskflow::new();
-                let module = taskflow.composed_of(&pipeline);
-                taskflow.task(module).name("module_of_pipeline");
+                compose_module(&mut taskflow, &pipeline, "module_of_pipeline");
 
                 executor.run(&taskflow).wait().expect("no task panicked");
 

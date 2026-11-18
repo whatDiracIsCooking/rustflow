@@ -34,7 +34,7 @@
 //!   coincidentally-right final count.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use rustflow::Executor;
 use rustflow::pipeline::pipe::{Pipe, PipeType, Pipeflow};
@@ -43,66 +43,24 @@ use rustflow::prelude::*;
 
 #[macro_use]
 mod common;
+#[path = "common/compose.rs"]
+mod compose;
+#[path = "common/looping.rs"]
+mod looping;
+#[path = "common/pipeline.rs"]
+mod pipeline;
+#[path = "common/serialized.rs"]
+mod serialized;
+#[path = "common/tokens.rs"]
+mod tokens;
 
-/// Upstream's `maxN`: the largest token count any case sweeps up to, and (for
-/// `Looping.Pipelines`) the number of rounds the condition task loops.
-const MAX_N: usize = 100;
-
-/// Runs `body` with every other case in this suite held back: `tests/pipelines.rs`'s
-/// own `serialized` helper, duplicated here because each file under `tests/`
-/// is its own crate -- its module docs give the full reasoning.
-fn serialized<R>(body: impl FnOnce() -> R) -> R {
-    static GATE: Mutex<()> = Mutex::new(());
-    let _guard = GATE.lock().unwrap_or_else(PoisonError::into_inner);
-    body()
-}
-
-/// A pipeline's `lines * pipes` scratch buffer: see `tests/pipelines.rs`'s
-/// own copy for why this is a `Mutex` rather than `unsafe`.
-#[derive(Clone)]
-struct Buffer {
-    rows: Arc<Mutex<Vec<Vec<i32>>>>,
-}
-
-impl Buffer {
-    /// A buffer of `num_lines` rows of `num_pipes` zeroed slots.
-    fn new(num_lines: usize, num_pipes: usize) -> Self {
-        Self {
-            rows: Arc::new(Mutex::new(vec![vec![0; num_pipes]; num_lines])),
-        }
-    }
-
-    /// Writes `value` into `line`'s `pipe` slot.
-    fn set(&self, line: usize, pipe: usize, value: i32) {
-        self.rows.lock().expect("uncontended")[line][pipe] = value;
-    }
-
-    /// Reads `line`'s `pipe` slot.
-    fn get(&self, line: usize, pipe: usize) -> i32 {
-        self.rows.lock().expect("uncontended")[line][pipe]
-    }
-
-    /// Zeroes every slot, between rounds.
-    fn clear(&self) {
-        for row in self.rows.lock().expect("uncontended").iter_mut() {
-            row.iter_mut().for_each(|slot| *slot = 0);
-        }
-    }
-}
-
-/// Asserts that `collected` holds exactly `n` values and, once sorted, is
-/// `start, start + 1, ..., start + n - 1`: see `tests/pipelines.rs`'s own
-/// copy -- a parallel pipe's tokens have no order among themselves, so the
-/// check is the right *set*, not the right sequence.
-fn assert_consecutive_from(collected: &Mutex<Vec<i32>>, start: i32, n: usize) {
-    let mut values = collected.lock().expect("uncontended");
-    assert_eq!(values.len(), n);
-    values.sort_unstable();
-    for (index, &value) in values.iter().enumerate() {
-        let offset = i32::try_from(index).expect("a case's token count fits in an i32");
-        assert_eq!(value, start + offset);
-    }
-}
+use compose::compose_module;
+use looping::{advance_round, wire_loop};
+use pipeline::{Buffer, collecting_pipe, counting_source, propagating_pipe};
+use serialized::serialized;
+// `MAX_N` is this file's round count as well as its token count: the
+// condition task of `Looping.Pipelines` loops that many times.
+use tokens::{MAX_N, assert_consecutive_from};
 
 // ----------------------------------------------------------------------------
 // Three.Parallel.Pipelines / Three.Concatenated.Pipelines: the three
@@ -157,21 +115,7 @@ impl ThreePipelines {
         let j1_4 = Arc::new(AtomicUsize::new(0));
         let buffer1 = Buffer::new(num_lines, 4);
 
-        let pipe1_0 = {
-            let j1_1 = Arc::clone(&j1_1);
-            let buffer1 = buffer1.clone();
-            Pipe::new(PipeType::Serial, move |pf: &mut Pipeflow| {
-                let current = j1_1.load(Ordering::Relaxed);
-                if current == n {
-                    pf.stop();
-                    return;
-                }
-                assert_eq!(pf.token() % num_lines, pf.line());
-                let value = i32::try_from(current + 1).expect("a token count fits in an i32");
-                buffer1.set(pf.line(), pf.pipe(), value);
-                j1_1.fetch_add(1, Ordering::Relaxed);
-            })
-        };
+        let pipe1_0 = counting_source(num_lines, move || n, &j1_1, &buffer1);
         let pipe1_1 = {
             let j1_2 = Arc::clone(&j1_2);
             let buffer1 = buffer1.clone();
@@ -211,8 +155,7 @@ impl ThreePipelines {
             })
         };
         let pl1 = Pipeline::new(num_lines, vec![pipe1_0, pipe1_1, pipe1_2, pipe1_3]);
-        let module1 = taskflow.composed_of(&pl1);
-        taskflow.task(module1).name("module_of_pipeline1");
+        let module1 = compose_module(taskflow, &pl1, "module_of_pipeline1");
 
         // Pipeline 2: SSP. Two serial pipes as pipeline 1's own first two,
         // then a parallel pipe that collects rather than checking a
@@ -223,21 +166,7 @@ impl ThreePipelines {
         let buffer2 = Buffer::new(num_lines, 3);
         let collection2: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
 
-        let pipe2_0 = {
-            let j2_1 = Arc::clone(&j2_1);
-            let buffer2 = buffer2.clone();
-            Pipe::new(PipeType::Serial, move |pf: &mut Pipeflow| {
-                let current = j2_1.load(Ordering::Relaxed);
-                if current == n {
-                    pf.stop();
-                    return;
-                }
-                assert_eq!(pf.token() % num_lines, pf.line());
-                let value = i32::try_from(current + 1).expect("a token count fits in an i32");
-                buffer2.set(pf.line(), pf.pipe(), value);
-                j2_1.fetch_add(1, Ordering::Relaxed);
-            })
-        };
+        let pipe2_0 = counting_source(num_lines, move || n, &j2_1, &buffer2);
         let pipe2_1 = {
             let j2_2 = Arc::clone(&j2_2);
             let buffer2 = buffer2.clone();
@@ -251,21 +180,9 @@ impl ThreePipelines {
                 j2_2.fetch_add(1, Ordering::Relaxed);
             })
         };
-        let pipe2_2 = {
-            let j2_3 = Arc::clone(&j2_3);
-            let buffer2 = buffer2.clone();
-            let collection2 = Arc::clone(&collection2);
-            Pipe::new(PipeType::Parallel, move |pf: &mut Pipeflow| {
-                let ticket = j2_3.fetch_add(1, Ordering::Relaxed);
-                assert!(ticket < n);
-                let mut collected = collection2.lock().expect("uncontended");
-                assert_eq!(pf.token() % num_lines, pf.line());
-                collected.push(buffer2.get(pf.line(), pf.pipe() - 1));
-            })
-        };
+        let pipe2_2 = collecting_pipe(num_lines, move || n, &j2_3, &buffer2, &collection2);
         let pl2 = Pipeline::new(num_lines, vec![pipe2_0, pipe2_1, pipe2_2]);
-        let module2 = taskflow.composed_of(&pl2);
-        taskflow.task(module2).name("module_of_pipeline2");
+        let module2 = compose_module(taskflow, &pl2, "module_of_pipeline2");
 
         // Pipeline 3: SP. One serial pipe as the other two's own first,
         // then a parallel pipe that collects.
@@ -274,36 +191,10 @@ impl ThreePipelines {
         let buffer3 = Buffer::new(num_lines, 2);
         let collection3: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
 
-        let pipe3_0 = {
-            let j3_1 = Arc::clone(&j3_1);
-            let buffer3 = buffer3.clone();
-            Pipe::new(PipeType::Serial, move |pf: &mut Pipeflow| {
-                let current = j3_1.load(Ordering::Relaxed);
-                if current == n {
-                    pf.stop();
-                    return;
-                }
-                assert_eq!(pf.token() % num_lines, pf.line());
-                let value = i32::try_from(current + 1).expect("a token count fits in an i32");
-                buffer3.set(pf.line(), pf.pipe(), value);
-                j3_1.fetch_add(1, Ordering::Relaxed);
-            })
-        };
-        let pipe3_1 = {
-            let j3_2 = Arc::clone(&j3_2);
-            let buffer3 = buffer3.clone();
-            let collection3 = Arc::clone(&collection3);
-            Pipe::new(PipeType::Parallel, move |pf: &mut Pipeflow| {
-                let ticket = j3_2.fetch_add(1, Ordering::Relaxed);
-                assert!(ticket < n);
-                let mut collected = collection3.lock().expect("uncontended");
-                assert_eq!(pf.token() % num_lines, pf.line());
-                collected.push(buffer3.get(pf.line(), pf.pipe() - 1));
-            })
-        };
+        let pipe3_0 = counting_source(num_lines, move || n, &j3_1, &buffer3);
+        let pipe3_1 = collecting_pipe(num_lines, move || n, &j3_2, &buffer3, &collection3);
         let pl3 = Pipeline::new(num_lines, vec![pipe3_0, pipe3_1]);
-        let module3 = taskflow.composed_of(&pl3);
-        taskflow.task(module3).name("module_of_pipeline3");
+        let module3 = compose_module(taskflow, &pl3, "module_of_pipeline3");
 
         Self {
             pl1,
@@ -612,37 +503,16 @@ fn looping_pipelines(num_lines: usize, num_workers: usize) {
         let collection2: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
         let collection4: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
 
-        let pipe0 = {
+        // Every pipe reads the round's own token count rather than a fixed
+        // `n`, which is what the builders' closure argument is for.
+        let this_round = {
             let round = Arc::clone(&round);
-            let j1 = Arc::clone(&j1);
-            let buffer = buffer.clone();
-            Pipe::new(PipeType::Serial, move |pf: &mut Pipeflow| {
-                let current = j1.load(Ordering::Relaxed);
-                if current == round.load(Ordering::Relaxed) {
-                    pf.stop();
-                    return;
-                }
-                assert_eq!(pf.token() % num_lines, pf.line());
-                let value = i32::try_from(current + 1).expect("a token count fits in an i32");
-                buffer.set(pf.line(), pf.pipe(), value);
-                j1.fetch_add(1, Ordering::Relaxed);
-            })
+            move || round.load(Ordering::Relaxed)
         };
 
-        let pipe1 = {
-            let round = Arc::clone(&round);
-            let j2 = Arc::clone(&j2);
-            let buffer = buffer.clone();
-            let collection2 = Arc::clone(&collection2);
-            Pipe::new(PipeType::Parallel, move |pf: &mut Pipeflow| {
-                let ticket = j2.fetch_add(1, Ordering::Relaxed);
-                assert!(ticket < round.load(Ordering::Relaxed));
-                let previous = buffer.get(pf.line(), pf.pipe() - 1);
-                buffer.set(pf.line(), pf.pipe(), previous + 1);
-                assert_eq!(pf.token() % num_lines, pf.line());
-                collection2.lock().expect("uncontended").push(previous);
-            })
-        };
+        let pipe0 = counting_source(num_lines, this_round.clone(), &j1, &buffer);
+
+        let pipe1 = propagating_pipe(num_lines, this_round.clone(), &j2, &buffer, &collection2);
 
         let pipe2 = {
             let round = Arc::clone(&round);
@@ -659,29 +529,10 @@ fn looping_pipelines(num_lines: usize, num_workers: usize) {
             })
         };
 
-        let pipe3 = {
-            let round = Arc::clone(&round);
-            let j4 = Arc::clone(&j4);
-            let buffer = buffer.clone();
-            let collection4 = Arc::clone(&collection4);
-            Pipe::new(PipeType::Parallel, move |pf: &mut Pipeflow| {
-                let ticket = j4.fetch_add(1, Ordering::Relaxed);
-                assert!(ticket < round.load(Ordering::Relaxed));
-                let value = buffer.get(pf.line(), pf.pipe() - 1);
-                assert_eq!(pf.token() % num_lines, pf.line());
-                collection4.lock().expect("uncontended").push(value);
-            })
-        };
+        let pipe3 = collecting_pipe(num_lines, this_round, &j4, &buffer, &collection4);
 
         let pl = Arc::new(Pipeline::new(num_lines, vec![pipe0, pipe1, pipe2, pipe3]));
-        let module = taskflow.composed_of(&*pl);
-        taskflow.task(module).name("module_of_pipeline");
-
-        let initial = taskflow.emplace(|| {});
-        taskflow.task(initial).name("initial").precede([module]);
-
-        let terminal = taskflow.emplace(|| {});
-        taskflow.task(terminal).name("terminal");
+        let module = compose_module(&mut taskflow, &*pl, "module_of_pipeline");
 
         let cond = {
             let round = Arc::clone(&round);
@@ -707,26 +558,17 @@ fn looping_pipelines(num_lines: usize, num_workers: usize) {
                 assert_consecutive_from(&collection4, 3, this_round);
                 assert_eq!(pl.num_tokens(), cnt);
 
-                j1.store(0, Ordering::Relaxed);
-                j2.store(0, Ordering::Relaxed);
-                j3.store(0, Ordering::Relaxed);
-                j4.store(0, Ordering::Relaxed);
                 buffer.clear();
-                collection2.lock().expect("uncontended").clear();
-                collection4.lock().expect("uncontended").clear();
-
-                let next_round = this_round + 1;
-                round.store(next_round, Ordering::Relaxed);
-                cnt += next_round;
-
-                i32::from(next_round >= MAX_N)
+                advance_round(
+                    &round,
+                    [&j1, &j2, &j3, &j4],
+                    [&collection2, &collection4],
+                    &mut cnt,
+                    MAX_N,
+                )
             })
         };
-        taskflow
-            .task(cond)
-            .name("cond")
-            .succeed([module])
-            .precede([module, terminal]);
+        wire_loop(&mut taskflow, module, cond);
 
         executor.run(&taskflow).wait().expect("no task panicked");
     });

@@ -20,41 +20,27 @@
 //!   cases are checking.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use rustflow::Executor;
-use rustflow::pipeline::data_pipeline::{
-    DataPipeline, parallel_pipe_with_flow, serial_pipe_with_flow,
-};
+use rustflow::pipeline::data_pipeline::{DataPipeline, serial_pipe_with_flow};
 use rustflow::prelude::*;
 
 #[macro_use]
 mod common;
+#[path = "common/compose.rs"]
+mod compose;
+#[path = "common/data_pipeline.rs"]
+mod data_pipeline;
+#[path = "common/serialized.rs"]
+mod serialized;
+#[path = "common/tokens.rs"]
+mod tokens;
 
-/// Upstream's `maxN`: the largest token count any case sweeps up to.
-const MAX_N: usize = 100;
-
-/// Runs `body` with every other case in this suite held back:
-/// `tests/pipelines.rs`'s own `serialized` and its doc comment's reasoning,
-/// unchanged here.
-fn serialized<R>(body: impl FnOnce() -> R) -> R {
-    static GATE: Mutex<()> = Mutex::new(());
-    let _guard = GATE.lock().unwrap_or_else(PoisonError::into_inner);
-    body()
-}
-
-/// Asserts that `collected` holds exactly `n` values and, once sorted, is
-/// `start, start + 1, ..., start + n - 1`: `tests/pipelines.rs`'s own helper
-/// of the same name, unchanged here.
-fn assert_consecutive_from(collected: &Mutex<Vec<i32>>, start: i32, n: usize) {
-    let mut values = collected.lock().expect("uncontended");
-    assert_eq!(values.len(), n);
-    values.sort_unstable();
-    for (index, &value) in values.iter().enumerate() {
-        let offset = i32::try_from(index).expect("a case's token count fits in an i32");
-        assert_eq!(value, start + offset);
-    }
-}
+use compose::compose_module;
+use data_pipeline::{collecting_pipe, counting_source, propagating_pipe};
+use serialized::serialized;
+use tokens::{MAX_N, assert_consecutive_from};
 
 // ----------------------------------------------------------------------------
 // DataPipeline.1P(S): one serial pipe, L lines, W workers
@@ -85,8 +71,7 @@ fn data_pipeline_1p_s(num_lines: usize, num_workers: usize) {
 
             let pipeline = DataPipeline::builder(num_lines).pipe(pipe0).build();
 
-            let module = taskflow.composed_of(&pipeline);
-            taskflow.task(module).name("module_of_data_pipeline");
+            compose_module(&mut taskflow, &pipeline, "module_of_data_pipeline");
 
             for attempt in 0..2 {
                 executor.run(&taskflow).wait().expect("no task panicked");
@@ -138,19 +123,7 @@ fn data_pipeline_2p_ss(num_lines: usize, num_workers: usize) {
             let j1 = Arc::new(AtomicUsize::new(0));
             let j2 = Arc::new(AtomicUsize::new(0));
 
-            let pipe0 = {
-                let j1 = Arc::clone(&j1);
-                serial_pipe_with_flow::<(), i32>(move |(), pf| {
-                    let current = j1.load(Ordering::Relaxed);
-                    if current == n {
-                        pf.stop();
-                        return 0;
-                    }
-                    assert_eq!(pf.token() % num_lines, pf.line());
-                    j1.fetch_add(1, Ordering::Relaxed);
-                    i32::try_from(current + 1).expect("a token count fits in an i32")
-                })
-            };
+            let pipe0 = counting_source(num_lines, move || n, &j1);
 
             let pipe1 = {
                 let j2 = Arc::clone(&j2);
@@ -170,8 +143,7 @@ fn data_pipeline_2p_ss(num_lines: usize, num_workers: usize) {
                 .pipe(pipe1)
                 .build();
 
-            let module = taskflow.composed_of(&pipeline);
-            taskflow.task(module).name("module_of_data_pipeline");
+            compose_module(&mut taskflow, &pipeline, "module_of_data_pipeline");
 
             for attempt in 0..2 {
                 executor.run(&taskflow).wait().expect("no task panicked");
@@ -227,38 +199,16 @@ fn data_pipeline_2p_sp(num_lines: usize, num_workers: usize) {
             let j2 = Arc::new(AtomicUsize::new(0));
             let collection: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
 
-            let pipe0 = {
-                let j1 = Arc::clone(&j1);
-                serial_pipe_with_flow::<(), i32>(move |(), pf| {
-                    let current = j1.load(Ordering::Relaxed);
-                    if current == n {
-                        pf.stop();
-                        return 0;
-                    }
-                    assert_eq!(pf.token() % num_lines, pf.line());
-                    j1.fetch_add(1, Ordering::Relaxed);
-                    i32::try_from(current + 1).expect("a token count fits in an i32")
-                })
-            };
+            let pipe0 = counting_source(num_lines, move || n, &j1);
 
-            let pipe1 = {
-                let j2 = Arc::clone(&j2);
-                let collection = Arc::clone(&collection);
-                parallel_pipe_with_flow::<i32, ()>(move |value, pf| {
-                    let ticket = j2.fetch_add(1, Ordering::Relaxed);
-                    assert!(ticket < n);
-                    assert_eq!(pf.token() % num_lines, pf.line());
-                    collection.lock().expect("uncontended").push(value);
-                })
-            };
+            let pipe1 = collecting_pipe(num_lines, move || n, &j2, &collection);
 
             let pipeline = DataPipeline::builder(num_lines)
                 .pipe(pipe0)
                 .pipe(pipe1)
                 .build();
 
-            let module = taskflow.composed_of(&pipeline);
-            taskflow.task(module).name("module_of_data_pipeline");
+            compose_module(&mut taskflow, &pipeline, "module_of_data_pipeline");
 
             for attempt in 0..2 {
                 executor.run(&taskflow).wait().expect("no task panicked");
@@ -314,19 +264,7 @@ fn data_pipeline_3p_sss(num_lines: usize, num_workers: usize) {
             let j2 = Arc::new(AtomicUsize::new(0));
             let j3 = Arc::new(AtomicUsize::new(0));
 
-            let pipe0 = {
-                let j1 = Arc::clone(&j1);
-                serial_pipe_with_flow::<(), i32>(move |(), pf| {
-                    let current = j1.load(Ordering::Relaxed);
-                    if current == n {
-                        pf.stop();
-                        return 0;
-                    }
-                    assert_eq!(pf.token() % num_lines, pf.line());
-                    j1.fetch_add(1, Ordering::Relaxed);
-                    i32::try_from(current + 1).expect("a token count fits in an i32")
-                })
-            };
+            let pipe0 = counting_source(num_lines, move || n, &j1);
 
             let pipe1 = {
                 let j2 = Arc::clone(&j2);
@@ -361,8 +299,7 @@ fn data_pipeline_3p_sss(num_lines: usize, num_workers: usize) {
                 .pipe(pipe2)
                 .build();
 
-            let module = taskflow.composed_of(&pipeline);
-            taskflow.task(module).name("module_of_data_pipeline");
+            compose_module(&mut taskflow, &pipeline, "module_of_data_pipeline");
 
             for attempt in 0..2 {
                 executor.run(&taskflow).wait().expect("no task panicked");
@@ -419,19 +356,7 @@ fn data_pipeline_3p_ssp(num_lines: usize, num_workers: usize) {
             let j3 = Arc::new(AtomicUsize::new(0));
             let collection: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
 
-            let pipe0 = {
-                let j1 = Arc::clone(&j1);
-                serial_pipe_with_flow::<(), i32>(move |(), pf| {
-                    let current = j1.load(Ordering::Relaxed);
-                    if current == n {
-                        pf.stop();
-                        return 0;
-                    }
-                    assert_eq!(pf.token() % num_lines, pf.line());
-                    j1.fetch_add(1, Ordering::Relaxed);
-                    i32::try_from(current + 1).expect("a token count fits in an i32")
-                })
-            };
+            let pipe0 = counting_source(num_lines, move || n, &j1);
 
             let pipe1 = {
                 let j2 = Arc::clone(&j2);
@@ -447,16 +372,7 @@ fn data_pipeline_3p_ssp(num_lines: usize, num_workers: usize) {
                 })
             };
 
-            let pipe2 = {
-                let j3 = Arc::clone(&j3);
-                let collection = Arc::clone(&collection);
-                parallel_pipe_with_flow::<i32, ()>(move |value, pf| {
-                    let ticket = j3.fetch_add(1, Ordering::Relaxed);
-                    assert!(ticket < n);
-                    assert_eq!(pf.token() % num_lines, pf.line());
-                    collection.lock().expect("uncontended").push(value);
-                })
-            };
+            let pipe2 = collecting_pipe(num_lines, move || n, &j3, &collection);
 
             let pipeline = DataPipeline::builder(num_lines)
                 .pipe(pipe0)
@@ -464,8 +380,7 @@ fn data_pipeline_3p_ssp(num_lines: usize, num_workers: usize) {
                 .pipe(pipe2)
                 .build();
 
-            let module = taskflow.composed_of(&pipeline);
-            taskflow.task(module).name("module_of_data_pipeline");
+            compose_module(&mut taskflow, &pipeline, "module_of_data_pipeline");
 
             for attempt in 0..2 {
                 executor.run(&taskflow).wait().expect("no task panicked");
@@ -525,31 +440,9 @@ fn data_pipeline_3p_sps(num_lines: usize, num_workers: usize) {
             let j3 = Arc::new(AtomicUsize::new(0));
             let collection: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
 
-            let pipe0 = {
-                let j1 = Arc::clone(&j1);
-                serial_pipe_with_flow::<(), i32>(move |(), pf| {
-                    let current = j1.load(Ordering::Relaxed);
-                    if current == n {
-                        pf.stop();
-                        return 0;
-                    }
-                    assert_eq!(pf.token() % num_lines, pf.line());
-                    j1.fetch_add(1, Ordering::Relaxed);
-                    i32::try_from(current + 1).expect("a token count fits in an i32")
-                })
-            };
+            let pipe0 = counting_source(num_lines, move || n, &j1);
 
-            let pipe1 = {
-                let j2 = Arc::clone(&j2);
-                let collection = Arc::clone(&collection);
-                parallel_pipe_with_flow::<i32, i32>(move |value, pf| {
-                    let ticket = j2.fetch_add(1, Ordering::Relaxed);
-                    assert!(ticket < n);
-                    assert_eq!(pf.token() % num_lines, pf.line());
-                    collection.lock().expect("uncontended").push(value);
-                    value + 1
-                })
-            };
+            let pipe1 = propagating_pipe(num_lines, move || n, &j2, &collection);
 
             let pipe2 = {
                 let j3 = Arc::clone(&j3);
@@ -570,8 +463,7 @@ fn data_pipeline_3p_sps(num_lines: usize, num_workers: usize) {
                 .pipe(pipe2)
                 .build();
 
-            let module = taskflow.composed_of(&pipeline);
-            taskflow.task(module).name("module_of_data_pipeline");
+            compose_module(&mut taskflow, &pipeline, "module_of_data_pipeline");
 
             for attempt in 0..2 {
                 executor.run(&taskflow).wait().expect("no task panicked");
@@ -632,42 +524,11 @@ fn data_pipeline_3p_spp(num_lines: usize, num_workers: usize) {
             let collection2: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
             let collection3: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
 
-            let pipe0 = {
-                let j1 = Arc::clone(&j1);
-                serial_pipe_with_flow::<(), i32>(move |(), pf| {
-                    let current = j1.load(Ordering::Relaxed);
-                    if current == n {
-                        pf.stop();
-                        return 0;
-                    }
-                    assert_eq!(pf.token() % num_lines, pf.line());
-                    j1.fetch_add(1, Ordering::Relaxed);
-                    i32::try_from(current + 1).expect("a token count fits in an i32")
-                })
-            };
+            let pipe0 = counting_source(num_lines, move || n, &j1);
 
-            let pipe1 = {
-                let j2 = Arc::clone(&j2);
-                let collection2 = Arc::clone(&collection2);
-                parallel_pipe_with_flow::<i32, i32>(move |value, pf| {
-                    let ticket = j2.fetch_add(1, Ordering::Relaxed);
-                    assert!(ticket < n);
-                    assert_eq!(pf.token() % num_lines, pf.line());
-                    collection2.lock().expect("uncontended").push(value);
-                    value + 1
-                })
-            };
+            let pipe1 = propagating_pipe(num_lines, move || n, &j2, &collection2);
 
-            let pipe2 = {
-                let j3 = Arc::clone(&j3);
-                let collection3 = Arc::clone(&collection3);
-                parallel_pipe_with_flow::<i32, ()>(move |value, pf| {
-                    let ticket = j3.fetch_add(1, Ordering::Relaxed);
-                    assert!(ticket < n);
-                    assert_eq!(pf.token() % num_lines, pf.line());
-                    collection3.lock().expect("uncontended").push(value);
-                })
-            };
+            let pipe2 = collecting_pipe(num_lines, move || n, &j3, &collection3);
 
             let pipeline = DataPipeline::builder(num_lines)
                 .pipe(pipe0)
@@ -675,8 +536,7 @@ fn data_pipeline_3p_spp(num_lines: usize, num_workers: usize) {
                 .pipe(pipe2)
                 .build();
 
-            let module = taskflow.composed_of(&pipeline);
-            taskflow.task(module).name("module_of_data_pipeline");
+            compose_module(&mut taskflow, &pipeline, "module_of_data_pipeline");
 
             for attempt in 0..2 {
                 executor.run(&taskflow).wait().expect("no task panicked");

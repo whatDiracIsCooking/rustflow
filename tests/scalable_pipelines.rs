@@ -77,16 +77,16 @@ use rustflow::prelude::*;
 
 #[macro_use]
 mod common;
+#[path = "common/compose.rs"]
+mod compose;
+// Only the gate and the composition scaffold: this suite's own cases spin up several multi-worker
+// `Executor`s each, and `cargo test`'s default harness runs many `#[test]`s
+// at once.
+#[path = "common/serialized.rs"]
+mod serialized;
 
-/// Runs `body` with every other case in this suite held back: the same gate
-/// `tests/pipelines.rs` uses, and for the same reason -- `cargo test`'s
-/// default harness runs many `#[test]`s at once, and this suite's own cases
-/// spin up several multi-worker `Executor`s each.
-fn serialized<R>(body: impl FnOnce() -> R) -> R {
-    static GATE: Mutex<()> = Mutex::new(());
-    let _guard = GATE.lock().unwrap_or_else(PoisonError::into_inner);
-    body()
-}
+use compose::compose_module;
+use serialized::serialized;
 
 /// A single serial pipe that does nothing: the throwaway shape every case
 /// below builds a [`Pipeline`] over before its first [`Pipeline::reset_pipes`]
@@ -180,8 +180,7 @@ fn scalable_pipeline_reset(num_lines: usize, num_pipes: usize) {
     pipeline.reset_pipes(pipes);
 
     let mut taskflow = Taskflow::new();
-    let module = taskflow.composed_of(&pipeline);
-    taskflow.task(module).name("module_of_pipeline");
+    compose_module(&mut taskflow, &pipeline, "module_of_pipeline");
 
     executor.run(&taskflow).wait().expect("no task panicked");
 
@@ -218,8 +217,7 @@ fn scalable_pipeline_iterative_reset(num_lines: usize, num_pipes: usize) {
     let pipeline = Arc::new(pipeline);
 
     let mut taskflow = Taskflow::new();
-    let module = taskflow.composed_of(&*pipeline);
-    taskflow.task(module).name("module_of_pipeline");
+    let module = compose_module(&mut taskflow, &*pipeline, "module_of_pipeline");
 
     let iteration = Arc::new(AtomicUsize::new(0));
     let cond = {
@@ -274,8 +272,7 @@ fn scalable_pipeline_lines_reset(num_lines: usize, num_pipes: usize) {
         pipeline.reset_lines(l, pipes);
 
         let mut taskflow = Taskflow::new();
-        let module = taskflow.composed_of(&pipeline);
-        taskflow.task(module).name("module_of_pipeline");
+        compose_module(&mut taskflow, &pipeline, "module_of_pipeline");
 
         executor.run(&taskflow).wait().expect("no task panicked");
 
@@ -365,8 +362,7 @@ fn data_pipeline_reset_pipes() {
             pipeline.reset_pipes(|builder| counting_chain(builder, Arc::clone(&reached_last)));
 
             let mut taskflow = Taskflow::new();
-            let module = taskflow.composed_of(&pipeline);
-            taskflow.task(module).name("module_of_data_pipeline");
+            compose_module(&mut taskflow, &pipeline, "module_of_data_pipeline");
 
             executor.run(&taskflow).wait().expect("no task panicked");
 
@@ -397,8 +393,7 @@ fn data_pipeline_lines_reset() {
             });
 
             let mut taskflow = Taskflow::new();
-            let module = taskflow.composed_of(&pipeline);
-            taskflow.task(module).name("module_of_data_pipeline");
+            compose_module(&mut taskflow, &pipeline, "module_of_data_pipeline");
 
             executor.run(&taskflow).wait().expect("no task panicked");
 
@@ -514,8 +509,7 @@ fn ifelse_spipeline(num_lines: usize, num_workers: usize) {
             pipeline.reset_pipes(pipes);
 
             let mut taskflow = Taskflow::new();
-            let module = taskflow.composed_of(&pipeline);
-            taskflow.task(module).name("pipeline");
+            compose_module(&mut taskflow, &pipeline, "pipeline");
 
             executor.run(&taskflow).wait().expect("no task panicked");
 
@@ -630,8 +624,7 @@ fn nested_pipeline_result(
     sub_pipeline.reset_lines(sub_l, vec![subpipe0, subpipe1, subpipe2]);
 
     let mut sub_taskflow = Taskflow::new();
-    let module = sub_taskflow.composed_of(&sub_pipeline);
-    sub_taskflow.task(module).name("module_of_subpipeline");
+    compose_module(&mut sub_taskflow, &sub_pipeline, "module_of_subpipeline");
 
     executor
         .corun(&sub_taskflow)
@@ -720,8 +713,7 @@ fn spipeline_in_spipeline(num_lines: usize, num_workers: usize, sub_lines: usize
                 pipeline.reset_lines(num_lines, pipes);
 
                 let mut taskflow = Taskflow::new();
-                let module = taskflow.composed_of(&pipeline);
-                taskflow.task(module).name("module_of_pipeline");
+                compose_module(&mut taskflow, &pipeline, "module_of_pipeline");
 
                 executor.run(&taskflow).wait().expect("no task panicked");
             }
@@ -877,8 +869,7 @@ fn snig_spipeline(num_lines: usize, num_workers: usize) {
                 })
             };
 
-            let module = taskflow.composed_of(&*pipeline);
-            taskflow.task(module).name("pipeline");
+            let module = compose_module(&mut taskflow, &*pipeline, "pipeline");
 
             let fetch = {
                 let finished = Arc::clone(&finished);
@@ -1001,8 +992,7 @@ fn spawn_subflow_pipeline(
     let mut pipeline = Pipeline::new(1, vec![dummy_pipe()]);
     pipeline.reset_lines(num_lines, pipes);
 
-    let module = subflow.composed_of(&pipeline);
-    subflow.task(module).name("module_of_pipeline");
+    let module = compose_module(subflow, &pipeline, "module_of_pipeline");
 
     if level + 1 < num_recurs {
         let next = subflow.emplace_subflow(move |nested: &mut Subflow<'_>| {
