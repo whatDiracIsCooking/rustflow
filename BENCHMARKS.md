@@ -2705,3 +2705,174 @@ upstream C++ = not published} table land with it. What is established here is
 that both ids run to completion at both worker counts, that each agrees with
 the sequential fold, and that every id the #186/#188 section quotes still
 exists under the name it quotes (`cargo bench -- --list`).
+
+## merge_sort
+
+`N` random `f64`s sorted by the recursion written out rather than by a
+library call: upstream's `merge_sort/taskflow.cpp` splits a range at its
+midpoint, `silent_async`s the right half into a `TaskGroup` of that level's
+own, sorts the left half on the calling worker, `corun`s, and merges the two
+sorted halves through a second array of the same length before copying them
+back. Below 1024 elements -- upstream's own cutoff, unchanged -- a range is
+sorted in place and nothing is spawned. The root is one `Executor::spawn`
+whose handle is waited, because the recursion has to start on a worker;
+upstream nests *two* `executor.async` calls around the same work, the inner
+one blocking a worker on its `wait()`, and this port submits one.
+
+**The baseline is `rayon::join`, not `par_sort_unstable_by`**, which is the
+one thing that keeps this section from duplicating the `sort` one above.
+There both columns are a library's own sort -- `Runtime::sort_by` against
+pattern-defeating quicksort -- and the table reads as a comparison of two
+sorting algorithms that happen to be parallel. Here both columns run the
+*same* merge sort with the same cutoff and the same merge, so what a row
+isolates is one `silent_async` plus one `corun` per level against one
+`rayon::join`, which is what upstream's own `tbb.cpp` writes on a
+`tbb::task_group`. The two sections are worth reading in that order: `sort`
+says what the shipped algorithm costs, this one says what the fork costs.
+
+Sizes are two points off upstream's `N = 10..=1e8` sweep, `10_000` and
+`1_000_000`. The sweep's first three points are below the 1024-element
+cutoff, where this shape degenerates into a single `sort_unstable_by` and
+spawns nothing at all -- the `sort` section already measures that case at
+`N = 1_000` -- so `10_000` is the first point of the sweep with a recursion
+in it, four levels deep and 15 spawned tasks, where the fixed cost of a run
+still shows; `1_000_000` is ten levels and 1023 spawned tasks, where the
+per-task cost dominates.
+
+**What bounds the depth is upstream's cutoff, and the task count that falls
+out of it is what makes this shape safe where `fibonacci`'s `rustflow-group`
+id is not.** A range is halved until it is at most 1024 long, so the
+recursion is `ceil(log2(N / 1024))` levels and the tasks outstanding at any
+moment are bounded by the 1023 of the larger size. The `fibonacci` section's
+own cliff -- a `TaskGroup::corun` nests a frame per *outstanding child*
+rather than one per level, because it waits on the stealing end of the queues
+-- sits some thousands of nodes up, between `fib(17)` and `fib(18)` at one
+worker. A thousand `msort` frames is inside it, checked at both worker counts
+in a release build rather than assumed -- which is what makes this one of the
+five nested shapes #342 can A/B the preempted-parent resume on without having
+to shrink first, where the `integrate` section below is the one that could
+not.
+
+**How the two halves reach the two branches, without `unsafe`.** Upstream's
+child captures the whole `std::vector<double>` by reference and is trusted to
+touch only `[mid, end)`; a `TaskGroup::silent_async` body here is
+`FnOnce() + Send + 'static` and so cannot hold the `&mut [f64]` that
+`split_at_mut` would give it. The `rustflow` column therefore keeps the array
+as a slice of `AtomicU64` holding `f64::to_bits` patterns, shared by `Arc`,
+and passes upstream's `begin`/`mid`/`end` indices -- the departure the
+`for_each` section above records, for the same reason, and a relaxed load and
+store are the instructions a plain load and store are on this target.
+Disjointness is then a property of the index arithmetic rather than something
+the compiler checks, which is exactly what the untimed assertion below is for.
+The `rayon` column does get real `&mut [f64]` halves out of `split_at_mut`,
+since a `join` body may borrow the frame that forked it; that asymmetry is in
+the baseline's favour, like the `Vec<f64>` the `for_each` baseline keeps.
+
+Each sample runs on a fresh shuffle through `Bencher::iter_batched`, reusing
+the `sort` section's pattern for its reason: the input is mutated in place, so
+criterion's plain `iter` would time a sort of already-sorted data on every
+sample after the first. The merge buffer is allocated inside the timed region
+on both sides, where upstream's `std::vector<T> buffer(data.size())` is.
+
+The check is in the untimed part of the run, before any id of a size is
+timed: both columns sort one shuffle at each size and worker count, and each
+output is compared element by element against a copy sorted by
+`sort_unstable_by` on one thread. The comparison is exact rather than a
+tolerance -- a sort permutes its input and invents no values, so the sorted
+sequence of a multiset of `f64`s is unique whatever order the halves were
+merged in -- and a mutation confirms it bites: a left branch handed one
+element fewer fails at index 762 of the 10_000 rather than producing a figure.
+
+**Figures: measured by #352**, which takes every M11 section's table in one
+quiet-box pass. This section lands with the shape, the ids
+(`rustflow/{1,24}w` and `rayon/{1,24}w` at sizes 10_000 and 1_000_000), the
+sizes and the baseline fixed, and no numbers and no load row: three sibling
+agents were building on this box while it was written, so a figure taken here
+would record the load rather than the shape. What is verified here is that
+the benchmark runs and that its answer is right --
+`cargo bench --all-features --bench merge_sort -- --test` drives all eight
+ids and the untimed comparison behind them.
+
+## integrate
+
+Adaptive quadrature of `f(x) = (x^2 + 1) x` over `[0, V]`, and the second of
+the two **data corun recursions**: upstream's `spawn_async` bisects the
+interval, compares the two-trapezoid estimate against the one it was handed,
+and if they differ by at least `epsilon = 1.0e-9` submits the left half as a
+`silent_async` child of a `TaskGroup` of that interval's own, refines the
+right half on the calling worker, `corun`s, and returns the sum of the two
+areas. The bisection, the error bound and the `f64` arithmetic are upstream's
+unchanged, down to the two one-sided comparisons it spells the bound with. As
+in `merge_sort`, the root is one `Executor::spawn` whose handle is waited.
+The baseline is `rayon::join`, which is the same recursion with the fork
+replaced and what upstream's `tbb.cpp` writes on a `tbb::task_group`.
+
+**Nothing is shared between the two branches**, which is what makes this the
+cheaper of the two data recursions to port: each half of an interval produces
+a single `f64`, so where upstream's child writes `area_x1x0` through a
+captured reference into its parent's frame, the port hands it an
+`Arc<AtomicU64>` holding an `f64::to_bits` pattern -- the slot `fibonacci`'s
+group recursion already uses. `Relaxed` on both ends, ordered by the `corun`.
+No `unsafe`, no shared mutable range, and no index discipline for an
+assertion to have to check.
+
+**What bounds the depth is the error bound; what bounds the size is the
+stack, and the size this shape completes at is two orders of magnitude below
+upstream's own sweep.** The recursion stops splitting once two trapezoids
+agree with one to within `epsilon`, which for this cubic happens at a width
+of about `(2 * epsilon / x)^(1/3)` near `x`: the depth grows as `log(V)`,
+which is 10 levels at `V = 1` and 11 at `V = 2`, while the number of
+intervals grows as `V^(4/3)` -- 828 spawned tasks at `V = 1`, 1852 at
+`V = 2`. It is the task count that binds. Upstream's `main.cpp` walks
+`v = 0, 100, .., 2000`, and its first non-degenerate point, `V = 100`, is
+some 390_000 spawned tasks; measured in a release build on this box,
+**`V = 3` -- 3478 spawned tasks -- overflows the stack of the one worker that
+has to pick them up**, and `V = 1` and `V = 2` are what completes, at both
+worker counts. So the sizes here are not points on upstream's sweep at all,
+and that is the finding rather than a quiet shrink.
+
+The cliff is the one the `fibonacci` and `skynet` sections describe, for the
+same reason: a `TaskGroup::corun` waits on the stealing end of the queues, so
+the worker waiting for its own child may be handed an *ancestor's*
+outstanding subtree instead, and nests one frame per outstanding task rather
+than one per level of recursion. Where exactly it bites is a property of the
+tree and of the frame, not a single task count -- `skynet` passes 11110
+spawned tasks at one worker with a frame of three `f64`s and an array slot,
+this recursion carries five `f64`s and a slot per level and stops between
+1852 and 3478 -- and what the three shapes agree on is the direction: one
+worker is the binding end, because the one worker that coruns is the only
+worker there is to pick the outstanding children up. `fibonacci`'s group id
+stops at `fib(15)` for it while its *runtime* id -- whose child goes onto the
+waiting worker's own LIFO queue, which #119 changed -- carries upstream's
+whole sweep to `fib(40)`. This shape has no runtime variant: upstream's
+`integrate/taskflow.cpp` is written on `task_group()` and the port follows
+it, so what #352 will tabulate is a `TaskGroup` column and the ceiling above
+is `TaskGroup`'s. #342 is where the resume that would raise it is measured,
+and if that work moves the cliff the sizes here move with it.
+
+The answer is checked twice before any id is timed, both outside every
+measured region, because the two checks catch different failures. **Against
+the closed form**, `integrate.hpp`'s own `integral_fn`, which upstream never
+compares against: the tolerance is an absolute `1e-5`, derived from
+`epsilon` rather than picked -- an accepted interval's trapezoid sum sits
+within `epsilon / 3` of the true area over it, so a tree of `K` accepted
+intervals is within `K * epsilon / 3`, which is `2.8e-7` over the 829 leaves
+at `V = 1` and `6.2e-7` over the 1853 at `V = 2` against a measured `8.4e-8`
+and `2.6e-7`. Absolute and not relative because `epsilon` is absolute: the
+areas here are `0.75` and `6`, and a relative bound would tighten as `V`
+falls for no reason the method has. **Against a sequential reference**, the
+same recursion with the fork taken out and through the same bisection helper:
+the tree's shape depends only on each node's own values and never on which
+worker ran it, so the sum is schedule-independent to the last bit, and the
+tolerance is a relative `1e-15` -- about five ULP, slack for two inlinings of
+one helper and nothing else. That second check is the one that catches a
+dropped subtree however small, and a mutation confirms the pair is layered
+the way this paragraph claims: a child whose area never reaches its parent's
+slot fails the closed-form check outright, while a parent that scales its
+child's area by `1 - 1e-12` passes it and fails the reference check at a
+relative `4.3e-12`.
+
+**Figures: measured by #352**, for the reason the `merge_sort` section above
+states. The ids are `rustflow/{1,24}w` and `rayon/{1,24}w` at `V = 1` and
+`V = 2`, and `cargo bench --all-features --bench integrate -- --test` drives
+all eight of them and both untimed checks.
