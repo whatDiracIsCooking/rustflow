@@ -392,6 +392,31 @@ mod tests {
         assert!(woken.is_empty());
     }
 
+    /// The error names the maximum the release would have passed, which is
+    /// the number upstream prints and the only thing it carries. The case
+    /// above has a maximum of 1, so it cannot tell a report of the maximum
+    /// from a report of any fixed number; this one moves the maximum with
+    /// `reset_to` and asks twice. #310 set its bar.
+    #[test]
+    fn an_over_release_names_the_maximum_it_would_have_passed() {
+        let semaphore = Semaphore::new(3);
+
+        let error = semaphore
+            .release(&mut Vec::new())
+            .expect_err("already at 3 of 3");
+        assert_eq!(error.max_value(), 3);
+
+        semaphore.reset_to(7);
+        let error = semaphore
+            .release(&mut Vec::new())
+            .expect_err("already at 7 of 7");
+        assert_eq!(error.max_value(), 7);
+        assert_eq!(
+            error.to_string(),
+            "can't release the semaphore more than its maximum value: 7"
+        );
+    }
+
     #[test]
     fn a_release_of_a_semaphore_of_zero_is_an_error() {
         let semaphore = Semaphore::default();
