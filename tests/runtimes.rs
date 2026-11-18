@@ -86,10 +86,10 @@
 //!   argument in full, including why every access of it can be relaxed.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use rustflow::prelude::*;
-use rustflow::{Executor, RunError, Xorshift32};
+use rustflow::{Executor, RunError, RuntimeWork, Xorshift32};
 
 // The spin and the cancellation handshake: there is no numbered family here
 // to want the matrix macro, and what the cases count is a per-index value in
@@ -1516,5 +1516,64 @@ fn two_runs_may_each_bypass_a_module_task() {
         inner_ran.load(Ordering::Relaxed),
         2,
         "each run's bypass entered the module and ran its graph"
+    );
+}
+
+/// A runtime node built by hand runs like one `emplace_runtime` builds:
+/// [`RuntimeWork::new`] wraps the body, `Handle::Runtime` carries it, and a
+/// graph the taskflow adopts is dispatched through the same arm -- so the
+/// body is handed a working [`Runtime`], not a stub. The counterpart of
+/// `subflows.rs`'s adopted `Handle::Subflow` node, and the reason the
+/// constructor stays public while `RuntimeWork::invoke` is the dispatch's
+/// own.
+///
+/// Invented: upstream builds every runtime node through `emplace`, its
+/// `Node::Runtime` alternative being constructed inside the graph.
+#[test]
+fn a_hand_built_runtime_node_is_handed_a_working_runtime() {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let workers = Arc::new(AtomicUsize::new(0));
+    let spawned = Arc::new(AtomicUsize::new(0));
+
+    let mut adopted = Graph::new();
+    adopted.add_named_node(
+        "by hand",
+        Handle::Runtime(RuntimeWork::new({
+            let ran = Arc::clone(&ran);
+            let workers = Arc::clone(&workers);
+            let spawned = Arc::clone(&spawned);
+            move |runtime: &mut Runtime<'_>| {
+                ran.fetch_add(1, Ordering::Relaxed);
+                workers.store(runtime.num_workers(), Ordering::Relaxed);
+                let spawned = Arc::clone(&spawned);
+                runtime.silent_async(move || {
+                    spawned.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+        })),
+    );
+
+    let mut taskflow = Taskflow::with_name("adopting");
+    taskflow.adopt(adopted);
+
+    Executor::new(3)
+        .run(&taskflow)
+        .wait()
+        .expect("the adopted body did not panic");
+
+    assert_eq!(ran.load(Ordering::Relaxed), 1, "the body ran once");
+    assert_eq!(
+        workers.load(Ordering::Relaxed),
+        3,
+        "and was handed the running executor's own runtime"
+    );
+    assert_eq!(
+        spawned.load(Ordering::Relaxed),
+        1,
+        "whose spawn the node's implicit join waited for"
+    );
+    assert!(
+        taskflow.dump().contains("by hand"),
+        "the adopted node is the taskflow's own"
     );
 }

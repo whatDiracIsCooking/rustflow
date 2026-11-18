@@ -643,6 +643,40 @@ fn iter_mut_reaches_every_live_node() {
     assert_eq!(named, vec!["a!", "c!"], "the walk's edits landed");
 }
 
+/// `Graph::clear` drops every node *and* every tombstone, so the handles a
+/// cleared graph hands out start over from zero. That is what separates it
+/// from erasing every node one at a time, which empties the graph just as
+/// well but leaves the arena's next index where it was.
+#[test]
+fn clear_drops_the_tombstones_too_and_restarts_the_handles() {
+    let mut graph = Graph::new();
+    let a = graph.add_named_node("a", Handle::Placeholder);
+    let b = graph.add_named_node("b", Handle::Placeholder);
+    graph.add_edge(a, b);
+
+    // The other way to empty a graph, and not this one.
+    assert!(graph.erase(a));
+    assert!(graph.erase(b));
+    assert!(graph.is_empty());
+    assert_eq!(
+        graph
+            .add_named_node("after erase", Handle::Placeholder)
+            .id(),
+        2,
+        "an erased slot is not reused"
+    );
+
+    graph.clear();
+    assert_eq!(graph.len(), 0);
+    assert!(graph.is_empty());
+    assert_eq!(graph.tasks().count(), 0, "and nothing is left to walk");
+
+    let reborn = graph.add_named_node("reborn", Handle::Placeholder);
+    assert_eq!(reborn.id(), 0, "a cleared graph starts over from zero");
+    assert_eq!(graph.node(reborn).name(), "reborn");
+    assert_eq!(graph.len(), 1);
+}
+
 /// `Node::handle_mut` hands back *this* node's handle, so work replaced
 /// through it is the work the node holds afterwards -- `TaskMut::work`'s claim
 /// one level up, for a graph a caller owns outright rather than one a
@@ -1052,6 +1086,51 @@ fn hash() {
     assert!(!set.insert(t2));
     assert!(set.insert(t3));
     assert_eq!(set.len(), 2);
+}
+
+// --------------------------------------------------------
+// Invented: the arena index a Task handle carries
+// --------------------------------------------------------
+
+/// A [`Task`] *is* the arena index of its node, and `Task::id` is that index
+/// read back out: the handles a graph hands out run 0, 1, 2 in creation
+/// order, `id`, [`Task::index`] and `u32::from` are three readings of the one
+/// number, and a handle rebuilt from the number addresses the node the
+/// original was taken for.
+///
+/// Invented: upstream's handle is a `Node*`, and `task.hpp` at the pin offers
+/// nothing to read out of it but `hash_value`, so the index this port hands
+/// out in its place has no upstream case. What it pins is the one promise
+/// `Task`'s docs make -- that a handle is only meaningful together with the
+/// graph that produced it -- from the index side.
+#[test]
+fn a_task_handle_is_the_arena_index_it_reads_back() {
+    let mut taskflow = Taskflow::new();
+    let first = placeholder(&mut taskflow, "first");
+    let second = placeholder(&mut taskflow, "second");
+
+    assert_eq!(first.id(), 0, "the first node of a graph is index zero");
+    assert_eq!(second.id(), 1, "and the next one is the one after it");
+
+    // The three readings of one index.
+    assert_eq!(
+        first.index(),
+        usize::try_from(first.id()).expect("an index fits in a usize here")
+    );
+    assert_eq!(u32::from(second), second.id());
+    assert_eq!(
+        Task::try_from(second.index()).expect("an index fits in a u32 here"),
+        second
+    );
+
+    // And the number addresses the node, not just itself.
+    assert_eq!(taskflow.graph().node(Task::new(first.id())).name(), "first");
+    assert_eq!(taskflow.task_ref(Task::new(second.id())).name(), "second");
+
+    // A handle outlives an edit of its node, the index being the identity.
+    taskflow.task(second).name("renamed");
+    assert_eq!(second.id(), 1);
+    assert_eq!(taskflow.task_ref(Task::new(second.id())).name(), "renamed");
 }
 
 // --------------------------------------------------------
