@@ -10,6 +10,14 @@
 //! than upstream's 8: CI runs on about two cores, and the upper half of
 //! upstream's sweep covers no shape the first four do not.
 //!
+//! Each of those sweep bodies builds its [`Executor`] once and runs the whole
+//! sweep on it, which is where upstream puts its own `tf::Executor
+//! executor(W);` -- above the same double loop, not inside it. A pool per
+//! iteration is 2495 thread pools spawned and joined per case, and what that
+//! buys is wall clock rather than coverage: every iteration already builds
+//! its own taskflow, partitioner and expected answer, and the sweep asserts
+//! nothing about a worker pool's first run.
+//!
 //! `ClosureWrapper.Reduce.*` and `ClosureWrapper.TransformReduce.*` are
 //! [`closure_wrapper_reduce`] and [`closure_wrapper_transform_reduce`]: the
 //! counting-wrapper case the issue asks for, pinning that the mutex behind
@@ -58,6 +66,7 @@ where
 {
     let mut rng = Xorshift32::new(7);
     let vec = random_values(&mut rng, 500);
+    let executor = Executor::new(workers);
 
     for n in 1..vec.len() {
         for chunk_size in [0usize, 1, 3, 7, 99] {
@@ -79,10 +88,7 @@ where
                 assert_eq!(pmin, want, "n={n} chunk_size={chunk_size}");
             });
 
-            Executor::new(workers)
-                .run(&taskflow)
-                .wait()
-                .expect("no task panicked");
+            executor.run(&taskflow).wait().expect("no task panicked");
         }
     }
 }
@@ -95,6 +101,7 @@ where
 {
     let mut rng = Xorshift32::new(11);
     let vec = random_values(&mut rng, 500);
+    let executor = Executor::new(workers);
 
     for n in 1..vec.len() {
         for chunk_size in [0usize, 1, 3, 7, 99] {
@@ -111,10 +118,7 @@ where
                 assert_eq!(sol, want, "n={n} chunk_size={chunk_size}");
             });
 
-            Executor::new(workers)
-                .run(&taskflow)
-                .wait()
-                .expect("no task panicked");
+            executor.run(&taskflow).wait().expect("no task panicked");
         }
     }
 }
@@ -127,6 +131,7 @@ where
 {
     let mut rng = Xorshift32::new(13);
     let vec = random_values(&mut rng, 500);
+    let executor = Executor::new(workers);
 
     for n in 1..vec.len() {
         for chunk_size in [0usize, 1, 3, 7, 99] {
@@ -149,10 +154,7 @@ where
                 assert_eq!(pmin, want, "n={n} chunk_size={chunk_size}");
             });
 
-            Executor::new(workers)
-                .run(&taskflow)
-                .wait()
-                .expect("no task panicked");
+            executor.run(&taskflow).wait().expect("no task panicked");
         }
     }
 }
@@ -167,6 +169,7 @@ where
     let mut rng = Xorshift32::new(17);
     let vec1 = random_values(&mut rng, 500);
     let vec2 = random_values(&mut rng, 500);
+    let executor = Executor::new(workers);
 
     for n in 1..vec1.len() {
         for chunk_size in [0usize, 1, 3, 7, 99] {
@@ -196,10 +199,7 @@ where
                 assert_eq!(pmin, want, "n={n} chunk_size={chunk_size}");
             });
 
-            Executor::new(workers)
-                .run(&taskflow)
-                .wait()
-                .expect("no task panicked");
+            executor.run(&taskflow).wait().expect("no task panicked");
         }
     }
 }
@@ -213,6 +213,7 @@ where
 {
     let mut rng = Xorshift32::new(19);
     let vec = random_values(&mut rng, 500);
+    let executor = Executor::new(workers);
 
     for n in 1..vec.len() {
         for chunk_size in [0usize, 1, 3, 7, 99] {
@@ -241,10 +242,7 @@ where
                 assert_eq!(sol, want, "n={n} chunk_size={chunk_size}");
             });
 
-            Executor::new(workers)
-                .run(&taskflow)
-                .wait()
-                .expect("no task panicked");
+            executor.run(&taskflow).wait().expect("no task panicked");
         }
     }
 }

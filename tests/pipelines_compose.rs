@@ -11,7 +11,7 @@
 //! Every adaptation `tests/pipelines.rs`'s own docs explain applies here too
 //! -- `Arc`s standing in for upstream's by-reference captures, and no
 //! in-graph "test" task, with assertions run directly after
-//! [`RunHandle::wait`](rustflow::RunHandle::wait) returns instead. One more is
+//! [`RunHandle::wait`](rustflow::RunHandle::wait) returns instead. Two more are
 //! specific to this file:
 //!
 //! - **Neither family here ever calls [`Pipeline::reset`].** Upstream's own
@@ -32,6 +32,20 @@
 //!   pipeline -- actually clears what it claims to: a round whose previous
 //!   leftover state survives shows up as a wrong second round, not a
 //!   coincidentally-right final count.
+//! - **The token sweep of the two `Three.*` families is subsampled.**
+//!   Upstream sweeps every token count in `0..=maxN` there, and a round's
+//!   work grows with the count, so those 101 counts were most of this
+//!   suite's wall clock. What a count decides is how a round fills the
+//!   lines -- fewer tokens than lines, exactly as many, enough to wrap
+//!   round them and come back -- and a pipe's own behaviour cycles with
+//!   `pf.token() % num_lines`, so every fill shape the 101 hold between
+//!   them is settled by the counts up to two full passes over the widest
+//!   line count this file sweeps. [`token_sweep`] is therefore every count
+//!   up to 18 and then every tenth up to [`MAX_N`]: 28 of the 101,
+//!   upstream's own largest among them. `Looping.Pipelines` keeps the whole
+//!   of its own sweep, which is a different quantity -- the number of times
+//!   its condition task loops the one pipeline module -- and costs well
+//!   under a tenth of what the two families above did.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -61,6 +75,16 @@ use serialized::serialized;
 // `MAX_N` is this file's round count as well as its token count: the
 // condition task of `Looping.Pipelines` loops that many times.
 use tokens::{MAX_N, assert_consecutive_from};
+
+/// The token counts a round of the two three-pipeline families runs: every
+/// count up to twice the widest line sweep (`2 * 8 + 2`), then every tenth
+/// up to [`MAX_N`], which is the last count upstream sweeps.
+///
+/// The module docs above say why this is a subsample of upstream's own
+/// `0..=maxN` where every other sweep in these suites is not.
+fn token_sweep() -> impl Iterator<Item = usize> {
+    (0..=18).chain((20..=MAX_N).step_by(10))
+}
 
 // ----------------------------------------------------------------------------
 // Three.Parallel.Pipelines / Three.Concatenated.Pipelines: the three
@@ -273,7 +297,7 @@ fn three_parallel_pipelines(num_lines: usize, num_workers: usize) {
     serialized(|| {
         let executor = Executor::new(num_workers);
 
-        for n in 0..=MAX_N {
+        for n in token_sweep() {
             let mut taskflow = Taskflow::new();
             let pipelines = ThreePipelines::build(&mut taskflow, num_lines, n);
 
@@ -375,7 +399,7 @@ fn three_concatenated_pipelines(num_lines: usize, num_workers: usize) {
     serialized(|| {
         let executor = Executor::new(num_workers);
 
-        for n in 0..=MAX_N {
+        for n in token_sweep() {
             let mut taskflow = Taskflow::new();
             let pipelines = ThreePipelines::build(&mut taskflow, num_lines, n);
 
