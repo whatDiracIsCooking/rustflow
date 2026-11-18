@@ -131,8 +131,9 @@ impl<R> Work<R> {
 ///
 /// # Panics
 ///
-/// Panics if the work is already running on another thread. Before issue
-/// #245 this could be tripped from outside the scheduler: a
+/// Panics if the work is already running on another thread. Before the
+/// per-node dispatch claim closed `Runtime::schedule`'s hole, this could be
+/// tripped from outside the scheduler: a
 /// [`Runtime::schedule`](crate::Runtime::schedule) bypass had no way to see
 /// that a non-preempting target -- or a preempting one still building what
 /// would make it preempt -- was genuinely running, and could queue a second
@@ -864,8 +865,8 @@ pub(crate) struct Semaphores {
 
 /// Whether a node's own callable is locked by a dispatch in progress, and
 /// whether a [`Runtime::schedule`](crate::Runtime::schedule) bypass asked --
-/// while it was -- to run the node again: the claim issue #245 gives every
-/// node to close a hole `Node::nstate`'s `PREEMPTED` bit cannot, that bit
+/// while it was -- to run the node again: the dispatch claim every node
+/// carries to close a hole `Node::nstate`'s `PREEMPTED` bit cannot, that bit
 /// being set only by the four handle kinds `preempts_itself` answers `true`
 /// for. A node of any other kind -- [`Handle::Static`], either conditioner,
 /// [`Handle::NonpreemptiveRuntime`] -- is never "entered" by that reckoning
@@ -875,8 +876,8 @@ pub(crate) struct Semaphores {
 /// cases `false`; this claim is what answers the question `is_entered` is
 /// not asking -- not "is this node's nested run outstanding" but "is this
 /// node's own callable locked right now" -- and `DESIGN.md`'s "Decisions
-/// taken in M8" has the caller-side attempt (#244) that could not close this
-/// from outside the scheduler.
+/// taken in M8" has the caller-side fix that was tried first and could not
+/// close this from outside the scheduler.
 ///
 /// One byte per node: an `AtomicU8` beside [`NodeBase`]'s own three words,
 /// which [`Semaphores`] and [`Node`]'s own data slot already account for

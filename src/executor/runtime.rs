@@ -775,11 +775,10 @@ impl fmt::Debug for NonpreemptiveRuntime<'_> {
 /// A panic out of the body is recorded exactly as a static task's is,
 /// through [`Job::record_panic`].
 ///
-/// Issue #245's clearest case: `work.invoke` both takes and drops the one
-/// lock this node's own dispatch claim stands in for, in one statement, so
-/// the claim here is taken immediately before that call and released
-/// immediately after it returns -- nothing between the two touches the
-/// callable at all.
+/// The dispatch claim's clearest case: `work.invoke` both takes and drops
+/// the one lock it stands in for, in one statement, so the claim here is
+/// taken immediately before that call and released immediately after it
+/// returns -- nothing between the two touches the callable at all.
 pub(crate) fn invoke_nonpreemptive(
     worker: &mut WorkerThread,
     job: &Job,
