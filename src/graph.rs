@@ -779,7 +779,6 @@ pub(crate) struct Semaphores {
 /// The state words are a `NodeBase` -- crate-private, so it is named rather
 /// than linked here -- which is upstream's arrangement and the reason a parent
 /// can be a node or an anchor indifferently.
-#[derive(Debug)]
 pub struct Node {
     name: String,
     handle: Handle,
@@ -794,6 +793,13 @@ pub struct Node {
     /// caller asks for either: upstream's `unique_ptr<Semaphores>`, boxed for
     /// its reason -- a graph that acquires nothing pays one pointer per node.
     semaphores: Option<Box<Semaphores>>,
+    /// The user data slot, `None` until a caller sets one: upstream's
+    /// `void* _data {nullptr}`. `Send + Sync` where upstream's pointer is
+    /// neither, because a node is reachable from any worker -- see
+    /// [`TaskMut::set_data`](crate::TaskMut::set_data) for the rest of what
+    /// the type change buys. A node that never sets one pays for the
+    /// `Option` alone, there being no second allocation behind a `None`.
+    data: Option<Box<dyn Any + Send + Sync>>,
 }
 
 impl Node {
@@ -807,6 +813,7 @@ impl Node {
             edges: Vec::new(),
             base: NodeBase::new(),
             semaphores: None,
+            data: None,
         }
     }
 
@@ -959,6 +966,28 @@ impl Node {
         self.semaphores.get_or_insert_default()
     }
 
+    /// The user data slot, upstream's `_data`, read-only and untyped: the
+    /// downcast lives on the task handles that call this, not here.
+    pub(crate) fn data(&self) -> Option<&(dyn Any + Send + Sync)> {
+        self.data.as_deref()
+    }
+
+    /// The same, mutably.
+    pub(crate) fn data_mut(&mut self) -> Option<&mut (dyn Any + Send + Sync)> {
+        self.data.as_deref_mut()
+    }
+
+    /// Replaces the user data slot, dropping whatever was there: upstream's
+    /// `_data = data`.
+    pub(crate) fn set_data(&mut self, data: Box<dyn Any + Send + Sync>) {
+        self.data = Some(data);
+    }
+
+    /// Takes the user data slot, leaving it empty.
+    pub(crate) fn take_data(&mut self) -> Option<Box<dyn Any + Send + Sync>> {
+        self.data.take()
+    }
+
     /// Acquires every semaphore this node asked for, in order, and answers
     /// whether the node may run: upstream's `Node::_acquire_all`.
     ///
@@ -1074,6 +1103,23 @@ impl Node {
         }
         self.edges.truncate(kept);
         old_len - kept
+    }
+}
+
+impl fmt::Debug for Node {
+    /// Hand-written because the data slot is a `Box<dyn Any + Send + Sync>`,
+    /// which has no [`Debug`](fmt::Debug); whether one is set is what gets
+    /// printed, as `NodeBase`'s panic slot already does.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Node")
+            .field("name", &self.name)
+            .field("handle", &self.handle)
+            .field("num_successors", &self.num_successors)
+            .field("edges", &self.edges)
+            .field("base", &self.base)
+            .field("semaphores", &self.semaphores)
+            .field("data", &self.data.is_some())
+            .finish()
     }
 }
 
