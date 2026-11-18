@@ -132,3 +132,15 @@ harness = false
 [[bench]]
 name = "scan"
 harness = false
+
+[[bench]]
+name = "primes"
+harness = false
+
+[[bench]]
+name = "mandelbrot"
+harness = false
+
+[[bench]]
+name = "matrix_multiplication"
+harness = false

@@ -2226,3 +2226,143 @@ applied fails the run rather than producing a figure.
 
 **Figures: measured by #352**, for the reason the `for_each` section above
 states.
+
+## primes
+
+Counts the primes in `[1, value)` by trial division: upstream's
+`primes_taskflow` is one `reduce_by_index` over
+`IndexRange<size_t>(1, value, 1)` whose local operator folds `is_prime(i)`
+over a chunk and whose global one is `std::plus`, with
+`DynamicPartitioner{primes_chunk}` -- a chunk of ten -- deciding how those
+chunks are handed out. "Ours includes building the graph" from this file's
+own header applies here as it does everywhere, and costs this shape the least
+of any section: the graph is one node, so what the `rustflow` ids measure is
+the partitioner's cursor and the arithmetic behind it.
+
+The baseline is `(1..value).into_par_iter().filter(is_prime).count()`, in the
+role TBB's `parallel_reduce` over a `blocked_range(1, value, primes_chunk)`
+plays in upstream's own `tbb.cpp`. **The two sides do not share a chunk
+size**, and that is deliberate: upstream hands TBB the same ten it hands the
+`DynamicPartitioner`, while a rayon parallel iterator splits adaptively from
+the length of the range and takes no chunk size at all. Forcing it to ten
+with `with_min_len` would measure a rayon nobody writes, so the baseline is
+left as it would be written and the difference is named here instead.
+
+Sizes are two points off upstream's `p = 10, 100, .. 1e8` sweep, ×10 a step:
+`10000`, where the fixed cost of a run still shows against a thousand chunks,
+and `1000000`, where the trial division dominates it. Upstream's own top point
+is minutes of arithmetic a round, which criterion's twenty samples an id would
+multiply. The ids are `primes/{rustflow,rayon}/{1,N}w` at each of those two
+sizes, with `N` the box's `available_parallelism`.
+
+Before any id is measured, both variants are run once per size *and* per
+worker count and their counts asserted against a single-threaded reference
+over the same `is_prime` -- a count that is only right on one thread is still
+wrong, so each worker count checks its own.
+
+**The figures and the load this section's run saw come from #352**, which
+measures every M11 section in one pass on a quiet box. This issue landed the
+benchmark, not the numbers: three agents were building on this machine while
+it was written, and a figure taken then would have recorded the load rather
+than the shape.
+
+## mandelbrot
+
+An escape-time render of the Mandelbrot set: upstream's `mandelbrot_taskflow`
+is one `for_each_index(0, H, 1, .., DynamicPartitioner(1))` whose body walks
+the `W` points of one index's line through `mandel.hpp`'s `escape_time`. **A
+chunk of one is the whole point of the shape.** The cost of a line varies by
+two orders of magnitude between the edge of the image and the interior of the
+set, where every point runs the full `MAX_ITERATION = 200`, so this is the
+suite's load-imbalance benchmark rather than a second uniform `for_each` --
+what a row of its table reads is how two schedulers hand out two hundred
+unequal pieces of work, not how fast either one dispatches. `D`, `H` and `W`
+stay the size knobs they are upstream, with `H == W == N` as `main.cpp` sets
+them.
+
+The baseline is `par_iter` over the same lines, in the role TBB's
+`parallel_for` plays in upstream's own `tbb.cpp`. Unlike the
+`matrix_multiplication` section below, **both columns here write into the same
+buffer type**, so the row compares the two schedulers and nothing else: the
+image is one `Mutex<Vec<u32>>` a line, and both `for_each_index` and
+`par_iter` visit each line exactly once, which makes every lock the lock of
+that line's only writer -- two uncontended atomics against the hundreds of
+transcendental calls a line of this kernel costs. Upstream synchronises
+nothing at all and relies on its writes landing at disjoint addresses, which a
+`'static` task body cannot express in safe Rust; `benches/mandelbrot.rs`'s own
+module docs say so next to the code, along with the other two departures (the
+image holds escape iterations rather than palette entries, since `get_color`'s
+only consumer is the `dump_tga` call `main.cpp` leaves commented out; and each
+index's line is contiguous rather than a stride-`W` column of upstream's
+picture, a transpose only that un-ported dump would notice).
+
+Sizes are two points off upstream's `N = 100..=1000` sweep, step `100`: `100`,
+where the per-line cost is small enough for the fixed cost of a run to show,
+and `500`, where the kernel dominates it. The ids are
+`mandelbrot/{rustflow,rayon}/{1,N}w` at each size.
+
+Before any id is measured, each variant renders into a buffer of its own, once
+per size and per worker count, and the whole image is asserted point for point
+against a single-threaded render by the same kernel. The comparison is exact
+because the quantity is an iteration count rather than a floating-point
+result, and the per-variant buffer is what makes a skipped line fail here
+instead of silently reading the other column's work.
+
+**The figures and the load this section's run saw come from #352**, for the
+reason the `primes` section above gives.
+
+## matrix_multiplication
+
+`N × N` `f64` matrices, `c = a * b`, and **the one shape in this group with a
+graph around its algorithms**: upstream's `matrix_multiplication_taskflow`
+builds four `for_each_index` tasks over `[0, N)` -- `init_a`, `init_b`,
+`init_c` and `comp_c` -- and joins them with
+`comp_c.succeed(init_a, init_b, init_c)`, three sources into one sink. The
+edges are ported as upstream has them, the partitioner is the default upstream
+leaves unspecified, and the bodies are upstream's: `a[i][j] = i + j`,
+`b[i][j] = i * j`, `c[i][j] = 0`, then the `ijk` triple loop. Both sides lay
+their matrices out as flat vectors indexed `i * n + j`, which is what
+`matrix_multiplication.hpp`'s `allocate_matrix` builds row by row, with no
+numeric library on either side of the table.
+
+The baseline is three `par_iter_mut` inits followed by a `par_chunks_mut`
+product, in the role TBB's `parallel_for` plays in upstream's own `tbb.cpp`.
+**Its three inits are three barriers where ours are three concurrent
+sources**, which is the one place in this suite where the construction cost
+"ours includes building the graph" charges us buys something back rather than
+only costing -- three independent `O(N²)` passes run together against three
+run in sequence, and at the smaller size below that is a visible share of the
+run.
+
+**The two columns do not share a representation, and part of any gap is
+that.** `comp_c` reads *all* of `b` while another row's body may still be
+writing `c`, and a task body here is `'static`, so there is no safe way to
+hand out `&mut` rows the way rayon's borrowing closures receive them --
+upstream's unsynchronised `double**` writes have no safe translation, and this
+port's posture is a safe shape over an `unsafe` reproduction of C++ pointer
+semantics. Our cells are therefore `AtomicU64` bit patterns accessed
+`Relaxed`, with the graph's join rather than the cell providing the ordering,
+exactly as upstream's edge does; rayon's are plain `f64`s. On x86-64 a relaxed
+load or store of a `u64` is a plain `mov`, but it is neither vectorisable nor
+hoistable, which is why `benches/matrix_multiplication.rs` accumulates
+upstream's `c[i][j] +=` in a local and stores once per `j` -- the additions and
+their order are unchanged, so the product is identical down to the bit, but
+the inner loop is not asking the optimiser for something an atomic cell cannot
+give. Read a row of this table as scheduler *plus* representation, and the
+`mandelbrot` section above as the one with the representation held fixed.
+
+Sizes are two points off upstream's `N = 128..=1024` sweep, step `32`: `128`,
+where the `O(N²)` inits and the graph are still a visible share of the run, and
+`512`, where the `O(N³)` product dominates them. The ids are
+`matrix_multiplication/{rustflow,rayon}/{1,N}w` at each size.
+
+Before any id is measured, each variant multiplies into matrices of its own,
+once per size and per worker count, and the whole product is asserted against
+a single-threaded reference. That comparison is exact rather than approximate,
+and legitimately so: every value is a whole number,
+`c[i][j] = Σ (i + k) * (k * j)`, and the largest of them at these sizes is
+under `2^53`, so every partial sum is exactly representable and the summation
+order cannot change the answer.
+
+**The figures and the load this section's run saw come from #352**, for the
+reason the `primes` section above gives.
