@@ -18,13 +18,21 @@
 //! `Module.AsyncLaunch`, `Module.SilentAsyncLaunch` and the two cases
 //! upstream both names `Module.DependentAsyncLaunch`, which launch a
 //! composition from a free-standing task rather than from a run. They are at
-//! the end of the file and the section there has the one adaptation they
-//! need.
+//! the end of the file, and issue #169 is what lets them call upstream's own
+//! `tf::make_module_task` directly rather than stand in for it with
+//! `Executor::corun`, which is what they did until then.
 //!
-//! One case of that file is deliberately not here: `Module4` builds its
-//! module tasks with `tf::make_module_task` from
-//! `taskflow/algorithm/module.hpp`, which is the algorithm library a later
-//! milestone brings.
+//! #169 also adds the doc example `taskflow/algorithm/module.hpp` carries for
+//! `make_module_task` itself -- independent taskflows launched in parallel,
+//! each its own async task rather than a node composed into one graph -- and
+//! the empty-taskflow no-op its own acceptance names.
+//!
+//! One case of that file is deliberately not here even so: `Module4` builds
+//! its module tasks with `tf::make_module_task` too, but as a node of a
+//! *static* graph rather than of a free-standing task, which is the same
+//! arithmetic `Module1` already makes over `composed_of`.
+//! `src/algorithm/module.rs`'s own unit tests pin that shape beside the
+//! function instead.
 //!
 //! Nothing here composes an *adopted* graph either, and nothing upstream does
 //! in this file: `adopt` is the owned form of the same node kind, so these
@@ -77,6 +85,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
+use rustflow::algorithm::module::make_module_task;
 use rustflow::prelude::*;
 use rustflow::{Executor, RunHandle};
 
@@ -653,46 +662,27 @@ fn five_then_a_module_of_five(counter: &Counter) -> Arc<Taskflow> {
     Arc::new(f1)
 }
 
-/// The body upstream builds with `tf::make_module_task(f1)`: run the whole of
-/// `f1` from inside a free-standing task.
+/// Upstream's `tf::make_module_task(f1)`: a runtime-shaped body that runs the
+/// whole of `f1` from inside whichever free-standing task it is handed to.
 ///
-/// **The one adaptation these four cases need.** Upstream's maker returns a
-/// `void(tf::Runtime&)` body that calls the executor's internal
-/// `_schedule_graph(.., graph, rt._node->_topology, rt._node)` -- it hangs
-/// `f1`'s graph under the async task's own node, so the node preempts itself
-/// and is resumed by the last child of that graph. `make_module_task` is in
-/// `taskflow/algorithm/module.hpp`, the algorithm library a later milestone
-/// brings, and this port has no seam that schedules a graph under a free node
-/// either.
-///
-/// What it has is [`Executor::corun`], which is the same claim made by the
-/// other route: the worker stays in its scheduling loop and runs that graph
-/// to completion before the body returns, rather than returning and being
-/// re-entered. Both make the launching task finish only once the whole
-/// composition has, which is what every one of these cases asserts -- so the
-/// count is upstream's, and what differs is which of the two waits the worker
-/// does. That also makes the body a plain one where upstream's is
-/// runtime-shaped: nothing here needs the scheduler handed to it.
-fn launch(executor: &Arc<Executor>, taskflow: &Arc<Taskflow>) -> impl FnOnce() + Send + 'static {
-    let executor = Arc::clone(executor);
-    let taskflow = Arc::clone(taskflow);
-    move || {
-        executor
-            .corun(&taskflow)
-            .expect("a free-standing task runs on a worker, which may corun");
-    }
+/// `make_module_task` itself, under the name these four cases call it by.
+/// `src/algorithm/module.rs` has the translation and the one difference from
+/// a `Handle::Module` node that is worth stating once rather than four times
+/// here.
+fn launch(taskflow: &Arc<Taskflow>) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static {
+    make_module_task(Arc::clone(taskflow))
 }
 
 /// Upstream's `module_with_async_launch(W)`: the composition launched from an
 /// `async` task, waited for through its handle.
 fn module_with_async_launch(workers: usize) {
     let context = format!("{workers} worker(s)");
-    let executor = Arc::new(Executor::new(workers));
+    let executor = Executor::new(workers);
     let counter = counter();
     let f1 = five_then_a_module_of_five(&counter);
 
     executor
-        .spawn(launch(&executor, &f1))
+        .spawn_runtime(launch(&f1))
         .wait()
         .expect("no task of the composition panicked");
 
@@ -717,11 +707,11 @@ worker_matrix! {
 /// handle on it, so the executor's own count of free tasks is what waits.
 fn module_with_silent_async_launch(workers: usize) {
     let context = format!("{workers} worker(s)");
-    let executor = Arc::new(Executor::new(workers));
+    let executor = Executor::new(workers);
     let counter = counter();
     let f1 = five_then_a_module_of_five(&counter);
 
-    executor.silent_async(launch(&executor, &f1));
+    executor.silent_async_runtime(launch(&f1));
     executor.wait_for_all();
 
     assert_eq!(
@@ -746,11 +736,11 @@ worker_matrix! {
 /// of the pair.
 fn module_with_dependent_async_launch(workers: usize) {
     let context = format!("{workers} worker(s)");
-    let executor = Arc::new(Executor::new(workers));
+    let executor = Executor::new(workers);
     let counter = counter();
     let f1 = five_then_a_module_of_five(&counter);
 
-    let (_task, done) = executor.dependent_async(launch(&executor, &f1), []);
+    let (_task, done) = executor.dependent_async_runtime(launch(&f1), []);
     done.wait().expect("no task of the composition panicked");
 
     assert_eq!(
@@ -780,11 +770,11 @@ worker_matrix! {
 /// to ask.
 fn module_with_silent_dependent_async_launch(workers: usize) {
     let context = format!("{workers} worker(s)");
-    let executor = Arc::new(Executor::new(workers));
+    let executor = Executor::new(workers);
     let counter = counter();
     let f1 = five_then_a_module_of_five(&counter);
 
-    let task = executor.silent_dependent_async(launch(&executor, &f1), []);
+    let task = executor.silent_dependent_async_runtime(launch(&f1), []);
     executor.wait_for_all();
 
     assert!(
@@ -806,4 +796,62 @@ worker_matrix! {
         module_with_silent_dependent_async_launch_3_workers(3),
         module_with_silent_dependent_async_launch_4_workers(4),
     }
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: the parallel-taskflows example from `module.hpp`'s own doc
+// ----------------------------------------------------------------------------
+
+/// `taskflow/algorithm/module.hpp`'s own doc example for `make_module_task`:
+/// four independent taskflows, each launched as its own async task rather
+/// than composed into one graph -- which is the shape `make_module_task`
+/// adds over `composed_of`, a module with nothing above it at all.
+///
+/// A counter per taskflow rather than upstream's four `printf`s, so the case
+/// can assert on it: each taskflow's one task runs exactly once, under the
+/// launch built from it and no other.
+#[test]
+fn the_parallel_taskflows_doc_example_runs_each_taskflow_once() {
+    let executor = Executor::new(4);
+    let counters: Vec<Counter> = (0..4).map(|_| counter()).collect();
+    let taskflows: Vec<Arc<Taskflow>> = counters
+        .iter()
+        .map(|counter| {
+            let mut taskflow = Taskflow::new();
+            let counter = Arc::clone(counter);
+            taskflow.emplace(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            });
+            Arc::new(taskflow)
+        })
+        .collect();
+
+    // Upstream's `executor.async(tf::make_module_task(A))` through `D`,
+    // with every handle dropped exactly as upstream's own four discard theirs.
+    for taskflow in &taskflows {
+        executor.spawn_runtime(make_module_task(Arc::clone(taskflow)));
+    }
+    executor.wait_for_all();
+
+    for (index, counter) in counters.iter().enumerate() {
+        assert_eq!(count(counter), 1, "taskflow {index} ran exactly once");
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: an empty taskflow is a no-op
+// ----------------------------------------------------------------------------
+
+/// `make_module_task` on an empty taskflow does nothing, and the async task
+/// it is the body of still finishes rather than hanging: the acceptance case
+/// issue #169 names on its own, over the launch shape these cases already
+/// use.
+#[test]
+fn make_module_task_on_an_empty_taskflow_is_a_no_op() {
+    let executor = Executor::new(2);
+
+    executor
+        .spawn_runtime(make_module_task(Arc::new(Taskflow::new())))
+        .wait()
+        .expect("an empty target is a no-op, not a failure");
 }

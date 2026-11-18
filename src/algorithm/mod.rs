@@ -12,4 +12,5 @@
 //!   wrapper a caller can run around every chunk's body.
 
 pub mod index_range;
+pub mod module;
 pub mod partitioner;
