@@ -83,7 +83,12 @@ jobs:
           RUSTFLAGS: "--cfg loom"
           CARGO_TARGET_DIR: ${{ github.workspace }}/target/loom
         run: |
-          set -euo pipefail
+          # POSIX only, no bashism: the container's /bin/sh is dash and the
+          # image ships no bash, so GitHub runs this step as `sh -e {0}` and
+          # dash rejects `set -o pipefail` before `cargo` is ever reached
+          # (#151). That is also why nothing below pipes a command whose
+          # status matters.
+          set -eu
 
           # Every model under tests/, found rather than listed: a workflow that
           # names its models skips the next one silently, and silently skipping
@@ -101,8 +106,20 @@ jobs:
           for model in $models; do
             log="$RUNNER_TEMP/$model.log"
             echo "::group::$model"
-            cargo test --release --test "$model" 2>&1 | tee "$log"
+            # Redirect rather than `| tee "$log"`: a pipeline's status is its
+            # last command's, so the pipe reported `tee`'s success and masked a
+            # failing model unless `pipefail` restored cargo's -- and pipefail
+            # is the bashism this step cannot have. Keep cargo's own status in
+            # `status`, then show the log either way. The cost is that output
+            # appears when the model finishes instead of streaming.
+            status=0
+            cargo test --release --test "$model" > "$log" 2>&1 || status=$?
+            cat "$log"
             echo "::endgroup::"
+            if [ "$status" -ne 0 ]; then
+              echo "::error::$model failed under cfg(loom)."
+              exit 1
+            fi
 
             # `#![cfg(loom)]` makes a model built WITHOUT the cfg an empty test
             # binary, and libtest then prints "0 passed" and exits 0. So a
