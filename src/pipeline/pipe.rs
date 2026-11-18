@@ -1,37 +1,29 @@
 //! Translated from `taskflow/algorithm/pipeline.hpp` (Taskflow v4.1.0).
 //!
-//! [`Pipeflow`] is the scheduling token a pipe callable is handed, carrying
-//! where that token is right now; [`PipeType`] is a pipe's direction; and
-//! [`Pipe`] pairs a direction with the callable the scheduler runs for every
-//! token that reaches it. None of the three drives a token through anything
-//! on its own -- the scheduler that does is a later addition on top of
-//! these shapes.
+//! [`Pipeflow`] is the scheduling token a pipe callable is handed; [`PipeType`]
+//! is a pipe's direction; [`Pipe`] pairs a direction with the callable the
+//! scheduler runs for every token that reaches it. The scheduler that drives
+//! a token through a sequence of these is a later addition on top of them.
 //!
 //! # Design
 //!
-//! `DESIGN.md`'s "Decisions taken in M8" section has the three choices this
-//! family is built on: why a pipeline's lines need no eleventh `Handle`
-//! variant, why a pipe callable's bound is `Fn + Send + Sync` and where the
-//! pipeline's own mutable state lives, and why one `Pipeline` type is enough
-//! for what upstream splits into two. It also records why upstream's
-//! `(Pipeflow&, NonpreemptiveRuntime&)` callable shape and deferred
-//! pipelines are both out of scope.
+//! `DESIGN.md`'s "Decisions taken in M8" section and the pipe-specific
+//! entries under "Rationale moved out" have why: the `Handle` variant a
+//! pipeline's lines needed after all, the pipe callable's `Fn + Send + Sync`
+//! bound, one `Pipeline` type for upstream's two, and what stayed out of
+//! scope.
 
 use std::fmt;
 
 /// A scheduling token's own view of its place in a pipeline: upstream's
 /// `tf::Pipeflow`.
 ///
-/// The pipeline scheduler hands a running pipe's callable a `&mut
-/// Pipeflow` so that it can read where the token it is running is --
-/// [`Pipeflow::line`], [`Pipeflow::pipe`] and [`Pipeflow::token`] -- and, if
-/// this is the pipeline's first pipe, end the scheduling of further tokens
-/// with [`Pipeflow::stop`].
-///
-/// The fields are `pub(crate)`, for the scheduler that builds and advances
-/// every token to reach directly: a pipe callable only ever reads this
-/// type, through the four methods below, and never constructs or advances
-/// one itself.
+/// The scheduler hands a running pipe's callable a `&mut Pipeflow` so it can
+/// read where the token is -- [`Pipeflow::line`], [`Pipeflow::pipe`] and
+/// [`Pipeflow::token`] -- and, from the first pipe, end further scheduling
+/// with [`Pipeflow::stop`]. The fields are `pub(crate)`: the scheduler builds
+/// and advances every token directly, and a pipe callable only ever reads it
+/// through the four methods below.
 ///
 /// # Examples
 ///
@@ -86,12 +78,7 @@ impl Pipeflow {
     ///
     /// Panics if called from any pipe but the first, upstream's
     /// `TF_THROW("only the first pipe can stop the token")`: only the first
-    /// pipe decides whether a new token enters the pipeline at all, so only
-    /// it may stop that from happening. A pipe callable's signature is
-    /// `Fn(&mut Pipeflow)`, with no `Result` to carry a typed error back to
-    /// the scheduler, so this follows the same convention a task body's own
-    /// failure already does in this crate -- a panic, because a panic is
-    /// the one channel every callable has, whatever its signature.
+    /// pipe decides whether a new token enters the pipeline at all.
     pub fn stop(&mut self) {
         if self.pipe != 0 {
             panic!("only the first pipe can stop the token");
@@ -102,16 +89,11 @@ impl Pipeflow {
 
 /// A pipe's direction: upstream's `tf::PipeType`.
 ///
-/// A [`PipeType::Serial`] pipe runs one token at a time, in token order, so
-/// a later token's callable at that pipe never starts before an earlier
-/// one's has returned; a [`PipeType::Parallel`] pipe places no such
-/// ordering between the tokens running through it.
-///
-/// The discriminants match upstream's `static_cast<size_t>(type)`, the
-/// value the scheduler stores into a pipe's join counter before it may run
-/// a token: two predecessors to join for a serial pipe -- the token before
-/// it on this line, and this token at the pipe before it -- against one for
-/// a parallel pipe, which only ever waits on the pipe before it.
+/// A [`PipeType::Serial`] pipe runs one token at a time, in token order; a
+/// [`PipeType::Parallel`] pipe places no such ordering on the tokens running
+/// through it. The discriminants match upstream's
+/// `static_cast<size_t>(type)`, the join-counter value the scheduler stores
+/// before a pipe may run a token.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum PipeType {
     /// Upstream's `PipeType::PARALLEL`, discriminant `1`.
@@ -122,12 +104,8 @@ pub enum PipeType {
 
 impl PipeType {
     /// This direction's join-counter value: upstream's
-    /// `static_cast<size_t>(type)`.
-    ///
-    /// A method rather than an `as usize` cast on the discriminant, so that
-    /// the crate's `cast_possible_truncation`/`cast_sign_loss` lints have
-    /// nothing to warn about here, now or if the discriminant's
-    /// representation ever changes.
+    /// `static_cast<size_t>(type)`, as a method rather than an `as usize`
+    /// cast so the crate's cast lints have nothing to warn about.
     ///
     /// # Examples
     ///
@@ -157,21 +135,12 @@ impl From<PipeType> for usize {
 /// A pipeline stage: upstream's `tf::Pipe`.
 ///
 /// Pairs a [`PipeType`] with the callable the pipeline scheduler runs for
-/// every token that reaches this pipe, handing it a `&mut Pipeflow` so that
-/// it can read where the running token is and, from the first pipe, stop
-/// the pipeline.
-///
-/// The callable bound is `Fn(&mut Pipeflow) + Send + Sync` rather than
-/// upstream's bare callable type: a [`PipeType::Parallel`] pipe runs its
-/// callable on several lines at once, so it must be callable through a
-/// shared `&Pipe` from more than one thread at the same time, which is
-/// exactly `Sync`. A [`PipeType::Serial`] pipe never needs that on its own,
-/// but [`Pipe::set_type`] lets a caller change a pipe's direction after it
-/// is built, so a serial pipe pays the same bound as a parallel one rather
-/// than this type carrying two incompatible shapes.
-///
-/// Upstream's second callable shape, `(Pipeflow&, NonpreemptiveRuntime&)`,
-/// is not ported: `DESIGN.md`'s "Decisions taken in M8" section says why.
+/// every token that reaches this pipe, handing it a `&mut Pipeflow` so it
+/// can read where the running token is and, from the first pipe, stop the
+/// pipeline. The callable bound is `Fn(&mut Pipeflow) + Send + Sync`, both
+/// kinds of pipe paying it alike, and upstream's second callable shape,
+/// `(Pipeflow&, NonpreemptiveRuntime&)`, is not ported; `DESIGN.md`'s
+/// "Rationale moved out" has why for both.
 pub struct Pipe {
     kind: PipeType,
     callable: Box<dyn Fn(&mut Pipeflow) + Send + Sync>,
@@ -231,13 +200,10 @@ impl Pipe {
     }
 
     /// Runs this pipe's callable against `pipeflow`: what the scheduler
-    /// calls for every token that reaches this pipe.
-    ///
-    /// Not upstream's API, which calls the stored callable through the
-    /// pipeline's own friend access rather than a named method; `pub`
-    /// because this crate has no equivalent of a C++ friend and
-    /// [`Work::invoke`](crate::graph::Work::invoke) is the same answer for
-    /// the same shape of problem.
+    /// calls for every token that reaches this pipe. `pub` stands in for
+    /// upstream's friend access, as
+    /// [`Work::invoke`](crate::graph::Work::invoke) does for the same shape
+    /// of problem.
     ///
     /// # Examples
     ///

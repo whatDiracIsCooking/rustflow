@@ -3,16 +3,20 @@
 A Rust port of [Taskflow](https://github.com/taskflow/taskflow), a C++
 task-parallel programming system built around task dependency graphs.
 
-**Status: steps 1 to 6 are in** — the static graph, the work-stealing
-executor, condition tasks and cancellation, dynamic tasking (subflows,
-runtime tasks and module composition), step 5's async family (async and
-dependent-async tasks submitted from the executor, from a runtime task or from
-a task group, with and without a handle on the result; task groups; and
-semaphores), and step 6's observers and algorithms: an `Observer` hook around
-every task a worker runs, with a built-in Chrome trace-event writer; and
-`for_each`, `for_each_index`, `reduce`, `sort`, `scan`, `transform`, `merge`
-and `find` over a borrowed slice or an `IndexRange`, each with a choice of
-partitioner and a `FlowBuilder` wrapper over owned data. Those are steps of
+**Status: all seven steps of "Order of work" are in** — the static graph, the
+work-stealing executor, condition tasks and cancellation, dynamic tasking
+(subflows, runtime tasks and module composition), step 5's async family
+(async and dependent-async tasks submitted from the executor, from a runtime
+task or from a task group, with and without a handle on the result; task
+groups; and semaphores), step 6's observers and algorithms: an `Observer`
+hook around every task a worker runs, with a built-in Chrome trace-event
+writer; and `for_each`, `for_each_index`, `reduce`, `sort`, `scan`,
+`transform`, `merge` and `find` over a borrowed slice or an `IndexRange`,
+each with a choice of partitioner and a `FlowBuilder` wrapper over owned
+data; and step 7's pipelines: a fixed chain of `Pipe`s run over a bounded
+number of parallel lines, `DataPipeline`'s typed builder over the same
+scheduler for pipes that pass data from each to the next, and the composition
+trait both compose into another graph through. Those are steps of
 "Order of work" at the end of this file, which is where the status is kept
 rather than duplicated here: each step is a GitHub milestone, so its issues
 are what is merged and what is not, and a milestone still open after the
@@ -285,16 +289,19 @@ comments are held to. The measured ones keep their numbers in
 ### Performance
 
 Every measured number this port has is in [`BENCHMARKS.md`](BENCHMARKS.md) —
-six of upstream's benchmarks ported to criterion with a rayon baseline in the
-role TBB's flow graph plays upstream, the machine and the load it was under
+upstream's benchmarks ported to criterion with a rayon baseline in the role
+TBB's flow graph plays upstream, plus the pipeline (issue #187), which has no
+rayon equivalent and compares against an `mpsc` thread chain in the role TBB's
+own `parallel_pipeline` plays there — the machine and the load each ran under
 recorded beside them, and after the tables the per-decision measurements: #40
 and #74 on what a job owns, the continuation #62 ported, the `Work`
 question, external submission (#60), a task body's own queue (#119), the
-spill-buffer count (#102) and what a free async task costs (#125). They are
-kept there rather than repeated here, so each figure has one owner.
-Benchmarks are deliberately outside the gate: a benchmark answers "how fast",
-which is not a pass or a fail, so what CI holds the suite to is that it still
-compiles.
+spill-buffer count (#102), what a free async task costs (#125) and the boxed
+per-line slot a `DataPipeline` pays for over a `Pipeline` of the same shape
+(#186, measured in #188). They are kept there rather than repeated here, so
+each figure has one owner. Benchmarks are deliberately outside the gate: a
+benchmark answers "how fast", which is not a pass or a fail, so what CI
+holds the suite to is that it still compiles.
 
 One of those results is bad, and tracked rather than filed away, because the
 honest state of play is more useful than a table of the shapes that happen to
@@ -341,7 +348,11 @@ Each step is a milestone of PR-sized issues; the upstream unit tests under
 4. **Dynamic tasking** — subflows, runtime tasks, module composition.
 5. **Async** — async and dependent-async tasks, task groups, semaphores.
 6. **Observers and algorithms** — partitioners, `for_each`, `reduce`, `sort`.
-7. **Pipelines** — the one family with no Rust equivalent.
+7. **Pipelines** — the one family with no Rust equivalent. Deferred
+   pipelines are not part of v4.1.0 and so are not ported: there is no
+   `defer` in `pipeline.hpp` at the pin, and while upstream's
+   `test_deferred_*.cpp` files exist, they are not in its own test
+   `CMakeLists`.
 
 One milestone has no step number: a **consolidation** ran between 5 and 6,
 named in "Status" above and with its decisions in [`DESIGN.md`](DESIGN.md).

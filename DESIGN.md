@@ -650,12 +650,15 @@ deliberately left none: #128 and #151 are the weekly loom workflow, whose own
 file and the README say what it runs, and #146 was two module docs still
 calling the async family a later milestone.
 
-## Rationale moved out of the executor's periphery
+## Rationale moved out
 
-The contract at the top of this file keeps a rationale in one place, and for a
-module that is a dozen lines of dispatch over machinery somebody else owns,
-that place cannot be the module itself. These entries are that place, moved
-there by #130, and each names the issue whose decision it records, as every
+The contract at the top of this file keeps a rationale in one place, and for
+a module that is a dozen lines of dispatch over machinery somebody else owns
+-- or a handful of value types whose own doc comments would otherwise retell
+a decision made once, elsewhere -- that place cannot be the module itself.
+These entries are that place: #130 moved the executor periphery's rationale
+here first, and the modules after it that were in the same position add to
+it the same way, each naming the issue whose decision it records, as every
 entry above does.
 
 - **A module task reaches its target through whatever owns it** (issues #49,
@@ -800,6 +803,29 @@ entry above does.
   concrete type. `Composable` is implemented for `Arc<Taskflow>` so every
   caller from before the trait existed is unaffected; a pipeline's own graph
   is the other implementor.
+- **A serial pipe pays the same callable bound as a parallel one, and
+  upstream's second callable shape is not ported** (issue #180). `Pipe`'s
+  bound, `Fn(&mut Pipeflow) + Send + Sync`, is forced by `PipeType::Parallel`
+  alone -- a parallel pipe runs its callable on more than one line's worker
+  at once, so it must be callable through one shared `&Pipe` from more than
+  one thread at the same time, which is exactly `Sync`. A serial pipe never
+  needs that on its own, but `Pipe::set_type` lets a caller change a pipe's
+  direction after it is built, so a serial pipe pays the bound a parallel
+  one would need rather than this type carrying two incompatible shapes that
+  a `set_type` call could silently make unsound.
+
+  Upstream's own `Pipe` accepts a second callable shape,
+  `(Pipeflow&, NonpreemptiveRuntime&)`, checked for with `is_invocable_v` the
+  same way `DataPipeline::_on_pipe` picks between its own three (the M8
+  entry on `DataPipe` above has that one); the port does not add a twin for
+  `Pipe`. A pipe that could reach the line's own `NonpreemptiveRuntime` could
+  call `schedule` on it directly, racing the very three-way outcome --
+  `rt.schedule(next line)` or not -- the pipeline's own line task already
+  computes from the two `fetch_sub`s around every pipe call; nothing a user
+  pipe body could legitimately schedule that the line task is not already
+  scheduling for it, and a seam that let it try would be a second, uncounted
+  way to reach exactly the double-dispatch hazard the entry below on
+  `Runtime::schedule`'s hole exists to close.
 
 ## Decisions taken in M7
 
@@ -1021,11 +1047,53 @@ entry above does.
   upstream, it is not wired into upstream's own test `CMakeLists` -- so
   there is no upstream test this port is on the hook for, and nothing here
   builds toward one.
+- **A pipeline's `Pipeflow` sits behind a per-line `Mutex`, not an
+  `UnsafeCell`** (issue #182). Upstream reaches every line's `Pipeflow`
+  through a raw pointer `_build`'s closure captures, sound there only
+  because the join-counter protocol already guarantees at most one line
+  task is ever reading or writing a given line's token at a time -- a
+  discipline nothing in the C++ type system checks, only the protocol.
+  `Pipeflow`'s fields are already `pub(crate)` for exactly this scheduler,
+  so a `Mutex<Pipeflow>` per line costs nothing an `UnsafeCell` would not
+  also have paid in review effort, and it pays that cost to the type
+  system instead: every access is an ordinary `lock()`, poisoning is
+  tolerated as every other shared lock in this crate tolerates it, and the
+  lock is never contended because the protocol that would make an
+  `UnsafeCell` sound here is the same protocol that keeps two line tasks
+  from ever locking the same line at once. `src/pipeline/scheduler.rs`'s
+  own `# Design` section has the full argument; the crate's two `unsafe`
+  modules, named in the README, are neither this one.
+- **Resetting a pipeline rebuilds its graph and state rather than mutating
+  them in place** (issue #185). Upstream's `reset` overloads read and write
+  `_pipes`, `_lines` and, for the wider overload, `_graph`/`_tasks` straight
+  through the `this` pointer every already-built line task's closure
+  captures, so a reset upstream performs is visible at once to a module
+  task that composed the object *before* the reset ran. A line task's
+  closure here instead captures an `Arc<State>` by value, and
+  `FlowBuilder::composed_of` hands out a clone of `Pipeline::taskflow`'s own
+  `Arc` that outlives the call -- so there is no single allocation this
+  port could mutate in place that every already-composed module task would
+  see, not without the kind of `unsafe` aliasing this port's porting posture
+  asks a port to design around rather than reproduce. `Pipeline::reset_pipes`
+  and `Pipeline::reset_lines` build a fresh graph and `State` instead and
+  swap them in, which means **a composition made before the call keeps
+  pointing at the pre-reset graph and keeps running exactly as it did** --
+  compose again after resetting to run the new shape. That is not a loss
+  against how upstream is actually used: every call site in upstream's own
+  `test_scalable_pipelines.cpp` resets before its one `composed_of` of a
+  given object, never after. `src/pipeline/scheduler.rs`'s own `# Design`
+  section has the full argument.
 - **`Runtime::schedule`'s hole is closed in the scheduler, not documented
-  and left to the caller** (issues #244, #245). `is_entered` -- the guard
-  the bullet above already covers one failure of -- only ever answers `true`
-  for the four handle kinds `preempts_itself` does, and only once their
-  dispatch arm has actually set `PREEMPTED`. Every other handle kind
+  and left to the caller** (issues #244, #245). M8's original premise is
+  false a second time over, and in the opposite direction from the bullet
+  above: `Handle::NonpreemptiveRuntime`'s dispatch arm never sets
+  `PREEMPTED` so that `is_entered` would stop blocking a pipeline's own
+  `schedule` bypass, but that same deliberate `false` means `is_entered`
+  also stops answering the question it originally existed to answer --
+  whether this node's callable is genuinely running right now. `is_entered`
+  only ever answers `true` for the four handle kinds `preempts_itself`
+  does, and only once their dispatch arm has actually set `PREEMPTED`.
+  Every other handle kind
   (`Handle::Static`, either conditioner, `Handle::NonpreemptiveRuntime`) is
   never "entered" by that reckoning even while its body is genuinely
   running, and `Handle::Subflow` is not either for as long as its body is
@@ -1074,6 +1142,16 @@ entry above does.
   asserting `schedule` refuses an entered one is kept exactly as a caller
   bug, not softened into a defer. The two module handles lock no callable at
   all, so `lock_callable` cannot trip on either of them.
+
+  What the claim holds every dispatch arm to is stricter than anything
+  upstream promises: upstream's line task is a bare `std::function<void()>`
+  call, invoked through whatever pointer `this` happens to be, with nothing
+  in the language or the library stopping two threads from calling the same
+  one at once -- only the join-counter arithmetic upstream trusts to never
+  schedule that. This port's one-worker-per-node invariant is the scheduler's
+  own rule rather than an accounting side effect, so the claim polices it
+  directly for every dispatch arm that can be asked to run a node twice,
+  pipeline or not, rather than trusting each caller's own counting to add up.
 
   A node queued twice through two *unrelated* channels before either has
   been claimed -- a real predecessor's release and a `schedule` bypass,
@@ -1148,6 +1226,21 @@ entry above does.
   then handed to `Pipeline::new` unchanged, so the token loop upstream
   duplicates between `Pipeline::_build` and `DataPipeline::_build` exists
   here exactly once.
+- **`src/pipeline/mod.rs` is exempted from the 1.2× ratio, the same way a
+  crate root already is** (issue #189). Its code is three `pub mod`
+  declarations; the file's whole purpose is the module-tree overview above
+  them, naming what each of `pipe`, `scheduler` and `data_pipeline` is for a
+  reader who has not yet opened any of the three. Cutting that overview to
+  3 prose lines to match 3 lines of code would not shrink a rationale this
+  contract puts elsewhere -- there is none to move, the whole file *is* the
+  pointer -- it would just delete the one place a reader meets the tree
+  before the modules themselves. The contract already exempts a crate root
+  on exactly this reasoning (`src/lib.rs`'s own code is a `pub mod`/`pub use`
+  list, so its denominator measures nothing a ratio can judge); a module
+  tree's own root is the same shape one level down, and issue #228, which
+  asks the more general question of whether a per-file ratio is the right
+  instrument for this crate at all, is where that reasoning would extend
+  further if it does.
 
 ## Decisions taken in M9
 
