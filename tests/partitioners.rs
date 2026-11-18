@@ -393,6 +393,84 @@ fn a_random_partitioner_takes_its_fractions_and_its_wrapper_together() {
     );
 }
 
+/// `GuidedPartitioner::with_closure_wrapper` and
+/// `RandomPartitioner::with_closure_wrapper` -- upstream's
+/// `explicit P(size_t, C&&)` for the two strategies the cases above do not
+/// reach -- take a chunk size and a wrapper together, and keep both.
+///
+/// What each half is asserted against is what its own strategy does with it,
+/// and that is where the two differ. A guided floor chunk size shapes the
+/// sequence, so the chunks this constructor's partitioner hands out are the
+/// ones `GuidedPartitioner::new` of the same floor does. A random one is
+/// kept for parity and never read by the loop, so what this pins there is
+/// the other half of the signature: the `alpha` and `beta` fractions
+/// `with_alpha_beta_and_closure_wrapper` overrides are still the defaults.
+#[test]
+fn the_guided_and_random_constructors_keep_their_chunk_size_and_their_wrapper() {
+    const N: usize = 90;
+    const W: usize = 3;
+
+    // The sequence a guided floor of four cuts, with no wrapper in the way.
+    let plain = GuidedPartitioner::<DefaultClosureWrapper>::new(4);
+    let next = AtomicUsize::new(0);
+    let mut expected = Vec::new();
+    plain.loop_dynamic(N, W, &next, |b, e| expected.push((b, e)));
+
+    let guided_chunks = std::cell::Cell::new(0_usize);
+    let counting = |body: &mut dyn FnMut()| {
+        guided_chunks.set(guided_chunks.get() + 1);
+        body();
+    };
+
+    let guided = GuidedPartitioner::with_closure_wrapper(4, counting);
+    assert_eq!(guided.chunk_size(), 4);
+    let next = AtomicUsize::new(0);
+    let mut cut = Vec::new();
+    guided.loop_dynamic(N, W, &next, |b, e| {
+        guided.call(|| cut.push((b, e)));
+    });
+    assert_eq!(
+        cut, expected,
+        "the chunk size given is the floor the guided sequence shrinks to"
+    );
+    assert_eq!(
+        guided_chunks.get(),
+        cut.len(),
+        "and the wrapper ran around every chunk of it"
+    );
+
+    let random_chunks = std::cell::Cell::new(0_usize);
+    let wrapping = |body: &mut dyn FnMut()| {
+        random_chunks.set(random_chunks.get() + 1);
+        body();
+    };
+
+    let random = RandomPartitioner::with_closure_wrapper(7, wrapping);
+    assert_eq!(
+        random.chunk_size(),
+        7,
+        "kept, though a random loop never reads it"
+    );
+    assert_eq!(random.alpha(), 0.01, "and the default fractions are intact");
+    assert_eq!(random.beta(), 0.5);
+
+    let next = AtomicUsize::new(0);
+    let mut chunks = 0;
+    let mut covered = 0;
+    random.loop_dynamic(N, W, &next, |b, e| {
+        random.call(|| {
+            chunks += 1;
+            covered += e - b;
+        });
+    });
+    assert_eq!(covered, N, "every index was handed out exactly once");
+    assert_eq!(
+        random_chunks.get(),
+        chunks,
+        "and this wrapper ran around every chunk too"
+    );
+}
+
 // ============================================================================
 // The cut itself
 //

@@ -860,6 +860,120 @@ fn remove_edge_removes_every_copy_of_an_edge_and_counts_them() {
     );
 }
 
+/// A node's own edge lists are the two halves of one vector, split at its
+/// successor count: `Node::successors` and `Node::predecessors` are the
+/// slices `Graph::successors` and `Graph::predecessors` hand on, and the two
+/// counts beside them are where the split falls.
+///
+/// Upstream keeps two vectors, `_successors` and `_predecessors`, so the one
+/// claim here it has no counterpart for is what a single vector costs:
+/// pushing a successor swaps the first predecessor to the back to keep the
+/// halves contiguous, which is why `Node::predecessors`' own doc promises
+/// insertion order only up to that swap.
+#[test]
+fn a_nodes_edge_halves_are_one_vector_split_at_its_successor_count() {
+    let mut graph = Graph::new();
+    let a = graph.add_named_node("a", Handle::Placeholder);
+    let b = graph.add_named_node("b", Handle::Placeholder);
+    let c = graph.add_named_node("c", Handle::Placeholder);
+    let d = graph.add_named_node("d", Handle::Placeholder);
+
+    graph.add_edge(a, b);
+    graph.add_edge(a, b);
+    graph.add_edge(c, b);
+
+    let node = graph.node(b);
+    assert_eq!(node.num_successors(), 0);
+    assert_eq!(node.num_predecessors(), 3, "the duplicate edge is kept");
+    assert!(node.successors().is_empty(), "b precedes nothing yet");
+    assert_eq!(node.predecessors().to_vec(), vec![a, a, c]);
+    assert_eq!(
+        graph.predecessors(b),
+        graph.node(b).predecessors(),
+        "the graph's query is the node's own half, handed on"
+    );
+    assert_eq!(graph.successors(a), graph.node(a).successors());
+    assert_eq!(graph.node(a).successors().to_vec(), vec![b, b]);
+    assert_eq!(graph.node(a).num_successors(), 2);
+
+    // The halves stay contiguous as `b` gains a successor of its own, so the
+    // predecessor it displaces goes to the back rather than staying put.
+    graph.add_edge(b, d);
+    let node = graph.node(b);
+    assert_eq!(node.successors().to_vec(), vec![d]);
+    assert_eq!(node.num_successors(), 1);
+    assert_eq!(node.num_predecessors(), 3, "and no predecessor was lost");
+    assert_eq!(
+        node.predecessors().to_vec(),
+        vec![a, c, a],
+        "the first predecessor was swapped to the back to make room"
+    );
+}
+
+/// The two task handles can be taken on a graph a caller owns outright, with
+/// no `Taskflow` in between: `TaskRef::new` and `TaskMut::new` are what
+/// `FlowBuilder::task_ref` and `FlowBuilder::task` hand back one level up,
+/// and the index `TaskMut::task` reads out of one is the node it was taken
+/// for.
+///
+/// No upstream case: a `tf::Task` wraps a `Node*` a builder hands out, and
+/// nothing upstream owns a graph a second handle could be taken against.
+#[test]
+fn the_two_task_handles_borrow_a_graph_a_caller_owns() {
+    let mut graph = Graph::new();
+    let a = graph.add_named_node("a", Handle::Placeholder);
+    let b = graph.add_named_node("b", Handle::Placeholder);
+
+    let read = TaskRef::new(&graph, b);
+    assert_eq!(
+        read.name(),
+        "b",
+        "the handle reads the node its index names"
+    );
+    assert_eq!(read.task(), b);
+    assert!(read.is_empty(), "a placeholder holds no work");
+
+    let mut edit = TaskMut::new(&mut graph, b);
+    assert_eq!(edit.task(), b);
+    edit.name("renamed").succeed([a]);
+    let taken = edit.task();
+
+    assert_eq!(taken, b, "the index outlives the borrow it was read from");
+    assert_eq!(graph.node(b).name(), "renamed", "the edits landed on `b`");
+    assert_eq!(graph.predecessors(b).to_vec(), vec![a]);
+    assert_eq!(
+        TaskRef::new(&graph, taken).name(),
+        "renamed",
+        "and addresses the same node once the borrow is over"
+    );
+    assert_eq!(
+        TaskRef::new(&graph, a).name(),
+        "a",
+        "neither handle answered about the graph's first node"
+    );
+}
+
+/// `TaskRef::new` refuses an index that addresses no node of the graph it is
+/// handed, instead of reading whatever is in that slot. The check is once,
+/// at construction, which is what makes every query on the handle
+/// infallible where upstream dereferences a `Node*` on trust.
+#[test]
+#[should_panic(expected = "Task(7) is out of range for a graph of 1 nodes")]
+fn a_read_handle_refuses_an_index_the_graph_does_not_hold() {
+    let mut graph = Graph::new();
+    graph.add_node(Handle::Placeholder);
+    let _ = TaskRef::new(&graph, Task::new(7));
+}
+
+/// `TaskMut::new`'s half of the check above.
+#[test]
+#[should_panic(expected = "Task(7) is out of range for a graph of 1 nodes")]
+fn an_editing_handle_refuses_an_index_the_graph_does_not_hold() {
+    let mut graph = Graph::new();
+    graph.add_node(Handle::Placeholder);
+    let _ = TaskMut::new(&mut graph, Task::new(7));
+}
+
 // --------------------------------------------------------
 // Testcase: the reborrow between the two task handles (not upstream's)
 //

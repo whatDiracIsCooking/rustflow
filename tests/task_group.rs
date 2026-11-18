@@ -95,15 +95,19 @@ use std::sync::{Arc, Mutex};
 use rustflow::prelude::*;
 use rustflow::{Executor, TaskGroup, Xorshift32};
 
-// The matrix macro and the spin both halves of the `Cancellation` handshake
-// wait on. `common/counters.rs` is not among them: half the counters here are
-// a recursion's return value rather than a tally of what ran, and the two
-// sorts compare vectors instead of counting at all.
+// The matrix macro, the spin both halves of the `Cancellation` handshake wait
+// on, and the payload check the one case here that expects a failure makes.
+// `common/counters.rs` is not among them: half the counters here are a
+// recursion's return value rather than a tally of what ran, and the two sorts
+// compare vectors instead of counting at all.
 #[macro_use]
 mod common;
+#[path = "common/panics.rs"]
+mod panics;
 #[path = "common/spin.rs"]
 mod spin;
 
+use panics::assert_panicked_with;
 use spin::spin_until;
 
 /// Upstream's `for(size_t i=0; i<1000; ++i)`, in both of the first two
@@ -719,4 +723,63 @@ worker_matrix! {
         quick_sort_7threads(7),
         quick_sort_8threads(8),
     }
+}
+
+/// Upstream's `TaskGroup::silent_async` over a `[](tf::Runtime&){}` body:
+/// the runtime-shaped form with no handle of any kind, which is why a corun
+/// is the only thing that can report for it.
+///
+/// Both claims are the method's own docs'. The body is handed a working
+/// [`Runtime`](rustflow::Runtime) -- it reads the pool it runs in and spawns
+/// a child of its own, which [`TaskGroup::corun`] waits for along with the
+/// body -- and a failure under it lands on the group's *anchor* rather than
+/// on a handle it does not have, so [`TaskGroup::try_corun`] is what hands
+/// the payload back. Upstream's own suite drives neither: its `TaskGroup`
+/// cases are the plain and dependent forms, and it has no failing body
+/// anywhere.
+#[test]
+fn a_silent_runtime_shaped_child_is_joined_and_reported_by_its_group() {
+    const WORKERS: usize = 2;
+
+    let executor = Arc::new(Executor::new(WORKERS));
+    let ran = Arc::new(AtomicUsize::new(0));
+
+    executor
+        .spawn({
+            let executor = Arc::clone(&executor);
+            let ran = Arc::clone(&ran);
+            move || {
+                let group = group_of(&executor);
+
+                group.silent_async_runtime({
+                    let ran = Arc::clone(&ran);
+                    move |spawner: &mut Runtime<'_>| {
+                        assert_eq!(spawner.num_workers(), WORKERS);
+                        ran.fetch_add(1, Ordering::Relaxed);
+                        let ran = Arc::clone(&ran);
+                        spawner.silent_async(move || {
+                            ran.fetch_add(1, Ordering::Relaxed);
+                        });
+                    }
+                });
+
+                group.corun();
+                assert_eq!(
+                    ran.load(Ordering::Relaxed),
+                    2,
+                    "the body and the child it spawned were both waited for"
+                );
+                assert_eq!(group.size(), 0);
+
+                // Nothing holds a handle on this one, so the anchor is where
+                // its failure lands and the corun is what reports it.
+                group.silent_async_runtime(|_: &mut Runtime<'_>| panic!("under the group"));
+                let error = group.try_corun().expect_err("the child failed");
+                assert_panicked_with(error, "under the group");
+            }
+        })
+        .wait()
+        .expect("the group's own failure was taken by `try_corun`");
+
+    assert_eq!(ran.load(Ordering::Relaxed), 2);
 }

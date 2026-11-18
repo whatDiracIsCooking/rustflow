@@ -20,7 +20,14 @@
 //!   *succeeds* anyway.
 //! - Releasing past the maximum is a [`SemaphoreError`] rather than
 //!   upstream's `TF_THROW`: what a task that over-releases has done is the
-//!   executor's decision, not this module's.
+//!   executor's decision, not this module's. The maximum it carries is read
+//!   back by `SemaphoreError::max_value`, which is `pub(crate)` because
+//!   nothing public hands a `SemaphoreError` out: the only release a caller
+//!   can reach is a task's own, through [`TaskMut::release`](crate::TaskMut::release),
+//!   and `src/executor/worker.rs` turns the failure of one into the panic
+//!   payload the run reports -- the text of this error, not the value. So
+//!   the number reaches a caller through `Display` and the accessor has no
+//!   caller outside the crate to serve.
 //! - Every query takes the lock, including [`Semaphore::max_value`], which
 //!   upstream reads unlocked even though `reset` writes it.
 
@@ -250,9 +257,12 @@ pub struct SemaphoreError {
 }
 
 impl SemaphoreError {
-    /// The maximum value the release would have gone past.
+    /// The maximum value the release would have gone past, which is what
+    /// [`Display`](fmt::Display) prints.
+    ///
+    /// Not `pub`: the `# Design` section above has why.
     #[must_use]
-    pub const fn max_value(self) -> usize {
+    pub(crate) const fn max_value(self) -> usize {
         self.max_value
     }
 }
@@ -262,7 +272,7 @@ impl fmt::Display for SemaphoreError {
         write!(
             f,
             "can't release the semaphore more than its maximum value: {}",
-            self.max_value
+            self.max_value()
         )
     }
 }

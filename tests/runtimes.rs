@@ -1255,6 +1255,78 @@ fn schedule_defers_a_bypass_onto_a_nonpreemptive_node_still_running() {
     }
 }
 
+/// This port's own: the whole surface a nonpreemptive runtime task's body is
+/// handed -- `num_workers`, `worker` and the one scheduling call the
+/// restricted handle keeps.
+///
+/// `FlowBuilder::emplace_nonpreemptive_runtime` is a public builder method,
+/// and `schedule` is what upstream's second runtime class exists for: the
+/// node is never `PREEMPTED`, so a bypass out of its own body needs no
+/// reasoning about what that body has spawned. The graph is
+/// [`a_runtime_task_schedules_a_module_task_the_graph_cannot_reach`]'s cut
+/// down to the bypass alone -- the conditioner takes the branch through the
+/// line task, so `bypassed`'s one strong predecessor never runs and the only
+/// way it runs at all is the call under test. The two accessors are asserted
+/// off the body's own recordings, including the relation
+/// `NonpreemptiveRuntime::worker_id`'s own doc states: it is
+/// `worker().id()` in one hop.
+#[test]
+fn a_nonpreemptive_runtime_body_reads_its_worker_and_schedules_a_task() {
+    for workers in 1..=4 {
+        let value = Arc::new(AtomicI32::new(0));
+        let seen_workers = Arc::new(AtomicUsize::new(0));
+        let hop_agrees = Arc::new(AtomicBool::new(false));
+        let id_is_a_workers = Arc::new(AtomicBool::new(false));
+
+        let mut taskflow = Taskflow::new();
+        let never = {
+            let value = Arc::clone(&value);
+            taskflow.emplace(move || value.store(-100, Ordering::Relaxed))
+        };
+        let bypassed = taskflow.emplace(count(&value));
+        taskflow.task(never).precede([bypassed]);
+
+        let line = {
+            let seen_workers = Arc::clone(&seen_workers);
+            let hop_agrees = Arc::clone(&hop_agrees);
+            let id_is_a_workers = Arc::clone(&id_is_a_workers);
+            taskflow.emplace_nonpreemptive_runtime(move |rt| {
+                seen_workers.store(rt.num_workers(), Ordering::Relaxed);
+                let id = rt.worker().id();
+                hop_agrees.store(id == rt.worker_id(), Ordering::Relaxed);
+                id_is_a_workers.store(id < rt.num_workers(), Ordering::Relaxed);
+                rt.schedule(bypassed);
+            })
+        };
+        let entrypoint = taskflow.emplace_condition(|| 0);
+        taskflow.task(entrypoint).precede([line, never]);
+
+        Executor::new(workers)
+            .run(&taskflow)
+            .wait()
+            .expect("no task panicked");
+
+        assert_eq!(
+            seen_workers.load(Ordering::Relaxed),
+            workers,
+            "{workers} worker(s): the body reads the pool it runs in"
+        );
+        assert!(
+            hop_agrees.load(Ordering::Relaxed),
+            "{workers} worker(s): `worker_id` is `worker().id()` in one hop"
+        );
+        assert!(
+            id_is_a_workers.load(Ordering::Relaxed),
+            "{workers} worker(s): the worker named is one of that pool's"
+        );
+        assert_eq!(
+            value.load(Ordering::Relaxed),
+            1,
+            "{workers} worker(s): the bypassed task ran and `never` did not"
+        );
+    }
+}
+
 /// Issue #245's other half: a target whose handle kind *does* preempt
 /// itself, caught in the window before it has. A `Handle::Subflow` is not
 /// `is_entered` for any of its body's own run -- `PREEMPTED` goes on only

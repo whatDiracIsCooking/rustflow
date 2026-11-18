@@ -12,6 +12,7 @@
 //! run outside any graph.
 
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -801,6 +802,127 @@ fn worker_row_counts(report: &str) -> Vec<u64> {
             fields.next()?.parse().ok()
         })
         .collect()
+}
+
+/// A sink that refuses every write, for the error path of a dump.
+struct Failing;
+
+impl io::Write for Failing {
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+        Err(io::Error::from(io::ErrorKind::BrokenPipe))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// [`ChromeObserver::dump`] is the primitive the string form is built on:
+/// the bytes it writes into a caller's own sink are exactly the document
+/// `dump_to_string` hands back, and an error from that sink comes back to
+/// the caller rather than being swallowed.
+///
+/// Upstream has one form, `dump(std::ostream&)`, and a `std::string`
+/// overload that runs it over an `ostringstream` -- so what is this port's
+/// own is the error: a Rust `io::Write` reports a refused write where an
+/// `ostream` sets a bit upstream never looks at.
+#[test]
+fn chrome_dump_writes_the_document_the_string_form_returns() {
+    let executor = Executor::new(2);
+    let observer = executor.make_observer(ChromeObserver::new());
+
+    let mut taskflow = Taskflow::new();
+    let dispatched = mixed_graph(&mut taskflow);
+    executor
+        .run(&taskflow)
+        .wait()
+        .expect("no task of the graph panicked");
+    assert_eq!(observer.num_tasks(), dispatched);
+
+    let mut written = Vec::new();
+    observer
+        .dump(&mut written)
+        .expect("writing to a Vec never fails");
+    assert_eq!(
+        String::from_utf8(written).expect("a dump is ASCII JSON"),
+        observer.dump_to_string(),
+        "the writer form and the string form are one document"
+    );
+
+    let error = observer
+        .dump(&mut Failing)
+        .expect_err("the sink refuses every write");
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe,
+        "the sink's own error, not one of this dump's making"
+    );
+}
+
+/// [`TfProfObserver::clear`] discards every recorded segment and leaves the
+/// observer recording; [`TfProfObserver::num_workers`] counts the workers
+/// that have recorded at least one task and keeps counting them afterwards.
+///
+/// That last part is upstream's own quirk, which this port matches rather
+/// than corrects and the method's docs name: a worker's slot of nesting
+/// levels is never shrunk back to nothing, so a `clear` that leaves
+/// `num_tasks` at zero leaves `num_workers` where it was. Upstream calls
+/// neither method from a case of its own -- both are read by its
+/// `TFProfManager` singleton, which `DESIGN.md` says is not ported.
+#[test]
+fn tfprof_clear_discards_every_segment_and_keeps_the_worker_count() {
+    const WORKERS: usize = 3;
+
+    assert_eq!(
+        TfProfObserver::new().num_workers(),
+        0,
+        "nothing is counted before `set_up` has run"
+    );
+
+    let executor = Executor::new(WORKERS);
+    let observer = executor.make_observer(TfProfObserver::new());
+
+    let mut taskflow = Taskflow::new();
+    let dispatched = mixed_graph(&mut taskflow);
+    executor
+        .run(&taskflow)
+        .wait()
+        .expect("no task of the graph panicked");
+
+    assert_eq!(observer.num_tasks(), dispatched);
+    let recorded_workers = observer.num_workers();
+    assert!(
+        (1..=WORKERS).contains(&recorded_workers),
+        "{recorded_workers} workers recorded a task, of {WORKERS}"
+    );
+
+    observer.clear();
+    assert_eq!(observer.num_tasks(), 0, "every segment went");
+    assert_eq!(
+        observer.num_workers(),
+        recorded_workers,
+        "and every worker counted stayed counted"
+    );
+
+    let mut dump = Vec::new();
+    observer
+        .dump(&mut dump)
+        .expect("writing to a Vec never fails");
+    let (_uid, segments) = parse_tfp_block(&dump);
+    assert!(
+        segments.is_empty(),
+        "a dump after a clear is a well-formed block with nothing in it"
+    );
+
+    executor
+        .run(&taskflow)
+        .wait()
+        .expect("no task of the graph panicked");
+    assert_eq!(
+        observer.num_tasks(),
+        dispatched,
+        "a cleared observer is still recording"
+    );
 }
 
 // ----------------------------------------------------------------------------
