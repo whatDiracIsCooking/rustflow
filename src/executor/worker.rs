@@ -3,100 +3,54 @@
 //! The scheduling loop itself -- upstream's `Executor::_spawn`,
 //! `_exploit_task`, `_explore_task`, `_wait_for_task`, `_schedule` and
 //! `_invoke`, from `taskflow/core/executor.hpp` of the same version -- is
-//! translated here too, rather than into the parent module, because every line
-//! of it either reads or writes one worker's own state or runs on that worker's
-//! thread. The parent module keeps what the *executor* owns: the worker array,
-//! the buffers, the notifier and the thread-id map. `_tear_down_topology`,
-//! which a worker calls but which is all about the run, lives in
-//! [`run_handle`](crate::executor::run_handle) with the rest of the run family.
+//! translated here rather than into the parent module, because every line of
+//! it either reads or writes one worker's own state or runs on that worker's
+//! thread. The parent module keeps what the *executor* owns, and
+//! `_tear_down_topology`, which a worker calls but which is all about the run,
+//! lives in [`run_handle`](crate::executor::run_handle).
 //!
-//! # Why a worker is two types here and one type upstream
+//! # Design
 //!
-//! Upstream's `Worker` holds all of it in one struct: the id, the sticky
-//! victim, the random generator, the bounded work-stealing queue, the thread
-//! handle and the `done` flag. It can, because C++ lets the executor reach into
-//! a worker from any thread and leaves "only the owner pops its own queue" as a
-//! comment.
+//! **A worker is two types here and one upstream.** Upstream's `Worker` holds
+//! the id, the sticky victim, the generator, the queue, the thread handle and
+//! the `done` flag in one struct, because C++ lets the executor reach into a
+//! worker from any thread and leaves "only the owner pops its own queue" as a
+//! comment. Here the compiler asks which fields are shared: [`Worker`] is the
+//! part other threads touch and is `Sync`, and `WorkerThread` is the part only
+//! the worker's own thread touches, created inside the spawned thread and
+//! moving nowhere -- so that rule is a property of where the value lives. A
+//! corun loop starts inside a task body, itself inside the `WorkerThread`
+//! frame already running that worker's loop, which the code it calls cannot
+//! name, so it gets a second view: `LocalQueue`. Upstream's `_thread` has no
+//! equivalent, a `JoinHandle` being owned by whoever will join it, which costs
+//! the port its trick of setting thread affinity from the prologue.
 //!
-//! Here the compiler asks which fields are shared, and the answer splits the
-//! struct in two:
-//!
-//! - [`Worker`] is the part other threads touch -- the id, the `done` flag the
-//!   executor sets at shutdown, and the [`Thief`] every other worker steals
-//!   through. It is `Sync`, it lives in the executor's worker array, and it is
-//!   what a [`WorkerInterface`] is handed.
-//! - `WorkerThread` is the part only the worker's own thread touches: the
-//!   owning end of its queue, its sticky victim and its generator. It is
-//!   created inside the spawned thread and moves nowhere, so the "only the
-//!   owner pushes or pops" rule that upstream writes in a comment is here a
-//!   property of where the value lives.
-//!
-//! That split is also why a `WorkerThread` does not always hold the owning
-//! end of its queue. A corun loop -- `WorkerThread::corun_until`, the loop
-//! `Executor::corun` runs -- starts from *inside* a task body, which is
-//! inside the `WorkerThread` frame already running that worker's loop, and a
-//! frame cannot be named from the code it called. So a corun loop gets a
-//! second `WorkerThread` over the same worker, built by
-//! `WorkerThread::corun_view`, and reaches the queue the only way a value
-//! without the owning end can: see `LocalQueue` below.
-//!
-//! The one upstream field with no equivalent is `_thread`: a `JoinHandle` is
-//! owned by whoever will join it, so the executor keeps the handles and the
-//! worker does not. That costs the port upstream's `WorkerInterface` trick of
-//! setting thread affinity from the prologue, which needs the handle; a
-//! `Worker` here cannot hand one out.
-//!
-//! # Conditional scheduling
-//!
-//! A conditioner -- [`Handle::Condition`] or [`Handle::MultiCondition`] -- is
-//! the one node kind that picks its own successors, and that single fact is
-//! what the strong/weak dependency split exists for. Upstream's `_invoke` has
-//! two switches over the handle because of it, and so does
-//! `WorkerThread::invoke`: the first runs the work and keeps what a
-//! conditioner returned, the second decides what this node's successors are
-//! owed.
-//!
-//! - An edge out of a *non*-conditioner is a **strong** dependency. It is
-//!   counted into the successor's join counter by `set_up_graph` in the
-//!   crate-private `executor::topology`, and finishing the predecessor
-//!   decrements that counter; the successor becomes ready when the count
-//!   reaches zero, which is when every strong predecessor has run.
-//! - An edge out of a conditioner is a **weak** dependency. It is not counted,
-//!   so it gates nothing. The conditioner's return value instead names
-//!   successor *positions* -- one `i32` for a condition task, any number of
-//!   them for a multi-condition one -- and each named successor is scheduled
-//!   outright. An index that is negative or past the last successor names
-//!   nothing, which is how a branch ends, and so does a conditioner whose body
-//!   panics: the panic is delivered to whatever is waiting for this node's
-//!   graph -- the run, for a top-level conditioner -- and the selection stays
-//!   empty. A panic also cancels the rest of that graph, so for a conditioner
-//!   the empty selection is belt and braces: there is nothing left to select
-//!   into.
+//! **Conditional scheduling.** A conditioner -- [`Handle::Condition`] or
+//! [`Handle::MultiCondition`] -- is the one node kind that picks its own
+//! successors, and that single fact is what the strong/weak dependency split
+//! exists for. An edge out of a *non*-conditioner is a **strong** dependency,
+//! counted into the successor's join counter by `set_up_graph` and spent as
+//! the predecessor finishes. An edge out of a conditioner is **weak**: it
+//! gates nothing, and the body's return value names successor *positions* --
+//! one `i32` for a condition task, any number for a multi-condition one --
+//! which are scheduled outright. An index that is negative or past the last
+//! successor names nothing, which is how a branch ends, and so does a
+//! conditioner whose body panics.
 //!
 //! A selected successor has its join counter *stored to zero* rather than
-//! decremented. That is upstream's "zeroing the join counter for invariant",
-//! and the invariant is that a node's counter reads zero exactly when the node
-//! is ready to run. A node entered through a weak edge cannot get there by
-//! arithmetic: a cycle may re-enter it before its strong predecessors run
-//! again -- in upstream's `loop_cond` shape the conditioner's weak successor is
-//! the conditioner itself, re-armed to its strong count a few lines earlier by
-//! the `fetch_add` that makes cycles work at all -- and nothing else is going
-//! to decrement it. So the counter is told.
-//!
-//! That is also where upstream's one rule for writing a conditional graph comes
-//! from (its `ConditionalTasking` page): **a task reached through a condition
-//! must be reachable only through that condition.** A weak successor that also
-//! has a strong predecessor can be started by the conditioner before that
-//! predecessor has run, since the zeroed counter says "ready" either way; and a
-//! weak successor two conditioners can both select may be started twice at
-//! once, which [`Work::invoke`](crate::Work::invoke) reports as a violated
-//! one-worker-per-node promise. Neither is diagnosed when the graph is built,
-//! and upstream does not diagnose them either.
-//!
-//! None of this state outlives a run. `run_n`/`run_until` re-arm every node
-//! through `set_up_graph` before queueing the next run's sources, so the
-//! counters a cycle drove to zero start the next run at their strong counts and
-//! two runs of one taskflow cannot see each other's arithmetic.
+//! decremented: upstream's "zeroing the join counter for invariant", the
+//! invariant being that a counter reads zero exactly when the node is ready to
+//! run, which a node entered through a weak edge cannot reach by arithmetic --
+//! a cycle may re-enter it before its strong predecessors run again. Hence
+//! upstream's one rule for writing a conditional graph (its
+//! `ConditionalTasking` page): **a task reached through a condition must be
+//! reachable only through that condition.** A weak successor with a strong
+//! predecessor can start before that predecessor has run, and one two
+//! conditioners both select may start twice at once, which
+//! [`Work::invoke`](crate::Work::invoke) reports as a violated
+//! one-worker-per-node promise; neither is diagnosed when the graph is built,
+//! as upstream does not diagnose them either. None of this state outlives a
+//! run, every node being re-armed before the next run's sources are queued.
 
 use std::any::Any;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -114,24 +68,19 @@ use crate::executor::{r#async, dependent_async, module, runtime, subflow};
 use crate::graph::{Handle, Node};
 
 /// What a strong release that lands on a node some bypass has already entered
-/// reports, instead of resuming that node: issue #107, and the successor arm
-/// of [`WorkerThread::invoke_one`] is where it is read.
-///
-/// A `&'static str` payload, which is what a `panic!` with a literal message
-/// produces and what [`RunError`](crate::RunError) renders first -- the same
-/// shape `executor::module`'s own refusal uses.
+/// reports, instead of resuming that node: the successor arm of
+/// [`WorkerThread::invoke_one`] is where it is read. A `&'static str` payload,
+/// which is what a `panic!` with a literal message produces and what
+/// [`RunError`](crate::RunError) renders first.
 const REENTERED: &str = "a task was released while it was already running: a \
                          bypassed dependency may not re-enter a task the run \
                          has already entered";
 
 /// A worker of an [`Executor`](crate::Executor), as every thread but its own
-/// sees it.
-///
-/// A worker id is an index in `0..num_workers`, fixed when the executor is
-/// built. The fields are `pub(crate)` rather than private because the
-/// scheduling loop in this module and the run methods that later modules add to
-/// `Executor` are all part of one scheduler that happens to be spread over
-/// several files; `pub(crate)` is what lets those files stay separate.
+/// sees it. A worker id is an index in `0..num_workers`, fixed when the
+/// executor is built. The fields are `pub(crate)` rather than private because
+/// the scheduling loop here and the run methods later modules add to `Executor`
+/// are one scheduler spread over several files.
 #[derive(Debug)]
 pub struct Worker {
     /// This worker's id, i.e. its index in the executor's worker array.
@@ -163,13 +112,10 @@ impl Worker {
     }
 
     /// Returns `true` if this worker's queue held nothing at the moment of the
-    /// call.
-    ///
-    /// Upstream exposes `queue_size()` and `queue_capacity()` here. A
-    /// `crossbeam` deque reports neither -- and its capacity would be a moving
-    /// target anyway, since it grows where upstream's is bounded -- so this is
-    /// the part of that interface the port can answer, and it is the only part
-    /// the scheduler itself asks for.
+    /// call. Upstream exposes `queue_size()` and `queue_capacity()` here; a
+    /// `crossbeam` deque reports neither, and its capacity would be a moving
+    /// target where upstream's is bounded, so this is the part of that
+    /// interface the port can answer.
     #[must_use]
     pub fn is_queue_empty(&self) -> bool {
         self.thief.is_empty()
@@ -181,34 +127,25 @@ impl Worker {
     }
 }
 
-/// A hook that runs on every worker thread, around the scheduling loop.
-///
-/// Upstream's `tf::WorkerInterface`, whose stated purpose is to let a caller
-/// configure a worker thread -- its name, its priority, its CPU affinity --
-/// from inside that thread, at the only two moments the executor offers.
-///
-/// Both methods take `&self` and run on every worker simultaneously, so an
-/// implementation that accumulates anything needs its own synchronisation; that
-/// is why the trait requires `Send + Sync` rather than leaving it to the
-/// `Arc<dyn WorkerInterface>` the executor stores.
+/// A hook that runs on every worker thread, around the scheduling loop:
+/// upstream's `tf::WorkerInterface`, whose stated purpose is to let a caller
+/// configure a worker thread -- its name, its priority, its CPU affinity -- from
+/// inside that thread, at the only two moments the executor offers. Both methods
+/// take `&self` and run on every worker at once, so an implementation that
+/// accumulates anything needs its own synchronisation, which is why the trait
+/// requires `Send + Sync`.
 pub trait WorkerInterface: Send + Sync {
     /// Runs on the worker thread before it enters the scheduling loop.
     fn scheduler_prologue(&self, worker: &Worker);
 
     /// Runs on the worker thread after it leaves the scheduling loop, with the
-    /// payload of the panic that ended the loop if one did.
-    ///
-    /// The payload stands in for upstream's `std::exception_ptr`: a panic is
-    /// this port's translation of an exception escaping a task body, and
-    /// [`panic::catch_unwind`] hands back exactly what was panicked with. It is
-    /// `None` on every normal shutdown.
+    /// payload of the panic that ended the loop if one did: upstream's
+    /// `std::exception_ptr`, `None` on every normal shutdown.
     fn scheduler_epilogue(&self, worker: &Worker, panicked: Option<Box<dyn Any + Send>>);
 }
 
 /// The worker state that belongs to the worker's own thread, and the scheduling
-/// loop over it.
-///
-/// Created inside the spawned thread and dropped when that thread ends.
+/// loop over it: created inside the spawned thread, dropped when it ends.
 pub(crate) struct WorkerThread {
     /// Everything the executor shares with its workers.
     pub(crate) shared: Arc<Shared>,
@@ -218,14 +155,12 @@ pub(crate) struct WorkerThread {
     /// Where this loop takes its local work from, and where it puts the work
     /// it makes ready. See [`LocalQueue`].
     pub(crate) queue: LocalQueue,
-    /// The queue this worker tries to steal from first.
-    ///
-    /// Upstream's `_sticky_victim`, and the reason the steal loop is not purely
-    /// random: a worker that stole from somebody once is likely to again, and
-    /// starting there turns a successful steal into a cache-warm one.
+    /// The queue this worker tries to steal from first: upstream's
+    /// `_sticky_victim`, and the reason the steal loop is not purely random --
+    /// a worker that stole from somebody once is likely to again.
     pub(crate) sticky_victim: usize,
-    /// This worker's victim-picking generator. Per-worker, because a shared one
-    /// would be a contended cache line on the hottest path there is.
+    /// This worker's victim-picking generator. Per-worker, a shared one being a
+    /// contended cache line on the hottest path there is.
     pub(crate) rng: Xorshift32,
 }
 
@@ -233,24 +168,11 @@ pub(crate) struct WorkerThread {
 ///
 /// Upstream needs no equivalent: its `_corun_until` takes the `Worker&` the
 /// executor hands out and pops that worker's queue through it. Here the owning
-/// end of a queue is a `!Sync` value that lives in the [`WorkerThread`] on the
-/// worker's own stack frame, and a task body -- which is what calls
-/// `Executor::corun` -- is called *by* that frame and cannot name it.
-///
-/// A corun loop therefore runs on a [`WorkerThread::corun_view`] of the same
-/// worker, which has no owning end, and the two accesses it needs are both
-/// reachable from the state every thread shares:
-///
-/// - taking local work becomes a steal from the worker's own [`Thief`] -- the
-///   same queue, from the first-in end rather than the last-in one;
-/// - publishing newly ready work goes to the shared buffers instead of the
-///   queue.
-///
-/// Both are a little slower than the owned end -- a steal is the contended
-/// side of the deque, and a buffer costs the pusher a hash and the taker a
-/// sweep -- and neither changes which jobs run or in what order they become
-/// ready. The whole trade is locality, and what it buys is that no part of
-/// this port needs a raw pointer to another thread's stack frame.
+/// end is a `!Sync` value in the [`WorkerThread`] on the worker's own stack
+/// frame, which a task body cannot name, so a corun loop runs on a
+/// [`WorkerThread::corun_view`] with no owning end: taking local work becomes a
+/// steal from the worker's own [`Thief`], and newly ready work goes to the
+/// shared buffers. Both are slower, and neither changes which jobs run.
 pub(crate) enum LocalQueue {
     /// The owning end, held by the thread running this worker's own scheduling
     /// loop: pops are LIFO and uncontended, and nothing else may touch it.
@@ -259,12 +181,10 @@ pub(crate) enum LocalQueue {
     Corun,
 }
 
-/// What one round of stealing came back with.
-///
-/// Upstream's `_explore_task` returns a `bool` and writes the stolen task
-/// through a reference, which leaves "returned true and the task is still null"
-/// as a third case the caller has to remember to handle. Naming the three
-/// outcomes is the same control flow with the case list written down.
+/// What one round of stealing came back with. Upstream's `_explore_task`
+/// returns a `bool` and writes the stolen task through a reference, which
+/// leaves "returned true and the task is still null" as a third case the
+/// caller has to remember; naming the three is the same control flow.
 pub(crate) enum Stolen {
     /// A job to run.
     Job(Job),
@@ -290,15 +210,11 @@ impl WorkerThread {
         }
     }
 
-    /// A second view of worker `id`, for a corun loop that starts inside one
-    /// of that worker's task bodies.
-    ///
-    /// Call it only from worker `id`'s own thread -- `Executor::corun` checks
-    /// that before it gets here. The two views share the worker's queue, but
-    /// not the sticky victim and not the generator: those are a `&mut` each,
-    /// and the owned one is borrowed by the frame below. Sharing them would
-    /// buy a warm first steal and cost the only thing that keeps the two views
-    /// apart, which is that only one of them is ever running.
+    /// A second view of worker `id`, for a corun loop that starts inside one of
+    /// that worker's task bodies. Call it only from worker `id`'s own thread --
+    /// `Executor::corun` checks that before it gets here. The two views share the
+    /// worker's queue but not the sticky victim and not the generator, those being
+    /// a `&mut` each and the owned one borrowed by the frame below.
     pub(crate) fn corun_view(shared: Arc<Shared>, id: usize) -> Self {
         // Where `new` starts a worker on its own queue, a corun view starts on
         // the first shared buffer: [`WorkerThread::pop`] has already looked at
@@ -314,12 +230,9 @@ impl WorkerThread {
         }
     }
 
-    /// Takes the next job from this worker's own queue, or `None` if it held
-    /// none. Upstream's `w._wsq.pop()`.
-    ///
-    /// `pub(crate)` for the unit tests in `executor::topology`, which drive
-    /// the scheduler one job at a time: what a worker's queue holds after a
-    /// job has been invoked is how the preemption protocol is observed.
+    /// Takes the next job from this worker's own queue, or `None` if it held none:
+    /// upstream's `w._wsq.pop()`. `pub(crate)` for the unit tests in
+    /// `executor::topology`, which drive the scheduler one job at a time.
     pub(crate) fn pop(&self) -> Option<Job> {
         match &self.queue {
             LocalQueue::Owned(queue) => queue.pop(),
@@ -344,43 +257,28 @@ impl WorkerThread {
         }
 
         // Upstream wraps the loop in `try { } catch(...)` and hands the
-        // exception to the epilogue. A panic is the equivalent here, and
-        // `AssertUnwindSafe` is the honest annotation: the state a panicking
-        // task could leave half-written is this worker's own, and this worker
-        // is about to stop touching it.
-        //
-        // The stop condition never fires: this worker leaves the loop the way
-        // upstream's does, through `_wait_for_task` reporting that the `done`
-        // flag is set. `run_until`'s docs name who passes one that does fire.
+        // exception to the epilogue; `AssertUnwindSafe` is the honest
+        // annotation, the state a panicking task could leave half-written being
+        // this worker's own. The stop condition never fires: this worker leaves
+        // the loop as upstream's does, on `_wait_for_task` reading `done`.
         let panicked = panic::catch_unwind(AssertUnwindSafe(|| self.run_until(|| false))).err();
 
         if let Some(interface) = interface {
             interface.scheduler_epilogue(self.worker(), panicked);
         }
-        // Without an interface the payload is dropped here, which is upstream's
-        // behaviour too: it stores the exception pointer and, with no interface
-        // to hand it to, lets it go. The default panic hook has already printed
-        // it by this point.
+        // Without an interface the payload is dropped here, as upstream drops
+        // its exception pointer; the default panic hook has already printed it.
     }
 
     /// The work-stealing loop: drain the local queue, then steal or sleep until
-    /// there is something to drain again, and stop when `stop` says so or when
-    /// the executor shuts this worker down.
-    ///
-    /// Upstream's `while(1)` over `_exploit_task` and `_wait_for_task`, which
-    /// breaks when the second one says the worker is done.
-    ///
-    /// The stop condition is a parameter rather than the `done` flag because
-    /// this loop was factored out for `corun`. It turned out not to be the
-    /// loop `corun` can use, and the reason is the one sentence worth keeping
-    /// from that attempt: [`WorkerThread::wait_for_task`] parks the worker,
-    /// and nothing wakes the notifier when a *topology* finishes -- only a
-    /// push does -- so a corun loop that reached the sleep path would wait for
-    /// a notification that is never sent, having parked the very thread the
-    /// run it is waiting for may need. [`WorkerThread::corun_until`] is
-    /// therefore its own loop, over [`WorkerThread::explore_task`], and this
-    /// one keeps the parameter for the only caller it has: `|| false`, the
-    /// worker loop that leaves only on the `done` flag.
+    /// there is something to drain again, and stop when `stop` says so or when the
+    /// executor shuts this worker down. Upstream's `while(1)` over `_exploit_task`
+    /// and `_wait_for_task`. The stop condition is a parameter because this loop was
+    /// factored out for `corun`, and why it turned out not to be the loop `corun`
+    /// can use is worth keeping: [`WorkerThread::wait_for_task`] parks the worker,
+    /// and nothing wakes the notifier when a *topology* finishes, so a corun loop
+    /// reaching the sleep path would wait for a notification never sent, having
+    /// parked the thread the run it waits for may need.
     pub(crate) fn run_until(&mut self, mut stop: impl FnMut() -> bool) {
         let mut job = None;
         loop {
@@ -396,28 +294,14 @@ impl WorkerThread {
     }
 
     /// The corun loop: keep running jobs -- this worker's own first, then
-    /// anybody's -- until `stop` says that whatever this thread is waiting for
-    /// has happened.
-    ///
-    /// Upstream's `_corun_until`, which is `goto exploit`/`goto explore` over
-    /// the same two moves this makes. Three things differ from
-    /// [`WorkerThread::run_until`], and all three are upstream's too:
-    ///
-    /// - one local job per round, not a drain: a job run here may itself
-    ///   corun, so each one costs stack, and upstream's comment says why it
-    ///   takes a single task -- draining "can potentially enter a very deep
-    ///   recursive corun, causing stack overflow".
-    /// - never sleeps. A worker that parks here is a worker the run it is
-    ///   waiting for cannot use, and nothing would wake it: see
-    ///   [`WorkerThread::run_until`]. So an empty sweep yields the core
-    ///   instead, as upstream's does.
-    /// - ignores the `done` flag, as upstream's loop does by never reading it.
-    ///   A corun is always nested inside a task body, so the run that task
-    ///   belongs to is in flight, so its handle is alive, so the executor
-    ///   cannot be dropped and no worker's flag can be set. Treating a
-    ///   shutdown as "found nothing" is therefore unreachable rather than
-    ///   wrong -- and leaving the loop on it would be wrong: the jobs of the
-    ///   inner run name a topology the corunning frame owns.
+    /// anybody's -- until `stop` says that whatever this thread is waiting for has
+    /// happened. Upstream's `_corun_until`. Three things differ from
+    /// [`WorkerThread::run_until`], and all three are upstream's too: one local job
+    /// per round rather than a drain, a job run here being able to corun itself and
+    /// upstream's comment warning of "a very deep recursive corun"; never sleeping,
+    /// a worker parked here being one the run it waits for cannot use; and ignoring
+    /// the `done` flag, a corun being nested inside a task body, so that run is in
+    /// flight and the executor cannot be dropped.
     pub(crate) fn corun_until(&mut self, mut stop: impl FnMut() -> bool) {
         while !stop() {
             if let Some(job) = self.pop() {
@@ -432,14 +316,11 @@ impl WorkerThread {
         }
     }
 
-    /// Runs `job`, then drains this worker's own queue, stopping early if
-    /// `stop` says to.
-    ///
-    /// Upstream's `_exploit_task`. Local work comes first and in LIFO order:
-    /// the job pushed most recently is the one most likely to still be in
-    /// cache, and taking it keeps the queue's older, coarser work available for
-    /// thieves. Jobs left in the queue by an early stop are not lost -- they
-    /// are picked up by the next drain, or stolen.
+    /// Runs `job`, then drains this worker's own queue, stopping early if `stop`
+    /// says to: upstream's `_exploit_task`. Local work comes first and in LIFO
+    /// order, the job pushed most recently being the one most likely to still be in
+    /// cache. Jobs left by an early stop are picked up by the next drain, or
+    /// stolen.
     fn exploit_task(&mut self, first: Option<Job>, stop: &mut impl FnMut() -> bool) {
         let mut job = first;
         while let Some(next) = job {
@@ -451,22 +332,13 @@ impl WorkerThread {
         }
     }
 
-    /// Queues `job` on this worker's own queue. Upstream's
-    /// `_schedule(Worker&, Node*)`.
-    ///
-    /// Upstream can fail this push -- its per-worker queue is bounded -- and
-    /// spills into the shared buffers when it does. The deque behind
-    /// [`WorkerQueue`] grows instead, so the spill path has no equivalent
-    /// here; see that module for the trade. A corun view has no queue of its
-    /// own and goes to the buffers for a different reason, which is
-    /// [`LocalQueue`]'s.
-    ///
-    /// Two kinds of caller, which is upstream's two callers of the same
-    /// overload: this worker releasing the successors of a job it has just
-    /// finished, and a *free async task* submitted from inside a runtime body
-    /// running on this worker (#119) -- upstream's
-    /// `_schedule(*w, animate(...))`, which `executor::async` reaches through
-    /// the `worker` argument of its submission.
+    /// Queues `job` on this worker's own queue: upstream's
+    /// `_schedule(Worker&, Node*)`. Upstream can fail this push, its per-worker
+    /// queue being bounded, and spills into the shared buffers; the deque behind
+    /// [`WorkerQueue`] grows instead, and a corun view goes to the buffers for
+    /// [`LocalQueue`]'s reason. Two kinds of caller, which is upstream's two callers
+    /// of the same overload: this worker releasing the successors of a job it has
+    /// just finished, and a free async task submitted from inside a runtime body.
     pub(crate) fn schedule(&self, job: Job) {
         match &self.queue {
             LocalQueue::Owned(queue) => queue.push(job),
@@ -475,53 +347,22 @@ impl WorkerThread {
         self.shared.notifier.notify_one();
     }
 
-    /// Runs `job`, and then whatever that job hands straight back to this
-    /// worker, until one of them hands back nothing.
+    /// Runs `job`, and then whatever that job hands straight back to this worker,
+    /// until one of them hands back nothing.
     ///
-    /// Upstream's `_invoke` is one function with a label at the top and a
-    /// `goto` at the bottom: `TF_INVOKE_CONTINUATION()` jumps back to
-    /// `begin_invoke:` with the one successor `_update_cache` kept out of the
-    /// queue. That is this loop, and [`WorkerThread::invoke_one`] is the body
-    /// it jumps back to the top of; what that method returns is upstream's
-    /// `cache`.
-    ///
-    /// # What the loop is for
-    ///
-    /// A chain runs end to end on the worker that started it. Without the
-    /// continuation every link is pushed to that worker's queue and may be
-    /// stolen before the worker gets back to it, so a thousand-task chain can
-    /// visit a thousand workers -- each steal paying a contended queue slot,
-    /// a cold cache line for the node, and (since #40) a clone and a drop of
-    /// the two shares a job carries. `BENCHMARKS.md` has what that cost on
-    /// `linear_chain` and what this bought back.
-    ///
-    /// It is also the mechanism two of upstream's own cases assert directly:
-    /// `WorkStealing.Continuation` compares `this_worker_id()` across a
-    /// thousand chained tasks, and `WorkStealing.Oversubscription` asserts
-    /// that `W/2` chains involve at most `W/2` workers. Both are in
-    /// `tests/work_stealing.rs`, and neither can pass without this.
-    ///
-    /// # Why the loop is here and not in the caller
-    ///
-    /// [`WorkerThread::exploit_task`] could take the continuation and run it
-    /// on its next turn round its own loop, which would be the same jobs in
-    /// the same order -- but not the same window: a job may only be held
-    /// while the run it belongs to cannot finish. A continuation is held
-    /// across the tear-down of the job that produced it, and what makes that
-    /// sound is that the continuation was *counted* against its parent before
-    /// it was kept (see [`WorkerThread::update_cache`]), so the counter that
-    /// job spends cannot reach zero while the continuation exists. That
-    /// argument is `invoke_one`'s to make, which is why the value never
-    /// leaves this method's `while let`.
-    ///
-    /// # What is still not ported
-    ///
-    /// Upstream caches one more thing than this does: `_tear_down_nonasync`
-    /// and `_tear_down_topology` pass their `cache` on, so a *preempted
-    /// parent* resumed by its last child is also continued on the spot.
-    /// `WorkerThread::finish_job` is where that would go, and it still
-    /// queues the parent like any other job -- which costs a chain nothing,
-    /// since a chain has no preempted parents to resume.
+    /// Upstream's `_invoke` is one function with a label at the top and a `goto` at
+    /// the bottom: `TF_INVOKE_CONTINUATION()` jumps back to `begin_invoke:` with the
+    /// one successor `_update_cache` kept out of the queue. That is this loop, and
+    /// [`WorkerThread::invoke_one`] is the body it jumps back to the top of. What it
+    /// buys is that a chain runs end to end on the worker that started it, where
+    /// without it every link may be stolen first; `BENCHMARKS.md` has the figures,
+    /// and two of upstream's own cases in `tests/work_stealing.rs` assert the
+    /// mechanism. The loop is here rather than in
+    /// [`WorkerThread::exploit_task`], which would run the same jobs in the same
+    /// order, because a job may only be held while the run it belongs to cannot
+    /// finish -- and what makes holding one across the tear-down of the job that
+    /// produced it sound is that it was counted against its parent first, which is
+    /// [`WorkerThread::update_cache`]'s argument to make.
     pub(crate) fn invoke(&mut self, job: Job) {
         let mut job = job;
         while let Some(continuation) = self.invoke_one(job) {
@@ -529,131 +370,73 @@ impl WorkerThread {
         }
     }
 
-    /// Runs one job: the task's work, then the bookkeeping that decides what
-    /// becomes runnable next. Returns the one successor kept out of the queue
-    /// for this worker to run next, if there was one.
+    /// Runs one job: the task's work, then the bookkeeping that decides what becomes
+    /// runnable next. Returns the one successor kept out of the queue for this
+    /// worker to run next, if there was one.
     ///
     /// Upstream's `_invoke` body, from `begin_invoke:` to the
     /// `TF_INVOKE_CONTINUATION()` at the end of it; the `goto` itself is
-    /// [`WorkerThread::invoke`]. The four node kinds it can run itself are static,
-    /// placeholder and the two conditioners; the four dynamic-tasking kinds
-    /// each get one line here into the module that owns them. [`module`] runs
-    /// a composed taskflow as of #49 and an adopted graph as of #74,
-    /// [`runtime`] runs a runtime task as of #51 and [`subflow`] a subflow
-    /// task as of #50. Upstream's two async kinds -- which belong to a
-    /// free-standing node rather than to a graph -- have arms of their own
-    /// below, which run such a node's body and refuse only a handle that was
-    /// built into a taskflow instead; its observers are a later milestone,
-    /// and none of the kinds is silently absent: the `match` below is
-    /// exhaustive over [`Handle`], so a new kind arrives as a compile error
-    /// here rather than as a task that mysteriously does nothing.
-    ///
-    /// The bookkeeping is upstream's two switches over the handle, in its
-    /// order: run the work, re-arm this node's own join counter, then release
-    /// successors -- every one of them for an ordinary task, only the selected
-    /// ones for a conditioner, and each one counted against this node's parent
-    /// before it is queued. The module docs set out the semantics; [`Release`]
-    /// is what carries the first switch's answer to the second.
-    ///
-    /// Before any of that come the three things upstream does at the top of
-    /// `_invoke`: the `PREEMPTED` fast path, the cancellation check and the
-    /// acquire of whatever semaphores this node asked for. The last two are
-    /// *inside* the fast path -- a resumed node has already been entered, so
-    /// it neither re-checks the cancellation nor acquires a second time --
-    /// and the release of whatever it asked to release is after the dispatch,
-    /// on the entry that finishes the node. The two semaphore hooks are #89's
-    /// and the module docs' "Semaphores" section has what they promise; the
-    /// comments in the body have why a woken job is queued rather than kept.
-    ///
-    /// The release of the successors is where the continuation comes from:
-    /// upstream's `_update_cache` keeps the last successor it found ready and
-    /// queues whatever it was holding, so a node with one ready successor
-    /// queues nothing at all. [`WorkerThread::update_cache`] is that
-    /// function, and `None` out of here is upstream's null `cache` -- a node
-    /// that preempted, a node whose run is cancelled, a node parked on a
-    /// semaphore, or a node that left nothing ready.
+    /// [`WorkerThread::invoke`]. The four kinds it runs itself are static,
+    /// placeholder and the two conditioners; the four dynamic-tasking kinds each get
+    /// one line into the module that owns them, and the two async kinds have arms
+    /// that refuse a handle somebody built into a taskflow. The `match` is
+    /// exhaustive over [`Handle`], so a new kind arrives as a compile error rather
+    /// than as a task that does nothing. The bookkeeping is upstream's two switches
+    /// over the handle, in its order: run the work, re-arm this node's own join
+    /// counter, then release successors, each counted against this node's parent
+    /// before it is queued. First, though, come the three things upstream does at
+    /// the top of `_invoke`: the `PREEMPTED` fast path, the cancellation check and
+    /// the acquire, the last two *inside* the fast path.
     fn invoke_one(&mut self, job: Job) -> Option<Job> {
         // The job owns a share of the run and of the taskflow's storage, so
         // this needs no `unsafe` and no argument about who outlives whom: both
-        // are alive because the job that named them is. See
-        // `executor::topology`.
+        // are alive because the job that named them is.
         let (node, graph, topology) = job.parts();
 
         // Upstream's `if(node->_nstate & NSTATE::PREEMPTED) goto invoke_task`:
-        // this is the *second* entry into a node whose nested graph has just
-        // finished, so the work below is a resumption rather than a start, and
-        // the cancellation check -- and the acquire with it -- is deliberately
-        // skipped. A parent that was cancelled while its children ran still
-        // has to come back through the dispatch, because that is where it
-        // clears its own `PREEMPTED` bit and releases what the run still
-        // owes, and a parent that acquired on its first entry still holds
-        // what it took.
+        // the *second* entry into a node whose nested graph has just finished,
+        // so the cancellation check -- and the acquire with it -- is skipped. A
+        // parent cancelled while its children ran still comes back through the
+        // dispatch, that being where it clears its own `PREEMPTED` bit.
         if node.nstate().load(Ordering::Relaxed) & Node::PREEMPTED == 0 {
             // Upstream's `_is_parent_cancelled()` early-out: a cancelled run
             // runs none of the work it had not started, and the job is torn
-            // down all the same -- the join counters still have to reach zero
-            // for the run to finish at all. The tail of this method says what
-            // spending the job here does; it is the same line.
+            // down all the same, the join counters still having to reach zero.
             if job.is_parent_cancelled() {
                 // Upstream's cancelled branch goes to `_tear_down_invoke`,
-                // which dispatches on the handle: a skipped *dependent-async*
-                // node still owes `FINISHED` and the list of tasks waiting
-                // for it, because nothing else will ever queue them and each
-                // was counted against this job's parent when it was
-                // submitted. Every other kind owes only the parent branch,
-                // which is `finish_job` below, and `release_skipped` answers
-                // for all of them -- it asks both questions itself. #92 is
-                // what made this reachable at all: a free node under a real
-                // run is the first one this early-out can skip, and
-                // `executor::dependent_async`'s hanging section has what
-                // stranding its successors would cost.
+                // which dispatches on the handle: a skipped dependent-async
+                // node still owes `FINISHED` and the tasks waiting for it,
+                // each counted against this job's parent at submission.
                 dependent_async::release_skipped(self, &job);
                 self.finish_job(job.finish());
-                // Upstream's `_tear_down_invoke` can leave a cache here -- the
-                // preempted parent this job was the last child of -- and
-                // `finish_job` cannot, for the reason this method's docs give.
                 return None;
             }
 
-            // Upstream's `to_acquire` block, the first of the two semaphore
-            // hooks: a node that cannot have every count it asked for does
-            // not run, and this job is now parked on the semaphore that
-            // refused -- which owns a clone of it and will schedule that
-            // clone when somebody releases.
-            //
-            // The job is *not* finished here, and that is the accounting:
-            // the clone inherits the one count this job holds against its
-            // parent, so the counter stays exactly as outstanding as it was
-            // and the run cannot finish while a task of it is parked. What
-            // `woken` holds is whatever the rollback inside `acquire_all`
-            // woke on the semaphores this node did get -- see that method,
-            // which is where the rollback is argued.
+            // Upstream's `to_acquire` block, the first semaphore hook: a node
+            // that cannot have every count it asked for does not run, and this
+            // job is parked on the semaphore that refused, which owns a clone
+            // of it. The job is *not* finished here, and that is the
+            // accounting: the clone inherits the count this job holds against
+            // its parent, so the run cannot finish while a task of it is
+            // parked.
             let mut woken = Vec::new();
             if !node.acquire_all(&job, &mut woken) {
                 self.shared.bulk_schedule(woken);
-                // Upstream's bare `return` with its `cache` still null: this
-                // worker has kept nothing, because the only jobs it made
-                // ready belong to semaphores rather than to this node.
+                // Nothing is kept: the only jobs made ready belong to
+                // semaphores rather than to this node.
                 return None;
             }
         }
 
+        self.observer_prologue(&job);
+
         let release = match node.handle() {
             // Upstream's `_invoke_static_task`, whose
             // `TF_EXECUTOR_EXCEPTION_HANDLER` is this `catch_unwind` and whose
-            // `_process_exception` is `Job::record_panic`: the failure is
-            // delivered to whatever is waiting for the graph this node is
-            // part of -- the run, for a top-level task -- cancels the rest of
-            // that graph, and is reported from `wait` or from the frame that
-            // was waiting, never raised on a worker thread. `AssertUnwindSafe`
-            // is the honest annotation -- the state a panicking body can leave
-            // half-written is the user's own, reachable only through what the
-            // closure captured.
-            //
-            // The successors below are still released, as upstream's are: its
-            // exception handler is the body of the first switch and does not
-            // skip the second. What stops them is the early-out above, when
-            // the worker that dequeues one finds the run cancelled.
+            // `_process_exception` is `Job::record_panic`: the failure goes to
+            // whatever is waiting for this node's graph and is reported from
+            // `wait` rather than raised on a worker. The successors below are
+            // still released, as upstream's are; the early-out stops them.
             Handle::Static(work) => {
                 if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| work.invoke())) {
                     job.record_panic(payload);
@@ -663,179 +446,111 @@ impl WorkerThread {
             // Upstream's `std::monostate` case: a placeholder has no work, and
             // it still has successors to release.
             Handle::Placeholder => Some(Release::Strong),
-            // Upstream's `_invoke_condition_task`, which is the static invoker
-            // plus a return value: the same exception handler, and `conds = {
-            // work() }` where the static one discards what it called. A panic
-            // is therefore recorded exactly as a static task's is -- rest of
-            // the run cancelled and all -- and the selection it leaves behind
-            // is empty, which selects no successor and ends the branch.
+            // Upstream's `_invoke_condition_task`: the static invoker plus a
+            // return value, so a panic is recorded as a static task's is and
+            // leaves an empty selection, which ends the branch.
             Handle::Condition(work) => Some(Release::Selected(
                 panic::catch_unwind(AssertUnwindSafe(|| work.invoke()))
                     .map_err(|payload| job.record_panic(payload))
                     .ok(),
             )),
-            // Upstream's `_invoke_multi_condition_task`, the same again over
-            // however many indices the body returns.
+            // Upstream's `_invoke_multi_condition_task`, over however many
+            // indices the body returns.
             Handle::MultiCondition(work) => Some(Release::SelectedMany(
                 panic::catch_unwind(AssertUnwindSafe(|| work.invoke()))
                     .map_err(|payload| job.record_panic(payload))
                     .unwrap_or_default(),
             )),
             // The four dynamic-tasking handles, each upstream's
-            // `_invoke_*_task` and each one line so that the three modules
-            // below are the only ones #50 and #51 have to edit. Every one of
-            // them may preempt this node rather than finish it, which is what
-            // the `None` under the match is about.
-            //
-            // The two module arms are upstream's two forwarders, and each
-            // hands over what its handle *owns* rather than the `Graph&`
-            // upstream resolves here: a nested graph is scheduled through
-            // whatever owns it, which for one of the two is a share and for
-            // the other is a path through this very node (#74). See
-            // [`module`].
+            // `_invoke_*_task` and each one line into the module that owns it.
+            // Every one may preempt this node rather than finish it, which the
+            // `None` under the match is about, and the two module arms hand
+            // over what their handle *owns* rather than a `Graph&`.
             Handle::Subflow { work, subgraph } => subflow::invoke(self, &job, work, subgraph),
             Handle::Runtime(work) => runtime::invoke(self, &job, work),
             Handle::Module(target) => module::invoke(self, &job, target),
             Handle::AdoptedModule(adopted) => module::invoke_adopted(self, &job, adopted),
-            // The two async handles, which are the one pair of arms here that
-            // a graph is not supposed to reach at all: an async task's node
-            // is free-standing and is dispatched through a job of its own
-            // arena, so what gets here is a handle somebody put in a
-            // taskflow. Both refuse, each in its own file for the reason the
-            // four above have theirs -- `r#async` landed with #88 and
-            // `dependent_async` is #91's -- and those docs say why running a
-            // `FnOnce` body as part of a graph is refused rather than
-            // supported.
+            // The two async handles, the one pair of arms a graph is not
+            // supposed to reach: an async task's node is free-standing and
+            // dispatched through a job of its own arena, so what gets here is a
+            // handle somebody put in a taskflow. Both refuse.
             Handle::Async(work) => r#async::invoke(self, &job, work),
             Handle::DependentAsync(work) => dependent_async::invoke(self, &job, work),
         };
 
-        // Upstream's `return true` out of `_invoke_subflow_task`,
-        // `_invoke_module_task_impl` and `_invoke_runtime_task`, which its
-        // `_invoke` turns into a bare `return`: this node is the parent of a
-        // graph that is now running, and it owes nothing until that graph is
-        // done. Its own join counter is not re-armed and its successors are
-        // not released, because the node has not finished -- the last job of
-        // the nested graph re-queues it, and the second entry takes the fast
-        // path above and falls through to here. Nothing is ready on this
-        // worker's behalf either, which is upstream's bare `return` with its
-        // `cache` still null.
+        self.observer_epilogue(&job);
+
+        // Upstream's `return true` out of its three preempting invokers, which
+        // its `_invoke` turns into a bare `return`: this node is the parent of
+        // a graph that is now running and owes nothing until that graph is
+        // done. The last job of that graph re-queues it, and the second entry
+        // takes the fast path above and falls through to here.
         let release = release?;
 
-        // Upstream's `to_release` block, the second hook, and it is here --
-        // after the dispatch and before the counters -- because this is the
-        // entry on which the node *finished*: an arm that preempted returned
-        // through the `?` above, holding what it acquired until the entry
-        // that resumes it gets this far.
-        //
-        // The woken jobs go to the shared buffers rather than into `cache`,
-        // which is the one place the continuation loop and the semaphores
-        // meet. Three reasons, and the first is the decisive one:
-        // [`WorkerThread::update_cache`] is for a job of *this* node's graph
-        // under *this* node's parent, counted against that parent by the
-        // caller a line earlier -- and a woken job is none of those. A
-        // semaphore is shared by whoever acquires it, so the job it hands
-        // back may belong to another graph and another run entirely, and
-        // nothing counts it now because the count it carries is the one it
-        // has held since it was first queued. Second, a release wakes a
-        // *set* -- the whole waiting list, which is exactly the jobs that
-        // may now run at once -- and the cache holds one, so picking a
-        // winner would be arbitrary where `bulk_schedule` costs one
-        // `notify_n` for the lot. Third, those jobs have no affinity with
-        // this worker to preserve: it never ran them, and some other worker
-        // parked most of them.
+        // Upstream's `to_release` block, the second hook, here -- after the
+        // dispatch and before the counters -- because this is the entry on
+        // which the node *finished*: an arm that preempted returned through the
+        // `?` above, holding what it acquired. The woken jobs go to the shared
+        // buffers rather than into `cache`, which is for a job of *this* node's
+        // graph under *this* node's parent: a woken job may be of another run.
         let mut woken = Vec::new();
         if let Err(error) = node.release_all(&mut woken) {
-            // Upstream's `TF_THROW` out of `Semaphore::_release`, which
-            // escapes the worker loop; here it is a failure of the task that
-            // over-released, recorded on whatever anchor is waiting for that
-            // task's graph and surfaced from `wait` as
-            // `RunError::Panicked`. A `String` payload because that is what a
-            // `panic!` of a formatted message leaves and what `RunError`'s
-            // own `Display` can read back.
+            // Upstream's `TF_THROW` out of `Semaphore::_release`, which escapes
+            // the worker loop; here it is a failure of the task that
+            // over-released, surfaced from `wait` as `RunError::Panicked`. A
+            // `String` payload because that is what a `panic!` of a formatted
+            // message leaves and what `RunError`'s `Display` reads back.
             job.record_panic(Box::new(error.to_string()));
         }
-        // Outside the `if`, because the failing release is the *first* one at
-        // its maximum and the ones before it succeeded: their waiting lists
-        // are already in `woken`, and dropping those jobs would leave their
-        // counts outstanding for ever -- a hang in place of a reported
-        // failure.
+        // Outside the `if`, because the releases before the failing one
+        // succeeded: dropping the jobs their waiting lists put in `woken` would
+        // leave those counts outstanding for ever.
         self.shared.bulk_schedule(woken);
 
-        // Upstream's comment, which is the whole reason this is a `fetch_add`
-        // of the strong-dependency count rather than a `store`: the counter
-        // has to be re-armed before any successor is scheduled, so that a
-        // cycle -- which only a conditioner can create -- finds this node
-        // ready again, and it has to be an add because the body just run may
-        // itself have scheduled this node.
+        // Upstream's comment, and the reason this is a `fetch_add` of the
+        // strong-dependency count rather than a `store`: the counter is re-armed
+        // before any successor is scheduled, so that a cycle finds this node
+        // ready, and it is an add because the body may have scheduled it.
         node.join_counter()
             .fetch_add(strong_dependencies(node), Ordering::Relaxed);
 
         // Upstream's `Node* cache {nullptr}`: the one successor this worker
-        // keeps for itself rather than queueing, which the two arms below
-        // fill through `update_cache` and the tail of this method returns.
+        // keeps for itself rather than queueing.
         let mut cache = None;
 
-        // Upstream's second switch over the handle, which [`Release`] has
-        // already answered. Either arm counts a successor against this node's
-        // parent before queueing it, or the run could look finished with a job
-        // still in flight.
+        // Upstream's second switch over the handle, which `Release` has already
+        // answered. Either arm counts a successor against this node's parent
+        // before queueing it, or the run could look finished with a job in
+        // flight.
         match release.selected() {
             // Upstream's `default` arm: every successor, each the moment its
-            // last strong dependency is spent.
-            //
-            // The decrement stops at zero, which is this port's one departure
-            // here and is issue #98: a successor's counter can *already* be
-            // zero when this runs, because something bypassed its
-            // dependencies -- `Runtime::schedule` stores a zero, as does the
-            // conditional arm below -- and upstream's bare `fetch_sub` on a
-            // `size_t` then wraps it to `SIZE_MAX`. The wrap is silent and
-            // not benign: a wrapped counter never equals the one
-            // `Runtime::corun` waits for nor the zero `Parent::outstanding`
-            // waits for, so a bypassed node that later coruns or preempts
-            // hangs. Flooring it keeps the counter's meaning -- how many
-            // dependencies are outstanding, never fewer than none -- and
-            // loses no release upstream delivers: a `fetch_sub` that
-            // returned 0 queued nothing either.
+            // last strong dependency is spent. The decrement floors at zero,
+            // which is this port's one departure here: a successor's counter
+            // can *already* be zero, something having bypassed its dependencies
+            // -- `Runtime::schedule` stores a zero, as does the arm below -- and
+            // upstream's bare `fetch_sub` on a `size_t` wraps it to `SIZE_MAX`,
+            // which no waiter matches, so a bypassed node that later coruns
+            // hangs. The floor loses no release upstream delivers.
             None => {
                 for &successor in node.successors() {
                     let next = graph.node(successor);
-                    // Issue #107, which is the other half of the bypass and
-                    // the one the floor cannot reach: an *entered* successor
-                    // -- see `is_entered` -- is a node something bypassed the
-                    // dependencies of, and the count it is holding is its own
-                    // outstanding work's rather than its dependencies'.
-                    // Spending one of those is not a release the node is
-                    // owed: it resumes the node before that work is done, and
-                    // takes the counter past the zero the work needs to
-                    // resume it at all. So the release is reported rather than
-                    // delivered, through the path a panicking body takes --
-                    // which leaves every reference the node holds intact, so
-                    // whatever it is waiting for still resumes it and the run
-                    // still finishes, with the failure rather than without it.
-                    //
-                    // The read is before the decrement, which is
-                    // `WorkerThread::finish_job`'s order and makes the same
-                    // trade: a node that preempts itself after this read is a
-                    // release this misses, and nothing here reports a node
-                    // that was *not* entered -- a node still owing a strong
-                    // dependency cannot have been entered by anything but a
-                    // bypass. [`Runtime::schedule`](crate::Runtime::schedule)
-                    // has which orderings this sees and which one stays the
-                    // caller's precondition.
+                    // The other half of the bypass, and the one the floor
+                    // cannot reach: an *entered* successor is a node something
+                    // bypassed the dependencies of, and the count it holds is
+                    // its own outstanding work's. Spending one would resume the
+                    // node before that work is done, so the release is reported
+                    // through the path a panicking body takes, which leaves the
+                    // node's references intact. The read is before the
+                    // decrement, as `finish_job`'s is.
                     if is_entered(next) {
                         job.record_panic(Box::new(REENTERED));
                         continue;
                     }
                     // `update` is a compare-exchange loop where upstream has
-                    // one `fetch_sub`, and that cost is deliberate: the
-                    // cheaper shape -- subtract, then add the one back when
-                    // the old value turned out to be zero -- is not sound,
-                    // because two predecessors of the same bypassed node can
-                    // be inside that window at once and the second reads the
-                    // first's `SIZE_MAX` as an ordinary count, leaving the
-                    // counter there. It returns the value the counter held,
-                    // as `fetch_sub` does.
+                    // one `fetch_sub`, and that cost is deliberate: the cheaper
+                    // shape -- subtract, then add the one back on a zero -- is
+                    // not sound, two predecessors of one bypassed node being
+                    // able to sit in that window at once.
                     let outstanding = next.join_counter().update(
                         Ordering::AcqRel,
                         Ordering::Acquire,
@@ -848,10 +563,8 @@ impl WorkerThread {
                 }
             }
             // Upstream's `CONDITION`/`MULTI_CONDITION` arm: only the
-            // successors the body named, each scheduled outright rather than
-            // waited for. An index naming no successor is upstream's
-            // `cond >= 0 && static_cast<size_t>(cond) < _num_successors`
-            // failing, and is how a branch ends.
+            // successors the body named, each scheduled outright. An index
+            // naming no successor is how a branch ends.
             Some(conditions) => {
                 let num_successors = node.num_successors();
                 for &condition in conditions {
@@ -861,9 +574,8 @@ impl WorkerThread {
                     let successor = node.successors()[index];
                     // Upstream's "zeroing the join counter for invariant": a
                     // weak successor may be re-entered on a cycle before its
-                    // strong predecessors run again, so nothing is going to
-                    // decrement its counter to the zero that means ready. See
-                    // the module docs.
+                    // strong predecessors run again, so nothing else would
+                    // decrement its counter to the zero that means ready.
                     graph
                         .node(successor)
                         .join_counter()
@@ -874,18 +586,14 @@ impl WorkerThread {
             }
         }
 
-        // Upstream's `_tear_down_nonasync`. Spending the job here is what
-        // releases its share of the taskflow's storage, and it has to happen
-        // before the join counter below may end the run -- `Job::finish`
-        // says why. It also ends the borrows this method has been working
-        // through, so the compiler is what stops anything from touching
-        // `node`, `graph` or the run afterwards.
-        //
-        // A continuation is held across this call, and `executor::topology`
-        // has why that is sound rather than a share outstanding one instant
-        // too long: the continuation was counted against this job's parent
-        // before it was kept, so the counter spent here cannot be the one
-        // that ends the run.
+        // Upstream's `_tear_down_nonasync`. Spending the job here releases its
+        // share of the taskflow's storage, which has to happen before the join
+        // counter may end the run -- `Job::finish` says why -- and ends the
+        // borrows this method works through, so the compiler is what stops
+        // anything touching `node`, `graph` or the run afterwards. The
+        // continuation held across this call was counted against this job's
+        // parent before it was kept, so the counter spent here cannot be the
+        // one that ends the run.
         self.finish_job(job.finish());
 
         // Upstream's `TF_INVOKE_CONTINUATION()`, which is a `goto` where this
@@ -893,24 +601,30 @@ impl WorkerThread {
         cache
     }
 
-    /// Keeps `job` for this worker to run next, queueing whatever was being
-    /// kept before it.
-    ///
-    /// Upstream's `_update_cache`, line for line. It is called once per
-    /// successor found ready, so a node that readies one successor queues
-    /// nothing and a node that readies `n` queues `n - 1` -- the last one
-    /// wins the cache, which is the same job this worker's own LIFO queue
-    /// would have handed back first anyway. That equivalence is why the
-    /// continuation changes no execution order at one worker: it only takes
-    /// the job a thief could have had.
-    ///
-    /// **The counting is the caller's**, and it has to happen before the job
-    /// gets here: a cached job is a job of the same graph under the same
-    /// parent as the one being torn down, so the `count_queued` that precedes
-    /// this call is what stops that tear-down from driving the parent's
-    /// counter to zero while this worker is still holding a job of it. See
-    /// `executor::topology`, which is where the order the shares are released
-    /// in is argued.
+    /// The point at which this worker is about to run `job`'s work: upstream's
+    /// `Executor::_observer_prologue`, which notifies every registered observer of
+    /// the entry. Empty until there are observers to notify, and named so that the
+    /// step that adds them adds a call. Upstream calls its own from inside each
+    /// `_invoke_*_task`, so its window is the body alone; the one call site here is
+    /// around the whole dispatch, which puts the scheduling of a nested graph inside
+    /// the window of the kind that preempts for it.
+    fn observer_prologue(&self, _job: &Job) {}
+
+    /// The point right after that: upstream's `Executor::_observer_epilogue`, which
+    /// notifies every registered observer of the exit. Reached on the entry that
+    /// *finishes* the node and on every entry that preempts it, the dispatch arm
+    /// having returned either way.
+    fn observer_epilogue(&self, _job: &Job) {}
+
+    /// Keeps `job` for this worker to run next, queueing whatever was being kept
+    /// before it: upstream's `_update_cache`, line for line. Called once per
+    /// successor found ready, so a node that readies `n` queues `n - 1`; the last
+    /// wins the cache, which is the job this worker's own LIFO queue would have
+    /// handed back first anyway. **The counting is the caller's**, and it has to
+    /// happen before the job gets here: a cached job belongs to the same graph under
+    /// the same parent as the one being torn down, so the `count_queued` before this
+    /// call is what stops that tear-down from driving the parent's counter to zero
+    /// while this worker still holds a job of it.
     fn update_cache(&self, cache: &mut Option<Job>, job: Job) {
         if let Some(previous) = cache.replace(job) {
             self.schedule(previous);
@@ -920,18 +634,17 @@ impl WorkerThread {
     /// Steals until something turns up, the worker is told to stop, or the
     /// attempts run out. Upstream's `_explore_task`.
     pub(crate) fn explore_task(&mut self) -> Stolen {
-        // Fast path, upstream's: with no topology running, every queue is empty
-        // by the executor's own invariant, so there is nothing to find and the
-        // caller should go to sleep. Relaxed is enough because this is a hint
-        // -- a topology that starts between this load and the sleep is caught
-        // by the notifier's two-phase guard in `wait_for_task`.
+        // Fast path, upstream's: with no topology running every queue is empty
+        // by the executor's own invariant, so the caller should sleep. Relaxed
+        // is enough because this is a hint -- a topology that starts between
+        // this load and the sleep is caught by the notifier's two-phase guard.
         if self.shared.num_topologies() == 0 {
             return Stolen::Nothing;
         }
 
         let max_victim = self.shared.num_queues();
-        // Upstream's `MAX_STEALS`: keep trying for a couple of passes over the
-        // queues before admitting that there is nothing to steal.
+        // Upstream's `MAX_STEALS`: a couple of passes over the queues before
+        // admitting that there is nothing to steal.
         let max_steals = (max_victim + 1) * 2;
 
         let mut num_steals = 0;
@@ -944,17 +657,16 @@ impl WorkerThread {
             }
 
             // Empty: draw a new victim, never ourselves -- our own queue is the
-            // one we just drained, so it is the least likely to hold anything.
+            // one just drained.
             let draw = usize::try_from(self.rng.next_u32())
                 .expect("a u32 fits in a usize on any target this crate supports");
             victim = victim_excluding(draw, self.id, max_victim);
 
             num_steals += 1;
             if num_steals > max_steals {
-                // Still nothing after a couple of passes: stop burning a core
-                // on it. Upstream yields on every attempt past that point and
-                // gives up 150 attempts later, by which time the notifier is
-                // the cheaper place to wait.
+                // Still nothing: upstream yields on every attempt past this
+                // point and gives up 150 attempts later, by which time the
+                // notifier is the cheaper place to wait.
                 thread::yield_now();
                 if num_steals > 150 + max_steals {
                     return Stolen::Nothing;
@@ -968,11 +680,9 @@ impl WorkerThread {
     }
 
     /// Sleeps until there is work, or until the executor shuts this worker
-    /// down. Upstream's `_wait_for_task`, whose `goto explore_task` is this
-    /// loop.
-    ///
-    /// Returns the job to run next, or `None` when the worker should leave the
-    /// scheduling loop.
+    /// down: upstream's `_wait_for_task`, whose `goto explore_task` is this
+    /// loop. Returns the job to run next, or `None` when the worker should
+    /// leave the scheduling loop.
     pub(crate) fn wait_for_task(&mut self) -> Option<Job> {
         loop {
             match self.explore_task() {
@@ -983,13 +693,13 @@ impl WorkerThread {
 
             // Everything below is inside the notifier's two-phase guard: the
             // predicate is "some queue is non-empty, or we are done", and
-            // `prepare_wait` has to come first so that a notification which
-            // arrives while we are checking cannot be lost. Each check that
-            // finds work must therefore cancel the wait before it leaves.
+            // `prepare_wait` comes first so that a notification arriving while
+            // we check cannot be lost, so each check that finds work cancels
+            // the wait before it leaves.
             self.shared.notifier.prepare_wait(self.id);
 
             // Fast path, upstream's: with no topology running there is nothing
-            // to scan for, so skip both O(N) sweeps and sleep.
+            // to scan for, so skip both sweeps and sleep.
             if self.shared.num_topologies() == 0 {
                 if self.worker().is_done() {
                     self.shared.notifier.cancel_wait(self.id);
@@ -999,23 +709,19 @@ impl WorkerThread {
                 continue;
             }
 
-            // Condition #1: the shared buffers must be empty. They are checked
-            // first because a job in a buffer was pushed by a thread that has
-            // no queue of its own, and nobody else is going to come looking.
-            //
-            // The sticky victim goes to the buffer that answered, not to the
-            // first one, which is upstream's behaviour as it walks the buffers
-            // one at a time: the next thing this worker does is steal from its
-            // sticky victim, so pointing it anywhere else spends an attempt on
-            // a queue already known to be empty.
+            // First condition: the shared buffers must be empty. Checked first
+            // because a job in a buffer was pushed by a thread with no queue of
+            // its own, and nobody else will come looking. The sticky victim
+            // goes to the buffer that answered, that being where this worker
+            // steals from next.
             if let Some(buffer) = self.shared.buffers.first_nonempty() {
                 self.shared.notifier.cancel_wait(self.id);
                 self.sticky_victim = self.shared.workers.len() + buffer;
                 continue;
             }
 
-            // Condition #2: every other worker's queue must be empty. Our own
-            // is skipped, as upstream skips it: we drained it on the way here,
+            // Second: every other worker's queue must be empty. Our own is
+            // skipped, as upstream skips it -- it was drained on the way here,
             // and anything pushed to it since was pushed by us.
             if let Some(victim) = self.first_nonempty_sibling() {
                 self.shared.notifier.cancel_wait(self.id);
@@ -1023,7 +729,7 @@ impl WorkerThread {
                 continue;
             }
 
-            // Condition #3: we must still be wanted.
+            // Third: we must still be wanted.
             if self.worker().is_done() {
                 self.shared.notifier.cancel_wait(self.id);
                 return None;
@@ -1033,11 +739,10 @@ impl WorkerThread {
         }
     }
 
-    /// Steals from queue `victim`, which is a worker queue below
-    /// `num_workers` and a shared buffer above it.
-    ///
-    /// The two kinds of queue being one index space is upstream's arrangement:
-    /// it is what lets a victim be drawn with a single remainder.
+    /// Steals from queue `victim`, which is a worker queue below `num_workers`
+    /// and a shared buffer above it. The two kinds being one index space is
+    /// upstream's arrangement, and is what lets a victim be drawn with a single
+    /// remainder.
     fn steal_from(&self, victim: usize) -> Option<Job> {
         let num_workers = self.shared.workers.len();
         if victim < num_workers {
@@ -1047,13 +752,11 @@ impl WorkerThread {
         }
     }
 
-    /// Returns the index of a sibling worker whose queue is not empty.
-    ///
-    /// Indexed rather than iterated, as upstream is, and for a reason upstream
-    /// states: its `_spawn` is still writing other workers' fields while this
-    /// runs. That race is gone here -- every [`Worker`] is fully built before
-    /// any thread starts -- but the mapping `k -> k + (k >= id)` is still the
-    /// cheapest way to walk every worker but oneself.
+    /// Returns the index of a sibling worker whose queue is not empty. Indexed
+    /// rather than iterated, as upstream is: that race -- its `_spawn` still
+    /// writing other workers' fields -- is gone here, every [`Worker`] being built
+    /// before any thread starts, but `k -> k + (k >= id)` is still the cheapest way
+    /// to walk every worker but oneself.
     fn first_nonempty_sibling(&self) -> Option<usize> {
         let workers = &self.shared.workers;
         (0..workers.len() - 1)
@@ -1070,16 +773,10 @@ impl WorkerThread {
 /// What the work a worker has just run leaves its node's successors owed.
 ///
 /// Upstream needs no such type: it declares one `SmallVector<int> conds` above
-/// its invoke `switch`, fills it in the two conditioner arms only, and then
-/// keys a second `switch` off the handle again to decide whether to read it --
-/// so "not a conditioner" and "a conditioner that selected nothing" are told
-/// apart by re-examining the handle rather than by the value. Here the value
-/// says which it is, which is what keeps the two passes over the handle from
-/// being able to disagree: a conditioner that panicked selects nothing, and
-/// that is a `Selected(None)`, never a `Strong`.
-///
-/// The three modules that run a nested graph answer with one of these too, or
-/// with `None` for a node they have preempted: see [`WorkerThread::invoke`].
+/// its invoke `switch`, fills it in the two conditioner arms only, then keys a
+/// second `switch` off the handle to decide whether to read it -- so "not a
+/// conditioner" and "a conditioner that selected nothing" are told apart by
+/// re-examining the handle rather than by the value. Here the value says so.
 pub(crate) enum Release {
     /// Every successor, each once its own strong dependencies are spent: the
     /// rule for every handle that is not a conditioner.
@@ -1095,12 +792,10 @@ pub(crate) enum Release {
 }
 
 impl Release {
-    /// The successor positions this release names, or `None` if it names no
-    /// positions at all because every successor is to be released instead.
-    ///
-    /// The two cases cannot be confused for one another, which is the whole
-    /// point of the type: `Some(&[])` is a branch that ended, `None` is an
-    /// ordinary task.
+    /// The successor positions this release names, or `None` if it names none at
+    /// all because every successor is to be released instead. The two cannot be
+    /// confused, which is the point of the type: `Some(&[])` is a branch that
+    /// ended, `None` an ordinary task.
     fn selected(&self) -> Option<&[i32]> {
         match self {
             Self::Strong => None,
@@ -1111,15 +806,11 @@ impl Release {
 }
 
 /// How many strong dependencies `node` has, out of the state word that holds
-/// the count and the scheduler's state bits together.
-///
-/// Upstream's `node->_nstate & NSTATE::STRONG_DEPENDENCIES_MASK`, and the mask
-/// is not decoration: the three state bits live above the count in the same
-/// word, so re-arming a join counter from the unmasked word would add
-/// 536,870,912 or more to it. The node would then never reach zero again and
-/// the failure would be a hang rather than a wrong answer -- which is why the
-/// mask arrived in the same change as `PREEMPTED`, the first bit the scheduler
-/// itself sets on a node it means to come back to.
+/// the count and the scheduler's state bits together: upstream's
+/// `node->_nstate & NSTATE::STRONG_DEPENDENCIES_MASK`. The mask is not
+/// decoration -- the state bits live above the count in the same word, so
+/// re-arming a join counter from the unmasked word would add half a billion to
+/// it, and the node would never reach zero again.
 fn strong_dependencies(node: &Node) -> usize {
     usize::try_from(node.nstate().load(Ordering::Relaxed) & Node::STRONG_DEPENDENCIES_MASK)
         .expect("a u32 always fits in a usize on a 32-bit target or wider")
@@ -1127,35 +818,21 @@ fn strong_dependencies(node: &Node) -> usize {
 
 /// Whether `node` has been **entered**: a node of a kind that preempts itself,
 /// carrying the `PREEMPTED` bit that kind's arm sets while its own nested work
-/// is outstanding.
-///
-/// Issue #107's question, and the one thing a strong release or a
-/// [`Runtime::schedule`](crate::Runtime::schedule) has to know before it
-/// touches a join counter: whether the count is a dependency count, which
-/// those two may spend and zero, or one reference per piece of outstanding
-/// work, which they may not.
-///
-/// It takes both halves, because neither answers it. The bit alone does not:
-/// `Node::nstate` is public, so a caller may set it on any node at all --
-/// `tests/basics.rs` sets each state bit on a *static* node from a
-/// predecessor's body, to pin that a state bit is never read as a dependency
-/// count -- and on a kind that never preempts there is no nested work for the
-/// bit to be about, so the count under it is exactly what it looks like. The
-/// kind alone does not either: a subflow or module task carries no reference
-/// of anybody's until the entry that preempts it sets the bit. The handle is
-/// read only when the bit is set, which is what keeps this off the cost of
-/// every release.
+/// is outstanding. The one thing a strong release or a
+/// [`Runtime::schedule`](crate::Runtime::schedule) must know before it touches
+/// a join counter: whether the count is a dependency count, which those two may
+/// spend and zero, or one reference per piece of outstanding work, which they
+/// may not. Both halves, because neither answers alone: `Node::nstate` is
+/// public, and a subflow or module task holds nobody's reference until the entry
+/// that preempts it sets the bit.
 pub(crate) fn is_entered(node: &Node) -> bool {
     node.nstate().load(Ordering::Relaxed) & Node::PREEMPTED != 0 && preempts_itself(node.handle())
 }
 
-/// Whether a node of this kind is one the scheduler may leave `PREEMPTED`:
-/// the four dynamic-tasking handles, which are the four arms of the dispatch
-/// above that can answer `None`.
-///
-/// An exhaustive match rather than one arm and a wildcard, for
-/// [`WorkerThread::invoke_one`]'s own reason: a handle added later has to
-/// answer this question here rather than inherit an answer.
+/// Whether a node of this kind is one the scheduler may leave `PREEMPTED`: the
+/// four dynamic-tasking handles, which are the four arms of the dispatch that
+/// can answer `None`. Exhaustive rather than one arm and a wildcard, for
+/// [`WorkerThread::invoke_one`]'s own reason.
 fn preempts_itself(handle: &Handle) -> bool {
     match handle {
         Handle::Subflow { .. }
@@ -1171,15 +848,12 @@ fn preempts_itself(handle: &Handle) -> bool {
     }
 }
 
-/// Narrows one index a conditioner returned onto a successor position, or
-/// `None` if it names no successor.
-///
-/// Upstream's `cond >= 0 && static_cast<size_t>(cond) < node->_num_successors`,
-/// which is two guards rather than one because its cast would otherwise turn a
-/// negative index into a huge positive one. `usize::try_from` is the same two
-/// guards with the cast removed: a negative `i32` fails the conversion and an
-/// out-of-range one fails the filter. That a bad index quietly selects nothing
-/// is upstream's behaviour and is load-bearing -- `return -1` is how a
+/// Narrows one index a conditioner returned onto a successor position, or `None`
+/// if it names no successor: upstream's
+/// `cond >= 0 && static_cast<size_t>(cond) < node->_num_successors`, which is
+/// two guards because its cast would turn a negative index into a huge positive
+/// one, and `usize::try_from` is the same two with the cast removed. That a bad
+/// index quietly selects nothing is load-bearing: `return -1` is how a
 /// conditional branch is written to end.
 fn selected_successor(condition: i32, num_successors: usize) -> Option<usize> {
     usize::try_from(condition)
@@ -1187,11 +861,10 @@ fn selected_successor(condition: i32, num_successors: usize) -> Option<usize> {
         .filter(|index| *index < num_successors)
 }
 
-/// Maps a raw draw onto the queues other than `id`.
-///
-/// Upstream's trick, in two lines: a remainder over one fewer queue than there
-/// are, then a shift past the hole left by `id`. Every victim but `id` is
-/// equally likely, and no branch is needed to reject a self-steal.
+/// Maps a raw draw onto the queues other than `id`: upstream's trick, in two
+/// lines -- a remainder over one fewer queue than there are, then a shift past
+/// the hole left by `id`. Every victim but `id` is equally likely, and no
+/// branch is needed to reject a self-steal.
 fn victim_excluding(draw: usize, id: usize, max_victim: usize) -> usize {
     debug_assert!(
         max_victim >= 2,
@@ -1203,13 +876,12 @@ fn victim_excluding(draw: usize, id: usize, max_victim: usize) -> usize {
     victim + usize::from(victim >= id)
 }
 
-/// A seed for one worker's generator, drawn from the calling thread's identity.
-///
-/// Upstream seeds from `std::hash<std::thread::id>`, which gives every worker
-/// of every executor in the process a different stream without a shared
-/// counter. The two halves of the hash are folded together rather than one of
-/// them being dropped: a `ThreadId` is a small counter, so its hash can carry
-/// what little entropy it has in either half.
+/// A seed for one worker's generator, drawn from the calling thread's identity:
+/// upstream seeds from `std::hash<std::thread::id>`, which gives every worker of
+/// every executor in the process a different stream without a shared counter.
+/// The two halves of the hash are folded together rather than one of them being
+/// dropped, a `ThreadId` being a small counter whose hash can carry what little
+/// entropy it has in either half.
 fn seed_from_current_thread() -> u32 {
     let mut hasher = DefaultHasher::new();
     thread::current().id().hash(&mut hasher);
