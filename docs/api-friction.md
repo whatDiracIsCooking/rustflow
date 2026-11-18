@@ -396,11 +396,31 @@ run both forms side by side on the same algorithm.
   reason; this is the same constraint confirmed from the call-site side, on
   the simpler one-input case.
 
-- **Status: open — tracked by #216**, which already has the question of
-  whether the per-algorithm extension traits should collapse into one. This
-  entry is the evidence for the wider question #216 does not yet ask: not
-  just "one trait or several" but "one shape or two" for the owned/borrowed
-  split itself, and the dependent-async gap neither shape covers.
+- **Status: tracked by #257, and settled there.** The answer to "one shape or
+  two" is *three*, because upstream has two of them as well. Reading
+  `taskflow/algorithm/*.hpp` at the pin, every `FlowBuilder` algorithm method
+  there is one derived line -- `return emplace(make_X_task(args...));` -- over
+  a `make_*_task` factory that is upstream's actual primitive, while
+  `tf::Runtime` has no algorithm members at all. That is this entry's own
+  second bullet read from upstream's side: the `Runtime::` form is the port's
+  invention, not an unfaithful translation of anything. Both of the port's
+  existing shapes stay, and #257's call-site counts are why neither is the
+  redundant one: `find` runs 15 `Runtime::` calls to 0 wrapper calls outside
+  `src/`, `scan` runs 2 to 14, and `tests/scan.rs` is wrapper-only. What gets
+  completed is the middle layer, the `'static` callable a `FlowBuilder`
+  wrapper, an async task *and* a dependent-async task can all accept: 17 new
+  factories, one per wrapper, filed as #292, #293, #294 and #295, with #296
+  rewriting `dependent_async_algorithm.rs` on them. That closes this entry's
+  third bullet, and corrects the reason the example gives for the gap -- a
+  `Runtime::scope` underneath an algorithm does not stop a factory from
+  handing back a cold callable, and `make_inclusive_scan_task` is the proof
+  already in the tree. The first bullet's `Arc<Mutex<_>>` cost is accepted
+  rather than fixed, since there is no safe counterpart to `std::ref(range)`,
+  whose soundness upstream rests on the programmer's claim about its
+  dependency edges rather than on anything a compiler checks; #257 records the
+  ownership-shape rule the 17 factories follow so the family reads as one
+  vocabulary. The in-place `transform` constraint in the fourth bullet is
+  unchanged by all of it.
 - **Reported in:** PR #241 (#198).
 
 ## Pipelines (step 7)

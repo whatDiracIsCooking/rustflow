@@ -1427,3 +1427,133 @@ entry above does.
   `rustflow::executor::queue::...` instead, the same module path
   `tests/notifiers.rs` already uses for the notifiers, which were never root
   names, and that edit belongs to #279, which owns the file.
+
+- **Three layers, not two forms: the `Runtime::` method and the `FlowBuilder`
+  wrapper both stay, and the `make_*_task` factory is the middle layer the
+  port is missing** (issue #257).
+
+  `docs/api-friction.md`'s "Algorithms (step 6): two forms where upstream has
+  one" is the evidence for this entry, and the first thing reading upstream
+  does to it is correct its framing. Upstream does not have one shape; it has
+  two, and the one it treats as primitive is the one this port lacks. Every
+  `FlowBuilder` algorithm method in `taskflow/algorithm/*.hpp` at the pin is
+  literally `return emplace(make_X_task(args...));` -- in `for_each.hpp`,
+  `transform.hpp`, `fill.hpp`, `generate.hpp`, `reduce.hpp`, `find.hpp`,
+  `sort.hpp`, `scan.hpp` and `merge.hpp` alike, without exception. Upstream's
+  primitive is therefore the factory, a cold callable over `tf::Runtime&`,
+  and its `FlowBuilder` method is one derived line over it. What upstream has
+  no counterpart for at all is this port's *other* form: `tf::Runtime`
+  carries no loop, sort, reduce or scan members, so `Runtime::for_each` and
+  its 27 siblings are this port's own invention.
+
+  The port has upstream's derived layer and a primitive of its own, and is
+  missing the layer in between. It needs three where upstream needs two for
+  one reason: upstream's `make_for_each_task(b, e, c, part)` is at once a
+  `'static` callable and a borrow of the caller's container, which compiles
+  only because its iterators are unchecked pointers and nothing verifies the
+  container outlives the task. In Rust a `'static` callable cannot hold a
+  `&mut [T]`, so the owned/borrowed split is forced and the only open question
+  is where the seam falls. It falls here: `Runtime::X(&mut [T], ..)` is the
+  borrowed primitive a body that already holds a live slice calls directly,
+  `make_X_task(owned, ..) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send +
+  'static` is the `'static` callable, and `FlowBuilder::X` is one
+  `emplace_runtime` line over the factory. Counting the surface at the time
+  of the decision: 28 `Runtime::` methods, 28 `FlowBuilder` wrapper methods
+  across eight extension traits, and 11 factories -- three for
+  `for_each_index`, two for `merge`, six for `scan` -- so 17 are missing and
+  the completed family is 1:1 with the wrappers.
+
+  **Neither existing shape goes.** Both carry real weight in the corpus: of
+  the 103 algorithm call sites in `tests/`, `examples/` and `benches/`, 62
+  call a `Runtime::` method and 41 call a wrapper, and the split is not
+  uniform per algorithm -- `find` is 15 to 0 (its four wrapper methods have
+  no call site outside `src/` at all, only a unit test and four doctests),
+  while `scan` is 2 to 14 and `tests/scan.rs` is wrapper-only, 12 calls with
+  no `Runtime::` call anywhere in the file. Dropping the wrapper would make
+  `scan` and `for_each_index` cost a hand-written closure per use at a dozen
+  sites that read like upstream today; dropping the `Runtime::` method would
+  delete the implementation every wrapper is built on and the only form that
+  reaches a `&mut [T]` a body already owns without a lock. The friction log's
+  own reading survives intact -- `taskflow.sort(Arc::clone(&data))` reads
+  almost exactly like upstream's `taskflow.sort(beg, end)`, and
+  `runtime.sort_by(&mut local, cmp)` is nicer than anything upstream can
+  write -- and the honest conclusion is that those two sentences describe two
+  different jobs rather than two candidates for one.
+
+  **The factory family is how a dependent-async body gets the algorithms**,
+  and completing it is the work this decision commissions. The gap the
+  friction log calls the widest it found is real: all three stages of
+  `examples/dependent_async_algorithm.rs` hand-lock an `Arc<Mutex<_>>` and
+  call a `Runtime::` method, because the wrapper builds through
+  `FlowBuilder::emplace_runtime` and a dependent-async task is never queued
+  into a `Taskflow` for that to call. The factory closes it with nothing new
+  invented: `impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static` is
+  accepted by `emplace_runtime`, by `Executor::spawn_runtime` and
+  `silent_async_runtime`, and by `dependent_async_runtime` and
+  `silent_dependent_async_runtime` whose bound is the weaker `FnOnce`. The
+  precedent is already tested: `src/algorithm/module.rs`'s
+  `a_module_task_runs_from_a_dependent_async_body` submits
+  `make_module_task` straight through `Executor::dependent_async_runtime`.
+  The one argument on record against a factory for the other families --
+  `examples/dependent_async_algorithm.rs`'s claim that a `Runtime::` method
+  is "not a callable a factory can hand back cold, because the chunk loop
+  underneath every one of them is built on `Runtime::scope`" -- does not
+  hold, and `make_inclusive_scan_task` is the counterexample sitting in the
+  tree: it hands back exactly such a callable, and `Runtime::inclusive_scan`
+  underneath it calls `rt.scope`. A factory's product is handed its
+  `&mut Runtime` when it *runs*; it never needed one to be built. The
+  seventeen factories, each beside the `Runtime::` method it wraps and with
+  the parameter list its wrapper already has, are filed as #292
+  (`make_for_each_task`, `make_sort_task`, `make_sort_by_task`), #293
+  (`make_transform_task`, `make_transform2_task`, `make_fill_task`,
+  `make_fill_n_task`, `make_generate_task`, `make_generate_n_task`), #294
+  (`make_reduce_task`, `make_transform_reduce_task`,
+  `make_transform_reduce2_task`, `make_reduce_by_index_task`) and #295
+  (`make_find_if_task`, `make_find_if_not_task`, `make_min_element_task`,
+  `make_max_element_task`), with #296 rewriting the example on them -- the
+  check that the gap actually closed, and the place the stale claim above
+  gets corrected. Each of the four also reduces its wrapper methods to the
+  `self.emplace_runtime(make_X_task(..))` one-liner `ScanBuilder` and
+  `ForEachIndexBuilder` already are, which is what makes the derived layer
+  cheap enough to keep.
+
+  **The `Arc<Mutex<_>>` is accepted, and the absence of a `std::ref(range)`
+  counterpart is permanent rather than pending.** Upstream's reference
+  wrapper is sound there only because its graph edges are trusted by
+  convention: `make_for_each_task(std::ref(beg), std::ref(end), ..)` hands
+  the task an unchecked alias into a container the caller still mutates, and
+  what keeps that from being a data race is the programmer's claim about the
+  dependency edges, nothing the compiler reads. Reproducing it would need
+  `unsafe` and would hand a caller exactly that footgun, which this port's
+  stated posture refuses; a lock taken once per invocation -- not once per
+  element -- is the price, and `src/algorithm/for_each_index.rs`'s "No
+  deferred `beg`/`end`/`step`/`range`" `# Design` section already names the
+  same gap from the implementation side. Two measurements make the cost
+  smaller than the friction log's framing suggests. It is a *slice*
+  algorithm's cost, not the family's: of the 28 wrappers, 23 take at least
+  one `Arc`, two (`merge`, `merge_by`) take owned `Vec`s and return the slot
+  they publish into, and three -- the `for_each_index` trio -- take no data
+  at all, since an index range is `Copy` and travels by value. And the port
+  has a form upstream does not for the case that actually chafes: a caller
+  who wants no lock computes the slice in a `Runtime` body and calls the
+  `Runtime::` method on it, which is what `tests/for_each.rs`'s stateful
+  cases do in place of upstream's `std::ref` ones. The rule the seventeen new
+  factories follow, so the family stays one vocabulary rather than three: a
+  value the body only reads is `Arc<Vec<T>>`, one it writes is
+  `Arc<Mutex<Vec<T>>>`, a scalar result is `Arc<Mutex<T>>`, a `Copy` range or
+  index travels by value, and a factory that *creates* the output storage
+  returns `(body, slot)` as `make_merge_task` does.
+
+  **What #216 inherits.** It is collapsing the *derived* layer -- 28 one-line
+  wrappers once #292 through #295 land -- not a primitive, which is why the
+  collapse is cheap and why it does not have to wait for those four: a
+  factory changes a wrapper's body, never its signature. It should keep all
+  28 methods (none is redundant; the counts above show which algorithms lean
+  on which form, not that any method is unused), fold the eight traits into
+  one whose every method is a single `emplace_runtime` call, and, per #256's
+  entry above, flatten `rustflow::algorithm`'s own front door: the collapsed
+  trait, the four partitioners and their `ClosureWrapper`, `IndexRange` and
+  `IndexRanges`, and the `make_*_task` family. The collapsed trait replaces
+  the eight prelude lines with one; the factories are *not* prelude names,
+  which is #256's boundary applied unchanged -- a program importing a
+  free-function form is choosing it, and chooses it by name.
