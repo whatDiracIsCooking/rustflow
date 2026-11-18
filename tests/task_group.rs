@@ -91,19 +91,20 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use rustflow::prelude::*;
 use rustflow::{Executor, TaskGroup, Xorshift32};
 
-/// How long a handshake waits for the other side before it gives up.
-///
-/// The deadline every suite in this crate keeps, and nothing here passes
-/// because of this number: the only thing that reaches it is a side that is
-/// never going to arrive. What it buys in *this* file is that the
-/// `Cancellation` case cannot wedge a worker for ever -- see the module docs.
-const GIVE_UP_AFTER: Duration = Duration::from_secs(120);
+// The matrix macro and the spin both halves of the `Cancellation` handshake
+// wait on. `common/counters.rs` is not among them: half the counters here are
+// a recursion's return value rather than a tally of what ran, and the two
+// sorts compare vectors instead of counting at all.
+#[macro_use]
+mod common;
+#[path = "common/spin.rs"]
+mod spin;
+
+use spin::spin_until;
 
 /// Upstream's `for(size_t i=0; i<1000; ++i)`, in both of the first two
 /// cases: a thousand children per group, and a thousand-link chain.
@@ -122,26 +123,6 @@ const FIBONACCI_OF_N: usize = 144;
 
 /// Upstream's `::rand()%100` over a seed of this file's own.
 const SEED: u32 = 0x5EED_1793;
-
-/// Spins until `flag` is set, panicking rather than hanging if it never is.
-fn spin_until(what: &str, flag: &AtomicBool) {
-    spin_while(what, || !flag.load(Ordering::Acquire));
-}
-
-/// Spins while `again` says to, panicking rather than hanging if it never
-/// stops saying it.
-///
-/// A spin with `yield_now` rather than a condvar because one end of every
-/// handshake here is a task body, and a worker that parked would be a worker
-/// not running the rest of the work -- including, in the `Cancellation` case,
-/// the very children the other end is waiting for.
-fn spin_while(what: &str, mut again: impl FnMut() -> bool) {
-    let deadline = Instant::now() + GIVE_UP_AFTER;
-    while again() {
-        assert!(Instant::now() < deadline, "gave up waiting for {what}");
-        thread::yield_now();
-    }
-}
 
 /// Opens a group on the calling worker, failing the case rather than
 /// returning an error: every call below is already inside a task body, so the
@@ -241,44 +222,17 @@ fn async_tasks(workers: usize) {
     assert_eq!(counter.load(Ordering::Relaxed), 2 * TASKS);
 }
 
-#[test]
-fn async_tasks_1thread() {
-    async_tasks(1);
-}
-
-#[test]
-fn async_tasks_2threads() {
-    async_tasks(2);
-}
-
-#[test]
-fn async_tasks_3threads() {
-    async_tasks(3);
-}
-
-#[test]
-fn async_tasks_4threads() {
-    async_tasks(4);
-}
-
-#[test]
-fn async_tasks_5threads() {
-    async_tasks(5);
-}
-
-#[test]
-fn async_tasks_6threads() {
-    async_tasks(6);
-}
-
-#[test]
-fn async_tasks_7threads() {
-    async_tasks(7);
-}
-
-#[test]
-fn async_tasks_8threads() {
-    async_tasks(8);
+worker_matrix! {
+    async_tasks {
+        async_tasks_1thread(1),
+        async_tasks_2threads(2),
+        async_tasks_3threads(3),
+        async_tasks_4threads(4),
+        async_tasks_5threads(5),
+        async_tasks_6threads(6),
+        async_tasks_7threads(7),
+        async_tasks_8threads(8),
+    }
 }
 
 /// Upstream's `TaskGroup.DependentAsync.<W>threads`: a thousand-link chain
@@ -350,44 +304,17 @@ fn dependent_async_chains(workers: usize) {
     assert_eq!(counter.load(Ordering::Relaxed), TASKS);
 }
 
-#[test]
-fn dependent_async_chains_1thread() {
-    dependent_async_chains(1);
-}
-
-#[test]
-fn dependent_async_chains_2threads() {
-    dependent_async_chains(2);
-}
-
-#[test]
-fn dependent_async_chains_3threads() {
-    dependent_async_chains(3);
-}
-
-#[test]
-fn dependent_async_chains_4threads() {
-    dependent_async_chains(4);
-}
-
-#[test]
-fn dependent_async_chains_5threads() {
-    dependent_async_chains(5);
-}
-
-#[test]
-fn dependent_async_chains_6threads() {
-    dependent_async_chains(6);
-}
-
-#[test]
-fn dependent_async_chains_7threads() {
-    dependent_async_chains(7);
-}
-
-#[test]
-fn dependent_async_chains_8threads() {
-    dependent_async_chains(8);
+worker_matrix! {
+    dependent_async_chains {
+        dependent_async_chains_1thread(1),
+        dependent_async_chains_2threads(2),
+        dependent_async_chains_3threads(3),
+        dependent_async_chains_4threads(4),
+        dependent_async_chains_5threads(5),
+        dependent_async_chains_6threads(6),
+        dependent_async_chains_7threads(7),
+        dependent_async_chains_8threads(8),
+    }
 }
 
 /// Upstream's `TaskGroup.Cancellation.<W>threads`: the other `W - 1` workers
@@ -398,7 +325,7 @@ fn dependent_async_chains_8threads() {
 /// The blocking is not incidental -- it is what makes "had not started yet"
 /// true of all hundred rather than likely -- and it is also the one hazard in
 /// this file, so both halves of it are bounded: a blocked child gives up
-/// after [`GIVE_UP_AFTER`] and panics, and the arrivals handshake does the
+/// after [`spin_until`]'s deadline and panics, and the arrivals handshake does the
 /// same, so a release that never comes fails the case instead of wedging the
 /// pool. A regression in the skip path shows up two ways and neither hangs
 /// here: a child that ran anyway lands on the counter, and a skipped child
@@ -430,14 +357,16 @@ fn cancellation(workers: usize) {
                     let release = Arc::clone(&release);
                     group.silent_async(move || {
                         arrivals.fetch_add(1, Ordering::Release);
-                        spin_until("the task group to release the blocked child", &release);
+                        spin_until("the task group to release the blocked child", || {
+                            release.load(Ordering::Acquire)
+                        });
                     });
                 }
 
                 // Upstream's `while(arrivals != W-1)`: every other worker is
                 // inside a child of this group and will stay there.
-                spin_while("the other workers to block", || {
-                    arrivals.load(Ordering::Acquire) != workers - 1
+                spin_until("the other workers to block", || {
+                    arrivals.load(Ordering::Acquire) == workers - 1
                 });
 
                 // The hundred that must never run, queued behind workers that
@@ -469,39 +398,16 @@ fn cancellation(workers: usize) {
     assert_eq!(ran.load(Ordering::Relaxed), 0);
 }
 
-#[test]
-fn cancellation_2threads() {
-    cancellation(2);
-}
-
-#[test]
-fn cancellation_3threads() {
-    cancellation(3);
-}
-
-#[test]
-fn cancellation_4threads() {
-    cancellation(4);
-}
-
-#[test]
-fn cancellation_5threads() {
-    cancellation(5);
-}
-
-#[test]
-fn cancellation_6threads() {
-    cancellation(6);
-}
-
-#[test]
-fn cancellation_7threads() {
-    cancellation(7);
-}
-
-#[test]
-fn cancellation_8threads() {
-    cancellation(8);
+worker_matrix! {
+    cancellation {
+        cancellation_2threads(2),
+        cancellation_3threads(3),
+        cancellation_4threads(4),
+        cancellation_5threads(5),
+        cancellation_6threads(6),
+        cancellation_7threads(7),
+        cancellation_8threads(8),
+    }
 }
 
 /// Upstream's `fibonacci(N, executor)`: one branch spawned into a group of
@@ -569,55 +475,30 @@ fn fibonacci_swapped(n: usize, executor: &Arc<Executor>) -> usize {
 ///
 /// `recurse` is one of the two shapes above, so that the eight cases below
 /// are eight lines rather than two copies of four.
-fn fibonacci_at(workers: usize, recurse: fn(usize, &Arc<Executor>) -> usize) -> usize {
+fn fibonacci_at(workers: usize, recurse: fn(usize, &Arc<Executor>) -> usize) {
     let executor = Arc::new(Executor::new(workers));
-    executor
+    let fib = executor
         .spawn({
             let executor = Arc::clone(&executor);
             move || recurse(FIBONACCI_N, &executor)
         })
         .wait()
-        .expect("no task panicked")
+        .expect("no task panicked");
+
+    assert_eq!(fib, FIBONACCI_OF_N);
 }
 
-#[test]
-fn fibonacci_1thread() {
-    assert_eq!(fibonacci_at(1, fibonacci), FIBONACCI_OF_N);
-}
-
-#[test]
-fn fibonacci_2threads() {
-    assert_eq!(fibonacci_at(2, fibonacci), FIBONACCI_OF_N);
-}
-
-#[test]
-fn fibonacci_3threads() {
-    assert_eq!(fibonacci_at(3, fibonacci), FIBONACCI_OF_N);
-}
-
-#[test]
-fn fibonacci_4threads() {
-    assert_eq!(fibonacci_at(4, fibonacci), FIBONACCI_OF_N);
-}
-
-#[test]
-fn fibonacci_swapped_1thread() {
-    assert_eq!(fibonacci_at(1, fibonacci_swapped), FIBONACCI_OF_N);
-}
-
-#[test]
-fn fibonacci_swapped_2threads() {
-    assert_eq!(fibonacci_at(2, fibonacci_swapped), FIBONACCI_OF_N);
-}
-
-#[test]
-fn fibonacci_swapped_3threads() {
-    assert_eq!(fibonacci_at(3, fibonacci_swapped), FIBONACCI_OF_N);
-}
-
-#[test]
-fn fibonacci_swapped_4threads() {
-    assert_eq!(fibonacci_at(4, fibonacci_swapped), FIBONACCI_OF_N);
+worker_matrix! {
+    fibonacci_at {
+        fibonacci_1thread(1, fibonacci),
+        fibonacci_2threads(2, fibonacci),
+        fibonacci_3threads(3, fibonacci),
+        fibonacci_4threads(4, fibonacci),
+        fibonacci_swapped_1thread(1, fibonacci_swapped),
+        fibonacci_swapped_2threads(2, fibonacci_swapped),
+        fibonacci_swapped_3threads(3, fibonacci_swapped),
+        fibonacci_swapped_4threads(4, fibonacci_swapped),
+    }
 }
 
 /// Upstream's `end - beg <= 5` cut-off, under which both sorts stop
@@ -776,44 +657,17 @@ fn merge_sort_at(workers: usize) {
     }
 }
 
-#[test]
-fn merge_sort_1thread() {
-    merge_sort_at(1);
-}
-
-#[test]
-fn merge_sort_2threads() {
-    merge_sort_at(2);
-}
-
-#[test]
-fn merge_sort_3threads() {
-    merge_sort_at(3);
-}
-
-#[test]
-fn merge_sort_4threads() {
-    merge_sort_at(4);
-}
-
-#[test]
-fn merge_sort_5threads() {
-    merge_sort_at(5);
-}
-
-#[test]
-fn merge_sort_6threads() {
-    merge_sort_at(6);
-}
-
-#[test]
-fn merge_sort_7threads() {
-    merge_sort_at(7);
-}
-
-#[test]
-fn merge_sort_8threads() {
-    merge_sort_at(8);
+worker_matrix! {
+    merge_sort_at {
+        merge_sort_1thread(1),
+        merge_sort_2threads(2),
+        merge_sort_3threads(3),
+        merge_sort_4threads(4),
+        merge_sort_5threads(5),
+        merge_sort_6threads(6),
+        merge_sort_7threads(7),
+        merge_sort_8threads(8),
+    }
 }
 
 /// Upstream's `quick_sort(unsigned W)`: five sizes through **one taskflow**,
@@ -854,42 +708,15 @@ fn quick_sort_at(workers: usize) {
     }
 }
 
-#[test]
-fn quick_sort_1thread() {
-    quick_sort_at(1);
-}
-
-#[test]
-fn quick_sort_2threads() {
-    quick_sort_at(2);
-}
-
-#[test]
-fn quick_sort_3threads() {
-    quick_sort_at(3);
-}
-
-#[test]
-fn quick_sort_4threads() {
-    quick_sort_at(4);
-}
-
-#[test]
-fn quick_sort_5threads() {
-    quick_sort_at(5);
-}
-
-#[test]
-fn quick_sort_6threads() {
-    quick_sort_at(6);
-}
-
-#[test]
-fn quick_sort_7threads() {
-    quick_sort_at(7);
-}
-
-#[test]
-fn quick_sort_8threads() {
-    quick_sort_at(8);
+worker_matrix! {
+    quick_sort_at {
+        quick_sort_1thread(1),
+        quick_sort_2threads(2),
+        quick_sort_3threads(3),
+        quick_sort_4threads(4),
+        quick_sort_5threads(5),
+        quick_sort_6threads(6),
+        quick_sort_7threads(7),
+        quick_sort_8threads(8),
+    }
 }

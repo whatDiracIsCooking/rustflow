@@ -115,18 +115,23 @@
 
 use std::panic;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustflow::prelude::*;
 use rustflow::{AsyncHandle, CorunError, Executor, JoinError, RunError, Semaphore};
 
-/// How many times a task body has run, shared with that body.
-type Counter = Arc<AtomicUsize>;
+// All three topics: the matrix macro, the counting the cases assert on, and
+// the counting body most of them attach. The `AtomicBool` flags below are
+// not counters and stay where they are.
+#[macro_use]
+mod common;
+#[path = "common/bodies.rs"]
+mod bodies;
+#[path = "common/counters.rs"]
+mod counters;
 
-/// A fresh counter.
-fn counter() -> Counter {
-    Arc::new(AtomicUsize::new(0))
-}
+use bodies::bump;
+use counters::{Counter, count, counter};
 
 /// Which handle kind the six tasks of a chain are built with.
 ///
@@ -357,13 +362,13 @@ fn a_thousand_tasks_failing_at_once_report_exactly_one_panic() {
 
         // The run is over, and a run is over only once every job of it has
         // finished, so both counts are settled and readable from here.
-        let started = started.load(Ordering::Relaxed);
+        let started = count(&started);
         assert!(
             (1..=FAILING_TASKS).contains(&started),
             "{workers} worker(s): {started} tasks started, out of {FAILING_TASKS}"
         );
         assert_eq!(
-            dropped.load(Ordering::Relaxed),
+            count(&dropped),
             started - 1,
             "{workers} worker(s): every payload but one is dropped by the run"
         );
@@ -372,7 +377,7 @@ fn a_thousand_tasks_failing_at_once_report_exactly_one_panic() {
         // `error` above all along.
         drop(error);
         assert_eq!(
-            dropped.load(Ordering::Relaxed),
+            count(&dropped),
             started,
             "{workers} worker(s): the reported payload was not the surviving one"
         );
@@ -427,7 +432,7 @@ fn a_corun_of_a_failing_taskflow_reports_to_the_calling_task() {
             .wait()
             .expect("the corunning task caught the failure");
         assert_eq!(
-            corun.load(Ordering::Relaxed),
+            count(&corun),
             1,
             "{workers} worker(s): the corunning task ran once"
         );
@@ -479,7 +484,7 @@ fn an_uncaught_corun_failure_becomes_the_outer_runs_failure() {
             .expect_err("the corunning task did not catch `x`");
         assert_failed_with_x(&error, &format!("{workers} worker(s), uncaught"));
         assert_eq!(
-            counter.load(Ordering::Relaxed),
+            count(&counter),
             2,
             "{workers} worker(s), uncaught: only the tasks before the failing one run"
         );
@@ -500,7 +505,7 @@ fn an_uncaught_corun_failure_becomes_the_outer_runs_failure() {
             .wait()
             .expect("the corunning task caught `x`");
         assert_eq!(
-            counter.load(Ordering::Relaxed),
+            count(&counter),
             4,
             "{workers} worker(s), caught: the second corun ran the same two tasks"
         );
@@ -781,7 +786,7 @@ fn only_the_children_before_a_failing_one_run_under_either_join() {
             .expect_err("the second child panicked");
         assert_failed_with(&error, "x", &context);
         assert_eq!(
-            num_tasks.load(Ordering::Relaxed),
+            count(&num_tasks),
             2,
             "{context}: only the children up to the failing one ran"
         );
@@ -800,7 +805,7 @@ fn only_the_children_before_a_failing_one_run_under_either_join() {
             .expect_err("the join re-raised what the second child panicked with");
         assert_failed_with(&error, "y", &context);
         assert_eq!(
-            num_tasks.load(Ordering::Relaxed),
+            count(&num_tasks),
             2,
             "{context}: only the children up to the failing one ran"
         );
@@ -848,14 +853,6 @@ fn chained_children(
         if matches!(join, Join::Explicit) {
             subflow.join().expect("a fresh subflow is joinable");
         }
-    }
-}
-
-/// A body that counts itself: upstream's `[&num_tasks](){ ++num_tasks; }`.
-fn bump(counter: &Counter) -> impl FnMut() + Send + 'static {
-    let counter = Arc::clone(counter);
-    move || {
-        counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -933,7 +930,7 @@ fn nested_subflow(workers: usize, join: Join) {
         .expect_err("the innermost child panicked");
     assert_failed_with(&error, "x", &context);
     assert_eq!(
-        num_tasks.load(Ordering::Relaxed),
+        count(&num_tasks),
         COUNTED,
         "{context}: two children of each level, three bodies and the failing child"
     );
@@ -970,7 +967,7 @@ fn nested_subflow(workers: usize, join: Join) {
         .wait()
         .expect("the corunning async task caught the failure");
     assert_eq!(
-        num_tasks.load(Ordering::Relaxed),
+        count(&num_tasks),
         COUNTED,
         "{context}, corun from an async task: the nested graph ran exactly as \
          far as it did under the run"
@@ -996,7 +993,7 @@ fn nested_subflow(workers: usize, join: Join) {
         "{context}, corun from a silent async task: the body did not reach its end"
     );
     assert_eq!(
-        num_tasks.load(Ordering::Relaxed),
+        count(&num_tasks),
         COUNTED,
         "{context}, corun from a silent async task: the nested graph ran \
          exactly as far as it did under the run"
@@ -1012,7 +1009,7 @@ fn nested_subflow(workers: usize, join: Join) {
         .wait()
         .expect("the corunning runtime-shaped async task caught the failure");
     assert_eq!(
-        num_tasks.load(Ordering::Relaxed),
+        count(&num_tasks),
         COUNTED,
         "{context}, corun from an async task's runtime: the nested graph ran \
          exactly as far as it did under the run"
@@ -1037,7 +1034,7 @@ fn nested_subflow(workers: usize, join: Join) {
          not reach its end"
     );
     assert_eq!(
-        num_tasks.load(Ordering::Relaxed),
+        count(&num_tasks),
         COUNTED,
         "{context}, corun from a silent async task's runtime: the nested \
          graph ran exactly as far as it did under the run"
@@ -1147,7 +1144,7 @@ fn the_innermost_explicit_anchor_catches_and_nothing_travels_past_it() {
             .wait()
             .expect("the inner join caught the only failure there was");
         assert_eq!(
-            caught.load(Ordering::Relaxed),
+            count(&caught),
             1,
             "{context}: the inner body caught its child's panic exactly once"
         );
@@ -1202,11 +1199,7 @@ fn a_corun_of_failing_subflows_reports_to_the_calling_task() {
             .run(&outer)
             .wait()
             .expect("the corunning task caught the failure");
-        assert_eq!(
-            corun.load(Ordering::Relaxed),
-            1,
-            "{context}: the corunning task ran once"
-        );
+        assert_eq!(count(&corun), 1, "{context}: the corunning task ran once");
     }
 }
 
@@ -1377,7 +1370,7 @@ fn an_uncaught_corun_failure_in_a_runtime_body_becomes_the_outer_runs_failure() 
             .expect_err("the corunning runtime task did not catch `x`");
         assert_failed_with_x(&error, &format!("{workers} worker(s), uncaught"));
         assert_eq!(
-            counter.load(Ordering::Relaxed),
+            count(&counter),
             2,
             "{workers} worker(s), uncaught: only the tasks before the failing one run"
         );
@@ -1398,7 +1391,7 @@ fn an_uncaught_corun_failure_in_a_runtime_body_becomes_the_outer_runs_failure() 
             .wait()
             .expect("the corunning runtime task caught `x`");
         assert_eq!(
-            counter.load(Ordering::Relaxed),
+            count(&counter),
             4,
             "{workers} worker(s), caught: the second corun ran the same two tasks"
         );
@@ -1441,24 +1434,13 @@ fn async_task(workers: usize) {
     executor.wait_for_all();
 }
 
-#[test]
-fn an_async_tasks_panic_reaches_its_handle_and_nothing_else_1_thread() {
-    async_task(1);
-}
-
-#[test]
-fn an_async_tasks_panic_reaches_its_handle_and_nothing_else_2_threads() {
-    async_task(2);
-}
-
-#[test]
-fn an_async_tasks_panic_reaches_its_handle_and_nothing_else_3_threads() {
-    async_task(3);
-}
-
-#[test]
-fn an_async_tasks_panic_reaches_its_handle_and_nothing_else_4_threads() {
-    async_task(4);
+worker_matrix! {
+    async_task {
+        an_async_tasks_panic_reaches_its_handle_and_nothing_else_1_thread(1),
+        an_async_tasks_panic_reaches_its_handle_and_nothing_else_2_threads(2),
+        an_async_tasks_panic_reaches_its_handle_and_nothing_else_3_threads(3),
+        an_async_tasks_panic_reaches_its_handle_and_nothing_else_4_threads(4),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1496,24 +1478,13 @@ fn async_with_runtime(workers: usize) {
     executor.wait_for_all();
 }
 
-#[test]
-fn a_thousand_runtime_shaped_async_tasks_each_report_their_own_panic_1_thread() {
-    async_with_runtime(1);
-}
-
-#[test]
-fn a_thousand_runtime_shaped_async_tasks_each_report_their_own_panic_2_threads() {
-    async_with_runtime(2);
-}
-
-#[test]
-fn a_thousand_runtime_shaped_async_tasks_each_report_their_own_panic_3_threads() {
-    async_with_runtime(3);
-}
-
-#[test]
-fn a_thousand_runtime_shaped_async_tasks_each_report_their_own_panic_4_threads() {
-    async_with_runtime(4);
+worker_matrix! {
+    async_with_runtime {
+        a_thousand_runtime_shaped_async_tasks_each_report_their_own_panic_1_thread(1),
+        a_thousand_runtime_shaped_async_tasks_each_report_their_own_panic_2_threads(2),
+        a_thousand_runtime_shaped_async_tasks_each_report_their_own_panic_3_threads(3),
+        a_thousand_runtime_shaped_async_tasks_each_report_their_own_panic_4_threads(4),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1553,24 +1524,13 @@ fn dependent_async_with_runtime(workers: usize) {
     executor.wait_for_all();
 }
 
-#[test]
-fn a_thousand_runtime_shaped_dependent_async_tasks_each_report_their_own_panic_1_thread() {
-    dependent_async_with_runtime(1);
-}
-
-#[test]
-fn a_thousand_runtime_shaped_dependent_async_tasks_each_report_their_own_panic_2_threads() {
-    dependent_async_with_runtime(2);
-}
-
-#[test]
-fn a_thousand_runtime_shaped_dependent_async_tasks_each_report_their_own_panic_3_threads() {
-    dependent_async_with_runtime(3);
-}
-
-#[test]
-fn a_thousand_runtime_shaped_dependent_async_tasks_each_report_their_own_panic_4_threads() {
-    dependent_async_with_runtime(4);
+worker_matrix! {
+    dependent_async_with_runtime {
+        a_thousand_runtime_shaped_dependent_async_tasks_each_report_their_own_panic_1_thread(1),
+        a_thousand_runtime_shaped_dependent_async_tasks_each_report_their_own_panic_2_threads(2),
+        a_thousand_runtime_shaped_dependent_async_tasks_each_report_their_own_panic_3_threads(3),
+        a_thousand_runtime_shaped_dependent_async_tasks_each_report_their_own_panic_4_threads(4),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1645,11 +1605,7 @@ fn runtime_async_task(workers: usize) {
         .run(&taskflow)
         .wait()
         .expect("a child's panic went to its own handle, not to the run");
-    assert_eq!(
-        flag.load(Ordering::Relaxed),
-        1,
-        "{context}: the rest of the graph ran"
-    );
+    assert_eq!(count(&flag), 1, "{context}: the rest of the graph ran");
 
     // Upstream's second phase: a silent child, and a corun that takes what it
     // left behind. The body has handled the failure, so the run has none.
@@ -1680,7 +1636,7 @@ fn runtime_async_task(workers: usize) {
         .wait()
         .expect("the runtime body caught its silent child's panic");
     assert_eq!(
-        flag.load(Ordering::Relaxed),
+        count(&flag),
         2,
         "{context}: the successor of a body that caught its child ran"
     );
@@ -1713,25 +1669,18 @@ fn runtime_async_task(workers: usize) {
         .expect_err("the bare corun re-raised the child's panic");
     assert_failed_with(&error, "a", &context);
     assert_eq!(
-        flag.load(Ordering::Relaxed),
+        count(&flag),
         0,
         "{context}: neither the rest of the failing body nor its successor ran"
     );
 }
 
-#[test]
-fn a_runtime_bodys_children_report_to_their_handle_their_node_or_the_run_2_threads() {
-    runtime_async_task(2);
-}
-
-#[test]
-fn a_runtime_bodys_children_report_to_their_handle_their_node_or_the_run_3_threads() {
-    runtime_async_task(3);
-}
-
-#[test]
-fn a_runtime_bodys_children_report_to_their_handle_their_node_or_the_run_4_threads() {
-    runtime_async_task(4);
+worker_matrix! {
+    runtime_async_task {
+        a_runtime_bodys_children_report_to_their_handle_their_node_or_the_run_2_threads(2),
+        a_runtime_bodys_children_report_to_their_handle_their_node_or_the_run_3_threads(3),
+        a_runtime_bodys_children_report_to_their_handle_their_node_or_the_run_4_threads(4),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1838,7 +1787,7 @@ fn task_group_async_task(workers: usize) {
                         "{context}: nothing above the group failed"
                     );
                     assert_eq!(
-                        counter.load(Ordering::Relaxed),
+                        count(&counter),
                         FAILING_CHILDREN,
                         "{context}: no child was skipped, since the group was never marked"
                     );
@@ -1867,7 +1816,7 @@ fn task_group_async_task(workers: usize) {
                         .try_corun()
                         .expect_err("a silent child's panic landed on the group");
                     assert_failed_with_x(&error, &context);
-                    let ran = counter.load(Ordering::Relaxed);
+                    let ran = count(&counter);
                     assert!(
                         ran <= workers,
                         "{context}: {ran} children ran past the mark, which is more than \
@@ -1884,29 +1833,14 @@ fn task_group_async_task(workers: usize) {
         .expect("no assertion inside the group's owner failed");
 }
 
-#[test]
-fn a_groups_failing_children_report_to_their_handles_or_to_the_group_1_thread() {
-    task_group_async_task(1);
-}
-
-#[test]
-fn a_groups_failing_children_report_to_their_handles_or_to_the_group_2_threads() {
-    task_group_async_task(2);
-}
-
-#[test]
-fn a_groups_failing_children_report_to_their_handles_or_to_the_group_3_threads() {
-    task_group_async_task(3);
-}
-
-#[test]
-fn a_groups_failing_children_report_to_their_handles_or_to_the_group_4_threads() {
-    task_group_async_task(4);
-}
-
-#[test]
-fn a_groups_failing_children_report_to_their_handles_or_to_the_group_5_threads() {
-    task_group_async_task(5);
+worker_matrix! {
+    task_group_async_task {
+        a_groups_failing_children_report_to_their_handles_or_to_the_group_1_thread(1),
+        a_groups_failing_children_report_to_their_handles_or_to_the_group_2_threads(2),
+        a_groups_failing_children_report_to_their_handles_or_to_the_group_3_threads(3),
+        a_groups_failing_children_report_to_their_handles_or_to_the_group_4_threads(4),
+        a_groups_failing_children_report_to_their_handles_or_to_the_group_5_threads(5),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1960,7 +1894,7 @@ fn runtime_async_from_a_free_node(workers: usize) {
                     "{context}: nothing above this node failed"
                 );
                 assert_eq!(
-                    counter.load(Ordering::Relaxed),
+                    count(&counter),
                     FAILING_CHILDREN,
                     "{context}: no child was skipped, since the node was never marked"
                 );
@@ -1985,7 +1919,7 @@ fn runtime_async_from_a_free_node(workers: usize) {
                     .try_corun()
                     .expect_err("a silent child's panic landed on this node");
                 assert_failed_with_x(&error, &context);
-                let ran = counter.load(Ordering::Relaxed);
+                let ran = count(&counter);
                 assert!(
                     ran <= workers,
                     "{context}: {ran} children ran past the mark, which is more than the \
@@ -2001,24 +1935,13 @@ fn runtime_async_from_a_free_node(workers: usize) {
         .expect("no assertion inside the runtime body failed");
 }
 
-#[test]
-fn a_runtime_nodes_failing_children_report_to_their_handles_or_to_the_node_1_thread() {
-    runtime_async_from_a_free_node(1);
-}
-
-#[test]
-fn a_runtime_nodes_failing_children_report_to_their_handles_or_to_the_node_2_threads() {
-    runtime_async_from_a_free_node(2);
-}
-
-#[test]
-fn a_runtime_nodes_failing_children_report_to_their_handles_or_to_the_node_3_threads() {
-    runtime_async_from_a_free_node(3);
-}
-
-#[test]
-fn a_runtime_nodes_failing_children_report_to_their_handles_or_to_the_node_4_threads() {
-    runtime_async_from_a_free_node(4);
+worker_matrix! {
+    runtime_async_from_a_free_node {
+        a_runtime_nodes_failing_children_report_to_their_handles_or_to_the_node_1_thread(1),
+        a_runtime_nodes_failing_children_report_to_their_handles_or_to_the_node_2_threads(2),
+        a_runtime_nodes_failing_children_report_to_their_handles_or_to_the_node_3_threads(3),
+        a_runtime_nodes_failing_children_report_to_their_handles_or_to_the_node_4_threads(4),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -2084,17 +2007,10 @@ fn semaphore1(workers: usize) {
     assert_failed_with(&error, "exception", &context);
 }
 
-#[test]
-fn a_failing_task_between_an_acquire_and_its_release_leaves_the_count_taken_1_thread() {
-    semaphore1(1);
-}
-
-#[test]
-fn a_failing_task_between_an_acquire_and_its_release_leaves_the_count_taken_2_threads() {
-    semaphore1(2);
-}
-
-#[test]
-fn a_failing_task_between_an_acquire_and_its_release_leaves_the_count_taken_3_threads() {
-    semaphore1(3);
+worker_matrix! {
+    semaphore1 {
+        a_failing_task_between_an_acquire_and_its_release_leaves_the_count_taken_1_thread(1),
+        a_failing_task_between_an_acquire_and_its_release_leaves_the_count_taken_2_threads(2),
+        a_failing_task_between_an_acquire_and_its_release_leaves_the_count_taken_3_threads(3),
+    }
 }

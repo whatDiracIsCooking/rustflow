@@ -74,20 +74,25 @@
 
 use std::mem;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
 
 use rustflow::prelude::*;
 use rustflow::{Executor, RunHandle};
 
-/// How many times a task body has run, shared with that body.
-type Counter = Arc<AtomicUsize>;
+// The matrix macro, the counting every case here asserts on, and the spin the
+// cancellation rendezvous waits on. `common/bodies.rs` is not among them: a
+// counting body here is built inside a `map` over a target graph's tasks, so
+// the clone it would hand back is the clone those closures already make.
+#[macro_use]
+mod common;
+#[path = "common/counters.rs"]
+mod counters;
+#[path = "common/spin.rs"]
+mod spin;
 
-/// A fresh counter.
-fn counter() -> Counter {
-    Arc::new(AtomicUsize::new(0))
-}
+use counters::{Counter, count, counter};
+use spin::spin_until;
 
 /// A target taskflow of `tasks` tasks in a chain, each counting itself:
 /// upstream's `f0`, whose five tasks are `A -> B -> C -> D -> E`.
@@ -139,7 +144,7 @@ fn run_n_counts_per_run(
             .wait()
             .expect("no task of a composition panicked");
         assert_eq!(
-            counter.load(Ordering::Relaxed),
+            count(counter),
             per_run * n,
             "{context}: {n} run(s) of a composition counting {per_run} each"
         );
@@ -166,7 +171,7 @@ fn a_hundred_queued_runs_count(
     let handles: Vec<RunHandle<'_>> = (0..100).map(|_| executor.run(taskflow)).collect();
     executor.wait_for_all();
     assert_eq!(
-        counter.load(Ordering::Relaxed),
+        count(counter),
         per_run * 100,
         "{context}: a hundred queued runs of a composition counting {per_run} each"
     );
@@ -210,7 +215,7 @@ fn module1(workers: usize) {
 
     executor.run(&f1).wait().expect("no task panicked");
     assert_eq!(
-        counter.load(Ordering::Relaxed),
+        count(&counter),
         10,
         "{context}: five tasks of `f1` and the five of its module"
     );
@@ -218,7 +223,7 @@ fn module1(workers: usize) {
     counter.store(0, Ordering::Relaxed);
     executor.run_n(&f1, 100).wait().expect("no task panicked");
     assert_eq!(
-        counter.load(Ordering::Relaxed),
+        count(&counter),
         10 * 100,
         "{context}: a hundred runs of the same composition"
     );
@@ -232,24 +237,13 @@ fn module1(workers: usize) {
     a_hundred_queued_runs_count(&executor, &f1, &counter, 15, &context);
 }
 
-#[test]
-fn module1_1_worker() {
-    module1(1);
-}
-
-#[test]
-fn module1_2_workers() {
-    module1(2);
-}
-
-#[test]
-fn module1_3_workers() {
-    module1(3);
-}
-
-#[test]
-fn module1_4_workers() {
-    module1(4);
+worker_matrix! {
+    module1 {
+        module1_1_worker(1),
+        module1_2_workers(2),
+        module1_3_workers(3),
+        module1_4_workers(4),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -276,24 +270,13 @@ fn module2(workers: usize) {
     a_hundred_queued_runs_count(&executor, &f2, &counter, 20, &context);
 }
 
-#[test]
-fn module2_1_worker() {
-    module2(1);
-}
-
-#[test]
-fn module2_2_workers() {
-    module2(2);
-}
-
-#[test]
-fn module2_3_workers() {
-    module2(3);
-}
-
-#[test]
-fn module2_4_workers() {
-    module2(4);
+worker_matrix! {
+    module2 {
+        module2_1_worker(1),
+        module2_2_workers(2),
+        module2_3_workers(3),
+        module2_4_workers(4),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -320,24 +303,13 @@ fn module3(workers: usize) {
     a_hundred_queued_runs_count(&executor, &f3, &counter, 16, &context);
 }
 
-#[test]
-fn module3_1_worker() {
-    module3(1);
-}
-
-#[test]
-fn module3_2_workers() {
-    module3(2);
-}
-
-#[test]
-fn module3_3_workers() {
-    module3(3);
-}
-
-#[test]
-fn module3_4_workers() {
-    module3(4);
+worker_matrix! {
+    module3 {
+        module3_1_worker(1),
+        module3_2_workers(2),
+        module3_3_workers(3),
+        module3_4_workers(4),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -382,50 +354,24 @@ fn parallel_modules(workers: usize) {
 
     executor.run(&taskflow).wait().expect("no task panicked");
     assert_eq!(
-        counter.load(Ordering::Relaxed),
+        count(&counter),
         80000,
         "{context}: every task of every composed taskflow ran exactly once"
     );
 }
 
-#[test]
-fn parallel_modules_1_worker() {
-    parallel_modules(1);
-}
-
-#[test]
-fn parallel_modules_2_workers() {
-    parallel_modules(2);
-}
-
-#[test]
-fn parallel_modules_3_workers() {
-    parallel_modules(3);
-}
-
-#[test]
-fn parallel_modules_4_workers() {
-    parallel_modules(4);
+worker_matrix! {
+    parallel_modules {
+        parallel_modules_1_worker(1),
+        parallel_modules_2_workers(2),
+        parallel_modules_3_workers(3),
+        parallel_modules_4_workers(4),
+    }
 }
 
 // ----------------------------------------------------------------------------
 // Testcase: cancelling a composition
 // ----------------------------------------------------------------------------
-
-/// Long enough that only a scheduling bug reaches it, short enough to report
-/// rather than hang a CI run: `tests/work_stealing.rs` carries the same
-/// constant for the same reason, which is that `cargo test` has no
-/// per-case timeout where doctest gave upstream one.
-const GIVE_UP_AFTER: Duration = Duration::from_secs(120);
-
-/// Spins until `ready`, and fails with `what` rather than spinning for ever.
-fn spin_until(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + GIVE_UP_AFTER;
-    while !ready() {
-        assert!(Instant::now() < deadline, "gave up waiting for {what}");
-        thread::yield_now();
-    }
-}
 
 /// Cancelling a run skips the tasks of a module graph it had not started, and
 /// the run still finishes.
@@ -491,7 +437,7 @@ fn cancelling_a_run_skips_the_rest_of_a_module() {
 
         run.wait().expect("cancelling a run is not a failure of it");
         assert_eq!(
-            counter.load(Ordering::Relaxed),
+            count(&counter),
             0,
             "{context}: the tasks behind the gate were never started"
         );
@@ -570,7 +516,7 @@ fn a_composition_is_editable_the_instant_its_run_reports_done() {
                         .wait()
                         .expect("no task of a composition panicked");
                     assert_eq!(
-                        counter.load(Ordering::Relaxed),
+                        count(&counter),
                         9,
                         "round {round}: three runs of a composition counting three each"
                     );
@@ -655,7 +601,7 @@ fn a_composition_is_editable_the_instant_wait_for_all_returns() {
                     mem::forget(executor.run_n(&taskflow, 3));
                     executor.wait_for_all();
                     assert_eq!(
-                        counter.load(Ordering::Relaxed),
+                        count(&counter),
                         9,
                         "round {round}: three runs of a composition counting three each"
                     );
@@ -751,31 +697,20 @@ fn module_with_async_launch(workers: usize) {
         .expect("no task of the composition panicked");
 
     assert_eq!(
-        counter.load(Ordering::Relaxed),
+        count(&counter),
         10,
         "{context}: the launching task's handle answered only once the whole \
          composition had run"
     );
 }
 
-#[test]
-fn module_with_async_launch_1_worker() {
-    module_with_async_launch(1);
-}
-
-#[test]
-fn module_with_async_launch_2_workers() {
-    module_with_async_launch(2);
-}
-
-#[test]
-fn module_with_async_launch_3_workers() {
-    module_with_async_launch(3);
-}
-
-#[test]
-fn module_with_async_launch_4_workers() {
-    module_with_async_launch(4);
+worker_matrix! {
+    module_with_async_launch {
+        module_with_async_launch_1_worker(1),
+        module_with_async_launch_2_workers(2),
+        module_with_async_launch_3_workers(3),
+        module_with_async_launch_4_workers(4),
+    }
 }
 
 /// Upstream's `module_with_silent_async_launch(W)`: the same launch with no
@@ -790,31 +725,20 @@ fn module_with_silent_async_launch(workers: usize) {
     executor.wait_for_all();
 
     assert_eq!(
-        counter.load(Ordering::Relaxed),
+        count(&counter),
         10,
         "{context}: `wait_for_all` waited for the launch and for the whole \
          composition under it"
     );
 }
 
-#[test]
-fn module_with_silent_async_launch_1_worker() {
-    module_with_silent_async_launch(1);
-}
-
-#[test]
-fn module_with_silent_async_launch_2_workers() {
-    module_with_silent_async_launch(2);
-}
-
-#[test]
-fn module_with_silent_async_launch_3_workers() {
-    module_with_silent_async_launch(3);
-}
-
-#[test]
-fn module_with_silent_async_launch_4_workers() {
-    module_with_silent_async_launch(4);
+worker_matrix! {
+    module_with_silent_async_launch {
+        module_with_silent_async_launch_1_worker(1),
+        module_with_silent_async_launch_2_workers(2),
+        module_with_silent_async_launch_3_workers(3),
+        module_with_silent_async_launch_4_workers(4),
+    }
 }
 
 /// Upstream's `module_with_dependent_async_launch(W)`: the launch as a
@@ -830,31 +754,20 @@ fn module_with_dependent_async_launch(workers: usize) {
     done.wait().expect("no task of the composition panicked");
 
     assert_eq!(
-        counter.load(Ordering::Relaxed),
+        count(&counter),
         10,
         "{context}: the pair's handle answered only once the whole \
          composition had run"
     );
 }
 
-#[test]
-fn module_with_dependent_async_launch_1_worker() {
-    module_with_dependent_async_launch(1);
-}
-
-#[test]
-fn module_with_dependent_async_launch_2_workers() {
-    module_with_dependent_async_launch(2);
-}
-
-#[test]
-fn module_with_dependent_async_launch_3_workers() {
-    module_with_dependent_async_launch(3);
-}
-
-#[test]
-fn module_with_dependent_async_launch_4_workers() {
-    module_with_dependent_async_launch(4);
+worker_matrix! {
+    module_with_dependent_async_launch {
+        module_with_dependent_async_launch_1_worker(1),
+        module_with_dependent_async_launch_2_workers(2),
+        module_with_dependent_async_launch_3_workers(3),
+        module_with_dependent_async_launch_4_workers(4),
+    }
 }
 
 /// Upstream's `module_with_silent_dependent_async_launch(W)`: the silent
@@ -879,29 +792,18 @@ fn module_with_silent_dependent_async_launch(workers: usize) {
         "{context}: the launching task is done once `wait_for_all` has returned"
     );
     assert_eq!(
-        counter.load(Ordering::Relaxed),
+        count(&counter),
         10,
         "{context}: `wait_for_all` waited for the launch and for the whole \
          composition under it"
     );
 }
 
-#[test]
-fn module_with_silent_dependent_async_launch_1_worker() {
-    module_with_silent_dependent_async_launch(1);
-}
-
-#[test]
-fn module_with_silent_dependent_async_launch_2_workers() {
-    module_with_silent_dependent_async_launch(2);
-}
-
-#[test]
-fn module_with_silent_dependent_async_launch_3_workers() {
-    module_with_silent_dependent_async_launch(3);
-}
-
-#[test]
-fn module_with_silent_dependent_async_launch_4_workers() {
-    module_with_silent_dependent_async_launch(4);
+worker_matrix! {
+    module_with_silent_dependent_async_launch {
+        module_with_silent_dependent_async_launch_1_worker(1),
+        module_with_silent_dependent_async_launch_2_workers(2),
+        module_with_silent_dependent_async_launch_3_workers(3),
+        module_with_silent_dependent_async_launch_4_workers(4),
+    }
 }

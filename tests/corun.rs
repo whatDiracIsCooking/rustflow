@@ -29,6 +29,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use rustflow::Executor;
 use rustflow::prelude::*;
 
+// The matrix macro and the counting body every task here attaches.
+// `common/counters.rs` is not among them: the counters below are read inside
+// a task body and from a spinning thread as well as from the assertions, so
+// they are spelled out where they are read.
+#[macro_use]
+mod common;
+#[path = "common/bodies.rs"]
+mod bodies;
+
+use bodies::bump;
+
 /// Upstream's `executor.run_n(taskflow, runs).wait()`.
 ///
 /// From a worker of `executor` that is `corun`, which is the whole point of
@@ -52,14 +63,6 @@ fn run_n(executor: &Executor, taskflow: &Taskflow, runs: usize) {
                 executor.run(taskflow).wait().expect("no task panicked");
             }
         }
-    }
-}
-
-/// A task body that bumps the counter.
-fn bump(counter: &Arc<AtomicUsize>) -> impl FnMut() + Send + 'static {
-    let counter = Arc::clone(counter);
-    move || {
-        counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -115,6 +118,10 @@ fn nested_runs(workers: usize) {
     let executor = Arc::new(Executor::new(workers));
     let counter = Arc::new(AtomicUsize::new(0));
 
+    // What this family costs is iteration rather than waiting: the 10/100/100
+    // fan-out above is upstream's own, and it is 110100 nested runs of a
+    // two-task graph -- 220200 bodies, and a topology set up, coruned and torn
+    // down for each run -- with no sleep anywhere in it.
     run_c(&executor, &counter);
 
     assert_eq!(counter.load(Ordering::Relaxed), 220_200);
@@ -126,34 +133,15 @@ fn nested_runs(workers: usize) {
     assert_eq!(executor.num_topologies(), 0);
 }
 
-#[test]
-fn nested_runs_1_thread() {
-    nested_runs(1);
-}
-
-#[test]
-fn nested_runs_2_threads() {
-    nested_runs(2);
-}
-
-#[test]
-fn nested_runs_3_threads() {
-    nested_runs(3);
-}
-
-#[test]
-fn nested_runs_4_threads() {
-    nested_runs(4);
-}
-
-#[test]
-fn nested_runs_8_threads() {
-    nested_runs(8);
-}
-
-#[test]
-fn nested_runs_16_threads() {
-    nested_runs(16);
+worker_matrix! {
+    nested_runs {
+        nested_runs_1_thread(1),
+        nested_runs_2_threads(2),
+        nested_runs_3_threads(3),
+        nested_runs_4_threads(4),
+        nested_runs_8_threads(8),
+        nested_runs_16_threads(16),
+    }
 }
 
 // --------------------------------------------------------

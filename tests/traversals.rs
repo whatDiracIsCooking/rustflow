@@ -72,6 +72,12 @@ use std::thread;
 use rustflow::Executor;
 use rustflow::prelude::*;
 
+// Only the matrix macro: every counter here is a field of the node struct the
+// cases walk rather than a share handed to a body, so there is nothing for
+// `common/counters.rs` or `common/bodies.rs` to carry.
+#[macro_use]
+mod common;
+
 /// Upstream's `struct Node`: the graph the taskflow is checked against.
 #[derive(Debug, Default)]
 struct Node {
@@ -194,24 +200,13 @@ fn static_traversal(workers: usize) {
     traverse(&Executor::new(workers));
 }
 
-#[test]
-fn static_traversal_1_worker() {
-    static_traversal(1);
-}
-
-#[test]
-fn static_traversal_2_workers() {
-    static_traversal(2);
-}
-
-#[test]
-fn static_traversal_3_workers() {
-    static_traversal(3);
-}
-
-#[test]
-fn static_traversal_4_workers() {
-    static_traversal(4);
+worker_matrix! {
+    static_traversal {
+        static_traversal_1_worker(1),
+        static_traversal_2_workers(2),
+        static_traversal_3_workers(3),
+        static_traversal_4_workers(4),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -286,24 +281,13 @@ fn dynamic_traversal(workers: usize) {
     traverse_dynamically(&Executor::new(workers));
 }
 
-#[test]
-fn dynamic_traversal_1_worker() {
-    dynamic_traversal(1);
-}
-
-#[test]
-fn dynamic_traversal_2_workers() {
-    dynamic_traversal(2);
-}
-
-#[test]
-fn dynamic_traversal_3_workers() {
-    dynamic_traversal(3);
-}
-
-#[test]
-fn dynamic_traversal_4_workers() {
-    dynamic_traversal(4);
+worker_matrix! {
+    dynamic_traversal {
+        dynamic_traversal_1_worker(1),
+        dynamic_traversal_2_workers(2),
+        dynamic_traversal_3_workers(3),
+        dynamic_traversal_4_workers(4),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -329,42 +313,15 @@ fn parallel_traversal(threads: usize) {
     });
 }
 
-#[test]
-fn parallel_traversal_1_thread() {
-    parallel_traversal(1);
-}
-
-#[test]
-fn parallel_traversal_2_threads() {
-    parallel_traversal(2);
-}
-
-#[test]
-fn parallel_traversal_3_threads() {
-    parallel_traversal(3);
-}
-
-#[test]
-fn parallel_traversal_4_threads() {
-    parallel_traversal(4);
-}
-
-#[test]
-fn parallel_traversal_5_threads() {
-    parallel_traversal(5);
-}
-
-#[test]
-fn parallel_traversal_6_threads() {
-    parallel_traversal(6);
-}
-
-#[test]
-fn parallel_traversal_7_threads() {
-    parallel_traversal(7);
-}
-
-#[test]
-fn parallel_traversal_8_threads() {
-    parallel_traversal(8);
+worker_matrix! {
+    parallel_traversal {
+        parallel_traversal_1_thread(1),
+        parallel_traversal_2_threads(2),
+        parallel_traversal_3_threads(3),
+        parallel_traversal_4_threads(4),
+        parallel_traversal_5_threads(5),
+        parallel_traversal_6_threads(6),
+        parallel_traversal_7_threads(7),
+        parallel_traversal_8_threads(8),
+    }
 }

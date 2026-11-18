@@ -38,7 +38,8 @@ use rustflow::prelude::*;
 /// How many tasks a taskflow is built with: upstream's `N`, a tenth of it.
 const N: usize = 1000;
 
-/// Upstream's `CountOnDestruction`, with the bump its task bodies do folded in:
+/// Upstream's `CountOnDestruction`, with the increment its task bodies do
+/// folded in:
 /// one of these is captured by each task body, bumps the counter once when the
 /// body runs, and bumps it again when it is dropped.
 ///
@@ -49,8 +50,10 @@ const N: usize = 1000;
 struct Counted(Arc<AtomicUsize>);
 
 impl Counted {
-    /// The task body's own increment.
-    fn bump(&self) {
+    /// The task body's own increment, which is not `common/bodies.rs`'s
+    /// `bump`: what each body here holds is the counted value itself, so that
+    /// dropping it counts a second time.
+    fn ran(&self) {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -66,7 +69,7 @@ impl Drop for Counted {
 fn make_taskflow(taskflow: &mut Taskflow, counter: &Arc<AtomicUsize>, tasks: usize) {
     for _ in 0..tasks {
         let counted = Counted(Arc::clone(counter));
-        taskflow.emplace(move || counted.bump());
+        taskflow.emplace(move || counted.ran());
     }
 }
 

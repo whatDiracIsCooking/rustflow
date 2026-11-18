@@ -76,10 +76,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rustflow::prelude::*;
 use rustflow::{Executor, RunError, RunHandle};
+
+// The counting body the cancellable graphs are built from and the spin the
+// rendezvous cases wait on. No matrix macro -- every case here loops over its
+// worker counts inside one `#[test]` -- and not `common/counters.rs`, whose
+// `count` is `Relaxed` where the two handshake counters below are read
+// `Acquire` by the thread they are a handshake with.
+#[path = "common/bodies.rs"]
+mod bodies;
+#[path = "common/spin.rs"]
+mod spin;
+
+use bodies::bump;
+use spin::spin_until;
 
 /// Upstream's task count, and the bound every cancellation case checks the
 /// counter against.
@@ -106,14 +119,11 @@ fn sleepers(counter: &Arc<AtomicUsize>) -> Taskflow {
     taskflow
 }
 
-/// A graph of `tasks` independent tasks that only bump `counter`.
-fn bumpers(counter: &Arc<AtomicUsize>, tasks: usize) -> Taskflow {
+/// A graph of `tasks` independent tasks that only count themselves.
+fn counting_graph(counter: &Arc<AtomicUsize>, tasks: usize) -> Taskflow {
     let mut taskflow = Taskflow::new();
     for _ in 0..tasks {
-        let counter = Arc::clone(counter);
-        taskflow.emplace(move || {
-            counter.fetch_add(1, Ordering::Relaxed);
-        });
+        taskflow.emplace(bump(counter));
     }
     taskflow
 }
@@ -142,7 +152,7 @@ fn count_callback(callbacks: &Arc<AtomicUsize>) -> impl FnOnce() + Send + 'stati
 fn future() {
     let executor = Executor::new(4);
     let counter = Arc::new(AtomicUsize::new(0));
-    let taskflow = bumpers(&counter, 100);
+    let taskflow = counting_graph(&counter, 100);
 
     executor.run(&taskflow).wait().expect("no task panicked");
 
@@ -158,7 +168,7 @@ fn future() {
 fn empty_future() {
     let executor = Executor::new(4);
     let counter = Arc::new(AtomicUsize::new(0));
-    let taskflow = bumpers(&counter, 100);
+    let taskflow = counting_graph(&counter, 100);
 
     let run = executor.run(&taskflow);
     let canceller = run.canceller();
@@ -624,35 +634,6 @@ fn cancel_composition() {
     }
 }
 
-/// How long a handshake waits for the other side before it gives up.
-const GIVE_UP_AFTER: Duration = Duration::from_secs(120);
-
-/// Spins until `flag` is set, failing rather than hanging if it never is.
-///
-/// The deadline-asserting spin of `executor::run_handle`'s own cases, which
-/// `tests/runtimes.rs` carries a copy of too: a defect that stopped a
-/// cancellation from reaching a nested graph should fail the case that is
-/// waiting for it rather than hang the suite.
-fn spin_until(what: &str, flag: &AtomicBool) {
-    let deadline = Instant::now() + GIVE_UP_AFTER;
-    while !flag.load(Ordering::Acquire) {
-        assert!(Instant::now() < deadline, "gave up waiting for {what}");
-        thread::yield_now();
-    }
-}
-
-/// Spins until `counter` reaches `target`, failing rather than hanging.
-///
-/// [`spin_until`] over a count rather than a flag, for the handshakes that
-/// wait on more than one body having arrived.
-fn spin_until_count(what: &str, counter: &AtomicUsize, target: usize) {
-    let deadline = Instant::now() + GIVE_UP_AFTER;
-    while counter.load(Ordering::Acquire) < target {
-        assert!(Instant::now() < deadline, "gave up waiting for {what}");
-        thread::yield_now();
-    }
-}
-
 /// Not an upstream case, and the one that gives `cancel_subflow` its teeth: a
 /// cancellation that lands while a subflow body is *between* emplacing its
 /// children and joining them skips every one of those children.
@@ -707,7 +688,9 @@ fn cancelling_a_run_skips_the_children_of_a_subflow_that_has_not_joined() {
             // and the thread it is waiting for is not one: the main thread
             // below cancels and sets the flag, so this wait cannot starve the
             // pool of anything the cancel needs.
-            spin_until("the run to be cancelled", &cancelled);
+            spin_until("the run to be cancelled", || {
+                cancelled.load(Ordering::Acquire)
+            });
 
             if body % 2 == 1 {
                 subflow.join().expect("a fresh subflow is joinable");
@@ -716,7 +699,9 @@ fn cancelling_a_run_skips_the_children_of_a_subflow_that_has_not_joined() {
     }
 
     let run = executor.run(&taskflow);
-    spin_until_count("both subflow bodies to emplace", &waiting, BODIES);
+    spin_until("both subflow bodies to emplace", || {
+        waiting.load(Ordering::Acquire) >= BODIES
+    });
     assert!(
         run.cancel(),
         "both bodies are still waiting, so the run is live"
@@ -757,7 +742,9 @@ fn cancelling_a_run_skips_the_rest_of_a_module_graph_that_is_mid_flight() {
             let cancelled = Arc::clone(&cancelled);
             target.emplace(move || {
                 waiting.store(true, Ordering::Release);
-                spin_until("the run to be cancelled", &cancelled);
+                spin_until("the run to be cancelled", || {
+                    cancelled.load(Ordering::Acquire)
+                });
             })
         };
         let second = {
@@ -781,7 +768,9 @@ fn cancelling_a_run_skips_the_rest_of_a_module_graph_that_is_mid_flight() {
     taskflow.task(module).precede([after]);
 
     let run = executor.run(&taskflow);
-    spin_until("the composed graph to start", &waiting);
+    spin_until("the composed graph to start", || {
+        waiting.load(Ordering::Acquire)
+    });
     assert!(run.cancel(), "the module's first task is still waiting");
     cancelled.store(true, Ordering::Release);
 

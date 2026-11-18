@@ -72,6 +72,13 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use rustflow::prelude::*;
 use rustflow::{AsyncTask, Executor};
 
+// Only the matrix macro. What the cases here record is a per-task *value*
+// rather than a count -- the `Results` array below -- and the three counters
+// that are counts are read with the array in the same assertion, so
+// `common/counters.rs` would carry a third of them.
+#[macro_use]
+mod common;
+
 /// Where the tasks of one case leave their results: upstream's
 /// `std::vector<int>`, shared with every body that writes it.
 type Results = Arc<Vec<AtomicI64>>;
@@ -1119,269 +1126,112 @@ fn recursive_fibonacci(workers: usize) {
     }
 }
 
-#[test]
-fn embarrassing_parallelism_1_thread() {
-    embarrassing_parallelism(1);
+worker_matrix! {
+    embarrassing_parallelism {
+        embarrassing_parallelism_1_thread(1),
+        embarrassing_parallelism_2_threads(2),
+        embarrassing_parallelism_4_threads(4),
+        embarrassing_parallelism_8_threads(8),
+        embarrassing_parallelism_16_threads(16),
+    }
 }
 
-#[test]
-fn embarrassing_parallelism_2_threads() {
-    embarrassing_parallelism(2);
+worker_matrix! {
+    linear_chain {
+        silent_dependent_async_linear_chain_1_thread(1),
+        silent_dependent_async_linear_chain_2_threads(2),
+        silent_dependent_async_linear_chain_4_threads(4),
+        silent_dependent_async_linear_chain_8_threads(8),
+        silent_dependent_async_linear_chain_16_threads(16),
+    }
 }
 
-#[test]
-fn embarrassing_parallelism_4_threads() {
-    embarrassing_parallelism(4);
+worker_matrix! {
+    simple_graph {
+        silent_dependent_async_simple_graph_1_thread(1),
+        silent_dependent_async_simple_graph_2_threads(2),
+        silent_dependent_async_simple_graph_4_threads(4),
+        silent_dependent_async_simple_graph_8_threads(8),
+        silent_dependent_async_simple_graph_16_threads(16),
+    }
 }
 
-#[test]
-fn embarrassing_parallelism_8_threads() {
-    embarrassing_parallelism(8);
+worker_matrix! {
+    simple_graph_2 {
+        simple_graph_2_1_thread(1),
+        simple_graph_2_2_threads(2),
+        simple_graph_2_4_threads(4),
+        simple_graph_2_8_threads(8),
+        simple_graph_2_16_threads(16),
+    }
 }
 
-#[test]
-fn embarrassing_parallelism_16_threads() {
-    embarrassing_parallelism(16);
+worker_matrix! {
+    complex_graph_rounds {
+        complex_graph_1_thread(1),
+        complex_graph_2_threads(2),
+        complex_graph_4_threads(4),
+        complex_graph_8_threads(8),
+        complex_graph_16_threads(16),
+    }
 }
 
-#[test]
-fn silent_dependent_async_linear_chain_1_thread() {
-    linear_chain(1);
+worker_matrix! {
+    complex_graph_from_worker {
+        complex_graph_from_worker_2_threads(2, 1),
+        complex_graph_from_worker_4_threads(4, 3),
+        complex_graph_from_worker_8_threads(8, 7),
+        complex_graph_from_worker_16_threads(16, 10),
+    }
 }
 
-#[test]
-fn silent_dependent_async_linear_chain_2_threads() {
-    linear_chain(2);
+worker_matrix! {
+    binary_tree {
+        binary_tree_1_thread(1),
+        binary_tree_2_threads(2),
+        binary_tree_3_threads(3),
+        binary_tree_4_threads(4),
+        binary_tree_8_threads(8),
+        binary_tree_16_threads(16),
+    }
 }
 
-#[test]
-fn silent_dependent_async_linear_chain_4_threads() {
-    linear_chain(4);
+worker_matrix! {
+    complete_linear_chain {
+        complete_linear_chain_1_thread(1),
+        complete_linear_chain_2_threads(2),
+        complete_linear_chain_4_threads(4),
+        complete_linear_chain_8_threads(8),
+        complete_linear_chain_16_threads(16),
+    }
 }
 
-#[test]
-fn silent_dependent_async_linear_chain_8_threads() {
-    linear_chain(8);
+worker_matrix! {
+    parallel_graph_construction {
+        parallel_graph_construction_1_thread(1),
+        parallel_graph_construction_2_threads(2),
+        parallel_graph_construction_4_threads(4),
+        parallel_graph_construction_8_threads(8),
+        parallel_graph_construction_16_threads(16),
+    }
 }
 
-#[test]
-fn silent_dependent_async_linear_chain_16_threads() {
-    linear_chain(16);
+worker_matrix! {
+    iterative_fibonacci {
+        iterative_fibonacci_1_thread(1),
+        iterative_fibonacci_2_threads(2),
+        iterative_fibonacci_4_threads(4),
+        iterative_fibonacci_8_threads(8),
+    }
 }
 
-#[test]
-fn silent_dependent_async_simple_graph_1_thread() {
-    simple_graph(1);
-}
-
-#[test]
-fn silent_dependent_async_simple_graph_2_threads() {
-    simple_graph(2);
-}
-
-#[test]
-fn silent_dependent_async_simple_graph_4_threads() {
-    simple_graph(4);
-}
-
-#[test]
-fn silent_dependent_async_simple_graph_8_threads() {
-    simple_graph(8);
-}
-
-#[test]
-fn silent_dependent_async_simple_graph_16_threads() {
-    simple_graph(16);
-}
-
-#[test]
-fn simple_graph_2_1_thread() {
-    simple_graph_2(1);
-}
-
-#[test]
-fn simple_graph_2_2_threads() {
-    simple_graph_2(2);
-}
-
-#[test]
-fn simple_graph_2_4_threads() {
-    simple_graph_2(4);
-}
-
-#[test]
-fn simple_graph_2_8_threads() {
-    simple_graph_2(8);
-}
-
-#[test]
-fn simple_graph_2_16_threads() {
-    simple_graph_2(16);
-}
-
-#[test]
-fn complex_graph_1_thread() {
-    complex_graph_rounds(1);
-}
-
-#[test]
-fn complex_graph_2_threads() {
-    complex_graph_rounds(2);
-}
-
-#[test]
-fn complex_graph_4_threads() {
-    complex_graph_rounds(4);
-}
-
-#[test]
-fn complex_graph_8_threads() {
-    complex_graph_rounds(8);
-}
-
-#[test]
-fn complex_graph_16_threads() {
-    complex_graph_rounds(16);
-}
-
-#[test]
-fn complex_graph_from_worker_2_threads() {
-    complex_graph_from_worker(2, 1);
-}
-
-#[test]
-fn complex_graph_from_worker_4_threads() {
-    complex_graph_from_worker(4, 3);
-}
-
-#[test]
-fn complex_graph_from_worker_8_threads() {
-    complex_graph_from_worker(8, 7);
-}
-
-#[test]
-fn complex_graph_from_worker_16_threads() {
-    complex_graph_from_worker(16, 10);
-}
-
-#[test]
-fn binary_tree_1_thread() {
-    binary_tree(1);
-}
-
-#[test]
-fn binary_tree_2_threads() {
-    binary_tree(2);
-}
-
-#[test]
-fn binary_tree_3_threads() {
-    binary_tree(3);
-}
-
-#[test]
-fn binary_tree_4_threads() {
-    binary_tree(4);
-}
-
-#[test]
-fn binary_tree_8_threads() {
-    binary_tree(8);
-}
-
-#[test]
-fn binary_tree_16_threads() {
-    binary_tree(16);
-}
-
-#[test]
-fn complete_linear_chain_1_thread() {
-    complete_linear_chain(1);
-}
-
-#[test]
-fn complete_linear_chain_2_threads() {
-    complete_linear_chain(2);
-}
-
-#[test]
-fn complete_linear_chain_4_threads() {
-    complete_linear_chain(4);
-}
-
-#[test]
-fn complete_linear_chain_8_threads() {
-    complete_linear_chain(8);
-}
-
-#[test]
-fn complete_linear_chain_16_threads() {
-    complete_linear_chain(16);
-}
-
-#[test]
-fn parallel_graph_construction_1_thread() {
-    parallel_graph_construction(1);
-}
-
-#[test]
-fn parallel_graph_construction_2_threads() {
-    parallel_graph_construction(2);
-}
-
-#[test]
-fn parallel_graph_construction_4_threads() {
-    parallel_graph_construction(4);
-}
-
-#[test]
-fn parallel_graph_construction_8_threads() {
-    parallel_graph_construction(8);
-}
-
-#[test]
-fn parallel_graph_construction_16_threads() {
-    parallel_graph_construction(16);
-}
-
-#[test]
-fn iterative_fibonacci_1_thread() {
-    iterative_fibonacci(1);
-}
-
-#[test]
-fn iterative_fibonacci_2_threads() {
-    iterative_fibonacci(2);
-}
-
-#[test]
-fn iterative_fibonacci_4_threads() {
-    iterative_fibonacci(4);
-}
-
-#[test]
-fn iterative_fibonacci_8_threads() {
-    iterative_fibonacci(8);
-}
-
-#[test]
-fn recursive_fibonacci_1_thread() {
-    recursive_fibonacci(1);
-}
-
-#[test]
-fn recursive_fibonacci_2_threads() {
-    recursive_fibonacci(2);
-}
-
-#[test]
-fn recursive_fibonacci_4_threads() {
-    recursive_fibonacci(4);
-}
-
-#[test]
-fn recursive_fibonacci_8_threads() {
-    recursive_fibonacci(8);
+worker_matrix! {
+    recursive_fibonacci {
+        recursive_fibonacci_1_thread(1),
+        recursive_fibonacci_2_threads(2),
+        recursive_fibonacci_4_threads(4),
+        recursive_fibonacci_8_threads(8),
+    }
 }
 
 /// Upstream's `silent_dependent_async_from_runtime(unsigned)` and
@@ -1472,42 +1322,15 @@ fn chain_from_runtime(workers: usize, handles: bool) {
     );
 }
 
-#[test]
-fn silent_dependent_async_from_runtime_1_thread() {
-    chain_from_runtime(1, false);
-}
-
-#[test]
-fn silent_dependent_async_from_runtime_2_threads() {
-    chain_from_runtime(2, false);
-}
-
-#[test]
-fn silent_dependent_async_from_runtime_3_threads() {
-    chain_from_runtime(3, false);
-}
-
-#[test]
-fn silent_dependent_async_from_runtime_4_threads() {
-    chain_from_runtime(4, false);
-}
-
-#[test]
-fn dependent_async_from_runtime_1_thread() {
-    chain_from_runtime(1, true);
-}
-
-#[test]
-fn dependent_async_from_runtime_2_threads() {
-    chain_from_runtime(2, true);
-}
-
-#[test]
-fn dependent_async_from_runtime_3_threads() {
-    chain_from_runtime(3, true);
-}
-
-#[test]
-fn dependent_async_from_runtime_4_threads() {
-    chain_from_runtime(4, true);
+worker_matrix! {
+    chain_from_runtime {
+        silent_dependent_async_from_runtime_1_thread(1, false),
+        silent_dependent_async_from_runtime_2_threads(2, false),
+        silent_dependent_async_from_runtime_3_threads(3, false),
+        silent_dependent_async_from_runtime_4_threads(4, false),
+        dependent_async_from_runtime_1_thread(1, true),
+        dependent_async_from_runtime_2_threads(2, true),
+        dependent_async_from_runtime_3_threads(3, true),
+        dependent_async_from_runtime_4_threads(4, true),
+    }
 }

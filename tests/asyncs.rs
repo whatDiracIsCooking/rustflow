@@ -59,7 +59,18 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustflow::prelude::*;
+
+// The matrix macro, and the spin the wait on the last share below is.
+// `wait_until_ran` is deliberately not that spin: its message names how many
+// of how many bodies arrived, which a `what` fixed before the wait begins
+// cannot say -- so it keeps its own loop and [`GIVE_UP_AFTER`].
+#[macro_use]
+mod common;
+#[path = "common/spin.rs"]
+mod spin;
+
 use rustflow::{AsyncHandle, Executor};
+use spin::spin_until;
 
 /// Upstream's `int N = 100000`, in both of its helpers.
 ///
@@ -254,7 +265,7 @@ impl Pools {
 
     /// Spins until `self.ran` reads `target`, failing rather than hanging if
     /// it never does: upstream's `while(counter.load() != 4000*N);`.
-    fn spin_until_ran(&self, target: usize) {
+    fn wait_until_ran(&self, target: usize) {
         let deadline = Instant::now() + GIVE_UP_AFTER;
         loop {
             let seen = self.ran.load(Ordering::Relaxed);
@@ -278,17 +289,11 @@ impl Pools {
 /// would run `Executor::drop` on a thread that destructor is about to join,
 /// and the node holding the last body is dropped by its worker just *after*
 /// the counter `wait_for_all` watches -- so this is a short wait rather than
-/// an invariant, and a deadline rather than a spin, for the reason
-/// [`GIVE_UP_AFTER`] gives.
-fn spin_until_sole_owner(pools: &Arc<Pools>) {
-    let deadline = Instant::now() + GIVE_UP_AFTER;
-    while Arc::strong_count(pools) != 1 {
-        assert!(
-            Instant::now() < deadline,
-            "gave up waiting for the last async node to be dropped"
-        );
-        thread::yield_now();
-    }
+/// an invariant, and [`spin_until`]'s deadline rather than a bare spin.
+fn wait_for_sole_owner(pools: &Arc<Pools>) {
+    spin_until("the last async node to be dropped", || {
+        Arc::strong_count(pools) == 1
+    });
 }
 
 /// Upstream's `mixed_executor_async(size_t N)`: `N` executors, each handed
@@ -349,7 +354,7 @@ fn mixed_executor_async(n: usize) {
         }
     }
 
-    pools.spin_until_ran(4 * ROUNDS * n);
+    pools.wait_until_ran(4 * ROUNDS * n);
 
     for executor in &pools.executors {
         executor.wait_for_all();
@@ -367,92 +372,39 @@ fn mixed_executor_async(n: usize) {
          submitted to, and of no other"
     );
 
-    spin_until_sole_owner(&pools);
+    wait_for_sole_owner(&pools);
 }
 
-#[test]
-fn async_1_thread() {
-    spawned_tasks(1);
+worker_matrix! {
+    spawned_tasks {
+        async_1_thread(1),
+        async_2_threads(2),
+        async_4_threads(4),
+        async_8_threads(8),
+        async_16_threads(16),
+    }
 }
 
-#[test]
-fn async_2_threads() {
-    spawned_tasks(2);
+worker_matrix! {
+    nested_spawned_tasks {
+        nested_async_1_thread(1),
+        nested_async_2_threads(2),
+        nested_async_4_threads(4),
+        nested_async_8_threads(8),
+        nested_async_16_threads(16),
+    }
 }
 
-#[test]
-fn async_4_threads() {
-    spawned_tasks(4);
-}
-
-#[test]
-fn async_8_threads() {
-    spawned_tasks(8);
-}
-
-#[test]
-fn async_16_threads() {
-    spawned_tasks(16);
-}
-
-#[test]
-fn nested_async_1_thread() {
-    nested_spawned_tasks(1);
-}
-
-#[test]
-fn nested_async_2_threads() {
-    nested_spawned_tasks(2);
-}
-
-#[test]
-fn nested_async_4_threads() {
-    nested_spawned_tasks(4);
-}
-
-#[test]
-fn nested_async_8_threads() {
-    nested_spawned_tasks(8);
-}
-
-#[test]
-fn nested_async_16_threads() {
-    nested_spawned_tasks(16);
-}
-
-#[test]
-fn mixed_async_1_executor() {
-    mixed_executor_async(1);
-}
-
-#[test]
-fn mixed_async_2_executors() {
-    mixed_executor_async(2);
-}
-
-#[test]
-fn mixed_async_4_executors() {
-    mixed_executor_async(4);
-}
-
-#[test]
-fn mixed_async_5_executors() {
-    mixed_executor_async(5);
-}
-
-#[test]
-fn mixed_async_6_executors() {
-    mixed_executor_async(6);
-}
-
-#[test]
-fn mixed_async_7_executors() {
-    mixed_executor_async(7);
-}
-
-#[test]
-fn mixed_async_8_executors() {
-    mixed_executor_async(8);
+worker_matrix! {
+    mixed_executor_async {
+        mixed_async_1_executor(1),
+        mixed_async_2_executors(2),
+        mixed_async_4_executors(4),
+        mixed_async_5_executors(5),
+        mixed_async_6_executors(6),
+        mixed_async_7_executors(7),
+        mixed_async_8_executors(8),
+    }
 }
 
 /// Upstream's `async_runtime(size_t W)`: four runtime tasks of one graph,
@@ -618,62 +570,24 @@ fn recursive_runtime_spawned_tasks(workers: usize) {
     );
 }
 
-#[test]
-fn async_runtime_1_thread() {
-    runtime_spawned_tasks(1);
+worker_matrix! {
+    runtime_spawned_tasks {
+        async_runtime_1_thread(1),
+        async_runtime_2_threads(2),
+        async_runtime_3_threads(3),
+        async_runtime_4_threads(4),
+        async_runtime_5_threads(5),
+        async_runtime_6_threads(6),
+        async_runtime_7_threads(7),
+        async_runtime_8_threads(8),
+    }
 }
 
-#[test]
-fn async_runtime_2_threads() {
-    runtime_spawned_tasks(2);
-}
-
-#[test]
-fn async_runtime_3_threads() {
-    runtime_spawned_tasks(3);
-}
-
-#[test]
-fn async_runtime_4_threads() {
-    runtime_spawned_tasks(4);
-}
-
-#[test]
-fn async_runtime_5_threads() {
-    runtime_spawned_tasks(5);
-}
-
-#[test]
-fn async_runtime_6_threads() {
-    runtime_spawned_tasks(6);
-}
-
-#[test]
-fn async_runtime_7_threads() {
-    runtime_spawned_tasks(7);
-}
-
-#[test]
-fn async_runtime_8_threads() {
-    runtime_spawned_tasks(8);
-}
-
-#[test]
-fn recursive_async_runtime_1_thread() {
-    recursive_runtime_spawned_tasks(1);
-}
-
-#[test]
-fn recursive_async_runtime_2_threads() {
-    recursive_runtime_spawned_tasks(2);
-}
-
-#[test]
-fn recursive_async_runtime_3_threads() {
-    recursive_runtime_spawned_tasks(3);
-}
-
-#[test]
-fn recursive_async_runtime_4_threads() {
-    recursive_runtime_spawned_tasks(4);
+worker_matrix! {
+    recursive_runtime_spawned_tasks {
+        recursive_async_runtime_1_thread(1),
+        recursive_async_runtime_2_threads(2),
+        recursive_async_runtime_3_threads(3),
+        recursive_async_runtime_4_threads(4),
+    }
 }
