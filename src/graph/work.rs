@@ -133,7 +133,7 @@ impl SubflowWork {
     ///
     /// Panics if the work is already running on another thread, which means
     /// the scheduler's one-worker-per-node invariant was violated.
-    pub fn invoke(&self, subflow: &mut Subflow<'_>) {
+    pub(crate) fn invoke(&self, subflow: &mut Subflow<'_>) {
         lock_callable(&self.0)(subflow);
     }
 }
@@ -175,7 +175,7 @@ impl RuntimeWork {
     ///
     /// Panics if the work is already running on another thread, which means
     /// the scheduler's one-worker-per-node invariant was violated.
-    pub fn invoke(&self, runtime: &mut Runtime<'_>) {
+    pub(crate) fn invoke(&self, runtime: &mut Runtime<'_>) {
         lock_callable(&self.0)(runtime);
     }
 }
@@ -370,7 +370,7 @@ impl AsyncWork {
     /// delivers the node's payload to them: upstream's
     /// `std::function<void(tf::Runtime&, bool)>` alternative, as two
     /// `FnOnce`s.
-    pub fn reentrant<B, C>(body: B, complete: C) -> Self
+    pub(crate) fn reentrant<B, C>(body: B, complete: C) -> Self
     where
         B: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
         C: FnOnce(Option<Box<dyn Any + Send>>) + Send + 'static,

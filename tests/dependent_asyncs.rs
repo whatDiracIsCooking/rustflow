@@ -1607,3 +1607,97 @@ fn use_count_counts_the_shares_of_one_task() {
     assert_eq!(task.use_count(), 0, "a reset handle manages nothing");
     assert!(task.empty());
 }
+
+/// `AsyncTask::hash_value` is the identity of the task a handle names, so it
+/// agrees with the handle's `Eq`: a clone of a handle hashes the same, two
+/// empty handles are one identity, and a `HashSet` of handles counts tasks
+/// rather than handles. Upstream's `async_task.hpp` documents the accessor
+/// with an example that only prints the number, and its suite has no case
+/// for it at all.
+///
+/// Read with the pool down, as [`use_count_counts_the_shares_of_one_task`]
+/// above is: while the executor still holds shares it may free a node whose
+/// address another task is then allocated at, which is a property of
+/// upstream's `std::hash<Node*>` too and not one a test may race with.
+#[test]
+fn hash_value_is_the_identity_of_the_task_a_handle_names() {
+    let empty = AsyncTask::default();
+    assert_eq!(
+        empty.hash_value(),
+        AsyncTask::default().hash_value(),
+        "two empty handles are one identity"
+    );
+
+    let (first, second) = {
+        let executor = Executor::new(2);
+        let (first, done_first) = executor.dependent_async(|| {}, []);
+        let (second, done_second) = executor.dependent_async(|| {}, []);
+        done_first.wait().expect("the body did not panic");
+        done_second.wait().expect("the body did not panic");
+        executor.wait_for_all();
+        (first, second)
+    };
+
+    // Consistent with `Eq`, which is the one promise a hash of an address can
+    // keep: equal handles hash equal, so a map keyed on handles finds a clone
+    // of a key it was given.
+    let clone = first.clone();
+    assert_eq!(first, clone, "a clone is a share of the same task");
+    assert_eq!(first.hash_value(), clone.hash_value());
+
+    // Distinct tasks: a hash of an address may in principle collide, but then
+    // the handles must still compare unequal -- `basics.rs`'s `hash` makes the
+    // same reservation for `TaskRef::hash_value`.
+    assert_ne!(first, second, "two submissions are two tasks");
+    assert!(first.hash_value() != second.hash_value() || first != second);
+
+    let mut released = first.clone();
+    assert_eq!(released.hash_value(), first.hash_value());
+    released.reset();
+    assert_eq!(
+        released.hash_value(),
+        empty.hash_value(),
+        "a reset handle is an empty one, and hashes as one"
+    );
+}
+
+/// `AsyncTask::take_panic` is where a **silent** task's own failure is
+/// parked: upstream's `exception_ptr()`. A silent task has no future to raise
+/// through -- `exceptions.rs` calls that upstream's "silently caught by the
+/// task" -- so the handle is the only way back to the payload, and it hands
+/// it over exactly once.
+///
+/// Upstream's suite reaches `exception_ptr()` from no case of its own; what
+/// is asserted here is the accessor's own documented contract, over the one
+/// shape that can fill the slot.
+#[test]
+fn take_panic_hands_a_silent_tasks_own_failure_over_once() {
+    let executor = Executor::new(2);
+
+    let clean = executor.silent_dependent_async(|| {}, []);
+    let failed = executor.silent_dependent_async(|| panic!("x"), []);
+    executor.wait_for_all();
+
+    assert!(clean.is_done() && failed.is_done());
+    assert!(
+        clean.take_panic().is_none(),
+        "a task that did not fail parked nothing"
+    );
+    assert!(
+        AsyncTask::default().take_panic().is_none(),
+        "and an empty handle names no slot at all"
+    );
+
+    let payload = failed
+        .take_panic()
+        .expect("the silent task's own failure, which nothing else collected");
+    assert_eq!(
+        payload.downcast_ref::<&str>(),
+        Some(&"x"),
+        "the payload keeps its identity"
+    );
+    assert!(
+        failed.take_panic().is_none(),
+        "taken rather than peeked: a second caller gets nothing"
+    );
+}

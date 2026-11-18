@@ -11,10 +11,10 @@
 //! [`rustflow::Executor::silent_async`]ed body is the fifth kind, `async`,
 //! run outside any graph.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rustflow::Executor;
 use rustflow::observer::chrome::ChromeObserver;
@@ -184,6 +184,134 @@ fn queue_size_agrees_with_is_queue_empty_on_one_worker() {
         .run(&taskflow)
         .wait()
         .expect("no task of the graph panicked");
+}
+
+/// Every [`TaskView`] query, read for tasks whose shape the graph pins:
+/// `join` has two predecessors, one of them the conditioner, so its strong
+/// and weak counts split one and one; `head` has two successors and no
+/// predecessor; and a view's `hash_value` is one task's identity, the same
+/// in the two hooks of one dispatch and consistent with the names apart.
+///
+/// Invented, as every case in this file is. [`Counting`] above is deliberate
+/// about saying nothing of the views it is handed; this is the case that
+/// does, which is what makes `TaskView`'s accessors reachable from outside
+/// the crate rather than only from `src/observer`'s own unit tests.
+#[test]
+fn a_task_view_answers_for_the_task_its_hook_was_handed() {
+    /// What one `on_entry` read out of its view.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Seen {
+        task_type: TaskType,
+        successors: usize,
+        predecessors: usize,
+        strong: usize,
+        weak: usize,
+        hash: u64,
+    }
+
+    #[derive(Default)]
+    struct Recording {
+        entered: Mutex<HashMap<String, Seen>>,
+        exited: Mutex<HashMap<String, u64>>,
+    }
+
+    impl Observer for Recording {
+        fn set_up(&self, _num_workers: usize) {}
+
+        fn on_entry(&self, _worker: WorkerView<'_>, task: TaskView<'_>) {
+            self.entered.lock().expect("uncontended").insert(
+                task.name().to_string(),
+                Seen {
+                    task_type: task.task_type(),
+                    successors: task.num_successors(),
+                    predecessors: task.num_predecessors(),
+                    strong: task.num_strong_dependencies(),
+                    weak: task.num_weak_dependencies(),
+                    hash: task.hash_value(),
+                },
+            );
+        }
+
+        fn on_exit(&self, _worker: WorkerView<'_>, task: TaskView<'_>) {
+            self.exited
+                .lock()
+                .expect("uncontended")
+                .insert(task.name().to_string(), task.hash_value());
+        }
+    }
+
+    let executor = Executor::new(2);
+    let observer = executor.make_observer(Recording::default());
+
+    // head -> cond -> join, with head -> join beside it: the conditioner
+    // always selects its first successor, so all three tasks run.
+    let mut taskflow = Taskflow::new();
+    let head = taskflow.emplace(|| {});
+    let cond = taskflow.emplace_condition(|| 0);
+    let join = taskflow.emplace(|| {});
+    taskflow.task(head).name("head").precede([cond, join]);
+    taskflow.task(cond).name("cond").precede([join]);
+    taskflow.task(join).name("join");
+
+    executor
+        .run(&taskflow)
+        .wait()
+        .expect("no task of the graph panicked");
+
+    let entered = observer.entered.lock().expect("uncontended").clone();
+    let head_seen = entered["head"];
+    assert_eq!(
+        (
+            head_seen.task_type,
+            head_seen.successors,
+            head_seen.predecessors,
+            head_seen.strong,
+            head_seen.weak
+        ),
+        (TaskType::Static, 2, 0, 0, 0),
+        "head precedes both of the others and follows nothing"
+    );
+    let cond_seen = entered["cond"];
+    assert_eq!(
+        (
+            cond_seen.task_type,
+            cond_seen.successors,
+            cond_seen.predecessors,
+            cond_seen.strong,
+            cond_seen.weak
+        ),
+        (TaskType::Condition, 1, 1, 1, 0),
+        "a conditioner's own predecessor is a strong one"
+    );
+    let join_seen = entered["join"];
+    assert_eq!(
+        (
+            join_seen.task_type,
+            join_seen.successors,
+            join_seen.predecessors,
+            join_seen.strong,
+            join_seen.weak
+        ),
+        (TaskType::Static, 0, 2, 1, 1),
+        "join follows head strongly and the conditioner weakly"
+    );
+
+    let exited = observer.exited.lock().expect("uncontended").clone();
+    for name in ["head", "cond", "join"] {
+        assert_eq!(
+            exited[name], entered[name].hash,
+            "{name}: the two hooks of one dispatch are handed one task"
+        );
+    }
+    let identities: HashSet<u64> = ["head", "cond", "join"]
+        .into_iter()
+        .map(|name| entered[name].hash)
+        .collect();
+    assert_eq!(
+        identities.len(),
+        3,
+        "three live nodes, three identities: a view hashes the node it borrows"
+    );
 }
 
 /// A worker's `queue_size()` never exceeds the number of tasks this run
