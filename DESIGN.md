@@ -2160,3 +2160,49 @@ entry above does.
   **not**: it declines to queue a successor nothing bypassed, so no `wake`
   ever ran. And the two async arms that refuse a handle built into a graph
   are now covered like every other kind, by the generic pair.
+- **An observer hook may panic, and the scheduler catches it** (issue #304).
+  The two answers the issue put were to catch the hook or to forbid a
+  panicking one in `Observer`'s documented obligations, and the first is
+  taken: `WorkerThread::observer_prologue` and
+  `WorkerThread::observer_epilogue` call each registered hook under a
+  `catch_unwind` and hand a payload to `Job::record_panic`, so the run
+  fails with `RunError::Panicked` carrying the hook's own payload and the
+  executor stays usable. What decided it is the cost of the violation, not
+  the elegance of the rule. The hook calls bracket the dispatch *inside*
+  the worker's scheduling loop, so a payload that escapes kills the worker
+  thread with the job in flight never finished: the run's join counter
+  stays short, `RunHandle::wait` blocks for ever, and the pool is one
+  worker down with no diagnostic beyond the default hook's print. A rule
+  the library cannot enforce, whose breach is a silent hang, loses to a
+  rule the scheduler keeps by construction -- and an `Observer` is
+  typically an adapter onto a caller's own logging or accounting, where a
+  panic is as reachable as it is in a task body the executor already
+  catches.
+
+  Three consequences are worth naming. The catch is **inside** the two
+  seam methods rather than at their call sites, which is what covers all
+  six `observer_epilogue` callers -- the generic one under
+  `WorkerThread::invoke_one`'s dispatch `match` and the five in
+  `executor::async` and `executor::dependent_async` -- and what keeps
+  #320's one `claim`/`release` pair balanced: a hook that panics now
+  cannot unwind out from between the claim and the release, so this fix
+  does not trade this hang for that one. It is one `catch_unwind` **per
+  observer** rather than one around the loop, matching what the successor
+  loop's `is_entered` branch and `Node::release_all` already do with a
+  failure mid-iteration: record it and carry on with the rest, so one
+  failing hook does not cost the observers after it their callback, with
+  the run keeping the first payload offered. And the failure does not
+  retract the dispatch the hook brackets: a panicking `on_entry` still
+  lets the body run -- this entry's cancellation check is already past --
+  and a panicking `on_exit` still leaves the node's tear-down to the
+  caller, exactly as a panicking task body still releases its successors.
+
+  Upstream is departed from knowingly here. Its `_observer_prologue` and
+  `_observer_epilogue` calls sit *outside* the
+  `TF_EXECUTOR_EXCEPTION_HANDLER` wrapping each `_invoke_*_task` body, so a
+  throwing hook unwinds into the `catch(...)` around its `_spawn` loop,
+  reaches `scheduler_epilogue` and ends that worker -- the same hang, in
+  C++. The third hook needs none of this: `Executor::make_observer` calls
+  `Observer::set_up` on the registering thread before inserting anything,
+  so its panic is raised to that caller and no observer is registered,
+  which `tests/observers.rs` pinned before this change and still does.
