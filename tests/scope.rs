@@ -13,23 +13,20 @@
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
 
+use rustflow::Executor;
 use rustflow::prelude::*;
-use rustflow::{Executor, RunError};
 
+#[path = "common/cancel.rs"]
+mod cancel;
+#[path = "common/panics.rs"]
+mod panics;
 #[path = "common/spin.rs"]
 mod spin;
 
+use cancel::spin_until_cancelled;
+use panics::assert_panicked_with;
 use spin::spin_until;
-
-/// How long the cancellation handshake below waits before it gives up.
-///
-/// `tests/runtimes.rs` keeps the identical constant for the identical
-/// handshake: a scheduling defect should fail this one case rather than hang
-/// the suite.
-const GIVE_UP_AFTER: Duration = Duration::from_secs(120);
 
 /// A value whose [`Drop`] counts itself, standing in for whatever a scoped
 /// child's closure captured: what the cancellation case below needs to see
@@ -152,16 +149,7 @@ fn a_child_panic_reaches_the_run_after_the_scope_has_joined_its_sibling() {
             .wait()
             .expect_err("the child's panic reaches the run");
 
-        match error {
-            RunError::Panicked(payload) => {
-                assert_eq!(
-                    payload.downcast_ref::<&str>(),
-                    Some(&"the child's own failure"),
-                    "the payload keeps its identity"
-                );
-            }
-            error => panic!("unexpected failure: {error:?}"),
-        }
+        assert_panicked_with(error, "the child's own failure");
         assert!(
             joined_before_panic_reraised.load(Ordering::Acquire),
             "{workers} worker(s): the sibling was neither run nor dropped \
@@ -225,16 +213,7 @@ fn a_sibling_is_dropped_not_run_when_one_worker_favours_its_panicking_twin() {
         .run(&taskflow)
         .wait()
         .expect_err("the child's panic reaches the run");
-    match error {
-        RunError::Panicked(payload) => {
-            assert_eq!(
-                payload.downcast_ref::<&str>(),
-                Some(&"the child's own failure"),
-                "the payload keeps its identity"
-            );
-        }
-        error => panic!("unexpected failure: {error:?}"),
-    }
+    assert_panicked_with(error, "the child's own failure");
 
     assert_eq!(
         ran.load(Ordering::Acquire),
@@ -281,23 +260,10 @@ fn a_cancelled_run_drops_every_unstarted_child_before_scope_returns() {
             move |runtime: &mut Runtime<'_>| {
                 reached.store(true, Ordering::Release);
 
-                // Upstream's handshake shape, as `tests/runtimes.rs`'s own
-                // cancellation case has it: the cancel has to arrive *after*
-                // the body has started and *before* `scope` is entered, so
-                // every child below is spawned under a run already
-                // cancelled.
-                let deadline = Instant::now() + GIVE_UP_AFTER;
-                while !cancelled.load(Ordering::Acquire) {
-                    assert!(
-                        Instant::now() < deadline,
-                        "gave up waiting for the cancellation to be visible"
-                    );
-                    thread::yield_now();
-                    if runtime.is_cancelled() {
-                        cancelled.store(true, Ordering::Release);
-                        break;
-                    }
-                }
+                // The cancel has to arrive *after* the body has started and
+                // *before* `scope` is entered, so every child below is
+                // spawned under a run already cancelled.
+                spin_until_cancelled(&cancelled, || runtime.is_cancelled());
 
                 runtime.scope(|s| {
                     for _ in 0..CHILDREN {

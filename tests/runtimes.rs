@@ -87,27 +87,24 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use rustflow::prelude::*;
 use rustflow::{Executor, RunError, Xorshift32};
 
-// Only the spin: there is no numbered family here to want the matrix macro,
-// and what the cases count is a per-index value in the shared buffer below
-// rather than a tally `common/counters.rs` could carry.
+// The spin and the cancellation handshake: there is no numbered family here
+// to want the matrix macro, and what the cases count is a per-index value in
+// the shared buffer below rather than a tally `common/counters.rs` could
+// carry.
+#[path = "common/cancel.rs"]
+mod cancel;
+#[path = "common/panics.rs"]
+mod panics;
 #[path = "common/spin.rs"]
 mod spin;
 
+use cancel::spin_until_cancelled;
+use panics::assert_panicked_with;
 use spin::spin_until;
-
-/// How long the one handshake written out below waits before it gives up.
-///
-/// [`spin_until`] is what every other wait in this suite is, and it is not
-/// what that one can be: its loop sets the flag it is waiting on from inside
-/// itself. The number is the same 120 seconds for the same reason -- a
-/// scheduling defect should fail one case rather than hang the suite.
-const GIVE_UP_AFTER: Duration = Duration::from_secs(120);
 
 /// Upstream's `Runtime.Schedule.ModuleTask`.
 ///
@@ -200,25 +197,7 @@ fn a_runtime_body_stops_when_its_run_is_cancelled() {
             move |runtime: &mut Runtime<'_>| {
                 reached.store(true, Ordering::Release);
 
-                // Upstream's `while(!cancelled)` with a deadline on it, for
-                // the reason `spin_until` has one: a defect that stopped the
-                // cancel from being visible here should fail this case rather
-                // than hang the suite. The body spins rather than sleeping
-                // because it is on a worker thread -- the one this executor
-                // may have -- and sleeping would be the deadlock
-                // `Executor::corun` exists to avoid.
-                let deadline = Instant::now() + GIVE_UP_AFTER;
-                while !cancelled.load(Ordering::Acquire) {
-                    assert!(
-                        Instant::now() < deadline,
-                        "gave up waiting for the cancellation to be visible"
-                    );
-                    thread::yield_now();
-                    if runtime.is_cancelled() {
-                        cancelled.store(true, Ordering::Release);
-                        break;
-                    }
-                }
+                spin_until_cancelled(&cancelled, || runtime.is_cancelled());
             }
         });
 
@@ -1052,17 +1031,8 @@ fn a_failing_child_is_reported_from_its_parents_corun() {
                 let error = runtime
                     .try_corun()
                     .expect_err("the child panicked under this node");
-                match error {
-                    RunError::Panicked(payload) => {
-                        assert_eq!(
-                            payload.downcast_ref::<&str>(),
-                            Some(&"the child's own failure"),
-                            "the payload keeps its identity"
-                        );
-                        reported.store(true, Ordering::Release);
-                    }
-                    error => panic!("unexpected failure: {error:?}"),
-                }
+                assert_panicked_with(error, "the child's own failure");
+                reported.store(true, Ordering::Release);
 
                 // Taking the payload is upstream's `_rethrow_exception`,
                 // which clears `EXCEPTION | CAUGHT` as well as the slot --

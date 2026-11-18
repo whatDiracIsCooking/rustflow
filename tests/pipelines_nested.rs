@@ -41,7 +41,7 @@
 //! [`pipeline_in_pipeline`] keeps that order.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use rustflow::Executor;
 use rustflow::pipeline::pipe::{Pipe, PipeType, Pipeflow};
@@ -50,21 +50,22 @@ use rustflow::prelude::*;
 
 #[macro_use]
 mod common;
+#[path = "common/compose.rs"]
+mod compose;
+#[path = "common/pipeline_answers.rs"]
+mod pipeline_answers;
+#[path = "common/serialized.rs"]
+mod serialized;
 
-/// Runs `body` with every other case in this suite held back:
-/// `tests/pipelines.rs`'s own `serialized` helper, duplicated here because
-/// each file under `tests/` is its own crate -- its module docs give the
-/// full reasoning.
-fn serialized<R>(body: impl FnOnce() -> R) -> R {
-    static GATE: Mutex<()> = Mutex::new(());
-    let _guard = GATE.lock().unwrap_or_else(PoisonError::into_inner);
-    body()
-}
+use compose::compose_module;
+use pipeline_answers::{assert_ifelse_answers, partial_sum, sub_pipeline_sum};
+use serialized::serialized;
 
-/// A pipeline's `lines * pipes` scratch buffer: see `tests/pipelines.rs`'s
-/// own copy for why this is a `Mutex` rather than `unsafe`. Used here for
-/// both an outer pipeline's own buffer and, inside [`run_sub_pipeline`], an
-/// inner one's -- the same shape either way.
+/// A pipeline's `lines * pipes` scratch buffer: `common/pipeline.rs`'s own
+/// copy says why this is a `Mutex` rather than `unsafe`, and why this suite
+/// keeps its own three methods of it rather than sharing that one. Used here
+/// for both an outer pipeline's own buffer and, inside [`run_sub_pipeline`],
+/// an inner one's -- the same shape either way.
 #[derive(Clone)]
 struct Buffer {
     rows: Arc<Mutex<Vec<Vec<i32>>>>,
@@ -103,27 +104,6 @@ fn next_source_value(state: &mut u64) -> i32 {
     *state ^= *state << 17;
     let value = *state % 9962;
     i32::try_from(value).expect("a value under 9962 fits in an i32")
-}
-
-/// Upstream's `ifelse_pipe_ans(a)`: the same three branches
-/// [`ifelse_pipeline`]'s own three pipes take, worked out independently on
-/// one value for that function's own check.
-fn ifelse_pipe_ans(value: i32) -> i32 {
-    let mut a = value;
-    if a / 2 != 0 {
-        a += 8;
-    }
-    if a > 4897 {
-        a -= 1834;
-    } else {
-        a += 3;
-    }
-    if (a + 9) / 4 < 50 {
-        a += 1;
-    } else {
-        a += 17;
-    }
-    a
 }
 
 /// Upstream's `ifelse_pipeline(L, w)`: a serial pipe that stops after `N`
@@ -189,16 +169,11 @@ fn ifelse_pipeline(num_lines: usize, num_workers: usize) {
             };
 
             let pipeline = Pipeline::new(num_lines, vec![pipe0, pipe1, pipe2]);
-            let module = taskflow.composed_of(&pipeline);
-            taskflow.task(module).name("module_of_pipeline");
+            compose_module(&mut taskflow, &pipeline, "module_of_pipeline");
 
             executor.run(&taskflow).wait().expect("no task panicked");
 
-            let collected = collection.lock().expect("uncontended");
-            assert_eq!(collected.len(), n);
-            for (token, &value) in collected.iter().enumerate() {
-                assert_eq!(value, ifelse_pipe_ans(source[token]));
-            }
+            assert_ifelse_answers(&collection, &source, n);
         }
     });
 }
@@ -229,16 +204,6 @@ worker_matrix! {
 // pipes each run a fresh SPS sub-pipeline to completion through
 // `Executor::corun` before producing the value the next outer pipe checks.
 // ----------------------------------------------------------------------------
-
-/// `0 + 1 + ... + (sub_n - 1)`: upstream's
-/// `std::accumulate(source[token].begin(), source[token].begin() + subN, 0)`,
-/// independent of which outer token's row of `source` is read since every
-/// row is upstream's own `std::iota(..., 0)` -- `0, 1, 2, ...` -- regardless
-/// of which row.
-fn partial_sum(sub_n: usize) -> i32 {
-    let sub_n = i32::try_from(sub_n).expect("a sub-token count fits in an i32");
-    sub_n * (sub_n - 1) / 2
-}
 
 /// Builds a fresh three-pipe (`SPS`) sub-pipeline of `sub_lines` lines over
 /// `sub_n` tokens, runs it to completion through [`Executor::corun`], and
@@ -315,19 +280,13 @@ fn run_sub_pipeline(executor: &Executor, sub_lines: usize, sub_n: usize, third_o
 
     let subpipeline = Pipeline::new(sub_lines, vec![subpipe0, subpipe1, subpipe2]);
     let mut inner = Taskflow::new();
-    let module = inner.composed_of(&subpipeline);
-    inner.task(module).name("module_of_subpipeline");
+    compose_module(&mut inner, &subpipeline, "module_of_subpipeline");
 
     executor
         .corun(&inner)
         .expect("a worker of this executor may corun the sub-pipeline");
 
-    assert_eq!(subj1.load(Ordering::Relaxed), sub_n);
-    assert_eq!(subj2.load(Ordering::Relaxed), sub_n);
-    assert_eq!(subj3.load(Ordering::Relaxed), sub_n);
-    let collected = subcollection.lock().expect("uncontended");
-    assert_eq!(collected.len(), sub_n);
-    collected.iter().sum()
+    sub_pipeline_sum([&subj1, &subj2, &subj3], &subcollection, sub_n)
 }
 
 /// Upstream's `pipeline_in_pipeline(L, w, subL)`: an outer `SPSS` pipeline
@@ -413,8 +372,7 @@ fn pipeline_in_pipeline(num_lines: usize, num_workers: usize, sub_lines: usize) 
                 };
 
                 let pipeline = Pipeline::new(num_lines, vec![pipe0, pipe1, pipe2, pipe3]);
-                let module = taskflow.composed_of(&pipeline);
-                taskflow.task(module).name("module_of_pipeline");
+                compose_module(&mut taskflow, &pipeline, "module_of_pipeline");
 
                 executor.run(&taskflow).wait().expect("no task panicked");
 

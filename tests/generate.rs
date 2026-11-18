@@ -20,22 +20,22 @@
 //!   alone rather than `int` and `long double` both: the element type does
 //!   not interact with the partitioning logic this port is checking.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-
 use rustflow::algorithm::SlicePartitioner;
 use rustflow::algorithm::partitioner::{
     DefaultClosureWrapper, DefaultPartitioner, DynamicPartitioner, GuidedPartitioner,
     RandomPartitioner, StaticPartitioner,
 };
 use rustflow::prelude::*;
-use rustflow::{Executor, Runtime};
 
 #[macro_use]
 mod common;
+#[path = "common/slice_graphs.rs"]
+mod slice_graphs;
 
-/// The length side of the sweep: see `tests/fill.rs`'s identical constant.
-const LENGTHS: [usize; 4] = [0, 1, 999, 10_000];
+use slice_graphs::{
+    assert_all, assert_filled_to, bounded_by_a_setup_task, from_a_setup_task, over_lengths,
+    over_owned_data, wrapper_runs_once_per_worker,
+};
 
 // ----------------------------------------------------------------------------
 // ParallelGenerate
@@ -48,20 +48,11 @@ fn parallel_generate<P>(workers: usize, make: impl Fn() -> P)
 where
     P: SlicePartitioner + Send + 'static,
 {
-    let executor = Executor::new(workers);
-    let mut taskflow = Taskflow::new();
-
-    for n in LENGTHS {
-        taskflow.clear();
-        let mut part = Some(make());
-        taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let part = part.take().expect("this task runs once");
-            let mut data = vec![0i64; n];
-            runtime.generate(&mut data, || 12, part);
-            assert!(data.iter().all(|&v| v == 12), "n={n}");
-        });
-        executor.run(&taskflow).wait().expect("no task panicked");
-    }
+    over_lengths(workers, make, |runtime, data, part| {
+        let n = data.len();
+        runtime.generate(data, || 12, part);
+        assert!(data.iter().all(|&v| v == 12), "n={n}");
+    });
 }
 
 fn parallel_generate_static(workers: usize) {
@@ -129,22 +120,13 @@ fn parallel_generate_n<P>(workers: usize, make: impl Fn() -> P)
 where
     P: SlicePartitioner + Send + 'static,
 {
-    let executor = Executor::new(workers);
-    let mut taskflow = Taskflow::new();
-
-    for n in LENGTHS {
+    over_lengths(workers, make, |runtime, data, part| {
+        let n = data.len();
         let count = n / 2;
-        taskflow.clear();
-        let mut part = Some(make());
-        taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let part = part.take().expect("this task runs once");
-            let mut data = vec![0i64; n];
-            runtime.generate_n(&mut data, count, || 12, part);
-            assert!(data[..count].iter().all(|&v| v == 12), "n={n}");
-            assert!(data[count..].iter().all(|&v| v == 0), "n={n}");
-        });
-        executor.run(&taskflow).wait().expect("no task panicked");
-    }
+        runtime.generate_n(data, count, || 12, part);
+        assert!(data[..count].iter().all(|&v| v == 12), "n={n}");
+        assert!(data[count..].iter().all(|&v| v == 0), "n={n}");
+    });
 }
 
 fn parallel_generate_n_static(workers: usize) {
@@ -211,125 +193,45 @@ worker_matrix! {
 /// identical shape.
 #[test]
 fn parallel_generate_stateful() {
-    let backing: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
-    let mut taskflow = Taskflow::new();
+    let backing = from_a_setup_task(4, |runtime, data| {
+        runtime.generate(
+            data,
+            || 12,
+            GuidedPartitioner::<DefaultClosureWrapper>::default(),
+        );
+    });
 
-    let setup = {
-        let backing = Arc::clone(&backing);
-        taskflow.emplace(move || {
-            *backing.lock().expect("uncontended") = vec![0; 10_000];
-        })
-    };
-
-    let runtime_task = {
-        let backing = Arc::clone(&backing);
-        taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = backing.lock().expect("uncontended");
-            runtime.generate(
-                &mut guard,
-                || 12,
-                GuidedPartitioner::<DefaultClosureWrapper>::default(),
-            );
-        })
-    };
-
-    taskflow.task(setup).precede([runtime_task]);
-
-    Executor::new(4)
-        .run(&taskflow)
-        .wait()
-        .expect("no task panicked");
-
-    assert!(
-        backing
-            .lock()
-            .expect("uncontended")
-            .iter()
-            .all(|&v| v == 12)
-    );
+    assert_all(&backing, 12);
 }
 
 /// Upstream's `ParallelGenerateStatefulMixed.4`: see `tests/fill.rs`'s
 /// identical shape.
 #[test]
 fn parallel_generate_stateful_mixed() {
-    let backing: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(vec![0; 10_000]));
-    let at = Arc::new(Mutex::new(0usize));
-    let mut taskflow = Taskflow::new();
+    let backing = bounded_by_a_setup_task(4, |runtime, data| {
+        runtime.generate(
+            data,
+            || 12,
+            GuidedPartitioner::<DefaultClosureWrapper>::default(),
+        );
+    });
 
-    let setup = {
-        let at = Arc::clone(&at);
-        taskflow.emplace(move || {
-            *at.lock().expect("uncontended") = 10_000;
-        })
-    };
-
-    let runtime_task = {
-        let backing = Arc::clone(&backing);
-        let at = Arc::clone(&at);
-        taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = backing.lock().expect("uncontended");
-            let end = *at.lock().expect("uncontended");
-            runtime.generate(
-                &mut guard[..end],
-                || 12,
-                GuidedPartitioner::<DefaultClosureWrapper>::default(),
-            );
-        })
-    };
-
-    taskflow.task(setup).precede([runtime_task]);
-
-    Executor::new(4)
-        .run(&taskflow)
-        .wait()
-        .expect("no task panicked");
-
-    assert!(
-        backing
-            .lock()
-            .expect("uncontended")
-            .iter()
-            .all(|&v| v == 12)
-    );
+    assert_all(&backing, 12);
 }
 
 /// Upstream's `ParallelGenerateNStateful.1`.
 #[test]
 fn parallel_generate_n_stateful() {
-    let backing: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
-    let mut taskflow = Taskflow::new();
+    let backing = from_a_setup_task(4, |runtime, data| {
+        runtime.generate_n(
+            data,
+            5000,
+            || 12,
+            GuidedPartitioner::<DefaultClosureWrapper>::default(),
+        );
+    });
 
-    let setup = {
-        let backing = Arc::clone(&backing);
-        taskflow.emplace(move || {
-            *backing.lock().expect("uncontended") = vec![0; 10_000];
-        })
-    };
-
-    let runtime_task = {
-        let backing = Arc::clone(&backing);
-        taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = backing.lock().expect("uncontended");
-            runtime.generate_n(
-                &mut guard,
-                5000,
-                || 12,
-                GuidedPartitioner::<DefaultClosureWrapper>::default(),
-            );
-        })
-    };
-
-    taskflow.task(setup).precede([runtime_task]);
-
-    Executor::new(4)
-        .run(&taskflow)
-        .wait()
-        .expect("no task panicked");
-
-    let guard = backing.lock().expect("uncontended");
-    assert!(guard[..5000].iter().all(|&v| v == 12));
-    assert!(guard[5000..].iter().all(|&v| v == 0));
+    assert_filled_to(&backing, 5000, 12, 0);
 }
 
 // ----------------------------------------------------------------------------
@@ -340,36 +242,30 @@ fn parallel_generate_n_stateful() {
 /// identical shape, over `generate` instead.
 #[test]
 fn flow_builder_generate_locks_and_runs_over_owned_data() {
-    let data = Arc::new(Mutex::new(vec![0i32; 500]));
-    let mut taskflow = Taskflow::new();
-    taskflow.generate(
-        Arc::clone(&data),
-        || 9,
-        GuidedPartitioner::<DefaultClosureWrapper>::default(),
-    );
+    let data = over_owned_data(|taskflow, data| {
+        taskflow.generate(
+            data,
+            || 9,
+            GuidedPartitioner::<DefaultClosureWrapper>::default(),
+        );
+    });
 
-    Executor::new(3).run(&taskflow).wait().expect("no panic");
-
-    assert!(data.lock().expect("uncontended").iter().all(|&v| v == 9));
+    assert_all(&data, 9);
 }
 
 /// `FlowBuilder::generate_n` over owned, `Arc`-shared data.
 #[test]
 fn flow_builder_generate_n_locks_and_runs_over_owned_data() {
-    let data = Arc::new(Mutex::new(vec![0i32; 500]));
-    let mut taskflow = Taskflow::new();
-    taskflow.generate_n(
-        Arc::clone(&data),
-        250,
-        || 9,
-        GuidedPartitioner::<DefaultClosureWrapper>::default(),
-    );
+    let data = over_owned_data(|taskflow, data| {
+        taskflow.generate_n(
+            data,
+            250,
+            || 9,
+            GuidedPartitioner::<DefaultClosureWrapper>::default(),
+        );
+    });
 
-    Executor::new(3).run(&taskflow).wait().expect("no panic");
-
-    let guard = data.lock().expect("uncontended");
-    assert!(guard[..250].iter().all(|&v| v == 9));
-    assert!(guard[250..].iter().all(|&v| v == 0));
+    assert_filled_to(&data, 250, 9, 0);
 }
 
 /// The closure wrapper runs once per worker task over that worker's whole
@@ -377,31 +273,8 @@ fn flow_builder_generate_n_locks_and_runs_over_owned_data() {
 /// case of its own; see `tests/fill.rs`'s identical note.
 #[test]
 fn closure_wrapper_runs_once_per_worker() {
-    for tc in 1..16usize {
-        let wrapper_called = Arc::new(AtomicUsize::new(0));
-        let mut taskflow = Taskflow::new();
-
-        let wrapper_called_body = Arc::clone(&wrapper_called);
-        taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut data = vec![0i32; 1000];
-            let wrapper_called = Arc::clone(&wrapper_called_body);
-            let wrapper = move |task: &mut dyn FnMut()| {
-                wrapper_called.fetch_add(1, Ordering::Relaxed);
-                task();
-            };
-            runtime.generate(
-                &mut data,
-                || 1,
-                StaticPartitioner::with_closure_wrapper(1, wrapper),
-            );
-            assert!(data.iter().all(|&v| v == 1));
-        });
-
-        Executor::new(tc)
-            .run(&taskflow)
-            .wait()
-            .expect("no task panicked");
-
-        assert_eq!(wrapper_called.load(Ordering::Relaxed), tc, "tc={tc}");
-    }
+    wrapper_runs_once_per_worker(|runtime, data, part| {
+        runtime.generate(data, || 1, part);
+        assert!(data.iter().all(|&v| v == 1));
+    });
 }
