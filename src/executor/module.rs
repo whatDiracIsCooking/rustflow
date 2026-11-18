@@ -3,183 +3,21 @@
 //! `taskflow/core/executor.hpp` (Taskflow v4.1.0).
 //!
 //! A module task stands for another whole graph: running the node runs that
-//! graph, and the node's successors wait for all of it. Upstream's three
-//! functions are two one-line forwarders onto one `_impl` over a `Graph&`,
-//! and the `_impl` is the whole of the semantics -- an empty target is
-//! nothing to do, and a non-empty one preempts the node and schedules the
-//! target graph under it.
+//! graph, and the node's successors wait for all of it.
 //!
-//! # Why the two handles are not one line each here
+//! # Design
 //!
-//! The handles differ only in who owns the target graph, which upstream can
-//! forget about the moment it has a `Graph&`. This port cannot: the jobs of a
-//! graph own what they name, so scheduling one needs whatever *owns* the
-//! graph rather than a reference into it -- `Shared::schedule_graph` takes a
-//! `GraphOwner`, and `Job::graph` resolves an index against it.
-//!
-//! [`Handle::Module`](crate::Handle::Module) owns a share: its target is an
-//! `Arc<Taskflow>`, whose storage is exactly what a run of that taskflow
-//! would be scheduled over, so [`invoke`] is upstream's forwarder with
-//! `Taskflow::flow` where upstream writes `.graph`.
-//! [`Handle::AdoptedModule`](crate::Handle::AdoptedModule) owns the graph
-//! itself: it sits inline in the handle, inside the arena of the graph the
-//! module node is in, so the only thing that names it is the *outer* owner
-//! plus that node's own index as a path to follow. `Job::graph_inside` is
-//! that path, which is issue #74 -- the widening of a job's graph owner to
-//! all four kinds of nested graph at once, rather than the module, subflow
-//! and runtime arms each reshaping the field in turn -- and [`invoke_adopted`]
-//! is a one-line forwarder over it, as upstream's is over its `Graph&`.
-//!
-//! What the path has to be right about is which arena an index means. A job
-//! of an adopted graph built over the *outer* owner would resolve its tasks
-//! against the composing taskflow's own nodes -- silently, against whatever
-//! sits at those indices -- which is why #49 refused the run rather than
-//! running one that way, and it is what
-//! `an_adopted_module_resolves_its_tasks_in_its_own_graph` below pins.
-//!
-//! # What running the target costs the node
-//!
-//! Upstream's protocol, which #47 ported and which this module is the first
-//! caller of. A module node is entered twice:
-//!
-//! - the **first** entry sets `NSTATE::PREEMPTED` on the node and schedules
-//!   the target graph under it. The node has not finished -- its join counter
-//!   is not re-armed and its successors are not released -- so the arm
-//!   answers `None` and `WorkerThread::invoke` returns without either;
-//! - the target graph's jobs count down the module node rather than the run,
-//!   and the last of them to finish finds the bit set and re-queues the job
-//!   the node was dequeued as;
-//! - the **second** entry clears the bit and answers [`Release::Strong`], so
-//!   the node finishes exactly as a static task does, with every successor
-//!   released once the whole target graph is done.
-//!
-//! The bit is set before the graph is scheduled because a child may finish
-//! before this call returns, and the child's read of it is ordered by the
-//! queue it came out of rather than by the bit's own ordering -- which is why
-//! both can be `Relaxed`, as upstream's plain `|=` is.
-//!
-//! # The empty target, widened by one case
-//!
-//! Upstream returns early on `graph.empty()`. This port asks
-//! `GraphOwner::has_source_task` instead -- `Flow::has_source_task` over
-//! whichever kind of owner the target is -- which is the same question
-//! widened to the graph that has nothing to *start* at: an empty one, or one
-//! whose every node is in a cycle. The widening is not cosmetic here. Scheduling a
-//! sourceless graph queues no job at all, so nothing would ever drive the
-//! module node's join counter off zero, and a node left `PREEMPTED` with no
-//! child to resume it hangs the run. [`Executor::run`](crate::Executor::run)
-//! and `corun_graph` ask the same question for the same reason.
-//!
-//! # A failure inside a module, and cancelling the run
-//!
-//! Neither needs a line of code here, and both are worth saying out loud
-//! because that is a claim about #47's and #48's machinery rather than an
-//! absence.
-//!
-//! A task of the target graph that panics reports through
-//! [`Job::record_panic`], whose walk goes up the parent chain from the
-//! failing node. A module node is no anchor -- it preempted itself, it did
-//! not undertake to look at a payload slot -- so the walk marks it on the way
-//! past and carries the payload to the first ancestor that is anchored, which
-//! for a composed taskflow is the run. So the failure comes out of the
-//! composing run's `wait`, as upstream's comes out of its `get()`, and the
-//! marks the walk left behind are what skip the rest of each graph the
-//! failure was inside of. That is upstream's `Exception.ModuleTask`, and it
-//! is ported in `tests/exceptions.rs`.
-//!
-//! Cancelling the run skips the module's remaining tasks through the same
-//! early-out as any other task's: every job of the target graph holds a share
-//! of the *run*'s topology, so `Job::is_parent_cancelled` answers yes for all
-//! of them on the first term alone, without the chain walk being needed. A
-//! cancelled module is still entered twice, because the early-out tears the
-//! job down rather than dropping it: the children that were already queued
-//! are skipped one by one, the last of them resumes the node, and the second
-//! entry releases successors that are themselves skipped. Nothing is left
-//! outstanding, which is what upstream's `CancelComposition` -- a hundred
-//! cancelled runs of a four-level composition, asserting only that they all
-//! finish -- is really checking.
-//!
-//! # One target, one run at a time
-//!
-//! The obligation upstream states for `composed_of` ("thread-safe as long as
-//! the target is not concurrently ran by two or more threads") survives
-//! translation unchanged, because what makes it an obligation is the graph's
-//! per-node state rather than anything about C++: a join counter and a state
-//! word belong to one run at a time, and two runs walking one graph would
-//! spend each other's counters.
-//!
-//! Sharing the target as an `Arc<Taskflow>` buys the caller the *lifetime*
-//! half of upstream's rule and not this half. What it does change is the
-//! failure: two workers reaching one node find the `try_lock` in
-//! [`Work::invoke`](crate::Work::invoke) already taken and panic with "work
-//! is already running: one worker per node was violated", which is reported
-//! as the run's failure like any other panic. A silent race on a counter
-//! would be the alternative, and it is the worse one.
-//!
-//! Two shapes that look like the forbidden one are not, which is why
-//! upstream's own tests queue a hundred runs of a composition without a wait
-//! between them:
-//!
-//! - **runs of one taskflow serialise.** Every run of a taskflow is queued on
-//!   that taskflow's own storage (#15) and started by the tear-down of the
-//!   one before it, so a hundred `run`s of a composing taskflow are a hundred
-//!   runs in a row -- and therefore a hundred runs in a row of each target
-//!   below it;
-//! - **two module tasks, one target, ordered.** A target composed twice into
-//!   one taskflow is one graph run twice in that taskflow's run, which is
-//!   fine as long as the two module nodes cannot overlap. Upstream's
-//!   `Module1`, `Module2` and `Module3` all order theirs with an edge, and
-//!   `tests/modules.rs` says so where it ports them.
-//!
-//! What is left is the real error, and it is the caller's: composing one
-//! target into two module tasks that can overlap, or running a taskflow
-//! directly while a composition of it is in flight. Neither is something this
-//! port can refuse without a lock on every run of every graph, and the most
-//! it can do with an obligation no type here expresses is to make breaking it
-//! report itself -- which the `try_lock` above does.
-//!
-//! # A target this run is already inside of
-//!
-//! One shape of that error is one this run **can** see coming, so it is
-//! refused here rather than left to the caller: a target that is a graph the
-//! module node is already inside of. A taskflow cannot be composed of itself
-//! when it is built -- `composed_of` takes an `Arc<Taskflow>` and the
-//! taskflow it builds into needs `&mut` -- but a subflow body can do it while
-//! the taskflow runs, since #50 made [`Subflow`](crate::Subflow) a
-//! [`FlowBuilder`](crate::FlowBuilder) and the taskflow a body belongs to can
-//! be alive behind an `Arc` the caller holds. Issue #82 is what that did, and
-//! the mechanism is worth writing down because none of it is about locking:
-//!
-//! - the body composes its own taskflow, so the module node in its subgraph
-//!   is handed the graph the run is *in*;
-//! - scheduling that graph calls `set_up_graph` on it, which re-arms every
-//!   node -- `nstate` to the node's dependency count, join counter with it --
-//!   and the subflow node the module node hangs under is one of those nodes.
-//!   It is carrying `PREEMPTED` and a join counter of one, and both are gone;
-//! - the subgraph then finishes, and `Shared::finish_job` reads a parent that
-//!   is no longer preempted. Nothing re-queues the subflow node, the run's
-//!   own counter never reaches zero, and `wait` never returns -- with every
-//!   worker parked, because the run is not slow, it is over and unreported.
-//!
-//! So the first entry asks [`Job::runs_inside`] whether the target is a graph
-//! this job is already inside of -- its own, or that of any node on its
-//! parent chain -- and refuses it through `Job::record_panic` if it is, which
-//! is the path a panicking task body takes: the payload becomes the run's,
-//! the rest of the run is cancelled, and `wait` answers `Err` instead of
-//! never returning. Two taskflows composing each other are the same cycle one
-//! link longer, and the walk finds them for the same reason.
-//!
-//! The walk costs one pointer comparison per level of nesting on a module
-//! node's first entry, and a module task of a top-level graph pays exactly
-//! one: its parent chain ends at the run. What it cannot see is a graph that
-//! encloses a [`corun`](crate::Executor::corun), whose anchor ends a chain
-//! without naming the job that started it -- and that route needs no second
-//! answer, because a corun of the taskflow whose task is coruning re-enters a
-//! node whose body is still running and is reported by
-//! [`Work::invoke`](crate::Work::invoke)'s `try_lock`, the failure #49
-//! established. A preempted node's body is *not* running, which is the whole
-//! of why the self-composing case slipped past that `try_lock` and needed a
-//! refusal of its own.
+//! Two handles, two ways to reach the target graph -- a share of a
+//! [`Taskflow`] for [`Handle::Module`](crate::Handle::Module), the path
+//! `Job::graph_inside` builds for
+//! [`Handle::AdoptedModule`](crate::Handle::AdoptedModule) -- and one refusal,
+//! [`CYCLE`], for a target this job is already inside of. `DESIGN.md` has both
+//! decisions, the second of them with upstream's `composed_of` obligation that
+//! a target is not run by two threads at once. The rest is the executor's own
+//! machinery, in the [`executor`](crate::executor) module docs: the preemption
+//! protocol the two entries below are, the sourceless graph upstream's
+//! `graph.empty()` early return widens to, and the anchor a failing task of
+//! the target reports to.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -189,52 +27,31 @@ use crate::executor::worker::{Release, WorkerThread};
 use crate::graph::{Graph, Node};
 use crate::taskflow::Taskflow;
 
-/// What a module task composed of a graph its own run is inside of reports,
-/// instead of hanging that run: see the module docs.
-///
-/// A `&'static str` payload, which is what `panic!` with a literal message
-/// produces and what [`RunError`](crate::RunError) renders first.
+/// What a module task composed of a graph its own run is inside of reports
+/// instead of hanging it: a `&'static str`, as `panic!` with a literal
+/// produces and [`RunError`](crate::RunError) renders first.
 const CYCLE: &str = "a module task may not run a graph it is already \
      inside of: a taskflow composed of itself, directly or through a cycle \
      of compositions, has no execution order";
 
 /// Runs the module task `job` is for, against the taskflow it is composed of:
-/// upstream's `_invoke_module_task`.
-///
-/// `None` means the node has been preempted -- its target graph is running,
-/// and the last job of that graph will resume it -- and is what keeps
-/// `WorkerThread::invoke` from releasing successors that have a whole graph
-/// still to wait for.
-///
-/// Upstream reaches the target as `std::get_if<Node::Module>(&_handle)->graph`
-/// and this reaches it as [`Taskflow::flow`], which is the same graph plus the
-/// share that owns it; the module docs say why the share is what the
-/// scheduling path needs.
+/// upstream's `_invoke_module_task`, reaching as [`Taskflow::flow`] what
+/// upstream reaches as `std::get_if<Node::Module>(&_handle)->graph`. `None`
+/// means the node has been preempted -- its target graph is running and the
+/// last job of that graph resumes it -- which keeps `WorkerThread::invoke`
+/// from releasing successors with a whole graph still to wait for.
 pub(crate) fn invoke(worker: &WorkerThread, job: &Job, target: &Arc<Taskflow>) -> Option<Release> {
     invoke_impl(worker, job, &GraphOwner::flow(target.flow()))
 }
 
-/// Runs the adopted module task `job` is for, against the graph its own
-/// handle owns: upstream's `_invoke_adopted_module_task`.
-///
-/// Upstream reaches the target as
-/// `std::get_if<Node::AdoptedModule>(&_handle)->graph` and this reaches it as
-/// the path `Job::graph_inside` builds -- this job's own owner plus this
-/// job's task index -- because a graph the handle owns inline is owned by
-/// nothing else. The module docs say why that is the whole difference between
-/// this forwarder and [`invoke`], and the refusal it replaces (#47's stub,
-/// kept by #49) is gone.
-///
-/// `target` is the graph the dispatch arm already had in hand, and it is
-/// taken as an argument for the assertion below rather than for the run: the
-/// path has to resolve to exactly that graph, and a port of a pointer walk
-/// should say so somewhere other than in prose. The check is a
-/// `debug_assert`, so the release build pays the one `Arc` the path costs and
-/// nothing else.
+/// Runs the adopted module task `job` is for, against the graph its own handle
+/// owns: upstream's `_invoke_adopted_module_task`, reaching as the path
+/// `Job::graph_inside` builds what upstream reaches as
+/// `std::get_if<Node::AdoptedModule>(&_handle)->graph`. `target` is taken for
+/// the assertion rather than for the run: the path has to resolve to exactly
+/// the graph the dispatch arm already had in hand.
 pub(crate) fn invoke_adopted(worker: &WorkerThread, job: &Job, target: &Graph) -> Option<Release> {
-    // `None`: an adopted graph is read where it lies, which is the half of
-    // #74's widening that needs no lease -- see `executor::topology` for the
-    // half that does.
+    // `None`: an adopted graph is read where it lies, needing no lease.
     let owner = job.graph_inside(None);
     debug_assert!(
         std::ptr::eq(owner.graph(), target),
@@ -245,14 +62,11 @@ pub(crate) fn invoke_adopted(worker: &WorkerThread, job: &Job, target: &Graph) -
 }
 
 /// Upstream's `_invoke_module_task_impl`, over whatever owns the target graph
-/// rather than over a `Graph&`.
-///
-/// The three answers are upstream's three, in its order: nothing to do, the
-/// first entry, the second entry.
+/// rather than over a `Graph&`. The three answers are upstream's three, in its
+/// order: nothing to do, the first entry, the second entry.
 fn invoke_impl(worker: &WorkerThread, job: &Job, target: &GraphOwner) -> Option<Release> {
-    // Upstream's `if(graph.empty()) return false`, widened to the graph with
-    // nothing to start at -- see the module docs, which say why scheduling
-    // one instead would hang the run rather than merely waste a walk.
+    // Upstream's `if(graph.empty()) return false`, widened: a sourceless graph
+    // would queue no job, so nothing would drive this node's counter off zero.
     if !target.has_source_task() {
         return Some(Release::Strong);
     }
@@ -260,31 +74,22 @@ fn invoke_impl(worker: &WorkerThread, job: &Job, target: &GraphOwner) -> Option<
     let node = job.node();
 
     // Upstream's `if((node->_nstate & NSTATE::PREEMPTED) == 0)`: the first
-    // entry, which starts the target graph and leaves the node owing its
-    // successors until that graph is done.
+    // entry, which leaves the node owing its successors. The refusal is ours.
     if node.nstate().load(Ordering::Relaxed) & Node::PREEMPTED == 0 {
-        // This port's own refusal, which upstream has no equivalent of:
-        // arming a graph that is already in flight above this node would
-        // clear the state the nodes of it are keeping, and the module docs
-        // have what that costs. Reported rather than run, through the path a
-        // panicking body takes, so that the node finishes here and the run's
-        // `wait` answers rather than never returning.
         if job.runs_inside(target.graph()) {
             job.record_panic(Box::new(CYCLE));
             return Some(Release::Strong);
         }
 
-        // Before the graph is scheduled, because a child may finish before
-        // this call returns and the bit is what tells the last one to re-queue
-        // this node.
+        // Set before the graph is scheduled: a child may finish before this
+        // call returns, and the bit is what tells the last one to re-queue
+        // this node. Relaxed, as upstream's plain `|=` is -- a child's read of
+        // it is ordered by the queue the child came out of.
         node.nstate().fetch_or(Node::PREEMPTED, Ordering::Relaxed);
 
-        // Upstream's `_schedule_graph(w, graph, node->_topology, node)`, whose
-        // `node` argument is a `Nested` here: the target graph's jobs count
-        // that node's join counter down, and what the last of them re-queues
-        // is the *job* the node was dequeued as rather than the node itself.
-        // That is #47's "the parent travels with the job", and it is why the
-        // run has to be passed as a share -- a nested job owns one of its own.
+        // Upstream's `_schedule_graph(w, graph, node->_topology, node)`,
+        // whose `node` is a `Nested` here: what the last job of the target
+        // graph re-queues is the *job* this node was dequeued as.
         let parent = Nested::new(Some(job.clone()));
         worker.shared.schedule_graph(
             Some(worker),
@@ -295,8 +100,7 @@ fn invoke_impl(worker: &WorkerThread, job: &Job, target: &GraphOwner) -> Option<
         return None;
     }
 
-    // Upstream's `node->_nstate &= ~NSTATE::PREEMPTED`: the second entry, with
-    // the target graph finished and this node free to finish too.
+    // Upstream's `node->_nstate &= ~NSTATE::PREEMPTED`: the second entry.
     node.nstate().fetch_and(!Node::PREEMPTED, Ordering::Relaxed);
     Some(Release::Strong)
 }

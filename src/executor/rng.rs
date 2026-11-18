@@ -1,43 +1,30 @@
 //! Translated from `Xorshift` in `taskflow/utility/math.hpp` (Taskflow v4.1.0).
 //!
-//! The one random number the scheduler needs: which queue to try stealing from
-//! next. A worker draws one per failed steal, so the generator sits on the
-//! hottest path in the executor and upstream answers that with a dozen lines of
-//! xorshift over a single machine word -- no distributions, no seeding
-//! ceremony, one register of state per worker.
+//! The one random number the scheduler needs: which queue a worker tries to
+//! steal from next, drawn once per failed steal.
 //!
-//! That is also why there is no `rand` here. The README's dependency policy
-//! admits a runtime crate only when it replaces something upstream hand-wrote
-//! *and* is better tested than our own port of it would be; a twelve-line
-//! integer recurrence with a known-answer test is neither.
+//! # Design
 //!
-//! Neither generator is cryptographic and neither is meant to be. Victim
-//! selection wants decorrelated low bits and nothing else: an adversary who
-//! predicts the next victim gains the ability to make a worker steal from an
-//! empty queue, which is what already happens most of the time anyway.
+//! No `rand`: a runtime crate has to be better tested than our own port of it
+//! would be (the README's dependency policy), which a twelve-line recurrence
+//! with a known-answer test is not. Nothing here is cryptographic either --
+//! victim selection wants decorrelated low bits and nothing more, and
+//! predicting the next victim buys a steal from an empty queue.
 
-/// What a zero seed becomes.
-///
-/// Upstream requires a non-zero seed and documents that a zero one "results in
-/// a degenerated generator that always returns zero" -- a worker whose victim
-/// is always queue 0. We fold instead of trusting the caller, because the
-/// executor seeds from a thread-id hash it does not choose. The constant is the
-/// 32-bit golden-ratio word, picked only for having bits in both halves.
+/// What a zero seed becomes: the 32-bit golden-ratio word. Zero is a fixed
+/// point of every xorshift -- upstream calls such a seed "a degenerated
+/// generator" -- and the executor seeds from a thread-id hash, not a choice.
 const ZERO_SEED_32: u32 = 0x9E37_79B9;
 
-/// What a zero seed becomes, for [`Xorshift64`]. The 64-bit golden-ratio word,
-/// for the same reason as [`ZERO_SEED_32`].
+/// `ZERO_SEED_32` for [`Xorshift64`]: the 64-bit golden-ratio word.
 const ZERO_SEED_64: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Marsaglia's 32-bit xorshift, over one word of state.
-///
 /// ```
 /// use rustflow::Xorshift32;
-///
 /// let mut rng = Xorshift32::new(12345);
 /// let first = rng.next_u32();
 /// assert_ne!(first, rng.next_u32());
-///
 /// // Same seed, same sequence: a scheduling bug stays reproducible.
 /// assert_eq!(Xorshift32::new(12345).next_u32(), first);
 /// ```
@@ -47,9 +34,7 @@ pub struct Xorshift32 {
 }
 
 impl Xorshift32 {
-    /// Creates a generator from `seed`, folding a zero seed to a fixed
-    /// non-zero word -- zero is a fixed point of every xorshift, so a zero
-    /// seed would give a generator that returns nothing but zero.
+    /// Creates a generator from `seed`, folding zero to `ZERO_SEED_32`.
     #[must_use]
     pub const fn new(seed: u32) -> Self {
         Self {
@@ -57,15 +42,10 @@ impl Xorshift32 {
         }
     }
 
-    /// Draws the next value.
-    ///
-    /// The shift triple `13, 17, 5` is upstream's, which is Marsaglia's: it is
-    /// one of the triples that gives the recurrence its full period of
-    /// `2^32 - 1`, so this is not a place to substitute nicer-looking numbers.
-    ///
-    /// Named `next_u32` rather than `next` so that the type is not mistaken for
-    /// an infinite [`Iterator`], which is the one thing it would be easy to
-    /// mistake it for.
+    /// Draws the next value. The shift triple `13, 17, 5` is Marsaglia's, one
+    /// of those giving this width its full period of `2^32 - 1`, so it is no
+    /// place for nicer numbers; the name keeps it from reading as an
+    /// [`Iterator`].
     pub fn next_u32(&mut self) -> u32 {
         self.state ^= self.state << 13;
         self.state ^= self.state >> 17;
@@ -75,10 +55,8 @@ impl Xorshift32 {
 }
 
 /// Marsaglia's 64-bit xorshift with upstream's multiplicative output stage.
-///
 /// ```
 /// use rustflow::Xorshift64;
-///
 /// let mut rng = Xorshift64::new(12345);
 /// assert_ne!(rng.next_u64(), rng.next_u64());
 /// ```
@@ -87,16 +65,12 @@ pub struct Xorshift64 {
     state: u64,
 }
 
-/// Upstream's output multiplier, applied to the 64-bit state.
-///
-/// A bare xorshift is linear over GF(2) and its low bits are visibly weak; one
-/// odd multiply mixes the high bits down, which is why upstream's own comment
-/// calls it "a multiplicative output transformation to improve distribution".
+/// Upstream's output multiplier: one odd multiply mixes a bare xorshift's high
+/// bits down over its visibly weak low ones.
 const OUTPUT_MULTIPLIER: u64 = 0x2545_F491_4F6C_DD1D;
 
 impl Xorshift64 {
-    /// Creates a generator from `seed`, folding a zero seed to a fixed
-    /// non-zero word, for the reason [`Xorshift32::new`] gives.
+    /// Creates a generator from `seed`, folding zero to `ZERO_SEED_64`.
     #[must_use]
     pub const fn new(seed: u64) -> Self {
         Self {
@@ -104,16 +78,13 @@ impl Xorshift64 {
         }
     }
 
-    /// Draws the next value.
-    ///
-    /// The shift triple is `13, 7, 17` here, not the 32-bit one: each width has
-    /// its own full-period triples.
+    /// Draws the next value. The shift triple is `13, 7, 17` here, not the
+    /// 32-bit one: each width has its own full-period triples.
     pub fn next_u64(&mut self) -> u64 {
         self.state ^= self.state << 13;
         self.state ^= self.state >> 7;
         self.state ^= self.state << 17;
-        // Wrapping, because the multiply is a mixing step and not arithmetic:
-        // upstream's unsigned product discards the high word the same way.
+        // Wrapping: a mixing step, not arithmetic, as upstream's product is.
         self.state.wrapping_mul(OUTPUT_MULTIPLIER)
     }
 }

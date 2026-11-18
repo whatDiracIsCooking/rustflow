@@ -32,7 +32,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 # retrofitted over a thousand call sites later.
 cast_possible_truncation = "warn"
 cast_sign_loss = "warn"
-undocumented_unsafe_blocks = "warn"
+# `deny` rather than `warn`: the crate's `unsafe` is one waiter slot in the
+# notifier, every site of it carries the invariant it rests on, and a new site
+# arriving without one is a design to reconsider rather than a warning to read.
+undocumented_unsafe_blocks = "deny"
 
 # loom is the one dependency the notifier's `cfg(loom)` build pulls in, and the
 # target expression is how it stays out of every other build: `cfg(loom)` is set

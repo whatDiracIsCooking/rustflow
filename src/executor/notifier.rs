@@ -106,24 +106,30 @@ mod sync {
             /// # Safety
             ///
             /// No other access to the cell may overlap this one mutably.
+            // SAFETY: nothing here discharges that; the obligation is passed
+            // to the caller, and the only caller in this module is
+            // `ThreadSlot`, which restates it as its own invariant over the
+            // waiter stack.
             pub(in crate::executor::notifier) unsafe fn with<R>(
                 &self,
                 f: impl FnOnce(&T) -> R,
             ) -> R {
-                // SAFETY: the caller guarantees no overlapping mutable access,
-                // so this shared reference is the only live one.
+                // SAFETY: no access overlaps this one mutably, so this shared
+                // reference is the only live one.
                 f(unsafe { &*self.0.get() })
             }
 
             /// # Safety
             ///
             /// No other access to the cell may overlap this one at all.
+            // SAFETY: as for `with`, the obligation is the caller's, and
+            // `ThreadSlot::publish` is the one place it is discharged.
             pub(in crate::executor::notifier) unsafe fn with_mut<R>(
                 &self,
                 f: impl FnOnce(&mut T) -> R,
             ) -> R {
-                // SAFETY: the caller guarantees no overlapping access, so this
-                // exclusive reference is the only live one.
+                // SAFETY: no access overlaps this one, so this exclusive
+                // reference is the only live one.
                 f(unsafe { &mut *self.0.get() })
             }
         }
@@ -141,14 +147,16 @@ mod sync {
             /// # Safety
             ///
             /// No other access to the cell may overlap this one mutably.
+            // SAFETY: the obligation is the caller's, as in the `std` shim
+            // above; what this build adds is that loom checks the claim for
+            // every interleaving it explores.
             pub(in crate::executor::notifier) unsafe fn with<R>(
                 &self,
                 f: impl FnOnce(&T) -> R,
             ) -> R {
                 self.0.with(|data| {
-                    // SAFETY: the caller guarantees no overlapping mutable
-                    // access; loom checks that claim for every interleaving it
-                    // explores.
+                    // SAFETY: no access overlaps this one mutably, which is
+                    // the claim loom's own cell is checking.
                     f(unsafe { &*data })
                 })
             }
@@ -156,14 +164,15 @@ mod sync {
             /// # Safety
             ///
             /// No other access to the cell may overlap this one at all.
+            // SAFETY: the obligation is the caller's, as in the `std` shim
+            // above, and loom checks it for every interleaving.
             pub(in crate::executor::notifier) unsafe fn with_mut<R>(
                 &self,
                 f: impl FnOnce(&mut T) -> R,
             ) -> R {
                 self.0.with_mut(|data| {
-                    // SAFETY: the caller guarantees no overlapping access;
-                    // loom checks that claim for every interleaving it
-                    // explores.
+                    // SAFETY: no access overlaps this one, which is the claim
+                    // loom's own cell is checking.
                     f(unsafe { &mut *data })
                 })
             }
@@ -307,9 +316,9 @@ struct NonblockingWaiter {
 
 /// A slot's [`Thread`] handle, readable without a lock.
 ///
-/// This is the whole of this module's `unsafe`, and the only reason it is sound
-/// is an invariant of upstream's waiter stack, restated here because the
-/// `unsafe` blocks below cite it:
+/// This is what the crate's `unsafe` is for, and the only reason it is sound is
+/// an invariant of upstream's waiter stack, restated here because every
+/// `// SAFETY:` below cites it:
 ///
 /// > A slot is reachable only through the stack top in the state word. Its owner
 /// > pushes it there and no one else does; a notifier removes it with a
@@ -322,10 +331,12 @@ struct NonblockingWaiter {
 /// `tests/loom_notifier.rs` is what checks the claim.
 struct ThreadSlot(sync::UnsafeCell<Option<Thread>>);
 
-// SAFETY: the type's own invariant, above: the cell is written only by the
-// slot's owner before the slot becomes reachable, and read only by the notifier
-// that has made it unreachable again, so no two accesses to it overlap even
-// though slots are shared between threads.
+// SAFETY: the type's own invariant, above, makes every access to the cell
+// exclusive -- the owner writes it only while the slot is unreachable through
+// the state word, and the one reader is the notifier that has made it
+// unreachable again -- so no two accesses overlap even though every slot is
+// shared between threads. A `Thread` handle is itself `Send`, which is what
+// allows the one written by the owner to be read on the notifier's thread.
 unsafe impl Sync for ThreadSlot {}
 
 impl ThreadSlot {
@@ -341,9 +352,13 @@ impl ThreadSlot {
     /// The caller must own the slot and the slot must be unreachable: either it
     /// has not been pushed onto the waiter stack yet, or it has been popped and
     /// signalled.
+    // SAFETY: discharged by `NonblockingNotifier::commit_wait`, which is the
+    // only caller: it publishes before the compare-exchange that pushes the
+    // slot, and a notifier that popped this slot on an earlier wait had read
+    // the handle and stored `SIGNALED` before this thread could leave `park`.
     unsafe fn publish(&self) {
-        // SAFETY: the caller guarantees the slot is unreachable, so no notifier
-        // can be reading the handle while this writes it.
+        // SAFETY: the slot is unreachable through the state word, so no
+        // notifier can hold it and this thread is the cell's only accessor.
         unsafe { self.0.with_mut(|handle| *handle = Some(thread::current())) }
     }
 
@@ -355,9 +370,14 @@ impl ThreadSlot {
     /// yet have stored `SIGNALED` into the slot's state: before that store, the
     /// owner cannot have returned from `commit_wait` and so cannot be
     /// overwriting the handle.
+    // SAFETY: discharged by `NonblockingNotifier::unpark_chain`, which is the
+    // only caller: every slot it walks was taken out of the state word by its
+    // caller's compare-exchange, so no second notifier can hold it, and the
+    // read precedes the `SIGNALED` swap that releases the owner.
     unsafe fn parked(&self) -> Option<Thread> {
-        // SAFETY: the caller guarantees the slot is popped and unsignalled, so
-        // the owner is inside its park loop and the handle is quiescent.
+        // SAFETY: the slot is popped and unsignalled, so its owner cannot have
+        // returned from `commit_wait` -- which requires seeing `SIGNALED` --
+        // and therefore cannot be writing the handle.
         unsafe { self.0.with(Clone::clone) }
     }
 }
@@ -520,9 +540,11 @@ impl NonblockingNotifier {
             // The link has to be read before the signal: once the owner sees
             // `SIGNALED` it may start another wait and overwrite it.
             let next = waiter.next.load(Ordering::Relaxed);
-            // SAFETY: `waiter` is one of the slots the caller popped, so no
-            // other notifier holds it, and nothing has signalled it yet -- so
-            // its owner is still inside `park` and the handle is quiescent.
+            // SAFETY: `waiter` is one of the slots the caller's
+            // compare-exchange took out of the state word, so no other
+            // notifier can hold it, and the swap below has not signalled it --
+            // so its owner cannot have returned from `commit_wait` and cannot
+            // be republishing the handle.
             let parked = unsafe { waiter.thread.parked() };
             if waiter
                 .state
@@ -605,11 +627,11 @@ impl Notifier for NonblockingNotifier {
         waiter
             .state
             .store(NonblockingWaiter::NOT_SIGNALED, Ordering::Relaxed);
-        // SAFETY: the slot is this thread's own and is not on the waiter stack:
-        // the only way onto the stack is the compare-exchange below, and the
-        // notifier that last popped the slot cannot still be holding it, since
-        // this thread only returned from its previous `commit_wait` once that
-        // notifier had stored `SIGNALED`.
+        // SAFETY: the slot is this thread's own and is off the waiter stack --
+        // the only way onto it is the compare-exchange below -- and the
+        // notifier that last popped it cannot still be holding it, this thread
+        // having returned from its previous `commit_wait` only once that
+        // notifier had read the handle and stored `SIGNALED`.
         unsafe { waiter.thread.publish() };
 
         let ticket_epoch = Self::ticket_epoch(waiter.epoch.load(Ordering::Relaxed));

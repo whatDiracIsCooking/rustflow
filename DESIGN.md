@@ -491,3 +491,121 @@ before the milestone opened.
   `tests/loom_storage.rs` are what says so -- and `Worker::invoke_one` gained
   two named empty seams, `observer_prologue` and `observer_epilogue`, so that
   the observers of step 6 add a call rather than a reading of that function.
+
+## Rationale moved out of the executor's periphery
+
+The contract at the top of this file keeps a rationale in one place, and for a
+module that is a dozen lines of dispatch over machinery somebody else owns,
+that place cannot be the module itself. These entries are that place, and each
+names the issue whose decision it records, as every entry above does.
+
+- **A module task reaches its target through whatever owns it** (issues #49,
+  #74). Upstream's three module functions are two forwarders onto one `_impl`
+  over a `Graph&`, which is all they need: a reference reaches the nodes and
+  the caller is left to keep them alive. A job of a graph here owns what it
+  names, so the forwarders differ in who owns the target.
+  `Handle::Module` owns a share and hands over `Taskflow::flow`;
+  `Handle::AdoptedModule` owns its graph *inline*, in the arena the module
+  node itself is in, so the only thing that names it is the outer owner plus
+  that node's index — the path `Job::graph_inside` builds. What the path has to
+  be right about is which arena an index means: a job of an adopted graph
+  built over the outer owner would resolve its tasks against the composing
+  taskflow's own nodes, silently, against whatever sits at those indices.
+- **A module task may not run a graph its own run is inside of** (issues #49,
+  #82). Upstream's obligation for `composed_of` — "thread-safe as long as the
+  target is not concurrently ran by two or more threads" — survives
+  translation, because what makes it an obligation is the target's per-node
+  state rather than anything about C++: a join counter and a state word belong
+  to one run at a time. Sharing the target as an `Arc<Taskflow>` buys the
+  caller the lifetime half of that rule and not this half; what it changes is
+  the failure, two workers reaching one node finding `Work::invoke`'s
+  `try_lock` taken and panicking, which the run reports, where a silent race
+  on a counter is the alternative.
+
+  One shape of that error a run *can* see coming is refused rather than left
+  to the caller: a target that is a graph the module node is already inside
+  of. A taskflow cannot be composed of itself when it is built — `composed_of`
+  takes an `Arc<Taskflow>` and the taskflow it builds into needs `&mut` — but a
+  subflow body can do it while the taskflow runs, a `Subflow` being a
+  `FlowBuilder` and the taskflow a body belongs to being alive behind an `Arc`
+  the caller holds. None of what that did is about locking: scheduling a graph
+  re-arms every node of it, so the subflow node the module node hangs under
+  loses the `PREEMPTED` bit and the join counter of one that `finish_job`
+  would have resumed it by; the subgraph then finishes, nothing re-queues that
+  node, the run's counter never reaches zero and `wait` never returns — with
+  every worker parked, the run being not slow but over and unreported. So a
+  module node's first entry asks whether the target is a graph this job is
+  already inside of, its own or that of any node on its parent chain, and
+  reports a panic payload instead of running it: the payload becomes the run's,
+  the rest of the run is cancelled, and `wait` answers `Err`. Two taskflows
+  composing each other are the same cycle one link longer, and the walk costs
+  one pointer comparison per level of nesting. What it cannot see is a chain a
+  `corun`'s anchor ends without naming the job that started it, and that route
+  needs no second answer: a corun of the taskflow whose task is coruning
+  re-enters a node whose body is still running, which the `try_lock` above
+  reports. A preempted node's body is *not* running, which is the whole of why
+  this case slipped past it.
+- **A node that parents a graph is entered twice, and the parent travels with
+  the job** (issue #47). Every graph the executor schedules is scheduled
+  *under* something, whose join counter the jobs of that graph decrement as
+  they finish: the run, for the nodes of a taskflow's own graph, whose counter
+  reaching zero ends the run; or something nested inside it — a node whose own
+  graph is running, the anchor a `corun` schedules a taskflow under, a node
+  whose children are async tasks, a `TaskGroup`'s anchor with no run around it
+  at all — whose counter reaching zero ends nothing and instead resumes the
+  node that was waiting or releases the frame watching it. Upstream stores that
+  parent on the node as `node->_parent`; here it is carried by the job, so a
+  parent chain is a chain of *jobs* and the parent of a node is reached as the
+  job that node was dequeued as — which is exactly what has to be queued again
+  to resume it.
+
+  A node that parents a graph cannot finish when its body returns, its
+  successors having to wait for that graph, so it is entered twice with
+  `NSTATE::PREEMPTED` saying which entry this is. The first entry runs whatever
+  the node does, sets the bit and schedules the nested graph under the node,
+  then answers "preempted": the node's counter is not re-armed and no successor
+  is released. The children are ordinary jobs, each counted against the node.
+  The tear-down of the last of them finds the counter at zero and the bit set
+  and queues the node's own job a second time — reading the bit *before* the
+  decrement, because the instant that counter reaches zero another worker may
+  be running the node. The second entry skips the cancellation check, an
+  entered node having to come back out through the dispatch whatever happened
+  meanwhile, clears the bit and answers with an ordinary release. The protocol
+  costs one requeue per nested graph where upstream resumes the parent on the
+  worker that finished the last child, its `_update_cache` being unported
+  (#62), and all four arms that can preempt a node do: a module task (#49,
+  #74), a runtime task that spawned work (#51), a subflow left to its implicit
+  join (#50) and a free node whose body is handed a `Runtime` (#90).
+- **The cancellation early-out reads the whole parent chain** (issue #48).
+  Upstream's `Node::_is_parent_cancelled` reads the immediate parent only,
+  which it can afford because `_process_exception` marks every ancestor on its
+  way up — and the walk here does that too, so one level would be enough. Every
+  level is read anyway: it costs one relaxed load per level of nesting and
+  answers strictly more, since a job whose own parent is unmarked can still
+  have a marked *grandparent*, when the failure was in a sibling subtree under
+  the same anchor, and every job under a failed anchor is one whose result
+  nobody will collect.
+- **A worker that waits for a nested graph does not park** (issue #16). A task
+  body runs on a worker thread, and an executor's workers are a fixed pool: the
+  only threads that will ever take a job out of its queues. So a task that
+  calls `Executor::run` and then waits — with `RunHandle::wait`, or by letting
+  the handle drop — parks one of those threads in the inner run's completion
+  slot while the work it waits for sits in the pool's queues. Nothing undoes
+  that: a parked thread is woken by the topology it waited on finishing, and
+  that topology finishes when some *other* worker runs its last job, so the
+  pool has to have a worker to spare. Four such waits on a four-worker executor
+  leave none, and at one worker it takes one. That is the deadlock upstream's
+  own documentation warns about, and `Executor::corun` is the answer: the
+  calling worker stays in the work-stealing loop, running the inner graph's
+  jobs and anybody else's until the inner run's last job has finished, so the
+  pool never loses a thread to waiting and no amount of nesting can drain it.
+  Three consequences a caller feels. The wait is not ordered, a corunning
+  worker running whatever it can steal, so a corun returns no sooner than the
+  inner run finishes and no later than the next job it picked up is done. It is
+  for a worker of *that* executor and nothing else, any other thread getting
+  `CorunError::NotAWorker` rather than the blocking wait, which would be a
+  mistake about which thread the code is on. And nesting a run on a *different*
+  executor and blocking on it is still fine, two pools being unable to starve
+  each other the way one starves itself. Every blocking wait on a nested graph
+  in the crate is this loop: `Subflow::join` (#50), `Runtime::corun` (#51) and
+  `TaskGroup::corun` (#93) as much as `Executor::corun` itself.

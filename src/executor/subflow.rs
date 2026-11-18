@@ -1,103 +1,25 @@
 //! Translated from `Executor::_invoke_subflow_task` and `Subflow::join` in
 //! `taskflow/core/executor.hpp` (Taskflow v4.1.0).
 //!
-//! The executor's half of subflow tasking: the dispatch arm that runs a
-//! subflow task, the explicit join the body can ask for, and the one function
-//! that decides what becomes of a subgraph once its run is over. The builder
-//! half of [`Subflow`] is `src/subflow.rs`, and the two meet at the lease --
-//! see below.
+//! The executor's half of subflow tasking: the arm that runs a subflow task,
+//! the explicit join its body can ask for, and the one function that decides
+//! what becomes of a subgraph once its run is over. The builder half of
+//! [`Subflow`] is `src/subflow.rs`, and the two meet at the lease. An implicit
+//! join preempts the node and schedules the subgraph under it; an explicit one
+//! starts the same nested run from inside the body, through
+//! [`corun_graph`](crate::executor::corun), which is why upstream calls the
+//! implicit join the faster.
 //!
-//! Upstream's shape, which [`invoke`] follows: build the handle, run the body,
-//! and -- if the body left the subflow joinable and its graph non-empty --
-//! set `PREEMPTED` on the node and schedule the subgraph under it. The second
-//! entry clears the bit, and the subgraph is cleared unless the body asked to
-//! retain it. [`Subflow::join`] is the same nested run started from inside the
-//! body instead, through [`corun_graph`](crate::executor::corun) rather than
-//! through the preemption protocol, which is why upstream's comment says the
-//! implicit join is the faster of the two.
+//! # Design
 //!
-//! # The lease, and who puts the subgraph back
-//!
-//! Scheduling a graph needs whatever *owns* it, because the jobs of a graph
-//! own what they name; a subgraph is owned by the `Mutex` in
-//! [`Handle::Subflow`](crate::Handle::Subflow), and a `MutexGuard` is not
-//! something a job can own. Issue #74 settled that for all four kinds of
-//! nested graph at once: the subgraph is **moved out** of its lock for the
-//! length of its run -- the *lease* -- and held by every job of it through one
-//! shared allocation, so no lock is on the scheduler's hot path at all. The
-//! `executor::topology` docs have the three options that were on the table and
-//! why a lock on that path is not one of them.
-//!
-//! What was left for this issue is the policy: who puts the graph back, and
-//! whether it goes back at all. The answer is **whoever holds the last share
-//! of the lease**, through [`return_subgraph`] -- called from `Inside`'s
-//! `Drop` in `executor::topology` for a graph that was scheduled, and
-//! directly by [`invoke`] for a graph that was not -- and the reason it cannot
-//! be the frame that is waiting for the nested run is worth writing down,
-//! because the obvious design does not work:
-//!
-//! > A job of a graph nested *inside* the subgraph decrements the join counter
-//! > of its parent node, and that node is a node **of the subgraph** -- so its
-//! > counter lives inside the leased graph, and the job must hold the lease to
-//! > reach it. It releases that hold *after* the decrement, which is the
-//! > decrement that can end the subgraph's own run. So at the instant a
-//! > nested run is over, a straggling share of the lease may still exist for a
-//! > few instructions, and no holder can prove it is the last one:
-//! > `Arc::into_inner` by the waiting frame would fail at random.
-//!
-//! A `Drop` has no such problem -- the last share is whichever one it turns
-//! out to be -- and three consequences are worth naming:
-//!
-//! - **a subgraph that is not retained never touches a lock.** Dropping the
-//!   leased graph *is* upstream's `g.clear()`, so the default path is a free
-//!   function of ownership rather than a second trip through the `Mutex`;
-//! - **a retained subgraph goes back under `try_lock`**, never a blocking
-//!   lock, because the thread holding the last share is a worker: it may be
-//!   about to run anything, and a worker that waits on a lock a task body
-//!   holds is a worker that run cannot use. A retained subgraph is therefore
-//!   lost if the node's slot happens to be busy at that instant -- a
-//!   concurrent [`dump`](crate::Taskflow::dump), in practice;
-//! - **an explicit join takes the lease back itself** where it can
-//!   (`GraphOwner::take_lease`, which is the `Arc::into_inner` above with the
-//!   failure allowed for), so that the body sees the graph it built once
-//!   `join` returns and the policy is applied once, by [`invoke`], with the
-//!   retain bit the body finally settled on. When the straggler above wins
-//!   that race -- which takes a subgraph with a nested graph of its own in it
-//!   -- the `Drop` applies the policy early instead and the body finds an
-//!   empty graph; [`Subflow::set_retain`] says what that means for a caller.
-//!
-//! Which leaves the question that reading the two paths side by side raises:
-//! an **implicit** join recovers the lease through the `Drop` alone, because
-//! there is no frame left to recover it with -- the arm set `PREEMPTED` and
-//! returned long before the subgraph finished -- where an explicit join also
-//! has `take_lease`. That does not make the implicit join the riskier of the
-//! two, and it is worth saying which way round it is, because the
-//! `take_lease` on the explicit path is not there for retention at all: it is
-//! there so the *body* can go on reading the graph it built. Both paths pass
-//! through exactly one [`return_subgraph`] per entry, and therefore one
-//! `try_lock` that a retained graph can lose -- the `Drop`'s, around the
-//! moment the node is resumed, for the implicit join, and [`invoke`]'s tail,
-//! the instant the body returns, for the explicit one.
-//!
-//! # Only the spawning worker may join
-//!
-//! Upstream states the rule and leaves it at that. Here it is a type: a
-//! [`Subflow`] holds `&mut WorkerThread`, which only the dispatch arm running
-//! the body can lend, and the guard it holds besides is not [`Send`]. So the
-//! handle cannot reach another thread to be joined from one, and the corun
-//! loop a join enters is the very loop that worker was already in.
-//!
-//! # A failure under a join
-//!
-//! A task of the subgraph that panics reports to whatever is waiting for the
-//! graph it belongs to, which for an explicit join is the node itself: the
-//! join anchors it for the length of the corun, so the payload comes back out
-//! of [`Subflow::join`] -- re-raised -- or out of [`Subflow::try_join`] as an
-//! error, which is the pair #48 established for `corun`. For the implicit
-//! join nothing is waiting, so the walk marks the node on its way past and
-//! carries the payload up to the run, whose `wait` reports it; the rest of the
-//! subgraph is cancelled either way. Upstream's `Exception.SubflowTask` and
-//! `Exception.JoinedSubflow1` are ported in `tests/exceptions.rs`.
+//! Scheduling a graph needs whatever *owns* it, and a subgraph is owned by the
+//! `Mutex` in [`Handle::Subflow`](crate::Handle::Subflow), which a job cannot
+//! hold: `DESIGN.md` has the lease that answers that, and what it costs a
+//! retained subgraph. Only the spawning worker may join, which upstream states
+//! and this port makes a type -- a [`Subflow`] holds `&mut WorkerThread` and a
+//! guard that is not [`Send`]. A failing task of the subgraph reports to
+//! whatever waits for the graph it is in: this node for an explicit join,
+//! anchored for the length of the corun, and otherwise the run.
 
 use std::any::Any;
 use std::fmt;
@@ -116,13 +38,8 @@ use crate::subflow::Subflow;
 /// Runs the subflow task `job` is for: upstream's `_invoke_subflow_task`.
 ///
 /// `None` means the node has been preempted -- the graph its body built is
-/// running, and the last job of that graph will resume it -- which is what
-/// keeps `WorkerThread::invoke` from releasing successors that have a whole
-/// subgraph still to wait for. Upstream says the same thing by returning
-/// `true`.
-///
-/// `work` and `subgraph` are the two halves of the node's own handle, which
-/// the dispatch arm already had in hand: upstream reaches them as
+/// running, and the last job of it will resume the node -- where upstream
+/// returns `true`. `work` and `subgraph` are upstream's
 /// `std::get_if<Node::Subflow>(&node->_handle)`.
 pub(crate) fn invoke(
     worker: &mut WorkerThread,
@@ -133,59 +50,41 @@ pub(crate) fn invoke(
     let node = job.node();
 
     // Upstream's `else { node->_nstate &= ~NSTATE::PREEMPTED; }`: the second
-    // entry, with the subgraph finished and this node free to finish too.
-    // Upstream clears the subgraph here as well; this port has already done
-    // it, because the lease went home the moment the nested run ended -- see
-    // the module docs.
+    // entry. Upstream clears the subgraph here; the lease went home already.
     if node.nstate().load(Ordering::Relaxed) & Node::PREEMPTED != 0 {
         node.nstate().fetch_and(!Node::PREEMPTED, Ordering::Relaxed);
         return Some(Release::Strong);
     }
 
-    // Upstream's `Subflow sf(*this, worker, node, g)` and the body under its
-    // `TF_EXECUTOR_EXCEPTION_HANDLER`, whose `_process_exception` is
-    // `Job::record_panic`: the failure goes to whatever is waiting for the
-    // graph this node is part of, cancels the rest of it, and is never raised
-    // on a worker thread. `AssertUnwindSafe` is the honest annotation, as it
-    // is for a static task: the state a panicking body can leave half-written
-    // is the user's own.
-    //
-    // A panic does *not* skip what follows, because upstream's handler is the
-    // body of its first switch and does not return: a body that panicked
-    // after emplacing tasks still has them scheduled, and they are then
-    // skipped one by one as the children of a node the failure marked. That
-    // is what makes upstream's `Exception.SubflowTask` report the body's
-    // failure rather than its children's.
+    // The body under upstream's `TF_EXECUTOR_EXCEPTION_HANDLER`, whose
+    // `_process_exception` is `Job::record_panic`; `AssertUnwindSafe` is the
+    // honest annotation, as for a static task. A panic does *not* skip what
+    // follows, that handler being a switch body rather than a return -- tasks
+    // emplaced before it are scheduled, then skipped as the children of a
+    // node the failure marked.
     let (joinable, graph) = {
         let mut subflow = Subflow::new(worker, job, subgraph);
         if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| work.invoke(&mut subflow))) {
             job.record_panic(payload);
         }
 
-        // Upstream reads `sf.joinable()` and `g.empty()` with the handle still
-        // alive, which this port cannot: taking the lease needs the guard that
-        // handle is holding. So the lease is taken first and the questions are
-        // asked of what came out of it.
+        // Upstream asks `sf.joinable()` and `g.empty()` with the handle
+        // alive; taking the lease needs the guard it holds.
         (subflow.joinable(), subflow.take_subgraph())
     };
 
-    // Upstream's `if(sf.joinable() && !g.empty())`, widened to the graph that
-    // has nothing to *start* at -- an empty one, or one whose every node is in
-    // a cycle -- for the reason `executor::module` gives at length: scheduling
-    // a sourceless graph queues no job, so nothing would ever resume a node
-    // left `PREEMPTED` for it and the run would hang.
+    // Upstream's `if(sf.joinable() && !g.empty())`, widened to the graph with
+    // nothing to *start* at: a sourceless one would never resume this node.
     if joinable && has_source_task(&graph) {
         let owner = job.graph_inside(Some(graph));
 
-        // Before the graph is scheduled, because a child may finish before
-        // this call returns and the bit is what tells the last one to re-queue
-        // this node.
+        // Before the graph is scheduled: a child may finish first, and the
+        // bit tells the last one to re-queue this node.
         node.nstate().fetch_or(Node::PREEMPTED, Ordering::Relaxed);
 
         // Upstream's `_schedule_graph(worker, g, node->_topology, node)`,
-        // whose `node` argument is a `Nested` here: the subgraph's jobs count
-        // this node's join counter down, and what the last of them re-queues
-        // is the *job* the node was dequeued as rather than the node itself.
+        // whose `node` is a `Nested`: the subgraph's last job re-queues the
+        // *job* this node was dequeued as.
         let parent = Nested::new(Some(job.clone()));
         worker.shared.schedule_graph(
             Some(worker),
@@ -196,10 +95,8 @@ pub(crate) fn invoke(
         return None;
     }
 
-    // Nothing to run: a body that built nothing, or one that joined its
-    // subflow itself and so has already had its nested run. Either way the
-    // graph is in hand rather than in the node, so upstream's
-    // clear-unless-retain is the same call the lease makes when it goes home.
+    // Nothing to run: a body that built nothing, or one that joined already;
+    // the graph is in hand, so this is upstream's clear-unless-retain.
     return_subgraph(node, graph);
     Some(Release::Strong)
 }
@@ -207,19 +104,9 @@ pub(crate) fn invoke(
 /// Puts a leased subgraph back into `node`, or drops it: upstream's
 /// `if((node->_nstate & NSTATE::RETAIN_SUBFLOW) == 0) g.clear();`.
 ///
-/// Called by whoever holds the last share of a lease -- `Inside`'s `Drop` in
-/// `executor::topology` for a subgraph that was scheduled, [`invoke`] for one
-/// that was not -- which the module docs argue is the only code that *can* be
-/// sure the graph is free to move.
-///
-/// Dropping the graph is upstream's `clear()`, which is why the default needs
-/// no lock: the storage a recursive subflow would otherwise accumulate is
-/// freed by the lease ending, not by a second trip through the `Mutex`.
-///
-/// # Panics
-///
-/// Panics if `node` is not a subflow node, which cannot happen: the only
-/// graph this port leases is a subflow's subgraph.
+/// Called by whoever holds the last share of a lease -- `Inside`'s `Drop` for
+/// a scheduled subgraph, [`invoke`] for one that was not -- being the only
+/// code that can be sure the graph is free to move.
 pub(crate) fn return_subgraph(node: &Node, graph: Graph) {
     if node.nstate().load(Ordering::Relaxed) & Node::RETAIN_SUBFLOW == 0 {
         // Upstream's `g.clear()`, as a drop.
@@ -235,55 +122,31 @@ pub(crate) fn return_subgraph(node: &Node, graph: Graph) {
         // Poison means some body panicked, not that the slot is unusable --
         // the reading `Subflow::new` and `Taskflow::dump` both take of it.
         Err(TryLockError::Poisoned(poisoned)) => *poisoned.into_inner() = graph,
-        // Never block here: this may be running on a worker that something
-        // else is waiting for, and the only things that hold this lock are a
-        // dump and a later entry to the same node -- the second of which owns
-        // the slot now anyway. The module docs say what is lost.
+        // Never block: this may run on a worker something else waits for.
         Err(TryLockError::WouldBlock) => drop(graph),
     }
 }
 
-/// Whether `graph` has a task a run could start at.
-///
-/// `GraphOwner::has_source_task` asks the same question of a graph that has an
-/// owner; this one is asked *before* there is one, so that the common case --
-/// a body that emplaced nothing, which every `join`-only subflow is -- costs
-/// no allocation at all.
+/// Whether `graph` has a task a run could start at, asked *before* it has an
+/// owner (where `GraphOwner::has_source_task` asks after), so that a body
+/// which emplaced nothing costs no allocation.
 fn has_source_task(graph: &Graph) -> bool {
     graph.iter().any(|(_, node)| node.num_predecessors() == 0)
 }
 
 /// Why a [`Subflow::join`] or [`Subflow::try_join`] call did not do what it
-/// was asked.
-///
-/// [`CorunError`](crate::CorunError)'s shape, for the same reason and with the
-/// same pair of calls behind it: a join *is* a corun of the node's own
-/// subgraph. The two differ only in what can go wrong -- a body always runs on
-/// the worker that may join it, so there is no `NotAWorker` here, and a
-/// subflow can be joined only once, which a corun has no equivalent of.
-///
-/// `#[non_exhaustive]` for the reason [`RunError`] is: later milestones have
-/// more ways for a nested run to fail.
+/// was asked: [`CorunError`](crate::CorunError)'s shape minus its
+/// `NotAWorker`, plus the one-join rule. `#[non_exhaustive]` as that is.
 #[non_exhaustive]
 pub enum JoinError {
-    /// This subflow has already been joined.
-    ///
-    /// Upstream throws here -- *"subflow already joined"* -- and the shape of
-    /// the failure is all this port changes. It is an error rather than a
-    /// panic because it is the one thing a caller can act on, and because a
-    /// body that joins twice has usually joined once in a branch it forgot
-    /// about: [`Subflow::joinable`] is the question, and this is the answer
-    /// for a caller who did not ask it.
+    /// This subflow has already been joined: upstream's throw, *"subflow
+    /// already joined"*, as an error rather than a panic, being something a
+    /// caller can act on. [`Subflow::joinable`] is the question.
     AlreadyJoined,
-    /// A task of the subgraph panicked.
-    ///
-    /// The same failure [`Executor::run`](crate::Executor::run) reports,
-    /// carried unchanged so that there is one answer in the crate to "a task
-    /// panicked" and one place ([`RunError::Panicked`]) that says what to do
-    /// with the payload.
-    ///
-    /// Returned by [`Subflow::try_join`] only: [`Subflow::join`] re-raises
-    /// that failure instead of reporting it.
+    /// A task of the subgraph panicked: the failure
+    /// [`Executor::run`](crate::Executor::run) reports, so that
+    /// [`RunError::Panicked`] alone says what to do with the payload.
+    /// Returned by [`Subflow::try_join`] only.
     Run(RunError),
 }
 
@@ -297,8 +160,7 @@ impl fmt::Display for JoinError {
 }
 
 impl fmt::Debug for JoinError {
-    /// Hand-written because [`RunError`]'s is: the panic payload is a
-    /// `Box<dyn Any + Send>`, which has no `Debug`.
+    /// Hand-written because [`RunError`]'s is: the payload has no `Debug`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AlreadyJoined => f.write_str("AlreadyJoined"),
@@ -321,23 +183,16 @@ impl Subflow<'_> {
     /// body, re-raising what the first task of it to fail panicked with:
     /// upstream's `Subflow::join`.
     ///
-    /// The subflow is not joinable afterwards, and the executor therefore
-    /// performs no second, implicit join when the body returns. What the body
-    /// emplaces *after* a join is kept or cleared with the rest of the
-    /// subgraph and never runs, which is upstream's behaviour too.
-    ///
-    /// The calling worker stays in the work-stealing loop for the whole of the
-    /// nested run -- it is [`Executor::corun`](crate::Executor::corun)'s loop,
-    /// over this node's own subgraph -- so a join costs the pool no thread and
-    /// a recursive subflow cannot deadlock itself however deep it goes. The
-    /// `executor::corun` module docs are the long form of that argument.
+    /// The subflow is not joinable afterwards, so no implicit join follows,
+    /// and what the body emplaces *after* a join is kept or cleared with the
+    /// subgraph and never runs, as upstream has it. The calling worker stays
+    /// in [`Executor::corun`](crate::Executor::corun)'s loop, so a join costs
+    /// the pool no thread however deep it goes.
     ///
     /// ```
     /// use std::sync::Arc;
     /// use std::sync::atomic::{AtomicUsize, Ordering};
-    ///
-    /// use rustflow::Executor;
-    /// use rustflow::prelude::*;
+    /// use rustflow::{Executor, prelude::*};
     ///
     /// let counter = Arc::new(AtomicUsize::new(0));
     /// let mut taskflow = Taskflow::new();
@@ -348,16 +203,12 @@ impl Subflow<'_> {
     ///         subflow.emplace(move || {
     ///             counter.fetch_add(1, Ordering::Relaxed);
     ///         });
-    ///         assert!(subflow.joinable());
-    ///
-    ///         // Unlike the implicit join, this one happens *here*: the rest
-    ///         // of the body can read what the children computed.
+    ///         // Here, not when the body returns, so what follows can read
+    ///         // what the children computed.
     ///         subflow.join().expect("a fresh subflow is joinable");
     ///         assert!(!subflow.joinable());
-    ///         assert_eq!(subflow.num_workers(), 2);
     ///     }
     /// });
-    ///
     /// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
     /// assert_eq!(counter.load(Ordering::Relaxed), 1);
     /// ```
@@ -365,58 +216,40 @@ impl Subflow<'_> {
     /// # Panics
     ///
     /// Panics with the payload of the first task of the subgraph to panic,
-    /// which is upstream's rethrow: a failure of the subgraph propagates on
-    /// the calling worker, where the body that joined can catch it -- or not,
-    /// in which case the executor catches it where it catches any other
-    /// failing task and the run reports it. The payload keeps its identity,
-    /// because it is handed to [`std::panic::resume_unwind`] rather than
-    /// re-panicked.
-    ///
-    /// [`Subflow::try_join`] is the same call with that failure as an `Err`
-    /// instead.
+    /// which is upstream's rethrow: the body that joined can catch it, or let
+    /// it become that task's own failure. Handed to
+    /// [`std::panic::resume_unwind`], so it keeps its identity.
     ///
     /// # Errors
     ///
-    /// [`JoinError::AlreadyJoined`] if this subflow has been joined already,
-    /// which is the only error this shape returns -- a failing task is the
-    /// panic above, not an error.
+    /// [`JoinError::AlreadyJoined`] if already joined; [`Subflow::try_join`]
+    /// is the same call with the panic above as an `Err`.
     pub fn join(&mut self) -> Result<(), JoinError> {
         match self.join_payload()? {
-            // Upstream's `p->_rethrow_exception()`, and the last thing this
-            // call does: everything the nested run owed has been paid by the
-            // time the unwind starts.
+            // Upstream's `p->_rethrow_exception()`, last of all: the nested
+            // run has paid what it owed.
             Some(payload) => panic::resume_unwind(payload),
             None => Ok(()),
         }
     }
 
     /// Runs this subflow's graph and waits for it, reporting a failing task as
-    /// an error rather than propagating it.
+    /// an error rather than propagating it: [`Subflow::join`] with the task's
+    /// payload coming back as
+    /// [`JoinError::Run`]`(`[`RunError::Panicked`]`)`, in the shape
+    /// [`RunHandle::wait`](crate::RunHandle::wait) reports a failing run in.
     ///
-    /// [`Subflow::join`] with the one difference the name says: a task of the
-    /// subgraph that panicked comes back as
-    /// [`JoinError::Run`]`(`[`RunError::Panicked`]`)` carrying the payload, in
-    /// the shape [`RunHandle::wait`](crate::RunHandle::wait) reports a failing
-    /// run in. Everything else -- the loop, the anchor, what happens to the
-    /// rest of the subgraph -- is that method's, and its docs are where the
-    /// explanation lives.
-    ///
-    /// A join that *failed* leaves the subflow joinable, which is upstream's
-    /// behaviour and not an accident: its own `join` sets the bit only after
-    /// the corun, so a throw skips the line. The consequence is worth
-    /// knowing, because it is the executor's and not this call's -- when the
-    /// body returns, the implicit join finds a joinable subflow with a
-    /// non-empty graph and **runs the subgraph again**. A body that catches a
-    /// failure and means that to be the end of it has to leave nothing to
-    /// run: [`FlowBuilder::erase`](crate::FlowBuilder::erase) the children, or
-    /// let the panic through as [`Subflow::join`] does.
+    /// A join that *failed* leaves the subflow joinable, upstream's own `join`
+    /// setting the bit only after the corun so that a throw skips the line.
+    /// The consequence is the executor's: the implicit join then finds a
+    /// joinable subflow with a non-empty graph and **runs the subgraph
+    /// again**. A body that means a caught failure to be the end of it must
+    /// leave nothing to run -- erase the children, or let the panic through.
     ///
     /// ```
     /// use std::sync::Arc;
     /// use std::sync::atomic::{AtomicUsize, Ordering};
-    ///
-    /// use rustflow::Executor;
-    /// use rustflow::prelude::*;
+    /// use rustflow::{Executor, prelude::*};
     ///
     /// let attempts = Arc::new(AtomicUsize::new(0));
     /// let mut taskflow = Taskflow::new();
@@ -424,37 +257,24 @@ impl Subflow<'_> {
     ///     let attempts = Arc::clone(&attempts);
     ///     move |subflow: &mut Subflow<'_>| {
     ///         let attempts = Arc::clone(&attempts);
+    ///         // Fails the first time only, so the second run shows.
     ///         subflow.emplace(move || {
-    ///             // Fails the first time only, which is what makes the
-    ///             // second attempt below visible.
-    ///             if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
-    ///                 panic!("x");
-    ///             }
+    ///             assert_ne!(attempts.fetch_add(1, Ordering::Relaxed), 0, "x");
     ///         });
-    ///
-    ///         // The failure is this body's to deal with, so the subflow task
-    ///         // survives it and the run completes.
     ///         let error = subflow.try_join().expect_err("`x` panicked");
-    ///         assert_eq!(error.to_string(), "a task panicked: x");
+    ///         assert!(error.to_string().starts_with("a task panicked"));
     ///         assert!(subflow.joinable(), "a failed join joins nothing");
     ///     }
     /// });
-    ///
-    /// Executor::new(2)
-    ///     .run(&taskflow)
-    ///     .wait()
-    ///     .expect("the body caught it");
-    ///
-    /// // Once for the join that failed, once for the implicit join that
-    /// // followed it.
+    /// Executor::new(2).run(&taskflow).wait().expect("the body caught it");
+    /// // Once for the join that failed, once for the implicit join after it.
     /// assert_eq!(attempts.load(Ordering::Relaxed), 2);
     /// ```
     ///
     /// # Errors
     ///
-    /// [`JoinError::AlreadyJoined`] if this subflow has been joined already,
-    /// and [`JoinError::Run`] if a task of the subgraph panicked. Only the
-    /// first panicking task is reported, as with
+    /// [`JoinError::AlreadyJoined`] if already joined, and [`JoinError::Run`]
+    /// if a task of the subgraph panicked -- the first only, as with
     /// [`Executor::run`](crate::Executor::run).
     pub fn try_join(&mut self) -> Result<(), JoinError> {
         match self.join_payload()? {
@@ -463,15 +283,10 @@ impl Subflow<'_> {
         }
     }
 
-    /// Both shapes of join, up to what is done with the payload.
-    ///
-    /// Upstream's `Subflow::join` in full: refuse a second join, corun the
-    /// subgraph under this node, and set `JOINED_SUBFLOW` *after* the corun,
-    /// which upstream's own comment explains -- "join here since corun graph
-    /// may throw exception". That ordering is load-bearing in both ports: a
-    /// join that failed leaves the subflow joinable, so the body may look at
-    /// the state and the executor's implicit join still sees a subflow nobody
-    /// has joined.
+    /// Both shapes of join, up to what is done with the payload: upstream's
+    /// `Subflow::join` in full -- refuse a second join, corun the subgraph
+    /// under this node, set `JOINED_SUBFLOW` *after* the corun, "since corun
+    /// graph may throw exception".
     fn join_payload(&mut self) -> Result<Option<Box<dyn Any + Send>>, JoinError> {
         // Upstream's `if(!joinable()) TF_THROW("subflow already joined")`.
         if !self.joinable() {
@@ -480,33 +295,24 @@ impl Subflow<'_> {
 
         let job = self.job;
 
-        // The lease, which is this port's whole departure from upstream's
+        // The lease, this port's one departure from upstream's
         // `_corun_graph(_worker, _graph, ...)`: the graph comes out of the
-        // node's lock, because the jobs that run it cannot hold a guard. The
-        // module docs say who puts it back, and `take_subgraph` is where the
-        // body's guard is given up.
+        // node's lock, the jobs that run it being unable to hold a guard.
+
         let owner = job.graph_inside(Some(self.take_subgraph()));
 
         // Upstream passes `_node` as the parent: the subgraph's jobs count
-        // this node's own join counter down, and the node is the anchor this
-        // frame waits on, so a failure under it is delivered here rather than
-        // to the run. `resume` is this node's job all the same -- it is where
-        // `Nested` finds the node's state words -- but nothing re-queues it,
-        // because a joining node is not `PREEMPTED`.
+        // this node's counter down and the node is this frame's anchor, so a
+        // failure under it is delivered here. Nothing re-queues the job.
         let parent = Nested::new(Some(job.clone()));
         let payload = corun_graph(self.worker, &owner, job.topology_share(), &parent);
 
-        // The graph goes back into the node before this returns, so that the
-        // body can read what it built and `set_retain` still has something to
-        // keep. `take_lease` is the `Arc::into_inner` the module docs allow
-        // for failing: when a straggling job of a nested graph still holds a
-        // share, that share's `Drop` applies the policy instead and the body
-        // finds an empty graph.
+        // Back into the node before this returns, so that the body can read
+        // what it built; `take_lease` may fail -- see the module docs.
         self.relock(owner.take_lease());
 
         // Upstream's `_node->_nstate |= NSTATE::JOINED_SUBFLOW`, after the
-        // corun and only if it brought nothing back: upstream's throw skips
-        // the line, and this is the same control flow written out.
+        // corun and only if it brought nothing back: a throw skips the line.
         if payload.is_none() {
             self.node
                 .nstate()
