@@ -87,6 +87,30 @@ impl<'a> Runtime<'a> {
         self.worker
     }
 
+    /// Returns the id of the worker running this runtime task's body, an
+    /// index in `0..`[`Runtime::num_workers`].
+    ///
+    /// [`Runtime::worker`]`().id()` in one hop, for a body that wants only
+    /// the number -- to seed a per-worker random number generator, say, as a
+    /// parallel algorithm's own partitioner may.
+    ///
+    /// ```
+    /// use rustflow::prelude::*;
+    /// use rustflow::{Executor, Runtime};
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// taskflow.emplace_runtime(|runtime: &mut Runtime<'_>| {
+    ///     assert_eq!(runtime.worker_id(), runtime.worker().id());
+    ///     assert!(runtime.worker_id() < runtime.num_workers());
+    /// });
+    ///
+    /// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
+    /// ```
+    #[must_use]
+    pub fn worker_id(&self) -> usize {
+        self.worker.id()
+    }
+
     /// How many workers the executor running this task has: the part of
     /// upstream's `executor()` that a runtime body can see, written
     /// `rt.executor().num_workers()` there. The same answer
@@ -163,6 +187,7 @@ mod tests {
 
         with_runtime(&taskflow, task, |runtime| {
             assert_eq!(runtime.worker().id(), 0);
+            assert_eq!(runtime.worker_id(), runtime.worker().id());
             // The worker count is what a body can see of the executor running
             // it, and it is the number upstream's partitioners ask for; the
             // module docs say why the executor itself is not here.

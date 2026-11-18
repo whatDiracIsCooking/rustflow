@@ -257,6 +257,7 @@ fn a_runtime_body_sees_the_pool_and_coruns_nothing() {
             move |runtime: &mut Runtime<'_>| {
                 assert!(!runtime.is_cancelled(), "the run is live");
                 assert!(runtime.worker().id() < runtime.num_workers());
+                assert_eq!(runtime.worker_id(), runtime.worker().id());
                 runtime.try_corun().expect("nothing was spawned to fail");
                 runtime.corun();
                 runtime.corun_all();
@@ -277,6 +278,83 @@ fn a_runtime_body_sees_the_pool_and_coruns_nothing() {
             i32::try_from(workers).expect("a worker count fits in an i32"),
             "the body saw the pool it is running on"
         );
+    }
+}
+
+/// This port's own: `Runtime::corun_until` is upstream's
+/// `rt.executor().corun_until`, made public rather than private to one
+/// algorithm for `scan.hpp`'s own reason -- "need to do public corun because
+/// multiple workers can call this" -- and this is that shape: every one of
+/// this run's runtime tasks is a source with no edges, so they all reach a
+/// shared barrier and every one but the last waits at it.
+///
+/// One worker is the case worth pinning: with nothing else queued, the
+/// barrier can only complete by each waiting call recursing into a job still
+/// queued, which is exactly what makes `corun_until` safe to call from
+/// inside a body regardless of how many threads the pool actually has.
+#[test]
+fn a_runtime_bodys_corun_until_passes_a_barrier_every_task_reaches() {
+    for workers in 1..=4 {
+        let arrived = Arc::new(AtomicI32::new(0));
+        let past = Arc::new(AtomicI32::new(0));
+        let total = i32::try_from(workers).expect("a worker count fits in an i32");
+
+        let mut taskflow = Taskflow::new();
+        for _ in 0..workers {
+            let arrived = Arc::clone(&arrived);
+            let past = Arc::clone(&past);
+            taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
+                if arrived.fetch_add(1, Ordering::AcqRel) + 1 == total {
+                    // The last one through releases everybody else.
+                    arrived.store(0, Ordering::Release);
+                } else {
+                    runtime.corun_until(|| arrived.load(Ordering::Acquire) == 0);
+                }
+                past.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+
+        Executor::new(workers)
+            .run(&taskflow)
+            .wait()
+            .expect("no task panicked");
+
+        assert_eq!(
+            past.load(Ordering::Relaxed),
+            total,
+            "{workers} worker(s): every runtime task passed the barrier"
+        );
+    }
+}
+
+/// Issue #168's fourth item, confirmed: a runtime-shaped body returned by a
+/// free function -- the shape every `make_xxx_task` upstream's algorithm
+/// headers define takes -- type-checks through `emplace_runtime` exactly as
+/// an inline closure does, with no `Callables` impl needed for it.
+#[test]
+fn a_runtime_shaped_body_from_a_free_function_type_checks() {
+    let counter = Arc::new(AtomicI32::new(0));
+
+    let mut taskflow = Taskflow::new();
+    taskflow.emplace_runtime(make_counting_task(&counter));
+
+    Executor::new(2)
+        .run(&taskflow)
+        .wait()
+        .expect("no task panicked");
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
+}
+
+/// Upstream's `make_xxx_task` free functions, boiled down to the one shape
+/// this seam needs: a function returning the `impl for<'a> FnMut(&mut
+/// Runtime<'a>) + Send + 'static` that `taskflow.emplace_runtime(..)` wants.
+fn make_counting_task(
+    counter: &Arc<AtomicI32>,
+) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static {
+    let counter = Arc::clone(counter);
+    move |runtime: &mut Runtime<'_>| {
+        runtime.corun();
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
