@@ -39,6 +39,7 @@
 //!
 pub mod chrome;
 pub mod tfprof;
+mod timeline;
 
 use std::fmt;
 use std::hash::{DefaultHasher, Hash, Hasher};
