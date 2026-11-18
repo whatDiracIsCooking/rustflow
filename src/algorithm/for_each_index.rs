@@ -465,25 +465,32 @@ impl<'rt> Runtime<'rt> {
     /// section.
     ///
     /// ```
+    /// use std::sync::atomic::{AtomicI64, Ordering};
+    ///
     /// use rustflow::algorithm::partitioner::DefaultPartitioner;
     /// use rustflow::prelude::*;
     /// use rustflow::Executor;
     ///
     /// let mut taskflow = Taskflow::new();
     /// taskflow.emplace_runtime(|runtime: &mut Runtime<'_>| {
-    ///     let mut squares = [0_i64; 10];
+    ///     // Borrowed from this body's own frame -- never an `Arc` -- which
+    ///     // is what `Runtime::scope` underneath makes sound: every worker
+    ///     // this spawns is joined before `for_each_index` returns.
+    ///     let squares: [AtomicI64; 10] = std::array::from_fn(|_| AtomicI64::new(0));
     ///     runtime.for_each_index(
     ///         0_i64,
     ///         10,
     ///         1,
     ///         |i| {
-    ///             #[allow(clippy::cast_sign_loss)]
     ///             let slot = usize::try_from(i).expect("non-negative index");
-    ///             let _ = slot;
+    ///             squares[slot].store(i * i, Ordering::Relaxed);
     ///         },
     ///         DefaultPartitioner::default(),
     ///     );
-    ///     let _ = &mut squares;
+    ///     for (slot, square) in squares.iter().enumerate() {
+    ///         let i = i64::try_from(slot).expect("slot fits in i64");
+    ///         assert_eq!(square.load(Ordering::Relaxed), i * i);
+    ///     }
     /// });
     ///
     /// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
