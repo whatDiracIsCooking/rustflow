@@ -3,18 +3,23 @@
 A Rust port of [Taskflow](https://github.com/taskflow/taskflow), a C++
 task-parallel programming system built around task dependency graphs.
 
-**Status: steps 1 to 5 are in** — the static graph, the work-stealing
+**Status: steps 1 to 6 are in** — the static graph, the work-stealing
 executor, condition tasks and cancellation, dynamic tasking (subflows,
-runtime tasks and module composition), and step 5's async family: async and
+runtime tasks and module composition), step 5's async family (async and
 dependent-async tasks submitted from the executor, from a runtime task or from
 a task group, with and without a handle on the result; task groups; and
-semaphores. Those are steps of "Order of work" at
-the end of this file, which is where the status is kept rather than duplicated
-here: each step is a GitHub milestone, so its issues are what is merged and
-what is not, and a milestone still open after the feature it names works is
-open on follow-ups rather than on the feature — the performance ones are named
-under "Performance", below. The toolchain, container setup and CI gate all of
-it rides on were in place and verified first.
+semaphores), and step 6's observers and algorithms: an `Observer` hook around
+every task a worker runs, with a built-in Chrome trace-event writer; and
+`for_each`, `for_each_index`, `reduce`, `sort`, `scan`, `transform`, `merge`
+and `find` over a borrowed slice or an `IndexRange`, each with a choice of
+partitioner and a `FlowBuilder` wrapper over owned data. Those are steps of
+"Order of work" at the end of this file, which is where the status is kept
+rather than duplicated here: each step is a GitHub milestone, so its issues
+are what is merged and what is not, and a milestone still open after the
+feature it names works is open on follow-ups rather than on the feature —
+the performance ones are named under "Performance", below. The toolchain,
+container setup and CI gate all of it rides on were in place and verified
+first.
 
 A **consolidation milestone** then ran between steps 5 and 6, and it changed
 no public API: what it changed is what a reader of the source meets. The async
@@ -283,7 +288,7 @@ Every measured number this port has is in [`BENCHMARKS.md`](BENCHMARKS.md) —
 six of upstream's benchmarks ported to criterion with a rayon baseline in the
 role TBB's flow graph plays upstream, the machine and the load it was under
 recorded beside them, and after the tables the per-decision measurements: #40
-and #74 on what a job owns, the continuation #62 did not port, the `Work`
+and #74 on what a job owns, the continuation #62 ported, the `Work`
 question, external submission (#60), a task body's own queue (#119), the
 spill-buffer count (#102) and what a free async task costs (#125). They are
 kept there rather than repeated here, so each figure has one owner.
@@ -291,9 +296,10 @@ Benchmarks are deliberately outside the gate: a benchmark answers "how fast",
 which is not a pass or a fail, so what CI holds the suite to is that it still
 compiles.
 
-Two of those results are bad, and both are tracked rather than filed away,
-because the honest state of play is more useful than a table of the shapes
-that happen to look good:
+One of those results is bad, and tracked rather than filed away, because the
+honest state of play is more useful than a table of the shapes that happen to
+look good. The other named below, #62, used to be the same kind of bad
+result and is now the fix for it:
 
 - **External submission** (issue #60). A graph submitted from a thread that is
   not one of the executor's workers reaches the pool only through the shared
@@ -315,15 +321,14 @@ that happen to look good:
   arena no longer carries a `Vec`'s spare capacity, which was 528 of the 848
   bytes a task, 6 to 7% of this path and five times that on the one a *worker*
   submits from (#144).
-- **The continuation optimisation** (issue #62). Upstream's `_update_cache` /
-  `TF_INVOKE_CONTINUATION` keeps one ready successor out of the queue and
-  resumes it on the worker that just finished its predecessor, so a chain runs
-  end to end where it started instead of being pushed and re-stolen per link.
-  It is unported, which is also the main lever on the `linear_chain`
-  regression above — under a job that owns what it names it saves the clone
-  and the drop as well as the queue push — and two of the stress cases
-  translated in #17 assert the locality it produces and had to be left out
-  without it.
+- **The continuation optimisation** (issue #62, landed in PR #99). Upstream's
+  `_update_cache` / `TF_INVOKE_CONTINUATION` keeps one ready successor out of
+  the queue and resumes it on the worker that just finished its predecessor,
+  so a chain runs end to end where it started instead of being pushed and
+  re-stolen per link. It is in now, in `src/executor/worker.rs`: at 24 workers
+  a `linear_chain` costs half what it did before the change, and at one
+  worker the queueing round trip it skips is still 22 to 34 ns a task. "The
+  #62 measurement" in [`BENCHMARKS.md`](BENCHMARKS.md) has the figures.
 
 ### Order of work
 

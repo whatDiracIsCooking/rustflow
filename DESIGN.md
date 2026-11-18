@@ -768,6 +768,38 @@ entry above does.
   each other the way one starves itself. Every blocking wait on a nested graph
   in the crate is this loop: `Subflow::join` (#50), `Runtime::corun` (#51) and
   `TaskGroup::corun` (#93) as much as `Executor::corun` itself.
+- **A cancelled task group should not be corun while a dependent-async chain
+  behind it still has successors to release** (issue #93). Upstream's skip
+  for a cancelled child goes through `_tear_down_invoke`, draining that
+  child's successor list as it tears the node down; the port's equivalent,
+  the skip at the top of `WorkerThread::invoke_one`, counts the anchor down
+  but does not drain it, which is the dependent-async arm's own job and is
+  never reached for a child that was skipped rather than run. A chain
+  cancelled mid-flight therefore leaves the jobs behind the cancelled link
+  unqueued, their counts still outstanding on the anchor, and a `corun`
+  after that does not return. The fix is a rule for the caller rather than
+  the scheduler: cancel a group whose outstanding children are
+  dependent-async tasks only once none of them still has a successor
+  waiting to be released.
+- **`FlowBuilder` is a trait with provided methods, not a base class**
+  (issue #23). Upstream's `tf::FlowBuilder` is a base class holding a
+  `Graph&`, which `tf::Taskflow` and `tf::Subflow` inherit for the
+  task-building API; Rust has no inheritance for code reuse, so the trait
+  asks an implementor for the one thing it cannot provide itself -- the
+  graph it builds into, as `FlowBuilder::graph` and `FlowBuilder::graph_mut`
+  -- and supplies everything else as a default method over that. `Runtime`
+  deliberately does not implement it: the graph a runtime task runs in is
+  the enclosing one, scheduled into but never edited, so it has no `task`
+  method to offer.
+- **`FlowBuilder::composed_of` takes anything `Composable`, not a concrete
+  `Arc<Taskflow>`** (issue #181). Upstream's own `composed_of` is a template
+  over its `GraphLike` concept rather than a `Taskflow` overload, because a
+  pipeline composes its own graph the same way a plain taskflow does; the
+  port gets that for free once the one thing `composed_of` needs -- a share
+  of the target's `Taskflow` -- is asked for through a trait instead of a
+  concrete type. `Composable` is implemented for `Arc<Taskflow>` so every
+  caller from before the trait existed is unaffected; a pipeline's own graph
+  is the other implementor.
 
 ## Decisions taken in M7
 
@@ -820,6 +852,85 @@ entry above does.
   `floor_to_usize` helper that had covered both sites was deleted once that
   site moved off it. `chunk_size_range`'s is, for now, the one instance the
   rule admits.
+- **The index algorithms take a slice or an `IndexRange`, never a generic
+  iterator pair** (issues #166, #170, #171). Upstream's `for_each`,
+  `for_each_index` and the rest are templates over `B`/`E` iterator pairs
+  that may be `std::ref`-wrapped so a task re-reads them on every run.
+  `IndexRange<T>` ports upstream's one-dimensional `IndexRanges<T, 1>` for
+  the integer domain; `Runtime::for_each` takes a borrowed `&mut [T]`
+  instead for the slice domain, each caller's own module arguing why a
+  borrowed slice reproduces that same lazy-fetch behaviour without a
+  reference-wrapper vocabulary Rust has no equivalent for. Multi-dimensional
+  `IndexRanges<T, N>` for `N > 1`, and a signature generic over an arbitrary
+  splittable iterator the way Rayon's `IndexedParallelIterator` is, are both
+  declined: every algorithm this milestone ports reads one contiguous slice
+  or one integer range, and a caller with something else first turns it
+  into one of those two shapes. `FlowBuilder`'s owned-data wrapper over each
+  (`ForEachBuilder` and the family beside it) takes the ownership question
+  off a caller who has no `&mut [T]` or range to hand a runtime task already
+  borrowing one.
+- **`find_if`, `find_if_not`, `min_element` and `max_element` return an
+  index, not an iterator** (issue #177). Upstream returns an iterator into
+  the input, `end` meaning "not found"; translating `end` needs the same
+  iterator-pair vocabulary the entry above declines, so the result is
+  `Option<usize>` instead, `None` where upstream returns `end`. A caller
+  that wants the element back indexes `data` with it.
+- **The observer list is one atomic check on the path with no observers,
+  and a mutex only when there is work to do** (issue #167). Upstream's own
+  `_observer_prologue`/`_observer_epilogue` iterate `_observers` -- an
+  `unordered_set` -- under no lock at all, relying on nothing ever mutating
+  it while a run is in flight, which upstream's own docs do not promise and
+  this port will not assume. The crate-private `ObserverList` instead keeps
+  a plain `AtomicUsize` count beside the list: the empty check both
+  scheduling seams open with is one relaxed load, and `ObserverList::insert`
+  and `ObserverList::remove` -- called rarely, never from a worker's hot
+  path -- are the only two callers that take the list's mutex to write it.
+  A non-empty seam takes that same mutex once, to clone the registered
+  `Arc`s into a `Vec` of its own, and releases it before calling anything,
+  so an observer that calls back into `make_observer` or `remove_observer`
+  cannot deadlock against the seam that is visiting it. The same issue
+  settles what a `WorkerView` can answer about a worker's queue: upstream
+  exposes `queue_size()` and `queue_capacity()`, and a `crossbeam` deque
+  reports neither, its capacity being a moving target where upstream's is
+  bounded, so `WorkerView::is_queue_empty` is the part of that interface
+  the port can answer, repeating exactly what `Worker` already exposes
+  rather than a second, inconsistent one.
+- **An observer epilogue skip is folded into the exhaustive dispatch
+  match, not read from a side `matches!`** (issues #211, #212). Two handle
+  kinds, `Handle::Async` and `Handle::DependentAsync`, tear themselves down
+  and signal a waiter from inside their own dispatch arms, before
+  `WorkerThread::invoke_one`'s generic post-match `observer_epilogue` call
+  could otherwise run -- so those two arms call it themselves and
+  `invoke_one` must skip its own call for them. Spelling that skip as a
+  `matches!` beside the exhaustive `match` that already dispatches on the
+  handle left the two lists able to drift: a later `Handle` variant that
+  also signals a waiter from inside its own tear-down could compile without
+  being added to it, silently reintroducing the exact missing-`on_exit`
+  defect #167 found. The fix makes each dispatch arm return an `Epilogue`
+  value instead -- `Pending` if the generic call still has to run,
+  `AlreadyRun` if the arm already made it -- read back from the same
+  `match`'s result rather than re-derived from the handle a second time, so
+  a new variant is a compile error there until it states which it is. A
+  second exhaustive match on `Handle` in `src/graph.rs` was considered and
+  declined: it would answer the question in a different place from the one
+  that already knows it, which is the two-places-to-keep-in-step problem
+  this entry exists to close rather than move.
+- **One per-algorithm `FlowBuilder` extension trait per module, rather than
+  one shared trait** (issues #170, #171, #173, #174, #175, #176, #177,
+  #178). `FlowBuilder` is a trait, not a struct, so an algorithm's
+  owned-data wrapper cannot be added as a second inherent `impl` block the
+  way a method on a concrete type could be. Each algorithm module therefore
+  declares its own blanket-implemented extension trait --
+  `impl<B: FlowBuilder + ?Sized> XxxBuilder for B {}` -- re-exported from
+  the prelude beside `FlowBuilder` itself, so a caller with
+  `use rustflow::prelude::*;` never has to name any of them. The shape is an
+  orchestration decision rather than a design one: it let these issues land
+  in parallel without several agents conflicting inside one `impl` block in
+  `src/flow_builder.rs`, at the cost of one public name per algorithm that
+  exists for no reason but where the parallelism pressure put it. Whether
+  to collapse them into one `AlgorithmBuilder: FlowBuilder` now that the
+  pressure is gone, or keep the split and call it settled, is issue #216's
+  to answer, not this entry's.
 
 ## Decisions taken in M8
 
