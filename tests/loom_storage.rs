@@ -13,6 +13,10 @@
 //!     cargo test --release --test loom_storage
 //! ```
 //!
+//! `.github/workflows/loom.yml` runs it weekly and on `workflow_dispatch`,
+//! alongside every other `tests/loom_*.rs`, which is the only thing watching
+//! this model outside a deliberate local run (#128).
+//!
 //! # What is modelled, and what is not
 //!
 //! The model is **standalone**: it does not drive the crate's `Storage` and

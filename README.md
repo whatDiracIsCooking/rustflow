@@ -62,6 +62,12 @@ than the result: CI runs four of the five commands in this image and
 image CI uses is the stock `rust` one and building cargo-deny from source
 there would cost every PR minutes.
 
+The loom models in `tests/loom_*.rs` are the one test target the gate does not
+build — they need a `cfg(loom)` rebuild of the whole dependency graph, which
+only `RUSTFLAGS` sets — so
+[`.github/workflows/loom.yml`](.github/workflows/loom.yml) runs them weekly and
+on `workflow_dispatch` instead of per PR.
+
 ## Working inside the container
 
 The image carries the agent tooling as well as the toolchain, pinned the same

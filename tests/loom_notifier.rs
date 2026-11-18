@@ -12,6 +12,11 @@
 //!     cargo test --release --test loom_notifier
 //! ```
 //!
+//! Out of the gate is not out of CI: `.github/workflows/loom.yml` runs that
+//! command for every model under `tests/`, weekly and on `workflow_dispatch`,
+//! so a notifier change that breaks this model is caught by something other
+//! than someone remembering to run it (#128).
+//!
 //! Give it a `CARGO_TARGET_DIR` of its own: `--cfg loom` makes every crate in
 //! the graph a separate build, so sharing the gate's directory forces a full
 //! rebuild in both directions every time you switch.
