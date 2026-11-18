@@ -70,6 +70,22 @@
 //! task that cannot have every count it asked for is parked rather than run,
 //! to be rescheduled by whoever releases.
 //!
+//! # Where the names live
+//!
+//! Every name here has a module that owns it, and the crate root re-exports
+//! the ones a caller writes: a type a caller constructs, a type a public API
+//! hands them or asks of them, and a trait whose methods they call or
+//! implement. A *family* -- `algorithm`, `observer`, `pipeline` -- is not
+//! flattened here but at its own front door, so [`pipeline::Pipeline`] and
+//! `observer`'s types are reached through their module; a part of the
+//! scheduler no program outside the crate drives, such as a
+//! [`Notifier`](executor::notifier::Notifier), keeps its module path, where
+//! the docs explaining it are. [`prelude`] is the smaller list inside that
+//! one: the names a program's first page spells, which [`prelude`]'s own docs
+//! state as a rule. `DESIGN.md`'s "Decisions taken in M10" entry has why both
+//! lists are drawn where they are, and which re-exports it leaves to be
+//! withdrawn.
+//!
 //! # Status
 //!
 //! Steps 1 to 5 of the README's "Order of work" are in: everything above is
@@ -137,29 +153,77 @@ pub use crate::executor::run_handle::{Canceller, RunError, RunHandle};
 pub use crate::executor::scope::Scope;
 pub use crate::executor::subflow::JoinError;
 pub use crate::executor::worker::{Worker, WorkerInterface};
-pub use crate::flow_builder::{Callables, FlowBuilder};
+pub use crate::flow_builder::{Callables, Composable, FlowBuilder};
 pub use crate::graph::{
     AsyncWork, Graph, Handle, Node, OnceWork, RuntimeWork, SubflowWork, Task, Work,
 };
 pub use crate::runtime::Runtime;
-pub use crate::semaphore::Semaphore;
+pub use crate::semaphore::{Semaphore, SemaphoreError};
 pub use crate::subflow::Subflow;
 pub use crate::task::{TaskMut, TaskRef, TaskType};
 pub use crate::task_group::TaskGroup;
 pub use crate::taskflow::Taskflow;
 
-/// The names you need in scope to build a graph.
+/// The names a program writes on its first page: everything it takes to build
+/// a taskflow, submit it to an executor and read the run's outcome.
 ///
-/// [`FlowBuilder`] is a trait, so its methods -- `emplace`, `placeholder`,
-/// `linearize` and the rest -- are only callable where it is imported. Upstream
-/// gets them from a base class and needs no equivalent.
+/// That is the whole of the rule, and it is a boundary as much as a list: a
+/// name is in the prelude if a program spells it while building a graph with
+/// [`Taskflow`] and running it with [`Executor::run`] -- the graph vocabulary,
+/// the two task handles, the body parameters the dynamic task kinds hand their
+/// closures, the run's outcome, and every trait whose methods that program
+/// calls, since Rust will not call a trait method whose trait is not in scope.
+/// Any other entry point into the crate is a feature a program chooses -- the
+/// async family, task groups, semaphores, scoped spawns, observers, pipelines,
+/// the algorithms' free-function and partitioner forms -- and its names are
+/// imported by name from the crate root or from the family's own module at the
+/// point the program chooses it. `DESIGN.md`'s "Decisions taken in M10" entry
+/// has why this reading and not the narrower one.
 ///
 /// ```
 /// use rustflow::prelude::*;
 ///
-/// let mut taskflow = Taskflow::with_name("example");
-/// let task = taskflow.emplace(|| println!("work"));
-/// assert!(taskflow.graph().node(task).handle().is_static());
+/// // Building: `Taskflow` implements `FlowBuilder`, and each algorithm's
+/// // wrappers come from an extension trait over the same builder.
+/// fn builds_everything<B>(_builder: &B)
+/// where
+///     B: FlowBuilder
+///         + FindBuilder
+///         + ForEachBuilder
+///         + ForEachIndexBuilder
+///         + MergeBuilder
+///         + ReduceBuilder
+///         + ScanBuilder
+///         + SortBuilder
+///         + ElementwiseBuilder,
+/// {
+/// }
+///
+/// let mut taskflow = Taskflow::with_name("first page");
+/// builds_everything(&taskflow);
+///
+/// let a: Task = taskflow.emplace(|| println!("A"));
+/// let b = taskflow.emplace_subflow(|subflow: &mut Subflow<'_>| {
+///     subflow.emplace(|| println!("B1"));
+/// });
+/// let c = taskflow.emplace_runtime(|_runtime: &mut Runtime<'_>| println!("C"));
+/// let mut handle: TaskMut<'_> = taskflow.task(b);
+/// handle.name("B").succeed([a]).precede([c]);
+///
+/// // Inspecting what was built.
+/// let view: TaskRef<'_> = taskflow.task_ref(a);
+/// assert_eq!(view.task_type(), TaskType::Static);
+/// let graph: &Graph = taskflow.graph();
+/// let node: &Node = graph.node(a);
+/// let Handle::Static(work) = node.handle() else { unreachable!() };
+/// let _: &Work = work;
+///
+/// // Running it, and reading the outcome.
+/// let executor = Executor::new(2);
+/// let run: RunHandle<'_> = executor.run(&taskflow);
+/// let _: Canceller = run.canceller();
+/// let outcome: Result<(), RunError> = run.wait();
+/// assert!(outcome.is_ok());
 /// ```
 pub mod prelude {
     pub use crate::algorithm::find::FindBuilder;
@@ -170,10 +234,13 @@ pub mod prelude {
     pub use crate::algorithm::scan::ScanBuilder;
     pub use crate::algorithm::sort::SortBuilder;
     pub use crate::algorithm::transform::ElementwiseBuilder;
+    pub use crate::executor::Executor;
+    pub use crate::executor::run_handle::{Canceller, RunError, RunHandle};
     pub use crate::flow_builder::FlowBuilder;
-    pub use crate::graph::{Graph, Handle, Task, Work};
+    pub use crate::graph::{Graph, Handle, Node, Task, Work};
     pub use crate::runtime::Runtime;
     pub use crate::subflow::Subflow;
+    pub use crate::task::{TaskMut, TaskRef, TaskType};
     pub use crate::taskflow::Taskflow;
 }
 

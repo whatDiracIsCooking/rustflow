@@ -1362,3 +1362,68 @@ entry above does.
   `src/executor/runtime.rs`, `src/task_group.rs`, `src/executor/corun.rs`
   and `src/executor/dependent_async.rs` -- a file a reviewer looks at, with
   the reason given once here rather than reinvented per PR.
+
+## Decisions taken in M10
+
+- **The prelude is a program's first page, and the crate root is the flat
+  namespace for the names a caller writes -- with each family flattened at
+  its own front door rather than at the root** (issue #256).
+
+  `rustflow::prelude` takes the wider of the two readings
+  `docs/api-friction.md` put side by side: it is the first-page vocabulary --
+  the names a program spells to build a taskflow, submit it to an executor
+  and read the run's outcome. That is `Taskflow`, `FlowBuilder` and the eight
+  algorithm extension traits; the graph vocabulary `Graph`, `Node`, `Task`,
+  `Handle` and `Work`; `TaskMut`, `TaskRef` and `TaskType`; the `Subflow` and
+  `Runtime` body parameters the dynamic task kinds hand their closures; and
+  `Executor` with `RunHandle`, `RunError` and `Canceller`. The narrow reading
+  -- only the traits a glob import needs to make `FlowBuilder`'s methods
+  callable -- is what was there by accident, and the corpus answers it: all
+  44 example programs write `Executor` in an import of their own, 40 of them
+  on the line after `use rustflow::prelude::*;`, as do 33 of the 34
+  prelude-using files in `tests/`. A prelude that leaves the single most
+  written name in the crate out of the one import a program makes first is
+  not a prelude; it is a list of trait fixups. The boundary is drawn at the
+  point a program *chooses* something, which is why the async family, task
+  groups, semaphores, scoped spawns, observers, pipelines and the algorithms'
+  free-function and partitioner forms stay out: a program imports those by
+  name, where it makes the choice. It also stops one step short of a prelude
+  member's own nested-wait outcome -- `JoinError` from `Subflow::join`,
+  `CorunError` from `Runtime::corun` -- because a body that joins or coruns
+  is past its first page; both are root names. Nothing was taken out of the
+  prelude, so no caller lost an import and an example's now-redundant
+  `use rustflow::Executor;` is free to stay.
+
+  The crate root is the port's counterpart of upstream's flat `tf::`
+  namespace, and a name earns a line in it by being one a program *using* the
+  crate writes: a type it constructs (`Taskflow`, `Executor`, `Semaphore`,
+  `Xorshift32`), a type a public API hands it or asks of it (`Task`,
+  `RunHandle`, `SemaphoreError`, `Scope`), or a trait whose methods it calls
+  or implements (`FlowBuilder`, `Composable`, `WorkerInterface`). Applying
+  that added the two names it showed were missing, `Composable` and
+  `SemaphoreError`, and it answers the friction log's `Xorshift32` report
+  with "already a root name, and not a prelude one" -- upstream documents
+  `tf::Xorshift` as a utility with its own examples, and
+  `examples/switch_case.rs` uses it as a caller would, standing in for
+  upstream's `rand()`. Two kinds of name do not earn a root line. A *family*
+  -- `algorithm`, `observer`, `pipeline` -- is flattened at its own front
+  door instead: `rustflow::pipeline::{Pipeline, DataPipeline, Pipe, PipeType,
+  Pipeflow, ...}` is this issue's own application of that, `rustflow::algorithm`
+  is issue #216's to flatten as it collapses the eight extension traits, and
+  `rustflow::observer` wants the two lines that would put `ChromeObserver`
+  and `TfProfObserver` beside `Observer` in files this issue does not own.
+  Flattening all three at the root would roughly double a 35-name list for
+  no gain: `rustflow::pipeline::Pipeline` reads as well as
+  `rustflow::Pipeline` and says more, which is a distinction a single C++
+  namespace has nowhere to draw. And a part of the scheduler that no program
+  outside the crate can drive is not a root name and ought not be `pub`
+  either, which is the arbiter issue #279 asks for: it excludes
+  `NonpreemptiveRuntime` and `NonpreemptiveRuntimeWork` (the README already
+  lists the first as deliberately not user-facing), the `executor::topology`
+  types, and the `executor::queue` trio `Buffers`, `Thief` and `WorkerQueue`,
+  whose only caller anywhere is `tests/wsq.rs` -- a test of the queue layer,
+  not a program using it. Those three root lines are the rule's one
+  outstanding application: withdrawing them edits `tests/wsq.rs` to name
+  `rustflow::executor::queue::...` instead, the same module path
+  `tests/notifiers.rs` already uses for the notifiers, which were never root
+  names, and that edit belongs to #279, which owns the file.
