@@ -112,6 +112,15 @@ only `RUSTFLAGS` sets — so
 [`.github/workflows/loom.yml`](.github/workflows/loom.yml) runs them weekly and
 on `workflow_dispatch` instead of per PR.
 
+CI runs the suite a second time as the `two-core` job of
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml): once, pinned with
+`taskset -c 0,1`, because most of the lifecycle races closed in this port were
+found that way rather than by a full-width run — two runnable workers sharing
+one core interleave a release against the wake that follows it in orders
+neither a 24-core box nor a 4-core runner produces. It is one run against the
+same bar, not a repeat count, so a failure in that job is a bug to file and
+never a test to loosen.
+
 ## Examples
 
 [`examples/`](examples/) is upstream's own directory, one file per example

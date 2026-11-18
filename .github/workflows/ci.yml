@@ -4,8 +4,8 @@
 # docker/compose.yaml, in the same container image -- so a green run here and a
 # green run on your machine mean the same thing. The remaining one, `cargo deny
 # check`, is the separate `deny` job below rather than a step here, for the
-# reason given there; this workflow is green only when both jobs are, which is
-# also what automerge.yml waits on.
+# reason given there; this workflow is green only when every one of its jobs
+# is, which is also what automerge.yml waits on.
 #
 # The toolchain pin lives in ONE place: `ARG RUST_VERSION` in the root
 # Dockerfile. The image below must be kept equal to it by hand; there is no
@@ -73,6 +73,67 @@ jobs:
       # dependencies, so a cache round-trip would cost more than the build it
       # saves. Add actions/cache on ~/.cargo/registry and ./target once there
       # is a dependency tree worth restoring.
+
+  # The same suite as `ci` above, run ONCE pinned to two cores. Most of the
+  # lifecycle races closed in this repo so far were found that way and not by
+  # a full-width run: with two runnable workers sharing a core, the scheduler
+  # interleaves a release against the wake that follows it in orders a
+  # 24-core box never produces -- and a 4-core runner does not produce them
+  # either, so `ci` above passes a regression of that class.
+  #
+  # One run against the same bar, deliberately not a repeat count and not a
+  # retry: the suite runs exactly once, the assertions are the suite's own,
+  # and a failure here is a bug to file rather than a test to loosen.
+  two-core:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.100-slim-bookworm
+    steps:
+      # Same first apt list as `ci`, for the same reason: before checkout, so
+      # that actions/checkout has git to use rather than falling back to a
+      # tarball with no .git directory. `taskset` needs nothing added to it --
+      # it comes from util-linux, which Debian marks Essential, so every
+      # bookworm image already carries it. The step below proves that on the
+      # runner rather than trusting this paragraph.
+      - name: Install container prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates pkg-config libssl-dev
+          rm -rf /var/lib/apt/lists/*
+
+      - uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+
+      # If pinning silently failed, this job would be a slower copy of `ci`
+      # that reports green while checking nothing new -- the same trap
+      # loom.yml guards against with its passing-count check. Ask the kernel
+      # what the affinity actually is instead.
+      - name: Check that two-core pinning takes effect
+        run: |
+          # POSIX only, no bashism, for the step shell loom.yml describes:
+          # GitHub runs this as `sh -e {0}` and dash rejects `set -o pipefail`
+          # before cargo is ever reached (#151).
+          set -eu
+          visible=$(taskset -c 0,1 nproc)
+          echo "runner CPUs: $(nproc); visible under taskset -c 0,1: $visible"
+          if [ "$visible" -ne 2 ]; then
+            echo "::error::taskset -c 0,1 left $visible CPU(s) visible -- this lane is not pinned."
+            exit 1
+          fi
+
+      # Compiling is not what this lane exercises, so it gets the whole runner
+      # and only the run below is pinned. `--no-run` runs no test, so the
+      # suite still executes exactly once. Nothing is shared with `ci` above
+      # (no cache there yet, see the note at the end of that job), so this
+      # job accepts its own build.
+      - name: Build the test binaries unpinned
+        run: cargo test --all-features --no-run
+
+      - name: Run the suite under two cores
+        run: taskset -c 0,1 cargo test --all-features
 
   # `ci` above already compiles every example under `--all-targets`, so
   # clippy and the doc-tests cover *that* they build; this job covers that
