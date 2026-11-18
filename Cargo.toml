@@ -148,3 +148,11 @@ harness = false
 [[bench]]
 name = "wavefront"
 harness = false
+
+[[bench]]
+name = "skynet"
+harness = false
+
+[[bench]]
+name = "nqueens"
+harness = false

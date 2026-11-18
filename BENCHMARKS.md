@@ -2442,3 +2442,135 @@ to its left reads a cell still holding its initial value and writes one the
 reference never produces. Deleting either edge of the grid makes that
 comparison fail at the parallel worker count, which is what the check is
 there for.
+
+## skynet
+
+A ten-way tree of depth `MaxDepth` whose leaves are the integers below
+`10^MaxDepth`, summed back up: upstream's `skynet_one_tf` opens a
+`tf::TaskGroup` per interior node, `silent_async`s ten children into it,
+`corun`s for them and adds the ten slots, and the root is one
+`executor.async(...)` whose handle is waited -- a group may only be opened by
+a worker. Both are translated as they stand, so the `rustflow-group` id is
+the same port shape `fibonacci`'s id of that name is: `task_group()`,
+`silent_async`, `corun`. It carries `group` rather than being plain
+`rustflow` because the submission path is the thing this shape measures, and
+there is exactly one `rustflow` variant of it here.
+
+**The baseline is `rayon::scope` plus ten `spawn`s per level**, which is the
+form upstream's own non-Taskflow column takes: `skynet/tbb.cpp` runs a
+`tbb::task_group`, `tg.run` ten times, then `tg.wait`. There is no graph on
+either side, so the construction asymmetry "What is measured" warns about is
+absent here as it is for `async_task` and `fibonacci`; what the two ids do
+not share is upstream's frame-borrowed `std::array<size_t, 10> results`,
+which a `Send + 'static` body cannot have. The `rustflow-group` id pays an
+`Arc<[AtomicU64; 10]>` per interior node for it -- one allocation and ten
+refcount pairs -- where the rayon id splits a plain `[u64; 10]` into ten
+disjoint `&mut`, since a scope's closures may borrow the frame the scope is
+on. `benches/skynet.rs`'s module docs list that and the two other departures.
+
+**Sizes are `MaxDepth = 3` and `4`** -- 1110 spawned tasks and 11110, a decade
+apart, the smaller where the fixed cost of a round still shows against the
+tree and the larger where the per-task cost dominates it. **Both are below
+upstream's own sweep, which runs `MaxDepth = 1..=8`, and what bounds them is
+the stack rather than the clock**: this is the cliff the `fibonacci` section
+above describes for the same group shape, measured here the same way, with a
+release build driven straight rather than under criterion.
+
+| id | workers | largest `MaxDepth` that passes | smallest that aborts |
+|---|---|---|---|
+| `rustflow-group` | 1 | 4 | 5 |
+| `rustflow-group` | 24 | 5 | 6 |
+
+One worker is the binding end, for the reason `fibonacci`'s own table gives:
+a corun keeps its worker in the work-stealing loop, a group's children go into
+the shared buffers rather than onto the submitting worker's queue, so a corun
+is handed the oldest outstanding job in the pool instead of the child it
+waits for and nests a frame per outstanding *child*. The one worker that
+coruns is the only worker there is to pick those children up. `MaxDepth = 4`
+is therefore a factor of ten in task count inside the one-worker ceiling, and
+each of the four sizes-by-workers combinations above was run ten times to
+check that it sits inside it rather than on it.
+
+**The answer is checked outside the measured region.** The leaves are exactly
+the integers below `n = 10^MaxDepth`, each counted once, so the sum is
+`n * (n - 1) / 2`; each id is run once per row and compared against it before
+criterion times anything, which upstream does not do at all --
+`skynet(executor, MaxDepth)` discards `skynet_one_tf`'s return value. A
+recursion that lost a subtree fails the bench rather than reporting a good
+number for doing less work.
+
+**The figures are not in this section yet, and that is deliberate.** This
+shape landed while sibling agents were building and testing this crate on the
+box, so a number taken now would be the load and not the shape -- the same
+trap "The machine, and what it was doing" and the `Work` decision above each
+record falling into. **#352 measures every section this milestone adds in one
+pass on a quiet box at full width**, and fills in the machine-and-load table
+and the size × workers × {`rustflow-group`, `rayon`, upstream C++ = not
+published} table in the format the `sort` section uses, together with the
+paragraph reading them.
+
+What the shape is here to measure, which is why the ids above are the ones
+#342 will A/B: every one of the `(10^MaxDepth - 1) / 9` interior nodes is a
+**preempted parent**, and when its last child finishes it goes back on a queue
+rather than being resumed on the spot. That is the half of upstream's locality
+optimisation this port has not taken (`WorkerThread::finish_job`), and the
+`Work` decision above says in as many words that nothing in this file measured
+it: "the shapes that would [move] are the nested ones, and nothing here
+measures those yet". This target and `nqueens` below are two of the five that
+now do.
+
+## nqueens
+
+The classic backtracking count -- one queen per column, prune the placements
+that attack an earlier one, count the complete boards -- with a task per
+surviving placement: upstream's `nqueens(j, a, executor)` opens a
+`tf::TaskGroup` per level, `silent_async`s one child per legal placement in
+column `j`, gathers each child's count through a per-child slot (`parts`),
+`corun`s, and returns the sum; the root is one `executor.async(...)` whose
+handle is read. The `rustflow-group` id is that, line for line, and is named
+for its submission path for the same reason `skynet`'s is.
+
+**The baseline is `rayon::scope` plus one `spawn` per legal placement**,
+again the form upstream's own `nqueens/tbb.cpp` takes with `tbb::task_group`:
+`g.run` per placement, then `g.wait`. Both sides prune with upstream's
+`queens_ok`, so the arithmetic is the same work in both columns; both sides
+give a child an owned board, because a scope's `spawn` is `Send` too and
+upstream's trick of handing child `i` a reference into the parent's
+`N`-by-`N` `buf` is not available to either. What only the `rustflow-group`
+id pays is `parts` as an `Arc<Vec<AtomicU64>>` where the rayon id splits a
+`Vec<u64>` into disjoint `&mut`. `benches/nqueens.rs`'s module docs list the
+departures in full.
+
+What this shape adds over `skynet` is that **the tree is ragged**: a level
+spawns between zero and `N` children depending on what the pruning leaves, so
+the fan-out is data rather than a constant and most interior nodes wait on a
+handful of children rather than on ten. The re-queue of a preempted parent is
+therefore a larger share of each parent's cost here than it is there, which
+is what makes the pair worth measuring rather than either one alone.
+
+**Sizes are `q = 6` and `8`** -- 152 spawned tasks and 2056, a factor of
+thirteen apart, with the same split of roles the other tables use. **Both are
+below upstream's own default sweep, which runs `q = 1..=14`, and what bounds
+them is the stack rather than the clock**, exactly as for `skynet`:
+
+| id | workers | largest `q` that passes | smallest that aborts |
+|---|---|---|---|
+| `rustflow-group` | 1 | 8 | 9 |
+| `rustflow-group` | 24 | 10 | 11 |
+
+`q = 8` is a factor of four in task count inside the one-worker ceiling,
+which is the margin `fibonacci`'s own sizes keep against its cliff, and each
+size-by-workers combination was run ten times to check it sits inside rather
+than on it. One worker is the binding end here too, and for the same reason.
+
+**The answer is checked outside the measured region**, against upstream's own
+`answers` table from `nqueens.hpp`: `answers[6]` is 4 and `answers[8]` is 92.
+Upstream checks the same table after its clock stops; the difference is only
+that the check here runs once per id, before criterion times that id a
+hundred times.
+
+**The figures are not in this section yet, for the reason the `skynet`
+section above gives, and #352 takes them**: the machine-and-load table, the
+size × workers × {`rustflow-group`, `rayon`, upstream C++ = not published}
+table and the paragraph reading them, measured on a quiet box in one pass with
+every other section this milestone adds.
