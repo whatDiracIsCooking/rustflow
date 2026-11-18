@@ -431,19 +431,13 @@ impl WorkerThread {
 
         self.observer_prologue(&job);
 
-        // The two free-standing node kinds call `observer_epilogue` for
-        // themselves, from inside `executor::async` and
-        // `executor::dependent_async`: each has its own tear-down --
-        // `Shared::finish_async`, a dependent task's successor release --
-        // that signals a waiter (`Executor::wait_for_all`,
-        // `Executor::drop`) from *inside* the dispatch below, before this
-        // match produces a value at all, so the generic call after it would
-        // run too late to order against that signal. Calling it there
-        // instead, right before each such signal, is what keeps "on_exit
-        // fires before anything the exit could unblock" true for them too.
-        let async_dispatch = matches!(node.handle(), Handle::Async(_) | Handle::DependentAsync(_));
-
-        let release = match node.handle() {
+        // Every arm below states its own epilogue behaviour as part of the
+        // value it returns, through `Epilogue::Pending` or
+        // `Epilogue::AlreadyRun`: whether this match's generic
+        // `observer_epilogue` call still has to run is folded into the same
+        // `match` that dispatches on the handle, rather than re-derived from
+        // it separately, so a new arm cannot compile without choosing.
+        let dispatch = match node.handle() {
             // Upstream's `_invoke_static_task`, whose
             // `TF_EXECUTOR_EXCEPTION_HANDLER` is this `catch_unwind` and whose
             // `_process_exception` is `Job::record_panic`: the failure goes to
@@ -454,46 +448,65 @@ impl WorkerThread {
                 if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| work.invoke())) {
                     job.record_panic(payload);
                 }
-                Some(Release::Strong)
+                Epilogue::Pending(Some(Release::Strong))
             }
             // Upstream's `std::monostate` case: a placeholder has no work, and
             // it still has successors to release.
-            Handle::Placeholder => Some(Release::Strong),
+            Handle::Placeholder => Epilogue::Pending(Some(Release::Strong)),
             // Upstream's `_invoke_condition_task`: the static invoker plus a
             // return value, so a panic is recorded as a static task's is and
             // leaves an empty selection, which ends the branch.
-            Handle::Condition(work) => Some(Release::Selected(
+            Handle::Condition(work) => Epilogue::Pending(Some(Release::Selected(
                 panic::catch_unwind(AssertUnwindSafe(|| work.invoke()))
                     .map_err(|payload| job.record_panic(payload))
                     .ok(),
-            )),
+            ))),
             // Upstream's `_invoke_multi_condition_task`, over however many
             // indices the body returns.
-            Handle::MultiCondition(work) => Some(Release::SelectedMany(
+            Handle::MultiCondition(work) => Epilogue::Pending(Some(Release::SelectedMany(
                 panic::catch_unwind(AssertUnwindSafe(|| work.invoke()))
                     .map_err(|payload| job.record_panic(payload))
                     .unwrap_or_default(),
-            )),
+            ))),
             // The four dynamic-tasking handles, each upstream's
             // `_invoke_*_task` and each one line into the module that owns it.
             // Every one may preempt this node rather than finish it, which the
             // `None` under the match is about, and the two module arms hand
-            // over what their handle *owns* rather than a `Graph&`.
-            Handle::Subflow { work, subgraph } => subflow::invoke(self, &job, work, subgraph),
-            Handle::Runtime(work) => runtime::invoke(self, &job, work),
-            Handle::Module(target) => module::invoke(self, &job, target),
-            Handle::AdoptedModule(adopted) => module::invoke_adopted(self, &job, adopted),
+            // over what their handle *owns* rather than a `Graph&`. None of
+            // the four signals a waiter from inside its own tear-down, so the
+            // generic call after this match is still the one that runs it.
+            Handle::Subflow { work, subgraph } => {
+                Epilogue::Pending(subflow::invoke(self, &job, work, subgraph))
+            }
+            Handle::Runtime(work) => Epilogue::Pending(runtime::invoke(self, &job, work)),
+            Handle::Module(target) => Epilogue::Pending(module::invoke(self, &job, target)),
+            Handle::AdoptedModule(adopted) => {
+                Epilogue::Pending(module::invoke_adopted(self, &job, adopted))
+            }
             // The two async handles, the one pair of arms a graph is not
             // supposed to reach: an async task's node is free-standing and
-            // dispatched through a job of its own arena, so what gets here is a
-            // handle somebody put in a taskflow. Both refuse.
-            Handle::Async(work) => r#async::invoke(self, &job, work),
-            Handle::DependentAsync(work) => dependent_async::invoke(self, &job, work),
+            // dispatched through a job of its own arena, so what gets here is
+            // a handle somebody put in a taskflow. Both refuse. Both also tear
+            // themselves down inside their own dispatch function --
+            // `Shared::finish_async`, a dependent task's successor release --
+            // which can signal a waiter (`Executor::wait_for_all`,
+            // `Executor::drop`) before this match produces a value at all, so
+            // each calls `observer_epilogue` itself, right before that signal,
+            // on every return path; see `executor::async::invoke` and
+            // `executor::dependent_async::invoke`.
+            Handle::Async(work) => Epilogue::AlreadyRun(r#async::invoke(self, &job, work)),
+            Handle::DependentAsync(work) => {
+                Epilogue::AlreadyRun(dependent_async::invoke(self, &job, work))
+            }
         };
 
-        if !async_dispatch {
-            self.observer_epilogue(&job);
-        }
+        let release = match dispatch {
+            Epilogue::Pending(release) => {
+                self.observer_epilogue(&job);
+                release
+            }
+            Epilogue::AlreadyRun(release) => release,
+        };
 
         // Upstream's `return true` out of its three preempting invokers, which
         // its `_invoke` turns into a bare `return`: this node is the parent of
@@ -648,10 +661,12 @@ impl WorkerThread {
     /// to -- `executor::async` and `executor::dependent_async` do, around
     /// `Shared::finish_async` and a dependent task's successor release, each
     /// of which can let `Executor::wait_for_all` or `Executor::drop` return
-    /// before the on_exit this call is for. `pub(crate)` for exactly that:
-    /// every other dispatch arm is finished by `WorkerThread::invoke_one`
-    /// itself, well after its own generic call, and has no reason to call
-    /// this directly.
+    /// before the on_exit this call is for. Such an arm reports
+    /// [`Epilogue::AlreadyRun`] from [`WorkerThread::invoke_one`]'s dispatch
+    /// `match`, which is what stops that match's generic call from running a
+    /// second time. `pub(crate)` for exactly that: every other dispatch arm
+    /// reports [`Epilogue::Pending`] and is finished by that generic call
+    /// instead, and has no reason to call this directly.
     pub(crate) fn observer_epilogue(&self, job: &Job) {
         if self.shared.observers.is_empty() {
             return;
@@ -816,6 +831,30 @@ impl WorkerThread {
     fn worker(&self) -> &Worker {
         &self.shared.workers[self.id]
     }
+}
+
+/// What one arm of [`WorkerThread::invoke_one`]'s dispatch `match` leaves for
+/// that method to finish: the [`Release`] the dispatch computed, if the node
+/// did not preempt itself, and whether the arm has already called
+/// [`WorkerThread::observer_epilogue`] for this job on every path through it.
+///
+/// No arm may skip the choice -- there is no third constructor and no `Deref`
+/// to a `bool` a caller could forget to read -- which is the point: a new
+/// [`Handle`] variant is a new arm of that `match`, and every existing arm
+/// already has to produce one of these two to type-check, so the arm cannot
+/// compile without picking one.
+pub(crate) enum Epilogue {
+    /// This arm's own tear-down cannot wake a waiter, so
+    /// [`WorkerThread::invoke_one`]'s generic call after the `match` still has
+    /// to run.
+    Pending(Option<Release>),
+    /// This arm already called [`WorkerThread::observer_epilogue`] itself,
+    /// from inside the dispatch function it delegates to, before a signal
+    /// that tear-down sends can let a waiter (`Executor::wait_for_all`,
+    /// `Executor::drop`) return -- [`Handle::Async`] and
+    /// [`Handle::DependentAsync`] are the two arms that do. The generic call
+    /// after the `match` must not run a second time.
+    AlreadyRun(Option<Release>),
 }
 
 /// What the work a worker has just run leaves its node's successors owed.
