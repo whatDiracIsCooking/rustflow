@@ -8,12 +8,13 @@
 //! own doctest already exercises [`Runtime::reduce_by_index`].
 //!
 //! The first section runs upstream's `reduce` benchmark through
-//! [`ReduceBuilder::reduce`], the owned-data `FlowBuilder` wrapper closest
-//! to upstream's own `taskflow.reduce(beg, end, init, bop)`. The second
-//! replaces upstream's `Data` struct (`a*a + 2*a*b + b*b`, chosen there only
-//! to give `transform` something to compute) with the algebraically
-//! identical `(a + b) * (a + b)`, and runs it through [`Runtime::transform_reduce`]
-//! directly, from inside a runtime task body -- the slice-borrowing form with
+//! [`AlgorithmBuilder::reduce`], the owned-data `FlowBuilder` wrapper
+//! closest to upstream's own `taskflow.reduce(beg, end, init, bop)`. The
+//! second replaces upstream's `Data` struct (`a*a + 2*a*b + b*b`, chosen
+//! there only to give `transform` something to compute) with the
+//! algebraically identical `(a + b) * (a + b)`, and runs it through
+//! [`Runtime::transform_reduce`] directly, from inside a runtime task body
+//! -- the slice-borrowing form with
 //! no upstream equivalent, since upstream's `tf::Runtime` has no reduction
 //! algorithms of its own.
 //!
@@ -22,6 +23,8 @@
 //! upstream prints is also checked with `assert!` or `assert_eq!`, so a
 //! non-zero exit from the binary is itself the test. See the README's
 //! "Examples" section.
+//!
+//! [`AlgorithmBuilder::reduce`]: rustflow::algorithm::AlgorithmBuilder::reduce
 
 use std::sync::{Arc, Mutex};
 
@@ -60,7 +63,7 @@ fn main() {
 }
 
 /// Upstream's `reduce(N)`: the minimum of `N` pseudo-random values, via
-/// [`ReduceBuilder::reduce`].
+/// `AlgorithmBuilder::reduce`.
 fn reduce_finds_the_minimum() {
     let mut state = 0xC0FF_EE01_u64;
     let data: Arc<Vec<i32>> = Arc::new(

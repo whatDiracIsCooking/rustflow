@@ -12,8 +12,11 @@
 //! `make_transform_inclusive_scan_task` overloads; and
 //! [`Runtime::transform_exclusive_scan`] is `make_transform_exclusive_scan_task`.
 //! Each also has a `make_*_task` free function building the owned-data
-//! runtime body `emplace_runtime` wants, and a [`ScanBuilder`] method
-//! queuing that body as a task.
+//! runtime body `emplace_runtime` wants, and a method on
+//! [`AlgorithmBuilder`] -- the one extension trait the whole algorithm family
+//! shares -- queuing that body as a task.
+//!
+//! [`AlgorithmBuilder`]: crate::algorithm::AlgorithmBuilder
 //!
 //! # Design
 //!
@@ -83,8 +86,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::flow_builder::FlowBuilder;
-use crate::graph::Task;
 use crate::runtime::Runtime;
 
 impl<'rt> Runtime<'rt> {
@@ -748,147 +749,6 @@ where
         rt.transform_exclusive_scan(&input, &mut guard, init.clone(), bop.clone(), uop.clone());
     }
 }
-
-/// The owned-data half of every scan method on [`Runtime`]: upstream's six
-/// `FlowBuilder::*_scan` members, over the six `make_*_task` functions
-/// above. A blanket-implemented extension trait rather than a second
-/// `trait FlowBuilder` block, for the reason [`FlowBuilder`]'s own `# Design`
-/// section gives: [`FlowBuilder`] is a trait, implemented by `Taskflow` and
-/// `Subflow`, with no single struct a second `impl` block could extend.
-///
-/// In [`crate::prelude`] alongside [`FlowBuilder`] itself, since a trait's
-/// methods are only callable where the trait is imported.
-pub trait ScanBuilder: FlowBuilder {
-    /// Creates a runtime task that locks `out` and runs
-    /// [`Runtime::inclusive_scan`] over it and `input`: upstream's
-    /// `FlowBuilder::inclusive_scan(first, last, d_first, bop)`.
-    ///
-    /// `rustflow::prelude::*` is the only import this example needs:
-    /// `ScanBuilder` itself is one of the prelude's names, not imported
-    /// here by name.
-    ///
-    /// ```
-    /// use std::sync::{Arc, Mutex};
-    ///
-    /// use rustflow::prelude::*;
-    /// use rustflow::Executor;
-    ///
-    /// let input = Arc::new(vec![1, 2, 3, 4, 5]);
-    /// let out = Arc::new(Mutex::new(vec![0; 5]));
-    ///
-    /// let mut taskflow = Taskflow::new();
-    /// taskflow.inclusive_scan(Arc::clone(&input), Arc::clone(&out), |a: &i32, b: &i32| a + b);
-    ///
-    /// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
-    /// assert_eq!(*out.lock().expect("uncontended"), vec![1, 3, 6, 10, 15]);
-    /// ```
-    fn inclusive_scan<T, F>(&mut self, input: Arc<Vec<T>>, out: Arc<Mutex<Vec<T>>>, bop: F) -> Task
-    where
-        T: Send + Sync + Clone + 'static,
-        F: Fn(&T, &T) -> T + Sync + Clone + Send + 'static,
-    {
-        self.emplace_runtime(make_inclusive_scan_task(input, out, bop))
-    }
-
-    /// Creates a runtime task that locks `out` and runs
-    /// [`Runtime::inclusive_scan_with_init`] over it and `input`: upstream's
-    /// `FlowBuilder::inclusive_scan(first, last, d_first, bop, init)`.
-    fn inclusive_scan_with_init<T, F>(
-        &mut self,
-        input: Arc<Vec<T>>,
-        out: Arc<Mutex<Vec<T>>>,
-        bop: F,
-        init: T,
-    ) -> Task
-    where
-        T: Send + Sync + Clone + 'static,
-        F: Fn(&T, &T) -> T + Sync + Clone + Send + 'static,
-    {
-        self.emplace_runtime(make_inclusive_scan_with_init_task(input, out, bop, init))
-    }
-
-    /// Creates a runtime task that locks `out` and runs
-    /// [`Runtime::exclusive_scan`] over it and `input`: upstream's
-    /// `FlowBuilder::exclusive_scan(first, last, d_first, init, bop)`.
-    fn exclusive_scan<T, F>(
-        &mut self,
-        input: Arc<Vec<T>>,
-        out: Arc<Mutex<Vec<T>>>,
-        init: T,
-        bop: F,
-    ) -> Task
-    where
-        T: Send + Sync + Clone + 'static,
-        F: Fn(&T, &T) -> T + Sync + Clone + Send + 'static,
-    {
-        self.emplace_runtime(make_exclusive_scan_task(input, out, init, bop))
-    }
-
-    /// Creates a runtime task that locks `out` and runs
-    /// [`Runtime::transform_inclusive_scan`] over it and `input`: upstream's
-    /// `FlowBuilder::transform_inclusive_scan(first, last, d_first, bop,
-    /// uop)`.
-    fn transform_inclusive_scan<T, F, Uop>(
-        &mut self,
-        input: Arc<Vec<T>>,
-        out: Arc<Mutex<Vec<T>>>,
-        bop: F,
-        uop: Uop,
-    ) -> Task
-    where
-        T: Send + Sync + Clone + 'static,
-        F: Fn(&T, &T) -> T + Sync + Clone + Send + 'static,
-        Uop: Fn(&T) -> T + Sync + Clone + Send + 'static,
-    {
-        self.emplace_runtime(make_transform_inclusive_scan_task(input, out, bop, uop))
-    }
-
-    /// Creates a runtime task that locks `out` and runs
-    /// [`Runtime::transform_inclusive_scan_with_init`] over it and `input`:
-    /// upstream's `FlowBuilder::transform_inclusive_scan(first, last,
-    /// d_first, bop, uop, init)`.
-    fn transform_inclusive_scan_with_init<T, F, Uop>(
-        &mut self,
-        input: Arc<Vec<T>>,
-        out: Arc<Mutex<Vec<T>>>,
-        bop: F,
-        uop: Uop,
-        init: T,
-    ) -> Task
-    where
-        T: Send + Sync + Clone + 'static,
-        F: Fn(&T, &T) -> T + Sync + Clone + Send + 'static,
-        Uop: Fn(&T) -> T + Sync + Clone + Send + 'static,
-    {
-        self.emplace_runtime(make_transform_inclusive_scan_with_init_task(
-            input, out, bop, uop, init,
-        ))
-    }
-
-    /// Creates a runtime task that locks `out` and runs
-    /// [`Runtime::transform_exclusive_scan`] over it and `input`: upstream's
-    /// `FlowBuilder::transform_exclusive_scan(first, last, d_first, init,
-    /// bop, uop)`.
-    fn transform_exclusive_scan<T, F, Uop>(
-        &mut self,
-        input: Arc<Vec<T>>,
-        out: Arc<Mutex<Vec<T>>>,
-        init: T,
-        bop: F,
-        uop: Uop,
-    ) -> Task
-    where
-        T: Send + Sync + Clone + 'static,
-        F: Fn(&T, &T) -> T + Sync + Clone + Send + 'static,
-        Uop: Fn(&T) -> T + Sync + Clone + Send + 'static,
-    {
-        self.emplace_runtime(make_transform_exclusive_scan_task(
-            input, out, init, bop, uop,
-        ))
-    }
-}
-
-impl<B: FlowBuilder + ?Sized> ScanBuilder for B {}
 
 #[cfg(test)]
 mod tests {

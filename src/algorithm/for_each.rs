@@ -6,8 +6,10 @@
 //! not here.
 //!
 //! [`Runtime::for_each`] is the runtime-task body upstream builds as a
-//! closure over `(b, e, c, part)`; [`ForEachBuilder::for_each`] is the
-//! owned-data wrapper over it.
+//! closure over `(b, e, c, part)`;
+//! [`AlgorithmBuilder::for_each`] is the owned-data wrapper over it.
+//!
+//! [`AlgorithmBuilder::for_each`]: crate::algorithm::AlgorithmBuilder::for_each
 //!
 //! # Design
 //!
@@ -29,27 +31,13 @@
 //! rather than here -- its own `# Design` section says why, and names the
 //! five issues that are expected to share its `pub(crate)` helpers.
 //!
-//! **`ForEachBuilder`, a blanket-implemented extension trait.**
-//! [`FlowBuilder`] is a *trait* (`src/flow_builder.rs`'s own `# Design`
-//! section says why), implemented by `Taskflow` and `Subflow` rather than a
-//! single struct a second `impl` block could extend -- so the owned-data
-//! wrapper is a trait of its own instead: one default method,
-//! blanket-implemented for every [`FlowBuilder`], so `taskflow.for_each(...)`
-//! reads identically at the call site. It is in [`crate::prelude`] alongside
-//! [`FlowBuilder`] itself, for the reason that module's own docs give: a
-//! trait's methods are only callable where the trait is imported.
-//!
 //! **`Arc<Mutex<Vec<T>>>`, not `Arc<[T]>` + `Fn(&T)`.** The owned-data
 //! wrapper exists so a body that does not already have a `&mut [T]` to hand
 //! [`Runtime::for_each`] still gets one: a `Mutex` is what turns the `Arc`'s
 //! shared ownership back into the exclusive `&mut` access the method
 //! needs, locked once per invocation rather than once per element.
 
-use std::sync::{Arc, Mutex};
-
 use crate::algorithm::SlicePartitioner;
-use crate::flow_builder::FlowBuilder;
-use crate::graph::Task;
 use crate::runtime::Runtime;
 
 impl<'rt> Runtime<'rt> {
@@ -124,63 +112,10 @@ impl<'rt> Runtime<'rt> {
     }
 }
 
-/// The owned-data half of [`Runtime::for_each`]: upstream's
-/// `FlowBuilder::for_each`. See this module's `# Design` section for why
-/// this is a separate, blanket-implemented trait rather than a second
-/// `trait FlowBuilder` block, and [`crate::prelude`] for why it is in the
-/// prelude alongside [`FlowBuilder`] itself.
-pub trait ForEachBuilder: FlowBuilder {
-    /// Creates a runtime task that locks `data` and runs [`Runtime::for_each`]
-    /// over it: upstream's `for_each(beg, end, c, part)`, over a shared
-    /// owned `Vec` rather than an iterator pair a caller must otherwise keep
-    /// alive.
-    ///
-    /// `f` and `part` are cloned on every run of the task -- relevant only
-    /// for a task revisited by a cycle -- matching upstream copying `c` and
-    /// `part` into the closure by value.
-    ///
-    /// `rustflow::prelude::*` is the only import this example needs beyond
-    /// the partitioner and the data it builds the task over: `ForEachBuilder`
-    /// itself is one of the prelude's names, not imported here by name.
-    ///
-    /// ```
-    /// use std::sync::{Arc, Mutex};
-    ///
-    /// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
-    /// use rustflow::prelude::*;
-    /// use rustflow::Executor;
-    ///
-    /// let mut taskflow = Taskflow::new();
-    /// let data = Arc::new(Mutex::new(vec![0u32; 10]));
-    /// taskflow.for_each(
-    ///     Arc::clone(&data),
-    ///     |x: &mut u32| *x = 1,
-    ///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
-    /// );
-    ///
-    /// Executor::new(4).run(&taskflow).wait().expect("no task panicked");
-    /// assert_eq!(data.lock().expect("uncontended").iter().sum::<u32>(), 10);
-    /// ```
-    fn for_each<T, F, P>(&mut self, data: Arc<Mutex<Vec<T>>>, f: F, part: P) -> Task
-    where
-        T: Send + 'static,
-        F: Fn(&mut T) + Sync + Clone + Send + 'static,
-        P: SlicePartitioner + Clone + Send + 'static,
-    {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = data
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runtime.for_each(&mut guard, f.clone(), part.clone());
-        })
-    }
-}
-
-impl<B: FlowBuilder + ?Sized> ForEachBuilder for B {}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::algorithm::partitioner::{

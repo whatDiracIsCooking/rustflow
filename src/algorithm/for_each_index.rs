@@ -12,10 +12,10 @@
 //! index at a time -- the shape a caller wants when the body itself knows
 //! how to walk a contiguous run faster than one call per element would.
 //! Each is available three ways: the `make_*_task` free function above,
-//! queued into a graph through [`ForEachIndexBuilder`]'s `FlowBuilder`
-//! wrapper; and a [`Runtime`] method built on [`Runtime::scope`], for a
-//! runtime task's body that wants `f` to borrow from its own frame instead
-//! of owning everything it touches.
+//! queued into a graph through its wrapper on [`AlgorithmBuilder`]; and a
+//! [`Runtime`] method built on [`Runtime::scope`], for a runtime task's body
+//! that wants `f` to borrow from its own frame instead of owning everything
+//! it touches.
 //!
 //! `for_each_by_index_nd` (free function
 //! [`make_for_each_by_index_nd_task`]) is `for_each_by_index`'s own
@@ -107,7 +107,7 @@
 //! branch can. [`make_for_each_by_index_nd_task`] is therefore a second,
 //! explicitly-named entry point rather than a second case of
 //! [`make_for_each_by_index_task`] -- [`Runtime::for_each_by_index_nd`] and
-//! [`ForEachIndexBuilder::for_each_by_index_nd`] alongside it, the same three
+//! [`AlgorithmBuilder::for_each_by_index_nd`] alongside it, the same three
 //! ways the 1-D form is already available.
 //!
 //! **Partitioning an N-D range only ever splits dimension 0.** A worker's
@@ -121,6 +121,10 @@
 //! `index_range`'s own `# Design` section says why a finer, any-dimension
 //! split like upstream's `ceil`/`floor`/`upper_slice`/`lower_slice` is out of
 //! this issue's scope.
+//!
+//! [`AlgorithmBuilder`]: crate::algorithm::AlgorithmBuilder
+//! [`AlgorithmBuilder::for_each_by_index_nd`]: crate::algorithm::AlgorithmBuilder::for_each_by_index_nd
+//! [`FlowBuilder::emplace_runtime`]: crate::FlowBuilder::emplace_runtime
 
 use std::boxed::Box;
 use std::sync::Arc;
@@ -133,8 +137,6 @@ use crate::algorithm::partitioner::{
     ClosureWrapper, DynamicLoop, DynamicPartitioner, GuidedPartitioner, Partitioner,
     RandomPartitioner, StaticLoop, StaticPartitioner,
 };
-use crate::flow_builder::FlowBuilder;
-use crate::graph::Task;
 use crate::runtime::Runtime;
 
 /// Dispatches the chunked per-worker tasks for this partitioner's own
@@ -820,85 +822,6 @@ impl<'rt> Runtime<'rt> {
     }
 }
 
-/// [`FlowBuilder`] wrappers for [`for_each_index`](make_for_each_index_task)
-/// and [`for_each_by_index`](make_for_each_by_index_task), queued into the
-/// graph as a runtime task.
-///
-/// A second trait rather than two more methods on [`FlowBuilder`] itself:
-/// this module owns only `src/algorithm/for_each_index.rs` this wave, and a
-/// default method must live in the trait that declares it, which rules out
-/// a second `impl FlowBuilder` block the way a second `impl Runtime` block
-/// (above) is possible for an inherent type. Blanket-implemented for every
-/// [`FlowBuilder`], so `taskflow.for_each_index(...)` reads the same at the
-/// call site as every other builder method once this trait is in scope --
-/// [`crate::prelude`] carries it for the same reason it carries
-/// [`FlowBuilder`] itself.
-///
-/// ```
-/// // Only the prelude, exactly as a caller would write it -- no direct
-/// // `use` of `ForEachIndexBuilder` itself.
-/// use rustflow::prelude::*;
-/// use rustflow::Executor;
-///
-/// let mut taskflow = Taskflow::new();
-/// taskflow.for_each_index(
-///     0_i32,
-///     5,
-///     1,
-///     |_| {},
-///     rustflow::algorithm::partitioner::DefaultPartitioner::default(),
-/// );
-///
-/// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
-/// ```
-pub trait ForEachIndexBuilder: FlowBuilder {
-    /// Creates a runtime task that walks `[beg, end)` in steps of `step`,
-    /// calling `f` once per index: upstream's `FlowBuilder::for_each_index`,
-    /// over [`make_for_each_index_task`].
-    fn for_each_index<T, C, P>(&mut self, beg: T, end: T, step: T, f: C, part: P) -> Task
-    where
-        T: IndexInt + Send + 'static,
-        C: Fn(T) + Clone + Send + 'static,
-        P: IndexDispatch + Clone + Send + 'static,
-    {
-        self.emplace_runtime(make_for_each_index_task(beg, end, step, f, part))
-    }
-
-    /// Creates a runtime task that walks `range` one chunk at a time,
-    /// calling `f` with each chunk's own sub-range: upstream's
-    /// `FlowBuilder::for_each_by_index`, over [`make_for_each_by_index_task`].
-    fn for_each_by_index<T, C, P>(&mut self, range: IndexRange<T>, f: C, part: P) -> Task
-    where
-        T: IndexInt + Send + 'static,
-        C: Fn(IndexRange<T>) + Clone + Send + 'static,
-        P: IndexDispatch + Clone + Send + 'static,
-    {
-        self.emplace_runtime(make_for_each_by_index_task(range, f, part))
-    }
-
-    /// Creates a runtime task that walks `range`'s Cartesian product one
-    /// dimension-0 row at a time, calling `f` with each row's own sub-range:
-    /// upstream's `FlowBuilder::for_each_by_index` for `R::rank > 1`, over
-    /// [`make_for_each_by_index_nd_task`]. See the module's `# Design`
-    /// section for why this is a distinct method rather than a second case
-    /// of [`Self::for_each_by_index`].
-    fn for_each_by_index_nd<T, C, P, const N: usize>(
-        &mut self,
-        range: IndexRanges<T, N>,
-        f: C,
-        part: P,
-    ) -> Task
-    where
-        T: IndexInt + Send + 'static,
-        C: Fn(IndexRanges<T, N>) + Clone + Send + 'static,
-        P: IndexDispatch + Clone + Send + 'static,
-    {
-        self.emplace_runtime(make_for_each_by_index_nd_task(range, f, part))
-    }
-}
-
-impl<B: FlowBuilder + ?Sized> ForEachIndexBuilder for B {}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -906,7 +829,9 @@ mod tests {
 
     use super::*;
     use crate::Executor;
+    use crate::algorithm::AlgorithmBuilder;
     use crate::algorithm::partitioner::{DefaultClosureWrapper, DefaultPartitioner};
+    use crate::flow_builder::FlowBuilder;
     use crate::taskflow::Taskflow;
 
     #[test]

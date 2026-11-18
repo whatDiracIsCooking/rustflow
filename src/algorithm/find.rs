@@ -5,8 +5,12 @@
 //! building a second closure, as [`crate::algorithm::for_each`] already does
 //! for the same reason. [`Runtime::min_element`] and [`Runtime::max_element`]
 //! are their `make_min_element_task`/`make_max_element_task`.
-//! [`FindBuilder`] is the owned-data wrapper over all four, in
-//! [`crate::prelude`] alongside [`crate::algorithm::for_each::ForEachBuilder`].
+//! The owned-data wrappers over all four are on [`AlgorithmBuilder`], the
+//! one extension trait the whole algorithm family shares, in
+//! [`crate::prelude`] alongside [`FlowBuilder`].
+//!
+//! [`AlgorithmBuilder`]: crate::algorithm::AlgorithmBuilder
+//! [`FlowBuilder`]: crate::FlowBuilder
 //!
 //! # Design
 //!
@@ -67,15 +71,13 @@
 //! element under `cmp`".
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError};
 
 use crate::Scope;
 use crate::algorithm::partitioner::{
     ClosureWrapper, DynamicLoop, DynamicPartitioner, GuidedPartitioner, Partitioner,
     RandomPartitioner, StaticLoop, StaticPartitioner,
 };
-use crate::flow_builder::FlowBuilder;
-use crate::graph::Task;
 use crate::runtime::Runtime;
 
 /// Closes [`FindPartitioner`] against implementations outside this crate,
@@ -686,135 +688,11 @@ impl<'rt> Runtime<'rt> {
     }
 }
 
-/// The owned-data half of [`Runtime::find_if`], [`Runtime::find_if_not`],
-/// [`Runtime::min_element`] and [`Runtime::max_element`]: upstream's
-/// `FlowBuilder::find_if` and friends. See
-/// [`crate::algorithm::for_each::ForEachBuilder`]'s own `# Design` section
-/// for why this is a separate, blanket-implemented trait rather than a
-/// second `trait FlowBuilder` block, and [`crate::prelude`] for why it sits
-/// in the prelude alongside [`FlowBuilder`] itself.
-pub trait FindBuilder: FlowBuilder {
-    /// Creates a runtime task that runs [`Runtime::find_if`] over `data` and
-    /// writes its answer into `result`: upstream's `find_if(beg, end,
-    /// result, predicate, part)`, over a shared owned `Vec` rather than an
-    /// iterator pair a caller must otherwise keep alive.
-    ///
-    /// `predicate` and `part` are cloned on every run of the task --
-    /// relevant only for a task revisited by a cycle -- matching upstream
-    /// copying both into the closure by value.
-    ///
-    /// `rustflow::prelude::*` is the only import this example needs beyond
-    /// the partitioner and the data it builds the task over: `FindBuilder`
-    /// itself is one of the prelude's names, not imported here by name.
-    ///
-    /// ```
-    /// use std::sync::{Arc, Mutex};
-    ///
-    /// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
-    /// use rustflow::prelude::*;
-    /// use rustflow::Executor;
-    ///
-    /// let mut taskflow = Taskflow::new();
-    /// let data = Arc::new((0..100).collect::<Vec<i32>>());
-    /// let result = Arc::new(Mutex::new(None));
-    /// taskflow.find_if(
-    ///     Arc::clone(&data),
-    ///     Arc::clone(&result),
-    ///     |&x| x == 42,
-    ///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
-    /// );
-    ///
-    /// Executor::new(4).run(&taskflow).wait().expect("no task panicked");
-    /// assert_eq!(*result.lock().expect("uncontended"), Some(42));
-    /// ```
-    fn find_if<T, F, P>(
-        &mut self,
-        data: Arc<Vec<T>>,
-        result: Arc<Mutex<Option<usize>>>,
-        predicate: F,
-        part: P,
-    ) -> Task
-    where
-        T: Sync + Send + 'static,
-        F: Fn(&T) -> bool + Sync + Clone + Send + 'static,
-        P: FindPartitioner + Clone + Send + 'static,
-    {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut found = None;
-            runtime.find_if(&data, &mut found, predicate.clone(), part.clone());
-            *result.lock().unwrap_or_else(PoisonError::into_inner) = found;
-        })
-    }
-
-    /// The `find_if_not` half of the pair: see [`FindBuilder::find_if`].
-    fn find_if_not<T, F, P>(
-        &mut self,
-        data: Arc<Vec<T>>,
-        result: Arc<Mutex<Option<usize>>>,
-        predicate: F,
-        part: P,
-    ) -> Task
-    where
-        T: Sync + Send + 'static,
-        F: Fn(&T) -> bool + Sync + Clone + Send + 'static,
-        P: FindPartitioner + Clone + Send + 'static,
-    {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut found = None;
-            runtime.find_if_not(&data, &mut found, predicate.clone(), part.clone());
-            *result.lock().unwrap_or_else(PoisonError::into_inner) = found;
-        })
-    }
-
-    /// The owned-data half of [`Runtime::min_element`]: see
-    /// [`FindBuilder::find_if`] for why this is a separate trait.
-    fn min_element<T, C, P>(
-        &mut self,
-        data: Arc<Vec<T>>,
-        result: Arc<Mutex<Option<usize>>>,
-        cmp: C,
-        part: P,
-    ) -> Task
-    where
-        T: Sync + Send + 'static,
-        C: Fn(&T, &T) -> bool + Sync + Clone + Send + 'static,
-        P: FindPartitioner + Clone + Send + 'static,
-    {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut found = None;
-            runtime.min_element(&data, &mut found, cmp.clone(), part.clone());
-            *result.lock().unwrap_or_else(PoisonError::into_inner) = found;
-        })
-    }
-
-    /// The `max_element` half of the pair: see [`FindBuilder::min_element`].
-    fn max_element<T, C, P>(
-        &mut self,
-        data: Arc<Vec<T>>,
-        result: Arc<Mutex<Option<usize>>>,
-        cmp: C,
-        part: P,
-    ) -> Task
-    where
-        T: Sync + Send + 'static,
-        C: Fn(&T, &T) -> bool + Sync + Clone + Send + 'static,
-        P: FindPartitioner + Clone + Send + 'static,
-    {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut found = None;
-            runtime.max_element(&data, &mut found, cmp.clone(), part.clone());
-            *result.lock().unwrap_or_else(PoisonError::into_inner) = found;
-        })
-    }
-}
-
-impl<B: FlowBuilder + ?Sized> FindBuilder for B {}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    use super::*;
     use crate::algorithm::partitioner::{
         DefaultClosureWrapper, DynamicPartitioner, GuidedPartitioner, StaticPartitioner,
     };

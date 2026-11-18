@@ -1732,3 +1732,64 @@ entry above does.
   `flow_builder.rs` and the three `graph/` files. `src/pipeline/mod.rs`
   belongs to none of the three, which the exempt verdict settles rather than
   needing a fourth pass.
+
+- **One `AlgorithmBuilder` for all 28 wrappers, declared in
+  `src/algorithm/mod.rs` and flattened at `rustflow::algorithm`'s front
+  door** (issue #216).
+
+  This supersedes M7's "one per-algorithm extension trait per module" entry,
+  which named the question and left it here. The eight traits it created --
+  `FindBuilder`, `ForEachBuilder`, `ForEachIndexBuilder`, `MergeBuilder`,
+  `ReduceBuilder`, `ScanBuilder`, `SortBuilder`, `ElementwiseBuilder` -- are
+  one `AlgorithmBuilder: FlowBuilder`, blanket-implemented for every
+  `FlowBuilder` exactly as each of them was, carrying all 28 methods
+  unchanged in signature and in body. The eight prelude lines are one, and
+  the corpus shows what the split was costing: of the 38 files in `tests/`
+  that import the prelude, 37 named none of the eight at all, and the one
+  that did -- `tests/for_each_index.rs` -- imported it beside a partitioner
+  trait rather than for anything the trait itself said; no example and no
+  benchmark imported one. A trait per algorithm was never a
+  distinction a caller could use, because none of the eight held a concept of
+  its own: the family shares one vocabulary of owned parameters, one
+  partitioner set and one lock-once-per-invocation ownership rule, all three
+  decided in the entry above rather than per algorithm.
+
+  **Not moved into `src/flow_builder.rs`.** That is the other shape #216
+  offered, and it reads better at first -- zero new names, since
+  `FlowBuilder` is already a prelude and a root name -- but it puts the
+  algorithm family inside the trait that defines what a task *is*. The
+  honest test is what each file then has to know: `FlowBuilder` would gain
+  28 methods whose signatures name `SlicePartitioner`, `ReducePartitioner`,
+  `FindPartitioner`, `IndexDispatch`, `IndexInt`, `IndexRange` and
+  `IndexRanges`, so `src/flow_builder.rs` -- the file `src/graph/`,
+  `src/taskflow.rs` and `src/subflow.rs` all build against -- would import
+  seven types from the algorithm tree to declare a layer *derived* from it.
+  The dependency runs the wrong way: an algorithm wrapper is built on
+  `FlowBuilder::emplace_runtime`, and nothing in the builder is built on an
+  algorithm. Keeping the wrappers in `src/algorithm/` keeps that arrow
+  pointing one way, and the extension trait is what Rust charges for it: one
+  name, in the prelude, which a caller writing `use rustflow::prelude::*;`
+  never spells.
+
+  **The front door.** Per the prelude/root entry above, `rustflow::algorithm`
+  is flattened here rather than at the crate root: `AlgorithmBuilder`, the
+  four partitioners with `DefaultPartitioner`, `ClosureWrapper` and
+  `DefaultClosureWrapper`, `IndexRange` and `IndexRanges`, and the twelve
+  `make_*_task` factories are re-exported from `src/algorithm/mod.rs`. The
+  factories are *not* prelude names, which is that entry's boundary applied
+  unchanged -- a program reaching for a free-function form chooses it, and
+  chooses it by name. The submodule paths all still resolve, so no caller
+  lost an import.
+
+  **What moved, and what a reader should expect of the diff.** The 28 method
+  bodies are untouched: a wrapper is still one `emplace_runtime` call over
+  the `Runtime` method or `make_*_task` factory of the same name, and the
+  four issues completing that factory family (#292 through #295) change
+  bodies, never signatures, so they land on top of this with no
+  re-collapsing. The one thing a `--list` comparison does see is that a
+  wrapper's doctest is now named `algorithm::AlgorithmBuilder::sort` where it
+  was `algorithm::sort::SortBuilder::sort`: 15 doctest item paths moved,
+  which is the trait rename itself and not a test gained or lost, and every
+  other name in the 2549 is identical. The per-module `# Design` sections
+  that each argued for their own trait are one paragraph in
+  `src/algorithm/mod.rs`, where the trait now is.

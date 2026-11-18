@@ -2,10 +2,12 @@
 //!
 //! [`Runtime::fill`] is upstream's `make_fill_task`/`FlowBuilder::fill`;
 //! [`Runtime::fill_n`] is the `_n` sibling, upstream's `make_fill_n_task`/
-//! `FlowBuilder::fill_n`. The owned-data wrapper over both lives in
-//! [`crate::algorithm::transform::ElementwiseBuilder`] -- that module's own
-//! `# Design` section says why one trait covers `transform`, `fill` and
-//! `generate`.
+//! `FlowBuilder::fill_n`. The owned-data wrappers over both are
+//! [`AlgorithmBuilder::fill`] and [`AlgorithmBuilder::fill_n`], on the one
+//! extension trait the whole algorithm family shares.
+//!
+//! [`AlgorithmBuilder::fill`]: crate::algorithm::AlgorithmBuilder::fill
+//! [`AlgorithmBuilder::fill_n`]: crate::algorithm::AlgorithmBuilder::fill_n
 //!
 //! # Design
 //!

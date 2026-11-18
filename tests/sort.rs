@@ -315,7 +315,7 @@ worker_matrix! {
 // ----------------------------------------------------------------------------
 
 /// Upstream's plain, non-stateful `taskflow.sort(beg, end)`, through
-/// [`SortBuilder::sort`] over a shared `Arc<Mutex<Vec<T>>>` rather than an
+/// `AlgorithmBuilder::sort` over a shared `Arc<Mutex<Vec<T>>>` rather than an
 /// iterator pair a caller must keep alive.
 #[test]
 fn flow_builder_sort_locks_and_runs_over_owned_data() {
@@ -332,7 +332,8 @@ fn flow_builder_sort_locks_and_runs_over_owned_data() {
     assert_eq!(*data.lock().expect("uncontended"), expected);
 }
 
-/// Upstream's `taskflow.sort(beg, end, cmp)`, through [`SortBuilder::sort_by`].
+/// Upstream's `taskflow.sort(beg, end, cmp)`, through
+/// `AlgorithmBuilder::sort_by`.
 #[test]
 fn flow_builder_sort_by_locks_and_runs_with_a_custom_comparator() {
     let raw = scattered(50_000, 1000);

@@ -3,10 +3,12 @@
 //! [`Runtime::generate`] is upstream's `make_generate_task`/
 //! `FlowBuilder::generate`; [`Runtime::generate_n`] is the `_n` sibling,
 //! upstream's `make_generate_n_task`/`FlowBuilder::generate_n`. The
-//! owned-data wrapper over both lives in
-//! [`crate::algorithm::transform::ElementwiseBuilder`] -- that module's own
-//! `# Design` section says why one trait covers `transform`, `fill` and
-//! `generate`.
+//! owned-data wrappers over both are [`AlgorithmBuilder::generate`] and
+//! [`AlgorithmBuilder::generate_n`], on the one extension trait the whole
+//! algorithm family shares.
+//!
+//! [`AlgorithmBuilder::generate`]: crate::algorithm::AlgorithmBuilder::generate
+//! [`AlgorithmBuilder::generate_n`]: crate::algorithm::AlgorithmBuilder::generate_n
 //!
 //! # Design
 //!
