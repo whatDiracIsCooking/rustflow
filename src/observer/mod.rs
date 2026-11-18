@@ -198,7 +198,7 @@ fn task_type_of(handle: &Handle) -> TaskType {
         Handle::Static(_) => TaskType::Static,
         Handle::Condition(_) | Handle::MultiCondition(_) => TaskType::Condition,
         Handle::Subflow { .. } => TaskType::Subflow,
-        Handle::Runtime(_) => TaskType::Runtime,
+        Handle::Runtime(_) | Handle::NonpreemptiveRuntime(_) => TaskType::Runtime,
         Handle::Module(_) | Handle::AdoptedModule(_) => TaskType::Module,
         Handle::Async(_) | Handle::DependentAsync(_) => TaskType::Async,
     }

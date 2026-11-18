@@ -1098,3 +1098,111 @@ fn a_failing_child_is_reported_from_its_parents_corun() {
         );
     }
 }
+
+/// This port's own, closing issue #230: `Runtime::schedule` targeting a
+/// nonpreemptive runtime task does not panic even while that task's body is
+/// genuinely still running, which is exactly the shape a pipeline line needs
+/// and an ordinary `Handle::Runtime` line task could not safely give it --
+/// that handle kind sets `PREEMPTED` before its body runs, so `schedule`
+/// would see it as "already entered" for the whole time the body is up,
+/// whether or not the body ever spawned anything.
+///
+/// `line` and `caller` are both source tasks with no edge between them, so
+/// at `workers >= 2` they run concurrently. `caller` spins until it has seen
+/// `line`'s body start, which puts the `schedule` call squarely inside that
+/// body's run rather than before or after it, then calls it.
+///
+/// What `caller` does *after* the call under test is this case's own: the
+/// bypass queues a second, genuine run of `line`'s body, which
+/// `NonpreemptiveRuntimeWork`'s shared lock -- the same one-worker-per-node
+/// assertion every work handle in the crate keeps -- refuses outright if it
+/// is ever actually entered while the first is still running. A real
+/// pipeline's own dependency counting never lets that happen; this case has
+/// to arrange it by hand, because nothing in `Runtime::schedule` itself
+/// serialises the two runs. `caller` keeps every worker occupied until
+/// `line`'s first run has genuinely returned -- itself, by spinning on
+/// `done` before its own body ends, and every worker beyond the two this
+/// case needs, with `filler` tasks that spin on the same signal -- so the
+/// second run is never even eligible to start until the first has let go of
+/// the lock it was never going to contend with in a correctly-driven
+/// pipeline. This is this case's own scaffolding, not something
+/// `Runtime::schedule` or `Handle::NonpreemptiveRuntime` provides, and the
+/// acceptance bar is narrower than it looks: a panic here would mean the
+/// `is_entered` guard saw `line` as still entered, not that two genuine runs
+/// can safely overlap -- they still may not, and nothing about this node
+/// kind claims otherwise.
+#[test]
+fn schedule_targets_a_nonpreemptive_node_whose_body_is_still_running() {
+    for workers in 2..=4 {
+        let started = Arc::new(AtomicBool::new(false));
+        let proceed = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let runs = Arc::new(AtomicI32::new(0));
+
+        let mut taskflow = Taskflow::new();
+        let line = {
+            let started = Arc::clone(&started);
+            let proceed = Arc::clone(&proceed);
+            let done = Arc::clone(&done);
+            let runs = Arc::clone(&runs);
+            taskflow.emplace_nonpreemptive_runtime(move |_| {
+                started.store(true, Ordering::Release);
+                spin_until("the caller to schedule this task", || {
+                    proceed.load(Ordering::Acquire)
+                });
+                runs.fetch_add(1, Ordering::Relaxed);
+                // Set on every run, so the bypassed run (which finds
+                // `proceed` already `true` and does not wait on it) marks
+                // itself done too -- harmless, since `caller` has already
+                // moved on to waiting on it by the time any run can reach
+                // this line.
+                done.store(true, Ordering::Release);
+            })
+        };
+        let _caller = {
+            let started = Arc::clone(&started);
+            let proceed = Arc::clone(&proceed);
+            let done = Arc::clone(&done);
+            taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
+                spin_until("the line task to start", || started.load(Ordering::Acquire));
+                // The call under test: `line`'s body has started and has not
+                // yet observed `proceed`, so it is still running right here.
+                runtime.schedule(line);
+                proceed.store(true, Ordering::Release);
+                // Keep this worker busy until `line`'s first run has
+                // actually returned and dropped the lock its body holds --
+                // see the function docs for why the bypass's second run must
+                // not be *eligible* to start before then.
+                spin_until("the line task's first run to finish", || {
+                    done.load(Ordering::Acquire)
+                });
+            })
+        };
+        // One per worker this case does not otherwise occupy, each keeping
+        // its own worker out of the steal loop on the same signal `caller`
+        // waits on -- so at every worker count in the matrix, nothing is
+        // free to pick up the bypassed run until it is safe to.
+        let _fillers: Vec<_> = (2..workers)
+            .map(|_| {
+                let done = Arc::clone(&done);
+                taskflow.emplace(move || {
+                    spin_until("the line task's first run to finish", || {
+                        done.load(Ordering::Acquire)
+                    });
+                })
+            })
+            .collect();
+
+        Executor::new(workers)
+            .run(&taskflow)
+            .wait()
+            .expect("no task panicked, in particular not `schedule`'s guard");
+
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            2,
+            "{workers} worker(s): the body ran once as a source task and \
+             once more through the bypass"
+        );
+    }
+}

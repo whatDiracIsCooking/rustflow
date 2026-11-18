@@ -37,6 +37,7 @@ use std::any::Any;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
+use crate::executor::runtime::NonpreemptiveRuntime;
 use crate::executor::topology::{Cancellable, Job};
 use crate::runtime::Runtime;
 use crate::semaphore::{Semaphore, SemaphoreError};
@@ -194,7 +195,11 @@ impl fmt::Debug for SubflowWork {
 ///
 /// Upstream's `std::function<void(tf::Runtime&)>`, under [`SubflowWork`]'s
 /// discipline. Upstream's second runtime shape,
-/// `std::function<void(tf::NonpreemptiveRuntime&)>`, is not ported.
+/// `std::function<void(tf::NonpreemptiveRuntime&)>`, is
+/// [`NonpreemptiveRuntimeWork`] rather than a second case of this type: the
+/// two run under different protocols -- `DESIGN.md`'s "Decisions taken in
+/// M8" has why -- and `preempts_itself` tells them apart by [`Handle`]
+/// variant rather than by a flag on a shared one.
 pub struct RuntimeWork(Mutex<RuntimeBody>);
 
 /// The boxed body of a runtime task, named for [`SubflowBody`]'s reason.
@@ -224,6 +229,48 @@ impl RuntimeWork {
 impl fmt::Debug for RuntimeWork {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("RuntimeWork(..)")
+    }
+}
+
+/// The callable behind a nonpreemptive runtime task, which is handed a
+/// restricted `NonpreemptiveRuntime` rather than the full [`Runtime`].
+///
+/// Upstream's `std::function<void(tf::NonpreemptiveRuntime&)>`, under
+/// [`SubflowWork`]'s locking discipline. The handle type is not part of this
+/// crate's public surface -- see [`Handle::NonpreemptiveRuntime`] for why a
+/// caller still names no type to use one -- so there is nothing here for this
+/// doc comment to link to.
+pub struct NonpreemptiveRuntimeWork(Mutex<NonpreemptiveRuntimeBody>);
+
+/// The boxed body of a nonpreemptive runtime task, named for [`SubflowBody`]'s
+/// reason.
+type NonpreemptiveRuntimeBody =
+    Box<dyn for<'a> FnMut(&mut NonpreemptiveRuntime<'a>) + Send + 'static>;
+
+impl NonpreemptiveRuntimeWork {
+    /// Wraps a callable as the work of a nonpreemptive runtime task.
+    pub(crate) fn new<C>(callable: C) -> Self
+    where
+        C: for<'a> FnMut(&mut NonpreemptiveRuntime<'a>) + Send + 'static,
+    {
+        Self(Mutex::new(Box::new(callable)))
+    }
+
+    /// Runs the callable against `line`, the body's restricted handle on the
+    /// scheduler.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the work is already running on another thread, which means
+    /// the scheduler's one-worker-per-node invariant was violated.
+    pub(crate) fn invoke(&self, line: &mut NonpreemptiveRuntime<'_>) {
+        lock_callable(&self.0)(line);
+    }
+}
+
+impl fmt::Debug for NonpreemptiveRuntimeWork {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NonpreemptiveRuntimeWork(..)")
     }
 }
 
@@ -390,10 +437,14 @@ impl AsyncWork {
 /// What a node does when the executor reaches it.
 ///
 /// Upstream is a `std::variant` of eleven alternatives (subflow, module,
-/// async, ...) and this port has ten of them: the one missing is upstream's
-/// `NonpreemptiveRuntime`, the second of its two runtime shapes. The enum is
-/// `#[non_exhaustive]` so that arriving at that eleventh does not break
-/// callers outside the crate.
+/// async, ...) and this port now has all eleven: [`Handle::NonpreemptiveRuntime`]
+/// is upstream's `NonpreemptiveRuntime`, the second of its two runtime
+/// shapes, which arrived separately from [`Handle::Runtime`] rather than at
+/// the same time -- `DESIGN.md`'s "Decisions taken in M8" has why a
+/// pipeline line forced a question the single `Handle::Runtime` protocol
+/// could not answer. The enum is `#[non_exhaustive]` so that a twelfth
+/// variant, should upstream ever grow one, does not break callers outside
+/// the crate.
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub enum Handle {
@@ -434,6 +485,25 @@ pub enum Handle {
     },
     /// A callable handed the scheduler itself, upstream's `Node::Runtime`.
     Runtime(RuntimeWork),
+    /// A callable handed a restricted scheduler handle that cannot spawn
+    /// nested work, upstream's `Node::NonpreemptiveRuntime`.
+    ///
+    /// Where [`Handle::Runtime`]'s dispatch arm sets `PREEMPTED` before the
+    /// body runs so that a child the body spawns can resume it,
+    /// this one never sets the bit at all and always finishes on its first
+    /// entry -- there is no protocol to resume, because the handle the body
+    /// is given has no way to spawn anything under this node.
+    /// `preempts_itself` answers `false` for it accordingly, which is what
+    /// makes [`Runtime::schedule`] targeting one safe at any point in its
+    /// body's run; `DESIGN.md`'s "Decisions taken in M8" has the failure
+    /// that this variant exists to close.
+    ///
+    /// Built through [`FlowBuilder::emplace_nonpreemptive_runtime`](crate::FlowBuilder::emplace_nonpreemptive_runtime).
+    /// The restricted handle itself is not part of this crate's public
+    /// surface -- a caller's body closure is handed one without ever
+    /// needing to name its type, the same way a closure passed to a generic
+    /// `Fn` bound never needs to.
+    NonpreemptiveRuntime(NonpreemptiveRuntimeWork),
     /// A task that stands for another whole taskflow, upstream's
     /// `Node::Module`.
     ///
@@ -506,6 +576,12 @@ impl Handle {
     #[must_use]
     pub fn is_runtime(&self) -> bool {
         matches!(self, Self::Runtime(_))
+    }
+
+    /// Returns `true` for [`Handle::NonpreemptiveRuntime`].
+    #[must_use]
+    pub fn is_nonpreemptive_runtime(&self) -> bool {
+        matches!(self, Self::NonpreemptiveRuntime(_))
     }
 
     /// Returns `true` for either module handle, [`Handle::Module`] and
@@ -1390,6 +1466,7 @@ const _: () = {
     assert_send_sync::<Work>();
     assert_send_sync::<SubflowWork>();
     assert_send_sync::<RuntimeWork>();
+    assert_send_sync::<NonpreemptiveRuntimeWork>();
     assert_send_sync::<Handle>();
     assert_send_sync::<NodeBase>();
     assert_send_sync::<Node>();
