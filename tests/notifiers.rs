@@ -46,6 +46,12 @@ use std::time::{Duration, Instant};
 
 use rustflow::executor::notifier::{AtomicNotifier, NonblockingNotifier, Notifier};
 
+// Only the matrix macro: every helper this file would otherwise take from
+// `tests/common/` it does without, because a notifier case counts with the
+// counters it declares inside its own `thread::scope`.
+#[macro_use]
+mod common;
+
 // ============================================================================
 // Shared templates, upstream's function templates over the notifier type
 // ============================================================================
@@ -531,14 +537,11 @@ fn atomic_notifier_invariants_prepare_cancel_restores_state() {
 
 // --- notify_before_commit ---
 
-#[test]
-fn atomic_notifier_notify_before_commit_5threads() {
-    notify_before_commit(&AtomicNotifier::new(5));
-}
-
-#[test]
-fn atomic_notifier_notify_before_commit_8threads() {
-    notify_before_commit(&AtomicNotifier::new(8));
+worker_matrix! {
+    notify_before_commit {
+        atomic_notifier_notify_before_commit_5threads(&AtomicNotifier::new(5)),
+        atomic_notifier_notify_before_commit_8threads(&AtomicNotifier::new(8)),
+    }
 }
 
 // --- cancel_only (no ghost waiters) ---
@@ -584,74 +587,51 @@ fn atomic_notifier_cancel_only_no_ghost_waiters_8threads() {
 
 // --- bug2: notify_n boundary (k == N must invoke the notify_all path) ---
 
-#[test]
-fn atomic_notifier_notify_n_exact_size_4threads() {
-    notify_n_releases_committed(&AtomicNotifier::new(4), 4, 50);
-}
-
-#[test]
-fn atomic_notifier_notify_n_exact_size_8threads() {
-    notify_n_releases_committed(&AtomicNotifier::new(8), 8, 50);
-}
-
-#[test]
-fn atomic_notifier_notify_n_exact_size_15threads() {
-    notify_n_releases_committed(&AtomicNotifier::new(15), 15, 30);
+worker_matrix! {
+    notify_n_releases_committed {
+        atomic_notifier_notify_n_exact_size_4threads(&AtomicNotifier::new(4), 4, 50),
+        atomic_notifier_notify_n_exact_size_8threads(&AtomicNotifier::new(8), 8, 50),
+        atomic_notifier_notify_n_exact_size_15threads(&AtomicNotifier::new(15), 15, 30),
+    }
 }
 
 // --- bug3: epoch field (prepare_wait must store the epoch, not the count) ---
 
-#[test]
-fn atomic_notifier_bug3_epoch_field_n2() {
-    notify_n_releases_committed(&AtomicNotifier::new(2), 1, 20);
-}
-
-#[test]
-fn atomic_notifier_bug3_epoch_field_n4() {
-    notify_n_releases_committed(&AtomicNotifier::new(4), 2, 20);
-}
-
-#[test]
-fn atomic_notifier_bug3_epoch_field_n8() {
-    notify_n_releases_committed(&AtomicNotifier::new(8), 4, 20);
+worker_matrix! {
+    notify_n_releases_committed {
+        atomic_notifier_bug3_epoch_field_n2(&AtomicNotifier::new(2), 1, 20),
+        atomic_notifier_bug3_epoch_field_n4(&AtomicNotifier::new(4), 2, 20),
+        atomic_notifier_bug3_epoch_field_n8(&AtomicNotifier::new(8), 4, 20),
+    }
 }
 
 // --- notify_n(0) is a strict noop ---
 
-#[test]
-fn atomic_notifier_notify_n_zero_is_noop_4threads() {
-    notify_n_zero_is_noop(&AtomicNotifier::new(4));
-}
-
-#[test]
-fn atomic_notifier_notify_n_zero_is_noop_8threads() {
-    notify_n_zero_is_noop(&AtomicNotifier::new(8));
+worker_matrix! {
+    notify_n_zero_is_noop {
+        atomic_notifier_notify_n_zero_is_noop_4threads(&AtomicNotifier::new(4)),
+        atomic_notifier_notify_n_zero_is_noop_8threads(&AtomicNotifier::new(8)),
+    }
 }
 
 // --- notify_one fires in the pre-waiter window ---
 
-#[test]
-fn atomic_notifier_notify_one_at_prewaiter_window_50rounds() {
-    notify_one_at_prewaiter_window(&AtomicNotifier::new(1), 50);
-}
-
-#[test]
-fn atomic_notifier_notify_one_at_prewaiter_window_200rounds() {
-    notify_one_at_prewaiter_window(&AtomicNotifier::new(1), 200);
+worker_matrix! {
+    notify_one_at_prewaiter_window {
+        atomic_notifier_notify_one_at_prewaiter_window_50rounds(&AtomicNotifier::new(1), 50),
+        atomic_notifier_notify_one_at_prewaiter_window_200rounds(&AtomicNotifier::new(1), 200),
+    }
 }
 
 // --- rapid_cancel_integrity ---
 // Stresses that many prepare+cancel cycles keep the waiter count accurate and
 // leave the notifier fully functional.
 
-#[test]
-fn atomic_notifier_rapid_cancel_integrity_1k_cycles() {
-    rapid_cancel_integrity(&AtomicNotifier::new(2), 1_000);
-}
-
-#[test]
-fn atomic_notifier_rapid_cancel_integrity_100k_cycles() {
-    rapid_cancel_integrity(&AtomicNotifier::new(2), 100_000);
+worker_matrix! {
+    rapid_cancel_integrity {
+        atomic_notifier_rapid_cancel_integrity_1k_cycles(&AtomicNotifier::new(2), 1_000),
+        atomic_notifier_rapid_cancel_integrity_100k_cycles(&AtomicNotifier::new(2), 100_000),
+    }
 }
 
 // ============================================================================
@@ -708,29 +688,14 @@ fn nonblocking_notifier_invariants_num_waiters_counts_only_committed() {
 
 // --- notify_before_commit ---
 
-#[test]
-fn nonblocking_notifier_notify_before_commit_1thread() {
-    notify_before_commit(&NonblockingNotifier::new(1));
-}
-
-#[test]
-fn nonblocking_notifier_notify_before_commit_2threads() {
-    notify_before_commit(&NonblockingNotifier::new(2));
-}
-
-#[test]
-fn nonblocking_notifier_notify_before_commit_4threads() {
-    notify_before_commit(&NonblockingNotifier::new(4));
-}
-
-#[test]
-fn nonblocking_notifier_notify_before_commit_8threads() {
-    notify_before_commit(&NonblockingNotifier::new(8));
-}
-
-#[test]
-fn nonblocking_notifier_notify_before_commit_15threads() {
-    notify_before_commit(&NonblockingNotifier::new(15));
+worker_matrix! {
+    notify_before_commit {
+        nonblocking_notifier_notify_before_commit_1thread(&NonblockingNotifier::new(1)),
+        nonblocking_notifier_notify_before_commit_2threads(&NonblockingNotifier::new(2)),
+        nonblocking_notifier_notify_before_commit_4threads(&NonblockingNotifier::new(4)),
+        nonblocking_notifier_notify_before_commit_8threads(&NonblockingNotifier::new(8)),
+        nonblocking_notifier_notify_before_commit_15threads(&NonblockingNotifier::new(15)),
+    }
 }
 
 // --- cancel_only (no ghost waiters) ---
@@ -799,87 +764,57 @@ fn nonblocking_notifier_cancel_only_no_ghost_waiters_8threads() {
 
 // --- notify_n boundary (k == N must invoke the notify_all path) ---
 
-#[test]
-fn nonblocking_notifier_notify_n_exact_size_4threads() {
-    notify_n_releases_committed(&NonblockingNotifier::new(4), 4, 50);
-}
-
-#[test]
-fn nonblocking_notifier_notify_n_exact_size_8threads() {
-    notify_n_releases_committed(&NonblockingNotifier::new(8), 8, 50);
-}
-
-#[test]
-fn nonblocking_notifier_notify_n_exact_size_15threads() {
-    notify_n_releases_committed(&NonblockingNotifier::new(15), 15, 30);
+worker_matrix! {
+    notify_n_releases_committed {
+        nonblocking_notifier_notify_n_exact_size_4threads(&NonblockingNotifier::new(4), 4, 50),
+        nonblocking_notifier_notify_n_exact_size_8threads(&NonblockingNotifier::new(8), 8, 50),
+        nonblocking_notifier_notify_n_exact_size_15threads(&NonblockingNotifier::new(15), 15, 30),
+    }
 }
 
 // --- notify_n(0) is a strict noop ---
 
-#[test]
-fn nonblocking_notifier_notify_n_zero_is_noop_4threads() {
-    notify_n_zero_is_noop(&NonblockingNotifier::new(4));
-}
-
-#[test]
-fn nonblocking_notifier_notify_n_zero_is_noop_8threads() {
-    notify_n_zero_is_noop(&NonblockingNotifier::new(8));
+worker_matrix! {
+    notify_n_zero_is_noop {
+        nonblocking_notifier_notify_n_zero_is_noop_4threads(&NonblockingNotifier::new(4)),
+        nonblocking_notifier_notify_n_zero_is_noop_8threads(&NonblockingNotifier::new(8)),
+    }
 }
 
 // --- notify_n(k) wakes k and not one more ---
 
-#[test]
-fn nonblocking_notifier_notify_n_no_over_release_n8_k1() {
-    notify_n_does_not_over_release(&NonblockingNotifier::new(8), 1, 100);
-}
-
-#[test]
-fn nonblocking_notifier_notify_n_no_over_release_n8_k3() {
-    notify_n_does_not_over_release(&NonblockingNotifier::new(8), 3, 100);
-}
-
-#[test]
-fn nonblocking_notifier_notify_n_no_over_release_n15_k7() {
-    notify_n_does_not_over_release(&NonblockingNotifier::new(15), 7, 60);
-}
-
-#[test]
-fn nonblocking_notifier_notify_n_no_over_release_n31_k15() {
-    notify_n_does_not_over_release(&NonblockingNotifier::new(31), 15, 40);
+worker_matrix! {
+    notify_n_does_not_over_release {
+        nonblocking_notifier_notify_n_no_over_release_n8_k1(&NonblockingNotifier::new(8), 1, 100),
+        nonblocking_notifier_notify_n_no_over_release_n8_k3(&NonblockingNotifier::new(8), 3, 100),
+        nonblocking_notifier_notify_n_no_over_release_n15_k7(&NonblockingNotifier::new(15), 7, 60),
+        nonblocking_notifier_notify_n_no_over_release_n31_k15(&NonblockingNotifier::new(31), 15, 40),
+    }
 }
 
 // --- rapid_cancel_integrity ---
 // Stresses that many prepare+cancel cycles keep the state word accurate and
 // leave the notifier fully functional.
 
-#[test]
-fn nonblocking_notifier_rapid_cancel_integrity_1k_cycles() {
-    rapid_cancel_integrity(&NonblockingNotifier::new(2), 1_000);
+worker_matrix! {
+    rapid_cancel_integrity {
+        nonblocking_notifier_rapid_cancel_integrity_1k_cycles(&NonblockingNotifier::new(2), 1_000),
+        nonblocking_notifier_rapid_cancel_integrity_100k_cycles(&NonblockingNotifier::new(2), 100_000),
+    }
 }
 
-#[test]
-fn nonblocking_notifier_rapid_cancel_integrity_100k_cycles() {
-    rapid_cancel_integrity(&NonblockingNotifier::new(2), 100_000);
-}
-
-#[test]
-fn nonblocking_notifier_rapid_cancel_epoch_integrity_1k_cycles() {
-    rapid_cancel_epoch_integrity(1_000);
-}
-
-#[test]
-fn nonblocking_notifier_rapid_cancel_epoch_integrity_100k_cycles() {
-    rapid_cancel_epoch_integrity(100_000);
+worker_matrix! {
+    rapid_cancel_epoch_integrity {
+        nonblocking_notifier_rapid_cancel_epoch_integrity_1k_cycles(1_000),
+        nonblocking_notifier_rapid_cancel_epoch_integrity_100k_cycles(100_000),
+    }
 }
 
 // --- notify_one fires in the pre-waiter window ---
 
-#[test]
-fn nonblocking_notifier_notify_one_at_prewaiter_window_50rounds() {
-    notify_one_at_prewaiter_window(&NonblockingNotifier::new(1), 50);
-}
-
-#[test]
-fn nonblocking_notifier_notify_one_at_prewaiter_window_200rounds() {
-    notify_one_at_prewaiter_window(&NonblockingNotifier::new(1), 200);
+worker_matrix! {
+    notify_one_at_prewaiter_window {
+        nonblocking_notifier_notify_one_at_prewaiter_window_50rounds(&NonblockingNotifier::new(1), 50),
+        nonblocking_notifier_notify_one_at_prewaiter_window_200rounds(&NonblockingNotifier::new(1), 200),
+    }
 }
