@@ -89,6 +89,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::Scope;
+use crate::algorithm::SliceSource;
 use crate::algorithm::index_range::{IndexInt, IndexRange};
 use crate::algorithm::partitioner::{
     ClosureWrapper, DynamicLoop, DynamicPartitioner, GuidedPartitioner, Partitioner,
@@ -595,7 +596,10 @@ impl<'rt> Runtime<'rt> {
 /// Builds the runtime body of a [`Runtime::reduce`] task over owned `data`,
 /// folding into a shared `init`: upstream's `make_reduce_task(b, e, init,
 /// bop, part)`. `init` is locked once for the task's whole run, and the
-/// whole fold goes through that one guard.
+/// whole fold goes through that one guard. `data` is any [`SliceSource`], so
+/// the locked vector an earlier factory wrote can be folded here; its guard
+/// is taken ahead of `init`'s and dropped with it when the body returns, the
+/// lock order the parent module's `# Design` section requires.
 ///
 /// `bop` and `part` are cloned on every run of the body -- relevant only for
 /// a task a cycle revisits -- matching upstream copying both into its own
@@ -624,7 +628,7 @@ impl<'rt> Runtime<'rt> {
 /// assert_eq!(*sum.lock().expect("uncontended"), 5050);
 /// ```
 pub fn make_reduce_task<T, O, P>(
-    data: Arc<Vec<T>>,
+    data: impl SliceSource<Item = T> + Send + 'static,
     init: Arc<Mutex<T>>,
     bop: O,
     part: P,
@@ -635,15 +639,16 @@ where
     P: ReducePartitioner + Clone + Send + 'static,
 {
     move |rt: &mut Runtime<'_>| {
+        let source = data.read_slice();
         let mut guard = init.lock().unwrap_or_else(PoisonError::into_inner);
-        rt.reduce(&data, &mut *guard, bop.clone(), part.clone());
+        rt.reduce(&source, &mut *guard, bop.clone(), part.clone());
     }
 }
 
 /// Builds the runtime body of a [`Runtime::transform_reduce`] task over
 /// owned `data`: upstream's single-input `make_transform_reduce_task(b, e,
-/// init, bop, uop, part)` overload. `init` is locked and the operators are
-/// cloned exactly as [`make_reduce_task`] does.
+/// init, bop, uop, part)` overload. `data` is a [`SliceSource`], and `init`
+/// is locked and the operators cloned exactly as [`make_reduce_task`] does.
 ///
 /// ```
 /// use std::sync::{Arc, Mutex};
@@ -669,7 +674,7 @@ where
 /// assert_eq!(*sum_of_squares.lock().expect("uncontended"), 385);
 /// ```
 pub fn make_transform_reduce_task<T, R, O, U, P>(
-    data: Arc<Vec<T>>,
+    data: impl SliceSource<Item = T> + Send + 'static,
     init: Arc<Mutex<R>>,
     bop: O,
     uop: U,
@@ -683,8 +688,9 @@ where
     P: ReducePartitioner + Clone + Send + 'static,
 {
     move |rt: &mut Runtime<'_>| {
+        let source = data.read_slice();
         let mut guard = init.lock().unwrap_or_else(PoisonError::into_inner);
-        rt.transform_reduce(&data, &mut *guard, bop.clone(), uop.clone(), part.clone());
+        rt.transform_reduce(&source, &mut *guard, bop.clone(), uop.clone(), part.clone());
     }
 }
 
@@ -692,8 +698,9 @@ where
 /// owned `data1` and `data2`: upstream's two-input
 /// `make_transform_reduce_task(beg1, end1, beg2, init, bop_r, bop_t, part)`
 /// overload, carrying the `2` for the reason this module's `# Design`
-/// section gives for the method's own name. `init` is locked and the
-/// operators are cloned exactly as [`make_reduce_task`] does.
+/// section gives for the method's own name. `data1` and `data2` are
+/// [`SliceSource`]s, read under guards taken in that order ahead of `init`'s
+/// lock; the operators are cloned exactly as [`make_reduce_task`] does.
 ///
 /// ```
 /// use std::sync::{Arc, Mutex};
@@ -721,8 +728,8 @@ where
 /// assert_eq!(*dot.lock().expect("uncontended"), 220);
 /// ```
 pub fn make_transform_reduce2_task<T1, T2, R, O, U, P>(
-    data1: Arc<Vec<T1>>,
-    data2: Arc<Vec<T2>>,
+    data1: impl SliceSource<Item = T1> + Send + 'static,
+    data2: impl SliceSource<Item = T2> + Send + 'static,
     init: Arc<Mutex<R>>,
     bop: O,
     uop: U,
@@ -737,10 +744,12 @@ where
     P: ReducePartitioner + Clone + Send + 'static,
 {
     move |rt: &mut Runtime<'_>| {
+        let first = data1.read_slice();
+        let second = data2.read_slice();
         let mut guard = init.lock().unwrap_or_else(PoisonError::into_inner);
         rt.transform_reduce2(
-            &data1,
-            &data2,
+            &first,
+            &second,
             &mut *guard,
             bop.clone(),
             uop.clone(),

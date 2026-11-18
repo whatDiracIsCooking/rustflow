@@ -1594,8 +1594,11 @@ entry above does.
   `Runtime::` method on it, which is what `tests/for_each.rs`'s stateful
   cases do in place of upstream's `std::ref` ones. The rule the seventeen new
   factories follow, so the family stays one vocabulary rather than three: a
-  value the body only reads is `Arc<Vec<T>>`, one it writes is
-  `Arc<Mutex<Vec<T>>>`, a scalar result is `Arc<Mutex<T>>`, a `Copy` range or
+  value the body only reads is any `SliceSource` -- `Arc<Vec<T>>`,
+  `Arc<Mutex<Vec<T>>>` or an owned `Vec<T>`, the read side the last entry of
+  this section states and the reason it is wider than one `Arc` -- one it
+  writes is `Arc<Mutex<Vec<T>>>`, a scalar result is `Arc<Mutex<T>>`, a
+  `Copy` range or
   index travels by value, and a factory that *creates* the output storage
   returns `(body, slot)` as `make_merge_task` does.
 
@@ -2027,3 +2030,67 @@ entry above does.
   has at least one worker (`Executor::new` asserts it), and each algorithm's
   driver has already returned for `n == 0` and taken the serial path for
   `w_total <= 1` before a partitioner sees either number.
+
+- **A factory's read parameter is one sealed source trait, and the family's
+  locking discipline is "every guard in parameter order, none past the body's
+  return"** (issue #318).
+
+  The ownership rule above gives every *writing* factory an
+  `Arc<Mutex<Vec<T>>>` and gave every *reading* one an `Arc<Vec<T>>`, and the
+  two are not interconvertible without copying the data. Across the eleven
+  factories with a read parameter -- `transform`, `transform2`, the six
+  scans, the three `reduce` forms that take a vector, the four finds and the
+  two merges -- that made the family unable to express a chain: the longest
+  one statable was for-each/sort into for-each/sort, the only factories that
+  read and write the same locked vector, and no factory could terminate a
+  chain by reducing what an earlier stage wrote. The program #296 specifies
+  compiled for its first stage and failed for its second and third with
+  `expected &Arc<Vec<_>>, found &Arc<Mutex<Vec<i32>>>`.
+
+  **What lands is `SliceSource`**, a trait sealed the way
+  `algorithm::SlicePartitioner` and `index_range::IndexInt` are, with an
+  `Item` associated type and a GAT guard that derefs to `Vec<Item>`:
+  `&'a Vec<T>` for `Arc<Vec<T>>` and for an owned `Vec<T>`, and
+  `MutexGuard<'a, Vec<T>>` for `Arc<Mutex<Vec<T>>>`. Every read parameter of
+  those eleven factories takes it -- fifteen parameters, the whole read side
+  rather than only the three factories #296 needs, since a half-converted
+  family is a worse API than either end state -- as
+  `impl SliceSource<Item = T>` in argument position rather than as a named
+  type parameter, which is what keeps every call site, doctest and turbofish
+  inferring unchanged and leaves all 28 `AlgorithmBuilder` wrapper signatures
+  byte for byte as they were. The guard is why this is a trait rather than a
+  `From` conversion: a locked source cannot hand out a `&[T]` without
+  something owning the lock for the duration of the read, and that something
+  is the guard the body holds for its own run.
+
+  **The alternative was a second `_locked` factory per read parameter**, and
+  it is rejected: it doubles eleven factories into two families a caller
+  picks between by name, each wrapper would still call only one of the two,
+  and the pair would have to be kept in step for every later change to
+  either. An `Arc<RwLock<Vec<T>>>` source was considered too, since a
+  read-write lock would let two *reading* stages run at once where a `Mutex`
+  serialises them. It is not taken: every writing factory publishes into an
+  `Arc<Mutex<Vec<T>>>`, so a chain built on `RwLock` would have to convert at
+  the seam -- the copy this decision exists to remove -- and a second lock
+  flavour in the vocabulary buys concurrency only for the reader-reader case
+  an edge already orders.
+
+  **The locking discipline**, stated here and in `src/algorithm/mod.rs`'s own
+  `# Design` section. A factory body locks each of its sources once per run,
+  in the order its signature lists them, and drops every guard before it
+  returns; the find family and `make_merge_task_by` release their read guards
+  before taking the lock they publish into, so a read guard is never held
+  across a write lock the read itself does not need. Two stages joined by a
+  dependency edge therefore cannot deadlock over a lock they share, in either
+  lock order, since the earlier body has returned -- and dropped its guards
+  -- before the later one is scheduled at all. Two stages that share a lock
+  and are *not* joined by an edge are a caller error, two readers included: a
+  body holds its guard across the chunk loop under it, that loop's wait runs
+  other ready work on the same worker (`WorkerThread::corun_until` steals),
+  and `Mutex` has no shared mode, so a worker that picks up the unordered
+  second stage blocks on a guard only its own stack could release. Handing
+  one `Arc<Mutex<Vec<T>>>` to two parameters of a single factory -- two read
+  sources, or a read source and the write target -- is that same error inside
+  one call, which is also why an in-place scan stays unexpressible: `input`
+  and `out` have to be two different locks, exactly as
+  `Runtime::inclusive_scan`'s own `&[T]`/`&mut [T]` pair cannot alias.

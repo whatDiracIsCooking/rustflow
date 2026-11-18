@@ -102,6 +102,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::algorithm::SliceSource;
 use crate::runtime::Runtime;
 
 impl<'rt> Runtime<'rt> {
@@ -508,8 +509,12 @@ fn scan_two_phase<T, F, Uop>(
 }
 
 /// Builds the runtime body of an [`Runtime::inclusive_scan`] task: upstream's
-/// `make_inclusive_scan_task`. `out` is locked once and scanned in place;
-/// `input` is read without locking, since nothing here ever writes to it.
+/// `make_inclusive_scan_task`. `out` is locked once and scanned in place.
+/// `input` is any [`SliceSource`], so the locked vector an earlier factory
+/// wrote can be scanned into `out`; its guard is taken ahead of `out`'s and
+/// dropped with it when the body returns, the lock order the parent module's
+/// `# Design` section requires -- which is also why `input` and `out` must
+/// not be the same lock.
 ///
 /// ```
 /// use std::sync::{Arc, Mutex};
@@ -532,7 +537,7 @@ fn scan_two_phase<T, F, Uop>(
 /// assert_eq!(*out.lock().expect("uncontended"), vec![1, 3, 6, 10, 15]);
 /// ```
 pub fn make_inclusive_scan_task<T, F>(
-    input: Arc<Vec<T>>,
+    input: impl SliceSource<Item = T> + Send + 'static,
     out: Arc<Mutex<Vec<T>>>,
     bop: F,
 ) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static
@@ -541,10 +546,11 @@ where
     F: Fn(&T, &T) -> T + Sync + Clone + Send + 'static,
 {
     move |rt: &mut Runtime<'_>| {
+        let source = input.read_slice();
         let mut guard = out
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        rt.inclusive_scan(&input, &mut guard, bop.clone());
+        rt.inclusive_scan(&source, &mut guard, bop.clone());
     }
 }
 
@@ -573,7 +579,7 @@ where
 /// assert_eq!(*out.lock().expect("uncontended"), vec![101, 103, 106, 110, 115]);
 /// ```
 pub fn make_inclusive_scan_with_init_task<T, F>(
-    input: Arc<Vec<T>>,
+    input: impl SliceSource<Item = T> + Send + 'static,
     out: Arc<Mutex<Vec<T>>>,
     bop: F,
     init: T,
@@ -583,10 +589,11 @@ where
     F: Fn(&T, &T) -> T + Sync + Clone + Send + 'static,
 {
     move |rt: &mut Runtime<'_>| {
+        let source = input.read_slice();
         let mut guard = out
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        rt.inclusive_scan_with_init(&input, &mut guard, bop.clone(), &init);
+        rt.inclusive_scan_with_init(&source, &mut guard, bop.clone(), &init);
     }
 }
 
@@ -615,7 +622,7 @@ where
 /// assert_eq!(*out.lock().expect("uncontended"), vec![100, 101, 103, 106, 110]);
 /// ```
 pub fn make_exclusive_scan_task<T, F>(
-    input: Arc<Vec<T>>,
+    input: impl SliceSource<Item = T> + Send + 'static,
     out: Arc<Mutex<Vec<T>>>,
     init: T,
     bop: F,
@@ -625,10 +632,11 @@ where
     F: Fn(&T, &T) -> T + Sync + Clone + Send + 'static,
 {
     move |rt: &mut Runtime<'_>| {
+        let source = input.read_slice();
         let mut guard = out
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        rt.exclusive_scan(&input, &mut guard, init.clone(), bop.clone());
+        rt.exclusive_scan(&source, &mut guard, init.clone(), bop.clone());
     }
 }
 
@@ -657,7 +665,7 @@ where
 /// assert_eq!(*out.lock().expect("uncontended"), vec![2, 6, 12, 20, 30]);
 /// ```
 pub fn make_transform_inclusive_scan_task<T, F, Uop>(
-    input: Arc<Vec<T>>,
+    input: impl SliceSource<Item = T> + Send + 'static,
     out: Arc<Mutex<Vec<T>>>,
     bop: F,
     uop: Uop,
@@ -668,10 +676,11 @@ where
     Uop: Fn(&T) -> T + Sync + Clone + Send + 'static,
 {
     move |rt: &mut Runtime<'_>| {
+        let source = input.read_slice();
         let mut guard = out
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        rt.transform_inclusive_scan(&input, &mut guard, bop.clone(), uop.clone());
+        rt.transform_inclusive_scan(&source, &mut guard, bop.clone(), uop.clone());
     }
 }
 
@@ -702,7 +711,7 @@ where
 /// assert_eq!(*out.lock().expect("uncontended"), vec![102, 106, 112, 120, 130]);
 /// ```
 pub fn make_transform_inclusive_scan_with_init_task<T, F, Uop>(
-    input: Arc<Vec<T>>,
+    input: impl SliceSource<Item = T> + Send + 'static,
     out: Arc<Mutex<Vec<T>>>,
     bop: F,
     uop: Uop,
@@ -714,10 +723,11 @@ where
     Uop: Fn(&T) -> T + Sync + Clone + Send + 'static,
 {
     move |rt: &mut Runtime<'_>| {
+        let source = input.read_slice();
         let mut guard = out
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        rt.transform_inclusive_scan_with_init(&input, &mut guard, bop.clone(), uop.clone(), &init);
+        rt.transform_inclusive_scan_with_init(&source, &mut guard, bop.clone(), uop.clone(), &init);
     }
 }
 
@@ -747,7 +757,7 @@ where
 /// assert_eq!(*out.lock().expect("uncontended"), vec![100, 102, 106, 112, 120]);
 /// ```
 pub fn make_transform_exclusive_scan_task<T, F, Uop>(
-    input: Arc<Vec<T>>,
+    input: impl SliceSource<Item = T> + Send + 'static,
     out: Arc<Mutex<Vec<T>>>,
     init: T,
     bop: F,
@@ -759,10 +769,11 @@ where
     Uop: Fn(&T) -> T + Sync + Clone + Send + 'static,
 {
     move |rt: &mut Runtime<'_>| {
+        let source = input.read_slice();
         let mut guard = out
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        rt.transform_exclusive_scan(&input, &mut guard, init.clone(), bop.clone(), uop.clone());
+        rt.transform_exclusive_scan(&source, &mut guard, init.clone(), bop.clone(), uop.clone());
     }
 }
 
@@ -771,6 +782,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::algorithm::for_each::make_for_each_task;
+    use crate::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
     use crate::prelude::*;
     use crate::{Executor, Runtime};
 
@@ -826,5 +839,41 @@ mod tests {
             .wait()
             .expect("no task panicked");
         assert_eq!(counter.load(Ordering::Relaxed), 26 + 3 + 22);
+    }
+
+    /// A scan factory reads locked data: the input here is the
+    /// `Arc<Mutex<Vec<i64>>>` the `for_each` factory before it wrote, which
+    /// is what lets a scan sit in the middle of a chain of factories. The
+    /// two nodes are linearized for the reason `algorithm`'s `# Design`
+    /// section gives, and `input` and `out` are deliberately two different
+    /// locks: one lock in both parameters would deadlock the body on its
+    /// second acquisition.
+    #[test]
+    fn an_inclusive_scan_factory_reads_a_locked_source() {
+        let input = Arc::new(Mutex::new(vec![0i64; 8]));
+        let out = Arc::new(Mutex::new(vec![0i64; 8]));
+
+        let mut taskflow = Taskflow::new();
+        let filled = taskflow.emplace_runtime(make_for_each_task(
+            Arc::clone(&input),
+            |x: &mut i64| *x = 2,
+            GuidedPartitioner::<DefaultClosureWrapper>::default(),
+        ));
+        let scanned = taskflow.emplace_runtime(make_inclusive_scan_task(
+            Arc::clone(&input),
+            Arc::clone(&out),
+            |a: &i64, b: &i64| a + b,
+        ));
+        taskflow.linearize([filled, scanned]);
+
+        Executor::new(3)
+            .run(&taskflow)
+            .wait()
+            .expect("no task panicked");
+
+        assert_eq!(
+            *out.lock().expect("uncontended"),
+            vec![2, 4, 6, 8, 10, 12, 14, 16]
+        );
     }
 }

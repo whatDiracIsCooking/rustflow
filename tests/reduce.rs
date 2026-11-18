@@ -28,6 +28,10 @@
 //! upstream counterpart: `test_reduce.cpp` submits every case through a
 //! taskflow, and the factory layer is what lets this port hand one of these
 //! algorithms to an async submission instead.
+//! [`a_factory_chain_ends_in_a_reduce_of_a_locked_vector`] is the three-stage
+//! version of the same thing, and has no upstream counterpart either: what
+//! it chains over one locked vector, upstream writes as three
+//! `tf::make_*_task` calls aliasing one unlocked `std::vector`.
 //!
 //! What is not here: the `TransformReduce.MoveOnlyData.*` cases.
 //! `src/algorithm/reduce.rs`'s own `# Design` section says why --
@@ -39,12 +43,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rustflow::algorithm::index_range::IndexRange;
-use rustflow::algorithm::make_reduce_task;
 use rustflow::algorithm::partitioner::{
     DefaultClosureWrapper, DynamicPartitioner, GuidedPartitioner, RandomPartitioner,
     StaticPartitioner,
 };
 use rustflow::algorithm::reduce::ReducePartitioner;
+use rustflow::algorithm::{make_for_each_task, make_reduce_task, make_transform_task};
 use rustflow::prelude::*;
 use rustflow::{Executor, Runtime, Xorshift32};
 
@@ -743,5 +747,69 @@ fn make_reduce_task_runs_from_a_silent_dependent_async_body() {
             5 + data.iter().sum::<usize>(),
             "n = {n}"
         );
+    }
+}
+
+// ----------------------------------------------------------------------------
+// A chain of factories over one locked vector
+// ----------------------------------------------------------------------------
+
+/// Three factories chained over the same `Arc<Mutex<Vec<i32>>>`, each a
+/// single [`Executor::silent_dependent_async_runtime`] submission depending
+/// on the one before it: `make_for_each_task` writes the locked vector,
+/// `make_transform_task` *reads* it into a second locked vector, and
+/// `make_reduce_task` folds that same locked vector into a scalar.
+///
+/// What this pins is the read side of the factory family: a factory whose
+/// body only reads takes any `SliceSource`, so the locked vector a writing
+/// factory produced is accepted where a plain `Arc<Vec<i32>>` is, with no
+/// copy between the stages and no closure literal at any of the three.
+///
+/// It is the deadlock case as well. Each body locks its sources for its own
+/// run only and drops every guard before it returns, and the two dependency
+/// edges mean no two of these bodies are ever in flight together -- so stage
+/// B's read lock on `data` is taken after stage A's guard is gone, and stage
+/// C's after B's, whichever worker steals which.
+#[test]
+fn a_factory_chain_ends_in_a_reduce_of_a_locked_vector() {
+    let executor = Executor::new(3);
+
+    for &n in &[0usize, 1, 9, 1500] {
+        let data = Arc::new(Mutex::new(vec![0i32; n]));
+        let scaled = Arc::new(Mutex::new(vec![0i32; n]));
+        let sum = Arc::new(Mutex::new(0i32));
+
+        let stage_a = executor.silent_dependent_async_runtime(
+            make_for_each_task(
+                Arc::clone(&data),
+                |i: &mut i32| *i = 1,
+                GuidedPartitioner::<DefaultClosureWrapper>::default(),
+            ),
+            [],
+        );
+        let stage_b = executor.silent_dependent_async_runtime(
+            make_transform_task(
+                Arc::clone(&data),
+                Arc::clone(&scaled),
+                |x: &i32| x * 10,
+                GuidedPartitioner::<DefaultClosureWrapper>::default(),
+            ),
+            [&stage_a],
+        );
+        let _stage_c = executor.silent_dependent_async_runtime(
+            make_reduce_task(
+                Arc::clone(&data),
+                Arc::clone(&sum),
+                |a: &i32, b: &i32| a + b,
+                GuidedPartitioner::<DefaultClosureWrapper>::default(),
+            ),
+            [&stage_b],
+        );
+        executor.wait_for_all();
+
+        let expected_sum = i32::try_from(n).expect("n fits an i32");
+        assert_eq!(*data.lock().expect("uncontended"), vec![1; n], "n = {n}");
+        assert_eq!(*scaled.lock().expect("uncontended"), vec![10; n], "n = {n}");
+        assert_eq!(*sum.lock().expect("uncontended"), expected_sum, "n = {n}");
     }
 }

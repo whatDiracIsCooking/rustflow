@@ -71,6 +71,7 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::algorithm::SliceSource;
 use crate::runtime::Runtime;
 
 // Upstream's inner `std::merge` call, over a comparator rather than its own
@@ -256,6 +257,11 @@ fn lock_result<T>(slot: &Mutex<Vec<T>>) -> std::sync::MutexGuard<'_, Vec<T>> {
 /// iterators into storage the caller keeps alive -- the module docs'
 /// `# Design` section says why.
 ///
+/// `a` and `b` are [`SliceSource`]s, so each may be an owned `Vec<T>`, a
+/// shared `Arc<Vec<T>>` or the `Arc<Mutex<Vec<T>>>` an earlier factory
+/// wrote; both are read under guards taken in that order and released
+/// before the result slot is locked.
+///
 /// Returns a body suitable for
 /// [`Executor::spawn_runtime`](crate::Executor::spawn_runtime),
 /// [`Executor::silent_async_runtime`](crate::Executor::silent_async_runtime),
@@ -283,8 +289,8 @@ fn lock_result<T>(slot: &Mutex<Vec<T>>) -> std::sync::MutexGuard<'_, Vec<T>> {
 /// assert_eq!(*result.lock().expect("uncontended"), [1, 2, 3, 4, 5, 6]);
 /// ```
 pub fn make_merge_task<T>(
-    a: Vec<T>,
-    b: Vec<T>,
+    a: impl SliceSource<Item = T> + Send + 'static,
+    b: impl SliceSource<Item = T> + Send + 'static,
 ) -> (
     impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static,
     Arc<Mutex<Vec<T>>>,
@@ -298,7 +304,8 @@ where
 /// Builds a runtime-shaped body that merges owned `a` and `b` under `cmp`,
 /// publishing the result through the returned slot: upstream's
 /// `make_merge_task`, over owned inputs -- see [`make_merge_task`] for the
-/// `Ord`-only form and the module docs' `# Design` section for why this
+/// `Ord`-only form, the shapes `a` and `b` accept and the order their guards
+/// are taken in, and the module docs' `# Design` section for why this
 /// returns a slot rather than writing through an iterator the caller
 /// already owns storage behind.
 ///
@@ -314,8 +321,8 @@ where
 /// assert_eq!(*result.lock().expect("uncontended"), [6, 5, 4, 3, 2, 1]);
 /// ```
 pub fn make_merge_task_by<T, C>(
-    a: Vec<T>,
-    b: Vec<T>,
+    a: impl SliceSource<Item = T> + Send + 'static,
+    b: impl SliceSource<Item = T> + Send + 'static,
     cmp: C,
 ) -> (
     impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static,
@@ -329,12 +336,20 @@ where
     let published = Arc::clone(&result);
 
     let body = move |rt: &mut Runtime<'_>| {
-        // A scratch buffer of the right length and already-valid `T`s, built
-        // from the very elements the merge below overwrites wholesale --
-        // the module docs' `# Design` section says why this needs `Clone`
-        // rather than, say, `Default`.
-        let mut buf: Vec<T> = a.iter().chain(b.iter()).cloned().collect();
-        rt.merge_by(&a, &b, &mut buf, &cmp);
+        // Both read guards end with this block, so the slot below is locked
+        // with neither of them held: `algorithm`'s own `# Design` section
+        // states that discipline for the whole family.
+        let buf = {
+            let first = a.read_slice();
+            let second = b.read_slice();
+            // A scratch buffer of the right length and already-valid `T`s,
+            // built from the very elements the merge below overwrites
+            // wholesale -- the module docs' `# Design` section says why this
+            // needs `Clone` rather than, say, `Default`.
+            let mut buf: Vec<T> = first.iter().chain(second.iter()).cloned().collect();
+            rt.merge_by(&first, &second, &mut buf, &cmp);
+            buf
+        };
         *lock_result(&published) = buf;
     };
 
@@ -430,5 +445,33 @@ mod tests {
             .clone()
             .expect("the subflow task ran");
         assert_eq!(*slot.lock().expect("uncontended"), [9, 7, 5, 3, 1]);
+    }
+
+    /// Both merge inputs are [`SliceSource`]s, so a merge can consume what
+    /// two earlier factories sorted in place rather than only a `Vec` the
+    /// caller built itself. The sorts are linearized ahead of the merge for
+    /// the reason `algorithm`'s `# Design` section gives; they could run
+    /// together, each holding a different lock, but the merge reads both and
+    /// so must follow both.
+    #[test]
+    fn a_merge_factory_reads_two_locked_sources() {
+        let a = Arc::new(Mutex::new(vec![5, 1, 3]));
+        let b = Arc::new(Mutex::new(vec![6, 2, 4]));
+
+        let mut taskflow = Taskflow::new();
+        let sorted_a =
+            taskflow.emplace_runtime(crate::algorithm::sort::make_sort_task(Arc::clone(&a)));
+        let sorted_b =
+            taskflow.emplace_runtime(crate::algorithm::sort::make_sort_task(Arc::clone(&b)));
+        let (body, merged) = make_merge_task(Arc::clone(&a), Arc::clone(&b));
+        let merge = taskflow.emplace_runtime(body);
+        taskflow.linearize([sorted_a, sorted_b, merge]);
+
+        Executor::new(2)
+            .run(&taskflow)
+            .wait()
+            .expect("no task panicked");
+
+        assert_eq!(*merged.lock().expect("uncontended"), [1, 2, 3, 4, 5, 6]);
     }
 }
