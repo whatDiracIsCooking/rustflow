@@ -66,6 +66,7 @@ use crate::executor::rng::Xorshift32;
 use crate::executor::topology::Job;
 use crate::executor::{r#async, dependent_async, module, runtime, subflow};
 use crate::graph::{Handle, Node};
+use crate::observer::{TaskView, WorkerView};
 
 /// What a strong release that lands on a node some bypass has already entered
 /// reports, instead of resuming that node: the successor arm of
@@ -430,6 +431,18 @@ impl WorkerThread {
 
         self.observer_prologue(&job);
 
+        // The two free-standing node kinds call `observer_epilogue` for
+        // themselves, from inside `executor::async` and
+        // `executor::dependent_async`: each has its own tear-down --
+        // `Shared::finish_async`, a dependent task's successor release --
+        // that signals a waiter (`Executor::wait_for_all`,
+        // `Executor::drop`) from *inside* the dispatch below, before this
+        // match produces a value at all, so the generic call after it would
+        // run too late to order against that signal. Calling it there
+        // instead, right before each such signal, is what keeps "on_exit
+        // fires before anything the exit could unblock" true for them too.
+        let async_dispatch = matches!(node.handle(), Handle::Async(_) | Handle::DependentAsync(_));
+
         let release = match node.handle() {
             // Upstream's `_invoke_static_task`, whose
             // `TF_EXECUTOR_EXCEPTION_HANDLER` is this `catch_unwind` and whose
@@ -478,7 +491,9 @@ impl WorkerThread {
             Handle::DependentAsync(work) => dependent_async::invoke(self, &job, work),
         };
 
-        self.observer_epilogue(&job);
+        if !async_dispatch {
+            self.observer_epilogue(&job);
+        }
 
         // Upstream's `return true` out of its three preempting invokers, which
         // its `_invoke` turns into a bare `return`: this node is the parent of
@@ -603,18 +618,51 @@ impl WorkerThread {
 
     /// The point at which this worker is about to run `job`'s work: upstream's
     /// `Executor::_observer_prologue`, which notifies every registered observer of
-    /// the entry. Empty until there are observers to notify, and named so that the
-    /// step that adds them adds a call. Upstream calls its own from inside each
-    /// `_invoke_*_task`, so its window is the body alone; the one call site here is
-    /// around the whole dispatch, which puts the scheduling of a nested graph inside
-    /// the window of the kind that preempts for it.
-    fn observer_prologue(&self, _job: &Job) {}
+    /// the entry. Upstream calls its own from inside each `_invoke_*_task`, so its
+    /// window is the body alone; the one call site here is around the whole
+    /// dispatch, which puts the scheduling of a nested graph inside the window of
+    /// the kind that preempts for it.
+    ///
+    /// The empty-list check is the one thing this does with no observers
+    /// registered: see the [`observer`](crate::observer) module docs' "Design"
+    /// section for why that is lock-free and allocates nothing.
+    fn observer_prologue(&self, job: &Job) {
+        if self.shared.observers.is_empty() {
+            return;
+        }
+        let (node, graph, _topology) = job.parts();
+        let worker = WorkerView::new(self.worker());
+        let task = TaskView::new(node, graph);
+        for observer in self.shared.observers.snapshot() {
+            observer.on_entry(worker, task);
+        }
+    }
 
     /// The point right after that: upstream's `Executor::_observer_epilogue`, which
     /// notifies every registered observer of the exit. Reached on the entry that
     /// *finishes* the node and on every entry that preempts it, the dispatch arm
     /// having returned either way.
-    fn observer_epilogue(&self, _job: &Job) {}
+    ///
+    /// Call this one yourself, from inside a dispatch arm, if that arm's own
+    /// tear-down can wake a waiter before this method's caller gets a chance
+    /// to -- `executor::async` and `executor::dependent_async` do, around
+    /// `Shared::finish_async` and a dependent task's successor release, each
+    /// of which can let `Executor::wait_for_all` or `Executor::drop` return
+    /// before the on_exit this call is for. `pub(crate)` for exactly that:
+    /// every other dispatch arm is finished by `WorkerThread::invoke_one`
+    /// itself, well after its own generic call, and has no reason to call
+    /// this directly.
+    pub(crate) fn observer_epilogue(&self, job: &Job) {
+        if self.shared.observers.is_empty() {
+            return;
+        }
+        let (node, graph, _topology) = job.parts();
+        let worker = WorkerView::new(self.worker());
+        let task = TaskView::new(node, graph);
+        for observer in self.shared.observers.snapshot() {
+            observer.on_exit(worker, task);
+        }
+    }
 
     /// Keeps `job` for this worker to run next, queueing whatever was being kept
     /// before it: upstream's `_update_cache`, line for line. Called once per

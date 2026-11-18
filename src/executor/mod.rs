@@ -87,6 +87,7 @@ use crate::executor::notifier::{DefaultNotifier, Notifier};
 use crate::executor::queue::{Buffers, WorkerQueue};
 use crate::executor::topology::Job;
 use crate::executor::worker::{Worker, WorkerInterface, WorkerThread};
+use crate::observer::{Observer, ObserverList};
 
 /// A work-stealing executor: a fixed pool of worker threads over a shared set
 /// of queues. [`Executor::run`] puts a taskflow on it.
@@ -160,6 +161,10 @@ pub(crate) struct Shared {
     pub(crate) thread_ids: OnceLock<HashMap<ThreadId, usize>>,
     /// Holds every worker until the executor is built. See [`StartGate`].
     pub(crate) start: StartGate,
+    /// The registered [`Observer`]s: upstream's `_observers`. See
+    /// [`ObserverList`] for the lock-free empty check the two scheduling
+    /// seams in [`worker`] open with.
+    pub(crate) observers: ObserverList,
 }
 
 impl Shared {
@@ -343,6 +348,51 @@ impl Executor {
         self.this_worker().map(Worker::id)
     }
 
+    /// Registers `observer` and returns a share of it: upstream's
+    /// `make_observer<Observer, ArgsT...>`.
+    ///
+    /// Upstream's is a variadic template that forwards `args` into
+    /// `std::make_shared<Observer>(args...)`, so the executor builds the
+    /// observer; Rust generics are not variadic, so this takes the built
+    /// value instead -- see the [`observer`](crate::observer) module docs'
+    /// "Design" section.
+    /// [`Observer::set_up`] is called once, here, with
+    /// [`Executor::num_workers`], before `observer` is registered.
+    #[must_use]
+    pub fn make_observer<O>(&self, observer: O) -> Arc<O>
+    where
+        O: Observer + 'static,
+    {
+        let observer = Arc::new(observer);
+        observer.set_up(self.num_workers());
+        // `Arc<O>::clone` fixes `T = O` from the receiver before the result
+        // coerces to `Arc<dyn Observer>` on assignment; going through
+        // `Arc::clone(&observer)` instead would let the let's own type
+        // annotation reach back into that call's inference and demand an
+        // `&Arc<dyn Observer>` argument, which `&observer` is not.
+        let registered: Arc<dyn Observer> = observer.clone();
+        self.shared.observers.insert(registered);
+        observer
+    }
+
+    /// Un-registers `observer`, identified by the same `Arc` [`make_observer`](Executor::make_observer)
+    /// returned: upstream's `remove_observer`. A no-op if `observer` is not
+    /// currently registered.
+    pub fn remove_observer<O>(&self, observer: &Arc<O>)
+    where
+        O: Observer + 'static,
+    {
+        let target: Arc<dyn Observer> = observer.clone();
+        self.shared.observers.remove(&target);
+    }
+
+    /// How many observers are currently registered: upstream's
+    /// `num_observers`.
+    #[must_use]
+    pub fn num_observers(&self) -> usize {
+        self.shared.observers.len()
+    }
+
     /// The worker that owns `thread`, if this executor has one.
     fn worker_of(&self, thread: ThreadId) -> Option<&Worker> {
         let &id = self.shared.thread_ids.get()?.get(&thread)?;
@@ -381,6 +431,7 @@ impl Executor {
                 no_asyncs: Condvar::new(),
                 thread_ids: OnceLock::new(),
                 start: StartGate::new(),
+                observers: ObserverList::new(),
             }),
             threads: Vec::with_capacity(num_workers),
         };
