@@ -669,8 +669,9 @@ impl Runtime<'_> {
     /// worker that parked here would be a worker the work it is waiting for
     /// cannot use. The predicate is upstream's -- the node's join counter
     /// back to one, that one being this body's own reference -- so a body
-    /// that has spawned nothing returns immediately, which in this milestone
-    /// is every body there is.
+    /// that has spawned nothing returns immediately, and one that spawned
+    /// children through [`Runtime::silent_async`] or one of its siblings
+    /// waits for the last of them.
     ///
     /// Being an *equality* rather than a `<=`, the predicate is only as good
     /// as the guarantee that nothing drives the counter below the reference
@@ -898,9 +899,9 @@ mod tests {
         taskflow.graph().node(task).nstate().load(Ordering::Relaxed) & ENTERED
     }
 
-    /// A body that returns without spawning anything is the whole of a
-    /// runtime task in this milestone: both bits come off on the first entry
-    /// and the node finishes like a static task, with its successors released
+    /// A body that returns without spawning anything is the simplest shape
+    /// a runtime task takes: both bits come off on the first entry and the
+    /// node finishes like a static task, with its successors released
     /// exactly once.
     ///
     /// "Released" is counted by the successor itself rather than found on the
@@ -1060,9 +1061,10 @@ mod tests {
     }
 
     /// A corun with nothing spawned is over before it starts: the counter is
-    /// already at the body's own one reference. That is every corun in this
-    /// milestone, which is why the branch above is tested by hand rather than
-    /// through one of these.
+    /// already at the body's own one reference. A corun that does wait needs
+    /// a real run behind it -- a hand-driven one would spin in a steal loop
+    /// that can find nothing to take -- so those cases live in
+    /// `tests/runtimes.rs` and the branch above is stepped by hand.
     ///
     /// The explicit anchor is a guard, so it has to be gone by the time the
     /// call returns -- a node left anchored would catch a failure of a

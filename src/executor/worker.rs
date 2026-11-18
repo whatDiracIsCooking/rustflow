@@ -541,11 +541,12 @@ impl WorkerThread {
     /// a composed taskflow as of #49 and an adopted graph as of #74,
     /// [`runtime`] runs a runtime task as of #51 and [`subflow`] a subflow
     /// task as of #50. Upstream's two async kinds -- which belong to a
-    /// free-standing node rather than to a graph -- and its observers are
-    /// each a later milestone, and none of them is silently absent: the
-    /// `match` below is exhaustive over
-    /// [`Handle`], so a new kind arrives as a compile error here rather than
-    /// as a task that mysteriously does nothing.
+    /// free-standing node rather than to a graph -- have arms of their own
+    /// below that refuse rather than run; its observers are a later
+    /// milestone, and none of the kinds is silently absent: the `match`
+    /// below is exhaustive over [`Handle`], so a new kind arrives as a
+    /// compile error here rather than as a task that mysteriously does
+    /// nothing.
     ///
     /// The bookkeeping is upstream's two switches over the handle, in its
     /// order: run the work, re-arm this node's own join counter, then release
