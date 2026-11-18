@@ -29,18 +29,15 @@
 //! rather than here -- its own `# Design` section says why, and names the
 //! five issues that are expected to share its `pub(crate)` helpers.
 //!
-//! **`ForEachBuilder`, not a second `trait FlowBuilder` block.** The
-//! orchestrator's brief for this issue asks for the owned-data wrapper as a
-//! second `impl FlowBuilder` block in this file, matching how `impl Runtime`
-//! is split across several modules -- but [`FlowBuilder`] is a *trait*
-//! (`src/flow_builder.rs`'s own `# Design` section says why), and Rust has
-//! no way to add a method to a trait from a second, separate `trait`
-//! declaration in another file. [`ForEachBuilder`] is the equivalent that
-//! *is* expressible: an extension trait with one default method, blanket-
-//! implemented for every [`FlowBuilder`], so `taskflow.for_each(...)` reads
-//! identically at the call site once this trait is imported -- which a
-//! caller already importing `rustflow::prelude::*` does not get for free,
-//! since nothing here edits the prelude.
+//! **`ForEachBuilder`, a blanket-implemented extension trait.**
+//! [`FlowBuilder`] is a *trait* (`src/flow_builder.rs`'s own `# Design`
+//! section says why), implemented by `Taskflow` and `Subflow` rather than a
+//! single struct a second `impl` block could extend -- so the owned-data
+//! wrapper is a trait of its own instead: one default method,
+//! blanket-implemented for every [`FlowBuilder`], so `taskflow.for_each(...)`
+//! reads identically at the call site. It is in [`crate::prelude`] alongside
+//! [`FlowBuilder`] itself, for the reason that module's own docs give: a
+//! trait's methods are only callable where the trait is imported.
 //!
 //! **`Arc<Mutex<Vec<T>>>`, not `Arc<[T]>` + `Fn(&T)`.** The owned-data
 //! wrapper exists so a body that does not already have a `&mut [T]` to hand
@@ -130,7 +127,8 @@ impl<'rt> Runtime<'rt> {
 /// The owned-data half of [`Runtime::for_each`]: upstream's
 /// `FlowBuilder::for_each`. See this module's `# Design` section for why
 /// this is a separate, blanket-implemented trait rather than a second
-/// `trait FlowBuilder` block.
+/// `trait FlowBuilder` block, and [`crate::prelude`] for why it is in the
+/// prelude alongside [`FlowBuilder`] itself.
 pub trait ForEachBuilder: FlowBuilder {
     /// Creates a runtime task that locks `data` and runs [`Runtime::for_each`]
     /// over it: upstream's `for_each(beg, end, c, part)`, over a shared
@@ -141,10 +139,13 @@ pub trait ForEachBuilder: FlowBuilder {
     /// for a task revisited by a cycle -- matching upstream copying `c` and
     /// `part` into the closure by value.
     ///
+    /// `rustflow::prelude::*` is the only import this example needs beyond
+    /// the partitioner and the data it builds the task over: `ForEachBuilder`
+    /// itself is one of the prelude's names, not imported here by name.
+    ///
     /// ```
     /// use std::sync::{Arc, Mutex};
     ///
-    /// use rustflow::algorithm::for_each::ForEachBuilder;
     /// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
     /// use rustflow::prelude::*;
     /// use rustflow::Executor;

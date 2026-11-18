@@ -161,6 +161,7 @@ pub use crate::taskflow::Taskflow;
 /// assert!(taskflow.graph().node(task).handle().is_static());
 /// ```
 pub mod prelude {
+    pub use crate::algorithm::for_each::ForEachBuilder;
     pub use crate::flow_builder::FlowBuilder;
     pub use crate::graph::{Graph, Handle, Task, Work};
     pub use crate::runtime::Runtime;
