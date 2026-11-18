@@ -3,8 +3,10 @@
 //! [`Pipeline`] is upstream's `tf::Pipeline`: a fixed chain of [`Pipe`]s run
 //! over `num_lines` parallel lines, composed into another graph as a module
 //! task. `DESIGN.md`'s "Decisions taken in M8" section covers the three
-//! choices the whole family is built on -- why a line is an ordinary runtime
-//! task, why a pipe callable's bound forces the pipeline's state to live
+//! choices the whole family is built on -- why a line is a
+//! [`Handle::NonpreemptiveRuntime`](crate::graph::Handle::NonpreemptiveRuntime)
+//! task rather than an ordinary [`Handle::Runtime`](crate::graph::Handle::Runtime)
+//! one, why a pipe callable's bound forces the pipeline's state to live
 //! behind an `Arc` of atomics, and why this one type stands for both of
 //! upstream's `Pipeline` and `ScalablePipeline`.
 //!
@@ -32,16 +34,16 @@
 //! for and may, on the loop's "downward" branch, carry on processing a
 //! *different* line's token in the same call -- upstream's `pf = &_pipeflows[n_l]`
 //! reassigning the pointer the loop walks rather than the task that is
-//! walking it. [`run_line`] below is that function; `active` is upstream's
+//! walking it. `run_line` below is that function; `active` is upstream's
 //! `pf->_line`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
+use crate::executor::runtime::NonpreemptiveRuntime;
 use crate::flow_builder::{Composable, FlowBuilder};
 use crate::graph::Task;
 use crate::pipeline::pipe::{Pipe, PipeType, Pipeflow};
-use crate::runtime::Runtime;
 use crate::taskflow::Taskflow;
 
 /// A pipeline scheduling framework: upstream's `tf::Pipeline` (and, this
@@ -169,8 +171,10 @@ impl State {
 
         for line in 1..self.num_lines {
             for pipe in 1..self.num_pipes() {
-                self.join_counter(line, pipe)
-                    .store(self.pipes[pipe].pipe_type().join_counter(), Ordering::Relaxed);
+                self.join_counter(line, pipe).store(
+                    self.pipes[pipe].pipe_type().join_counter(),
+                    Ordering::Relaxed,
+                );
             }
         }
 
@@ -183,8 +187,10 @@ impl State {
             // `Pipeline::new` has already checked the first pipe is serial,
             // so this is always `2 - 1 == 1`; written as the subtraction
             // anyway, to read the same as the value it is standing for.
-            self.join_counter(line, 0)
-                .store(self.pipes[0].pipe_type().join_counter() - 1, Ordering::Relaxed);
+            self.join_counter(line, 0).store(
+                self.pipes[0].pipe_type().join_counter() - 1,
+                Ordering::Relaxed,
+            );
         }
     }
 }
@@ -223,8 +229,12 @@ impl Pipeline {
             num_lines,
             pipes,
             num_tokens: AtomicUsize::new(0),
-            join_counters: (0..num_lines * num_pipes).map(|_| AtomicUsize::new(0)).collect(),
-            pipeflows: (0..num_lines).map(|_| Mutex::new(Pipeflow::default())).collect(),
+            join_counters: (0..num_lines * num_pipes)
+                .map(|_| AtomicUsize::new(0))
+                .collect(),
+            pipeflows: (0..num_lines)
+                .map(|_| Mutex::new(Pipeflow::default()))
+                .collect(),
             line_tasks: OnceLock::new(),
         });
         state.reset();
@@ -243,8 +253,8 @@ impl Pipeline {
         let line_tasks: Vec<Task> = (0..num_lines)
             .map(|line| {
                 let state = Arc::clone(&state);
-                let task = taskflow
-                    .emplace_runtime(move |rt: &mut Runtime<'_>| run_line(&state, line, rt));
+                let task =
+                    taskflow.emplace_nonpreemptive_runtime(move |rt| run_line(&state, line, rt));
                 taskflow.task(task).name(format!("rt-{line}"));
                 task
             })
@@ -323,7 +333,7 @@ impl Composable for &Pipeline {
 /// different one on the "downward" branch, exactly as upstream's `pf`
 /// pointer may come to alias a different line's token without this call
 /// ever becoming a different *task*.
-fn run_line(state: &Arc<State>, line: usize, rt: &mut Runtime<'_>) {
+fn run_line(state: &Arc<State>, line: usize, rt: &mut NonpreemptiveRuntime<'_>) {
     let mut active = line;
 
     loop {
@@ -339,9 +349,10 @@ fn run_line(state: &Arc<State>, line: usize, rt: &mut Runtime<'_>) {
             // about to run back to its type's value *before* running the
             // pipe, so the next token to reach this (line, pipe) pair has
             // something to count down from.
-            state
-                .join_counter(active, current_pipe)
-                .store(state.pipes[current_pipe].pipe_type().join_counter(), Ordering::Relaxed);
+            state.join_counter(active, current_pipe).store(
+                state.pipes[current_pipe].pipe_type().join_counter(),
+                Ordering::Relaxed,
+            );
 
             if current_pipe == 0 {
                 let token = state.num_tokens.load(Ordering::Relaxed);
@@ -412,10 +423,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::Executor;
     use crate::flow_builder::FlowBuilder;
     use crate::pipeline::pipe::{Pipe, PipeType, Pipeflow};
     use crate::taskflow::Taskflow;
-    use crate::Executor;
 
     #[test]
     #[should_panic(expected = "must have at least one line")]
@@ -432,7 +443,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "first pipe must be serial")]
     fn a_parallel_first_pipe_panics() {
-        let _ = Pipeline::new(1, vec![Pipe::new(PipeType::Parallel, |_: &mut Pipeflow| {})]);
+        let _ = Pipeline::new(
+            1,
+            vec![Pipe::new(PipeType::Parallel, |_: &mut Pipeflow| {})],
+        );
     }
 
     #[test]
