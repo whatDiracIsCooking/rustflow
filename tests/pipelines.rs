@@ -631,8 +631,9 @@ worker_matrix! {
 // cases here are one per place that task can be when the panic happens --
 // the first serial pipe, which is the one generating tokens, a serial pipe
 // after it, and a parallel one. The reset-and-rerun half of the row is the
-// fourth case, `#[ignore]`d against the defect it found; its own doc comment
-// says why it is one case for the three chains rather than three.
+// fourth case, which was `#[ignore]`d against the defect it found until that
+// defect was fixed; its own doc comment says why it is one case for the three
+// chains rather than three.
 
 /// How many tokens each case below lets through when nothing panics.
 const TOKENS: usize = 5;
@@ -849,18 +850,18 @@ fn a_panicking_parallel_pipe_fails_the_composing_run() {
 /// cases above cover: the tokens in flight are not merely dropped, the
 /// pipeline is runnable again afterwards.
 ///
-/// `#[ignore]` for #320, the defect this cell found and the reason it is one
-/// case rather than three. A line task is bypass-scheduled
+/// This cell found #320 and was `#[ignore]`d against it, which is also the
+/// reason it is one case rather than three. A line task is bypass-scheduled
 /// (`Runtime::schedule`), and every line but the one the conditioner selects
-/// is reachable *only* that way, so a panic that leaves another line queued
-/// and then skipped by the cancellation leaves that line's node claimed for
-/// ever: the next run's bypass of it queues nothing, having already told the
-/// parent to expect it, and the run never finishes. The chain here is the
-/// parallel one because it is the shape that reproduces most readily, but
-/// all three chains above hang on the same window when they are rerun, and
-/// one fix retires all of it.
+/// is reachable *only* that way, so a panic that left another line queued
+/// and then skipped by the cancellation left that line's node claimed for
+/// ever: the next run's bypass of it queued nothing, having already told the
+/// parent to expect it, and the run never finished. The chain here is the
+/// parallel one because it is the shape that reproduced most readily, but
+/// all three chains above hung on the same window when rerun, and the one
+/// fix -- the claim handed back by every job dispatch, skipped or not --
+/// retired all of it.
 #[test]
-#[ignore = "hangs until #320 stops a cancelled run leaking a dispatch claim"]
 fn a_reset_pipeline_runs_again_after_a_panicking_pipe() {
     serialized(|| {
         let executor = Executor::new(LINES);

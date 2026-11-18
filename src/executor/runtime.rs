@@ -607,14 +607,16 @@ fn schedule_bypassing(job: &Job, thread: &mut WorkerThread, task: Task) {
     job.parent().count_queued(job.topology(), 1);
 
     // `is_entered` above answers only "is this node's nested run
-    // outstanding", which says nothing about a target whose own callable is
-    // locked right now -- `DESIGN.md` has the handle kinds that leaves out.
+    // outstanding", which says nothing about a target a job has already been
+    // dequeued for -- `DESIGN.md` has the handle kinds that leaves out.
     // `wake` answers that question instead: `true` means nothing holds the
     // target's claim, so queueing now is what this call always did; `false`
-    // means a dispatch is already running the target's callable and will
-    // queue this same job the instant it releases -- see `DispatchClaim`'s
-    // own docs for the ordering that makes a `false` here never a lost
-    // wake.
+    // means a job for this node is already in `WorkerThread::invoke_one`,
+    // which hands the claim back exactly once -- after the dispatch, on the
+    // entry that finishes the node, or straight away if cancellation makes
+    // it skip the dispatch -- and queues this same job as it does. See
+    // `DispatchClaim`'s own docs for the ordering that makes a `false` here
+    // never a lost wake.
     if target.dispatch_claim().wake() {
         // Upstream's `_executor._schedule(_worker, node)`: this worker's own
         // queue. `Job::successor` is the job of a task of the same graph,
@@ -722,17 +724,15 @@ impl fmt::Debug for NonpreemptiveRuntime<'_> {
 /// dispatch arm to fold in. A panic out of the body is recorded as a static
 /// task's is, through [`Job::record_panic`].
 ///
-/// The dispatch claim's clearest case: `work.invoke` both takes and drops the
-/// one lock it stands in for, in one statement, so the claim here is taken
-/// immediately before that call and released immediately after it returns.
+/// The dispatch claim's clearest case, and the caller's to hold: `work.invoke`
+/// both takes and drops the one lock the claim stands in for, in one
+/// statement, so the `Release` returned here is already the point the node is
+/// idle again.
 pub(crate) fn invoke_nonpreemptive(
     worker: &mut WorkerThread,
     job: &Job,
     work: &NonpreemptiveRuntimeWork,
 ) -> Release {
-    let node = job.node();
-    node.dispatch_claim().claim();
-
     // The same construction `run_body` gives a full `Runtime`, over the
     // restricted handle instead: the mutable borrow of the worker's
     // scheduling loop still has to end where the body does, which is a
@@ -747,16 +747,6 @@ pub(crate) fn invoke_nonpreemptive(
     // closure captured.
     if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| work.invoke(&mut line))) {
         job.record_panic(payload);
-    }
-
-    // The guard `work.invoke` took has already dropped by the time that call
-    // returned, so the release below is sound the moment it runs: whatever
-    // `Runtime::schedule`'s bypass asked for while this call held the claim
-    // is honoured now, by queueing this same job again -- a clone, since
-    // `job` is only borrowed here and the rest of this dispatch still needs
-    // it.
-    if node.dispatch_claim().release() {
-        worker.schedule(job.clone());
     }
 
     Release::Strong

@@ -1329,3 +1329,192 @@ fn schedule_defers_a_bypass_onto_a_subflow_node_still_building_its_subgraph() {
         );
     }
 }
+
+/// Issue #320: a bypass whose job is then *skipped by cancellation* used to
+/// leave the target claimed for ever, and the next run that bypassed the
+/// same node hung.
+///
+/// Deterministic on one worker and reachable only through the bypass: the
+/// conditioner selects its second successor, so `bypassed` has no edge that
+/// would ever run it and no later dispatch that would heal its claim. The
+/// first run's body schedules it and then panics, which cancels the run
+/// before the queued job is dequeued, so that job is skipped; the second run
+/// is the assertion, both that it returns at all and that the bypass it made
+/// was honoured.
+#[test]
+fn a_bypass_skipped_by_cancellation_leaves_the_next_run_able_to_bypass_again() {
+    let ran = Arc::new(AtomicI32::new(0));
+    let fails = Arc::new(AtomicBool::new(true));
+
+    let mut taskflow = Taskflow::new();
+    let bypassed = {
+        let ran = Arc::clone(&ran);
+        taskflow.emplace(move || {
+            ran.fetch_add(1, Ordering::Relaxed);
+        })
+    };
+    let taken = taskflow.emplace(|| {});
+    let branch = taskflow.emplace_condition(|| 1);
+    taskflow.task(branch).precede([bypassed, taken]);
+    let _caller = {
+        let fails = Arc::clone(&fails);
+        taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
+            runtime.schedule(bypassed);
+            if fails.load(Ordering::Relaxed) {
+                panic!("the run is cancelled with the bypassed job still queued");
+            }
+        })
+    };
+
+    let executor = Executor::new(1);
+    let error = executor
+        .run(&taskflow)
+        .wait()
+        .expect_err("the body panicked, so the run failed");
+    assert_panicked_with(
+        error,
+        "the run is cancelled with the bypassed job still queued",
+    );
+    assert_eq!(
+        ran.load(Ordering::Relaxed),
+        0,
+        "the cancelled run skipped the job the bypass had queued"
+    );
+
+    fails.store(false, Ordering::Relaxed);
+    executor
+        .run(&taskflow)
+        .wait()
+        .expect("the second run finishes rather than hanging on a leaked claim");
+    assert_eq!(
+        ran.load(Ordering::Relaxed),
+        1,
+        "the second run's bypass queued the task and it ran"
+    );
+}
+
+/// Issue #320's panic-free half, on a target whose handle runs no body at
+/// all: a `Handle::Placeholder`, which no dispatch arm ever claimed or
+/// released, so the claim `wake` took to queue it in the first run was still
+/// set when the second run bypassed the same node -- which then queued
+/// nothing and hung, having already paid the count.
+///
+/// Two consecutive runs of one taskflow, one worker, no panic anywhere: the
+/// assertion is that the second `wait` returns.
+#[test]
+fn two_runs_may_each_bypass_a_placeholder() {
+    let mut taskflow = Taskflow::new();
+    let bypassed = taskflow.placeholder();
+    let taken = taskflow.emplace(|| {});
+    let branch = taskflow.emplace_condition(|| 1);
+    taskflow.task(branch).precede([bypassed, taken]);
+    let _caller = taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
+        runtime.schedule(bypassed);
+    });
+
+    let executor = Executor::new(1);
+    for run in 1..=2 {
+        executor
+            .run(&taskflow)
+            .wait()
+            .unwrap_or_else(|error| panic!("run {run} failed: {error:?}"));
+    }
+}
+
+/// Issue #320's panic-free half again, on a target whose handle *does* run a
+/// body and whose arm preempts rather than finishing on its one entry: a
+/// preemptive `Handle::Runtime`, which never released the claim either.
+///
+/// `bypassed` spawns one child, so its first entry preempts the node and its
+/// second finishes it -- the entry the claim is now held until. Two
+/// consecutive runs, one worker: the second used to hang, and the body count
+/// is what says the bypass was honoured on both.
+#[test]
+fn two_runs_may_each_bypass_a_preemptive_runtime_task() {
+    let bodies = Arc::new(AtomicI32::new(0));
+    let children = Arc::new(AtomicI32::new(0));
+
+    let mut taskflow = Taskflow::new();
+    let bypassed = {
+        let bodies = Arc::clone(&bodies);
+        let children = Arc::clone(&children);
+        taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
+            bodies.fetch_add(1, Ordering::Relaxed);
+            let children = Arc::clone(&children);
+            // Spawned and not joined: the node is preempted when this body
+            // returns, and the child's own tear-down is what resumes it.
+            runtime.silent_async(move || {
+                children.fetch_add(1, Ordering::Relaxed);
+            });
+        })
+    };
+    let taken = taskflow.emplace(|| {});
+    let branch = taskflow.emplace_condition(|| 1);
+    taskflow.task(branch).precede([bypassed, taken]);
+    let _caller = taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
+        runtime.schedule(bypassed);
+    });
+
+    let executor = Executor::new(1);
+    for run in 1..=2 {
+        executor
+            .run(&taskflow)
+            .wait()
+            .unwrap_or_else(|error| panic!("run {run} failed: {error:?}"));
+    }
+    assert_eq!(
+        bodies.load(Ordering::Relaxed),
+        2,
+        "the bypass was honoured on both runs"
+    );
+    assert_eq!(
+        children.load(Ordering::Relaxed),
+        2,
+        "and each entry's own child ran before its node was resumed"
+    );
+}
+
+/// Issue #320's third witness, and the one that puts the claim's new rule on
+/// a handle kind that *preempts over a graph it does not own*: a module
+/// task, bypassed in two consecutive runs of one taskflow.
+///
+/// Upstream's `Runtime.Schedule.ModuleTask` -- the first case in this file --
+/// is this shape over a single run, which is why nothing caught it: the
+/// claim `wake` took to queue the module node was never handed back, and the
+/// second run's bypass of it queued nothing while having already told the
+/// parent to expect it. The inner graph's own counter is the assertion that
+/// both bypasses were honoured.
+#[test]
+fn two_runs_may_each_bypass_a_module_task() {
+    let inner_ran = Arc::new(AtomicI32::new(0));
+    let inner = {
+        let mut inner = Taskflow::new();
+        let inner_ran = Arc::clone(&inner_ran);
+        inner.emplace(move || {
+            inner_ran.fetch_add(1, Ordering::Relaxed);
+        });
+        Arc::new(inner)
+    };
+
+    let mut taskflow = Taskflow::new();
+    let bypassed = taskflow.composed_of(Arc::clone(&inner));
+    let taken = taskflow.emplace(|| {});
+    let branch = taskflow.emplace_condition(|| 1);
+    taskflow.task(branch).precede([bypassed, taken]);
+    let _caller = taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
+        runtime.schedule(bypassed);
+    });
+
+    let executor = Executor::new(1);
+    for run in 1..=2 {
+        executor
+            .run(&taskflow)
+            .wait()
+            .unwrap_or_else(|error| panic!("run {run} failed: {error:?}"));
+    }
+    assert_eq!(
+        inner_ran.load(Ordering::Relaxed),
+        2,
+        "each run's bypass entered the module and ran its graph"
+    );
+}

@@ -1,11 +1,14 @@
 //! A [`loom`](https://docs.rs/loom) model of the protocol `Node::dispatch_claim`
-//! gives `Runtime::schedule`'s bypass (`src/graph.rs`'s `DispatchClaim`,
-//! taken from and released back to `src/executor/runtime.rs`'s
-//! `schedule_bypassing`, `invoke_nonpreemptive` and `src/executor/subflow.rs`'s
-//! `invoke`). Issue #245 is where the claim got this model, closing a hole
+//! gives `Runtime::schedule`'s bypass (`src/graph/node.rs`'s `DispatchClaim`,
+//! taken by `src/executor/runtime.rs`'s `schedule_bypassing` and given back
+//! by `src/executor/worker.rs`'s `invoke_one`, once per job it dequeues).
+//! Issue #245 is where the claim got this model, closing a hole
 //! `Runtime::schedule`'s own guard -- `is_entered` -- could not see: a node
 //! whose callable is locked right now, by a dispatch of a handle kind
 //! `is_entered` never answers `true` for, or has not answered `true` for yet.
+//! Issue #320 is where the release moved to `invoke_one` from the five
+//! dispatch arms that used to make it, and gave this file its second
+//! scenario: the arms were not all of the ways a dequeued job retires.
 //!
 //! **This file is not part of the gate**, for `tests/loom_notifier.rs`'s
 //! reason: loom needs a `cfg(loom)` build of the whole graph, which only
@@ -33,8 +36,11 @@
 //! - [`dispatch`] is one worker running the node once under a claim it
 //!   already holds: enter the callable, leave it, release -- and, if the
 //!   release reports a schedule arrived while it was held, do all of that
-//!   again, which is the one requeue the real dispatch arms perform
-//!   themselves rather than handing to anyone else.
+//!   again, which is the one requeue `invoke_one` performs itself rather
+//!   than handing to anyone else.
+//! - [`skipped`] is the other way a dequeued job retires: `invoke_one`'s
+//!   cancellation early-out, which dispatches nothing at all and so takes
+//!   and gives back the claim around a no-op.
 //! - [`one_run`] fixes the one thing issue #245's own ordering argument
 //!   establishes deterministically (`src/graph.rs`'s `DispatchClaim` docs)
 //!   rather than leaving it to loom's search: `claim` happens, synchronously,
@@ -44,10 +50,13 @@
 //!   queueings racing before either has claimed anything, which
 //!   `DispatchClaim` does not answer and this model does not either.
 //!
-//! The model earns its keep by **mutation**, `tests/loom_storage.rs`'s way:
-//! alongside the real `wake`, it carries [`wake_unguarded`] -- `is_entered`'s
-//! own pre-#245 shape, "queue now" with no claim check at all -- and asserts
-//! that loom *finds* the overlap that makes possible.
+//! The model earns its keep by **mutation**, `tests/loom_storage.rs`'s way,
+//! one per scenario: alongside the real `wake` it carries [`wake_unguarded`]
+//! -- `is_entered`'s own pre-#245 shape, "queue now" with no claim check at
+//! all -- and asserts that loom *finds* the overlap that makes possible;
+//! alongside [`skipped`] it carries [`skipped_leaking`], the pre-#320
+//! early-out that returned before the dispatch and so released nothing, and
+//! asserts the claim is found left behind.
 
 #![cfg(loom)]
 
@@ -113,6 +122,10 @@ fn leave_callable(busy: &AtomicBool) {
 /// once more, if the release reports a schedule arrived while it was held.
 /// Bounded to one extra run because this model's single `wake`-or-mutation
 /// call can set `PENDING` at most once.
+///
+/// `invoke_one`'s generic pair, with the handle `match` between the two
+/// halves stood in for by the callable; what the real one takes before the
+/// `match` is the `claim` [`one_run`] makes before spawning.
 fn dispatch(state: &AtomicU8, busy: &AtomicBool, runs: &AtomicUsize) {
     enter_callable(busy);
     runs.fetch_add(1, Ordering::Relaxed);
@@ -163,6 +176,60 @@ fn one_run(schedule_wake: fn(&AtomicU8) -> bool) {
     waker.join().unwrap();
 }
 
+/// One worker retiring a job it dequeued without dispatching the node at
+/// all: `invoke_one`'s cancellation early-out, which claims and releases
+/// around a no-op. The inner pair is its requeue of a bypass that landed
+/// while the claim was held -- the requeued job is skipped the same way, and
+/// its own release is what clears the claim.
+fn skipped(state: &AtomicU8) {
+    claim(state);
+    if release(state) {
+        claim(state);
+        release(state);
+    }
+}
+
+/// The mutation: the same early-out before issue #320, which returned before
+/// the dispatch `match` and so neither claimed nor released anything.
+fn skipped_leaking(_state: &AtomicU8) {}
+
+/// One run of the skipped-job model: an *idle* node -- no claim is taken
+/// here, unlike [`one_run`] -- that two threads bypass concurrently. Exactly
+/// one of them is told to queue, since the other's `wake` finds the claim
+/// the first took, and the one told to queue runs `retire` over the job it
+/// queued: a job of a cancelled run, which the real `invoke_one` skips.
+///
+/// The claim must be idle again once both threads have finished, whichever
+/// of them queued and whenever the other's `wake` landed: a bit left set
+/// here is a node no later bypass can ever queue.
+fn one_skipped_run(retire: fn(&AtomicU8)) {
+    let state = Arc::new(AtomicU8::new(0));
+
+    let bypasses: Vec<_> = (0..2)
+        .map(|_| {
+            let state = Arc::clone(&state);
+            thread::spawn(move || {
+                if wake(&state) {
+                    retire(&state);
+                }
+            })
+        })
+        .collect();
+
+    for bypass in bypasses {
+        bypass.join().unwrap();
+    }
+
+    // `Acquire`, pairing with the `AcqRel` of whichever `release` stored
+    // last: this reads the word a dispatch published on its way out, which
+    // is the same pairing the next `wake` to arrive would make.
+    assert_eq!(
+        state.load(Ordering::Acquire),
+        0,
+        "the claim was handed back: a later bypass is told to queue"
+    );
+}
+
 /// `bounded_model`'s identical reason in every other model here: the
 /// unbounded search is exponential in the atomics this protocol touches, and
 /// three preemptions is loom's own recommendation and already enough to find
@@ -189,4 +256,23 @@ fn a_wake_during_an_already_claimed_dispatch_is_deferred_not_raced() {
 #[should_panic(expected = "two dispatches locked the same node's callable at once")]
 fn mutation_an_unguarded_wake_is_found_racing_the_callable() {
     bounded_model(|| one_run(wake_unguarded));
+}
+
+/// The other half of the protocol the crate ships, issue #320's: a job that
+/// retires without dispatching the node hands the claim back all the same,
+/// so the word is idle again whatever order the two bypasses land in and
+/// whichever of them was the one told to queue.
+#[test]
+fn a_bypass_whose_job_is_skipped_leaves_the_claim_idle() {
+    bounded_model(|| one_skipped_run(skipped));
+}
+
+/// Mutation: the cancellation early-out's own pre-#320 shape, returning
+/// before the dispatch and so releasing nothing -- the claim is found left
+/// behind on a node no dispatch holds, which is exactly the hang a later
+/// bypass of that node met.
+#[test]
+#[should_panic(expected = "the claim was handed back")]
+fn mutation_a_skipped_job_that_releases_nothing_leaks_the_claim() {
+    bounded_model(|| one_skipped_run(skipped_leaking));
 }

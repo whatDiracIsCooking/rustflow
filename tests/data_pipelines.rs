@@ -590,8 +590,9 @@ worker_matrix! {
 // places a line task can be when a pipe panics are the scheduler's and are
 // pinned there; what is this file's own is the typed slot each pipe hands
 // the next, which a failed run leaves empty for the line it failed on. Two
-// cases over that one chain, the second `#[ignore]`d against the defect it
-// found -- its own doc comment says which.
+// cases over that one chain, the second of them `#[ignore]`d against the
+// defect it found until that defect was fixed -- its own doc comment says
+// which.
 
 /// How many tokens the chain below lets through when nothing panics.
 const TOKENS: usize = 5;
@@ -773,16 +774,15 @@ fn a_panicking_data_pipe_fails_the_composing_run() {
 /// which is what makes the failing pipe's own empty slot a state `reset`
 /// clears rather than one the next run trips over.
 ///
-/// `#[ignore]` for #320, which `tests/pipelines.rs`'s own ignored cell found
-/// and states in full: a line task is bypass-scheduled
-/// (`Runtime::schedule`), and a panic that leaves another line queued and
-/// then skipped by the cancellation leaves that line's node claimed for
-/// ever, so the next run's bypass of it queues nothing and the run never
-/// finishes. Nothing about the typed chain is particular to that -- this
-/// cell hangs on the same window, 7 runs of 40 pinned to two cores -- so
-/// the one fix retires both.
+/// `#[ignore]`d for #320 until it was fixed, which
+/// `tests/pipelines.rs`'s own cell found and states in full: a line task is
+/// bypass-scheduled (`Runtime::schedule`), and a panic that left another
+/// line queued and then skipped by the cancellation left that line's node
+/// claimed for ever, so the next run's bypass of it queued nothing and the
+/// run never finished. Nothing about the typed chain was particular to that
+/// -- this cell hung on the same window, 7 runs of 40 pinned to two cores --
+/// so the one fix retired both.
 #[test]
-#[ignore = "hangs until #320 stops a cancelled run leaking a dispatch claim"]
 fn a_reset_data_pipeline_runs_again_after_a_panicking_pipe() {
     serialized(|| {
         let executor = Executor::new(LINES);

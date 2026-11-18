@@ -447,6 +447,14 @@ impl WorkerThread {
     /// before it is queued. First, though, come the three things upstream does at
     /// the top of `_invoke`: the `PREEMPTED` fast path, the cancellation check and
     /// the acquire, the last two *inside* the fast path.
+    ///
+    /// This port's own addition is that the node's `DispatchClaim` is taken and
+    /// given back here rather than by any arm: one `claim` before the `match`
+    /// and one `release` after it, deferred to the second entry when the arm
+    /// preempts, and taken and given straight back by the cancellation
+    /// early-out, which dispatches nothing. Every job dequeued for a node
+    /// therefore hands the claim back exactly once, which is the invariant
+    /// `Runtime::schedule`'s bypass relies on.
     fn invoke_one(&mut self, job: Job) -> Option<Job> {
         // The job owns a share of the run and of the taskflow's storage, so
         // this needs no `unsafe` and no argument about who outlives whom: both
@@ -463,6 +471,22 @@ impl WorkerThread {
             // runs none of the work it had not started, and the job is torn
             // down all the same, the join counters still having to reach zero.
             if job.is_parent_cancelled() {
+                // The claim pair this job owes even though nothing is
+                // dispatched under it: a `Runtime::schedule` bypass hands the
+                // claim to the job it queues, so a job skipped here is
+                // holding one -- and `claim` is what makes that true whether
+                // the bypass that queued it has arrived or not, being
+                // idempotent against the one `wake` already took. A bypass
+                // that landed meanwhile is requeued exactly as the release
+                // below the dispatch requeues it; its `count_queued` was
+                // paid when it committed, and the requeued job is skipped
+                // here in turn, so its own `release` is what clears the
+                // claim.
+                node.dispatch_claim().claim();
+                if node.dispatch_claim().release() {
+                    self.schedule(job.clone());
+                }
+
                 // Upstream's cancelled branch goes to `_tear_down_invoke`,
                 // which dispatches on the handle: a skipped dependent-async
                 // node still owes `FINISHED` and the tasks waiting for it,
@@ -488,6 +512,17 @@ impl WorkerThread {
             }
         }
 
+        // The dispatch claim, taken once here for whatever handle the `match`
+        // below turns out to dispatch and given back once under it: a job
+        // dequeued for this node is the one thing every arm has in common,
+        // and `DispatchClaim`'s own docs have why that is where the claim
+        // belongs rather than in the arms. Earlier than any arm's own lock,
+        // so it covers the observer hook as well as the body; idempotent
+        // against the claim a `Runtime::schedule` bypass took to queue this
+        // job, and against the one a first entry into a preempting node is
+        // still holding.
+        node.dispatch_claim().claim();
+
         self.observer_prologue(&job);
 
         // Every arm below states its own epilogue behaviour as part of the
@@ -504,20 +539,8 @@ impl WorkerThread {
             // `wait` rather than raised on a worker. The successors below are
             // still released, as upstream's are; the early-out stops them.
             Handle::Static(work) => {
-                // Issue #245: claimed before the lock `work.invoke` takes and
-                // released once it has dropped, so a `Runtime::schedule`
-                // bypass that lands while this call is still running defers
-                // onto the claim instead of racing a second worker onto the
-                // same callable -- see `DispatchClaim`'s own docs. This arm
-                // never preempts, so "the guard has dropped" and "this node
-                // is idle again" are the same instant; the release belongs
-                // right here rather than anywhere later.
-                node.dispatch_claim().claim();
                 if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| work.invoke())) {
                     job.record_panic(payload);
-                }
-                if node.dispatch_claim().release() {
-                    self.schedule(job.clone());
                 }
                 Epilogue::Pending(Some(Release::Strong))
             }
@@ -528,29 +551,21 @@ impl WorkerThread {
             // return value, so a panic is recorded as a static task's is and
             // leaves an empty selection, which ends the branch.
             Handle::Condition(work) => {
-                node.dispatch_claim().claim();
                 let release = Release::Selected(
                     panic::catch_unwind(AssertUnwindSafe(|| work.invoke()))
                         .map_err(|payload| job.record_panic(payload))
                         .ok(),
                 );
-                if node.dispatch_claim().release() {
-                    self.schedule(job.clone());
-                }
                 Epilogue::Pending(Some(release))
             }
             // Upstream's `_invoke_multi_condition_task`, over however many
             // indices the body returns.
             Handle::MultiCondition(work) => {
-                node.dispatch_claim().claim();
                 let release = Release::SelectedMany(
                     panic::catch_unwind(AssertUnwindSafe(|| work.invoke()))
                         .map_err(|payload| job.record_panic(payload))
                         .unwrap_or_default(),
                 );
-                if node.dispatch_claim().release() {
-                    self.schedule(job.clone());
-                }
                 Epilogue::Pending(Some(release))
             }
             // The five dynamic-tasking handles, each upstream's
@@ -611,7 +626,24 @@ impl WorkerThread {
         // a graph that is now running and owes nothing until that graph is
         // done. The last job of that graph re-queues it, and the second entry
         // takes the fast path above and falls through to here.
+        //
+        // The claim taken above is deliberately *not* released on this
+        // return: a preempted node is not idle, and telling a bypass
+        // otherwise is the double dispatch the claim exists to prevent. The
+        // second entry is the one that reaches the release below, which is
+        // what makes `Epilogue`'s `None` the whole of the deferral.
         let release = release?;
+
+        // The claim, given back on the entry that *finished* the node: the
+        // guard whichever arm above locked is long dropped by the time its
+        // call returned, so there is nothing left to publish -- see
+        // `DispatchClaim`'s own `# Ordering` section. A bypass that asked for
+        // this node while the claim was held queued nothing of its own and is
+        // honoured here instead, by queueing this job afresh; nothing else is
+        // watching for that flag.
+        if node.dispatch_claim().release() {
+            self.schedule(job.clone());
+        }
 
         // Upstream's `to_release` block, the second hook, here -- after the
         // dispatch and before the counters -- because this is the entry on
