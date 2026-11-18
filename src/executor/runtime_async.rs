@@ -3,219 +3,80 @@
 //! `silent_dependent_async`, in both of upstream's body shapes -- plus the
 //! runtime-shaped branches of `_dependent_async` and
 //! `_silent_dependent_async` in `taskflow/core/async.hpp` of the same
-//! release, which are the two [`Executor`] forms #91 left out.
+//! release, which are the two [`Executor`] forms at the end of this module.
 //!
-//! This is what a runtime task's handle has been waiting for since #51. A
-//! body can now spawn work **under its own node**, which is the only work a
+//! A body can spawn work **under its own node**, which is the only work a
 //! [`Runtime::corun`] can wait for and the only thing that makes the implicit
-//! join at the end of the body mean anything: until now a task a body
-//! [`schedule`](Runtime::schedule)d was a *sibling*, counted against the
-//! node's own parent, so the join counter a corun watches never rose and
-//! every corun returned at once.
+//! join at the end of the body mean anything: a task a body
+//! [`schedule`](Runtime::schedule)s is a *sibling*, counted against the
+//! node's own parent.
 //!
-//! # A child is a free node with a parent
+//! # Design
 //!
 //! Upstream's four methods are one line each -- raise `_node->_join_counter`,
 //! then call `_executor._silent_async(..., _node->_topology, _node)` -- and
-//! the whole of what they do is pass the two arguments that say *where this
-//! task belongs*: the run, and the node to count it against. The port's
-//! answer to those two arguments is a [`Parent::Nested`] over the node's own
-//! job, and it is one value rather than two because this port's run travels
-//! with the job rather than with the node:
+//! the ten here are one line each for the same reason: the submission core in
+//! [`async`](crate::executor::r#async) takes everything that varies, so a
+//! method of this module decides only which [`Spawn`] shape the body is and
+//! which [`Submission`] it goes under.
 //!
-//! - **the counting** is [`Parent::count_queued`], which for a
-//!   [`Parent::Nested`] is a `fetch_add` on the parent node's join counter --
-//!   upstream's own `_node->_join_counter.fetch_add(1)`, in the submission
-//!   rather than in the caller. So the methods below do *not* raise the
-//!   counter themselves: `Shared::schedule_async_task` and
-//!   `Shared::schedule_dependent_async_task` take exactly one count per
-//!   child, before the job can be queued, and a second one here would be a
-//!   count nothing ever spends;
-//! - **the run** stays the sentinel on the child's own job, which is
-//!   [`Job::free`]'s only choice and is deliberate: `Topology::is_free_standing`
-//!   is what both async dispatch arms use to refuse a handle somebody built
-//!   into a taskflow's graph, so a child carrying the real run would be
-//!   refused outright. The run that is actually waiting is reached through
-//!   the chain instead -- #105 for a failure, #115 for a cancellation -- and
-//!   both of those walks carry the run of the job at the chain's *root*
-//!   precisely so that this shape answers for it.
+//! [`Submission::under_node`] answers upstream's two trailing arguments in
+//! one value, and three things follow. The counting is
+//! `Parent::count_queued`, which the submission itself takes -- upstream's
+//! own `fetch_add(1)`, moved one call inwards -- so nothing here raises a
+//! counter and a second count would be one nothing ever spends. The run stays
+//! the sentinel on the child's own job, which is what both async dispatch
+//! arms test to refuse a handle somebody built into a graph, so the run that
+//! is actually waiting is reached up the parent chain instead. And the worker
+//! it names is this body's own, upstream's `if(auto w = this_worker(); w)`
+//! branch and the one branch only a runtime handle can take, a [`Runtime`]
+//! holding `&mut WorkerThread` because a corun needs it. `DESIGN.md` has what
+//! that destination buys -- a recursion bounded by its own depth rather than
+//! by the size of its task tree -- and `tests/runtimes.rs` carries the
+//! measurement. One case keeps the shared buffers and is the same rule rather
+//! than an exception: a runtime body invoked by a *corun loop* runs on a
+//! `WorkerThread::corun_view`, which has no owning end to lend.
 //!
-//! # What this module is not: the tear-down
+//! The tear-down is not here. The parent branches of `_tear_down_async` and
+//! `_tear_down_dependent_async` are `WorkerThread::finish_job`, which every
+//! nested graph needs; what this module adds is the first caller that can
+//! *reach* that branch with a free node.
 //!
-//! The parent branches of `_tear_down_async` and
-//! `_tear_down_dependent_async` -- read the parent's `nstate` *before* the
-//! `fetch_sub`, decrement, and if that reached zero and the parent was
-//! `PREEMPTED` re-queue it -- are one function in this port,
-//! `WorkerThread::finish_job`, and it has been there since #51 because every
-//! nested graph needs it. So nothing here implements the other end of the
-//! protocol: what this module adds is the first caller that can *reach* that
-//! branch with a free node, and the `Parent::Nested` it hands the submission
-//! is the whole of how.
-//!
-//! The order in `finish_job` is upstream's and is what makes a child safe to
-//! finish at any moment: the bit is read before the decrement, because the
-//! instant the counter reaches zero another worker may already be running
-//! the resumed node and clearing it.
-//!
-//! # Where a child is queued, and the stack depth that buys (#119)
-//!
-//! On the queue of the worker running the body, which is upstream's
-//! `if(auto w = this_worker(); w)` branch of `_schedule_async_task` and the
-//! one branch of it only a runtime handle can take. The owning end of a
-//! worker's queue belongs to the `WorkerThread` frame that called the body
-//! and cannot be looked up from the code that frame called -- so the
-//! submission takes the worker as an argument, and a [`Runtime`] is the
-//! submitter that *has* one to pass: the handle holds `&mut WorkerThread`,
-//! because a corun needs it. `executor::async`'s module docs have both
-//! branches and `src/task_group.rs` has the submitter that comes nearest to
-//! having one and still cannot.
-//!
-//! What it buys is **stack depth**, and the mechanism is worth stating
-//! because it is not obvious. A worker's own queue is LIFO and
-//! [`Runtime::corun`] pops that same owning end, so the job a waiting body
-//! gets back is the child it has just spawned -- the one it is waiting for --
-//! and the nesting grows one frame per level of *recursion*. The shared
-//! buffers hand back the oldest outstanding job in the pool instead, which is
-//! somebody else's unfinished subtree: a corun that picks that up coruns
-//! *inside* a corun whose predicate is still unsatisfied, so the nesting
-//! grows one frame per outstanding *child*, which for a recursive case is
-//! most of the task tree. That was this port until #119, and it overflowed a
-//! worker's 2 MiB stack at `fib(15)` in a debug build.
-//!
-//! Measured after the change, in a debug build and at one worker: a chain of
-//! nested coruns reaches **500 levels** and overflows by 600, so what bounds
-//! a recursion now is its own depth and not the size of its task tree.
-//! `tests/runtimes.rs` therefore runs upstream's own inputs -- `fib(25)` at
-//! one to four workers, both sorts to ten thousand elements -- and its header
-//! carries the rest of the measurement.
-//!
-//! One case keeps the buffers, and it is the same rule rather than an
-//! exception: a runtime body invoked by a *corun loop* is running on a
-//! `WorkerThread::corun_view`, which has no owning end to lend, so
-//! `WorkerThread::schedule` sends its children to the buffers. A body nested
-//! inside an [`Executor::corun`](crate::Executor::corun) or a
-//! [`TaskGroup::corun`](crate::TaskGroup::corun) is therefore back to the
-//! lower ceiling, for exactly the reason the frame below it has no queue.
-//!
-//! None of this is a correctness claim either way: the work all runs, in any
-//! order, at any worker count. What the destination decides is how deep a
-//! recursion may go before the stack rather than the scheduler gives out.
-//!
-//! # What a failure under a child reaches
-//!
-//! The walk in `Job::record_panic`, from the child's node up its chain, which
-//! for these four shapes ends at the runtime node itself:
-//!
-//! - an **entered** runtime node carries `IMPLICITLY_ANCHORED` (#51), so a
-//!   child that panics leaves its payload in that node's slot and
-//!   [`Runtime::try_corun`] hands it back -- or [`Runtime::corun`] re-raises
-//!   it on this worker, which is upstream's `_rethrow_exception`;
-//! - a node that is *also* explicitly anchored stops the walk one step
-//!   earlier and in the same slot: a body inside a [`Runtime::corun`] holds
-//!   that bit for the length of the wait, and an
-//!   [`Executor::spawn_runtime`] node holds it for its whole life so that
-//!   its `complete` can report the failure to the handle;
-//! - and because the walk *marks* every base it passes, the first child to
-//!   fail cancels its own siblings: `Job::is_parent_cancelled` reads the same
-//!   bit one link down.
-//!
-//! A body that never coruns is the case worth being plain about: the payload
-//! sits in the node's slot, the implicit join still waits for every child,
-//! and the node then finishes **normally** -- a failure under a runtime task
-//! of a graph that nobody collected is dropped by the next `set_up_graph` of
-//! that graph, which is upstream's behaviour too. Corun if you want to know.
-//!
-//! # What cancelling the run reaches
-//!
-//! The children, through the chain described above: `Parent::ancestor_cancelled`
-//! reads the estate of every parent and then the run of the job at the root
-//! (#115), so a child queued before a cancellation is dequeued, skipped and
-//! torn down without running -- which still counts it off its parent, so the
-//! node is still resumed and the run still finishes. That is upstream's
-//! `_is_parent_cancelled` over `_topology` and `_parent`, reached the long
-//! way round because the child's own job holds the sentinel.
-//!
-//! # The cost: one parent per child
-//!
-//! Upstream passes a `Node*`. Each child here gets an `Arc<Nested>` holding a
-//! clone of the runtime node's job -- one allocation and three atomic
-//! increments -- because the parent has to own the job that resumes the node,
-//! and because a [`Runtime`] is built fresh for each invocation and has
-//! nowhere to cache one: its fields are borrows of the frame that built it.
-//! A body that spawns a thousand children pays a thousand of those, which is
-//! the same order as the node and the body it is already paying for, and the
-//! alternative -- a field on the handle, built whether or not the body
-//! spawns -- is a cost on every runtime task to save one on some.
-
-use std::any::Any;
+//! A failure under a child takes the walk in `Job::record_panic` up its
+//! chain, which for these shapes ends at the runtime node itself: an entered
+//! runtime node is an implicit anchor, so the payload lands in that node's
+//! slot, where [`Runtime::try_corun`] hands it back and [`Runtime::corun`]
+//! re-raises it -- and because the walk marks every base it passes, the first
+//! child to fail cancels its siblings. A child that is *itself* explicitly
+//! anchored stops the walk one step earlier, in its own slot. A body that
+//! never coruns is the case worth being plain about: the implicit join still
+//! waits for every child and the node then finishes **normally**, so a
+//! failure nobody collected is dropped by the next `set_up_graph` of that
+//! graph, which is upstream's behaviour too. Cancelling the run reaches the
+//! children through the same chain, and a child skipped that way is still
+//! counted off its parent, so the node is still resumed and the run still
+//! finishes.
 
 use crate::async_task::AsyncTask;
 use crate::executor::Executor;
-use crate::executor::r#async::{AsyncHandle, ESTATE_NONE};
-use crate::executor::run_handle::RunError;
-use crate::executor::topology::{Cancellable, Nested, Parent};
-use crate::graph::AsyncWork;
+use crate::executor::r#async::{AsyncHandle, Spawn, Submission};
 use crate::runtime::Runtime;
-
-/// The one argument a finishing entry hands `complete`: the node's payload
-/// slot, which is upstream's `rt._node->_exception_ptr` and is `None` for a
-/// task that did not fail.
-///
-/// Named because it is spelled out three times otherwise -- in the signature
-/// below, in the closure it builds and in `graph`'s own alias for the boxed
-/// body, which is private to that module.
-type Payload = Option<Box<dyn Any + Send>>;
-
-/// An empty [`AsyncHandle`] and the `complete` half of an
-/// [`AsyncWork::Reentrant`] body that fills it: upstream's
-/// `std::promise<void> p; auto fu{p.get_future()};` together with the
-/// `reentered` branch that reads `rt._node->_exception_ptr` into it.
-///
-/// The pair every handle-returning *runtime-shaped* submission needs, and
-/// there are four of them -- [`Executor::spawn_runtime`],
-/// [`Executor::dependent_async_runtime`], [`Runtime::spawn_runtime`] and
-/// [`Runtime::dependent_async_runtime`] -- which differ in the node kind and
-/// the parent and in nothing else. Written once here rather than four times,
-/// for the reason [`AsyncHandle::for_body`] is written once: the promise and
-/// the future are two ends of one slot.
-///
-/// It is not a third construction site for a handle. [`AsyncHandle::pending`]
-/// is the seam, and this is its one caller.
-pub(crate) fn completion() -> (AsyncHandle<()>, impl FnOnce(Payload) + Send + 'static) {
-    let (handle, delivery) = AsyncHandle::pending();
-
-    // Upstream's `reentered` branch in full: `eptr ?
-    // p.object.set_exception(eptr) : p.object.set_value()`.
-    let complete = move |payload: Payload| {
-        delivery.deliver(match payload {
-            Some(payload) => Err(RunError::Panicked(payload)),
-            None => Ok(()),
-        });
-    };
-
-    (handle, complete)
-}
 
 impl Runtime<'_> {
     /// Spawns `body` under this runtime task and hands back a handle on its
     /// result: upstream's `Runtime::async`, under
-    /// [`Executor::spawn`](crate::Executor::spawn)'s name for the reason
-    /// `executor::async` gives.
+    /// [`Executor::spawn`](crate::Executor::spawn)'s name.
     ///
     /// The child is counted against this runtime task's node, which is the
     /// whole difference from the executor's own `spawn`: it is **joined**
     /// before this task's successors run, whether the body waits for it with
-    /// [`Runtime::corun`] or simply returns and leaves it to the implicit
-    /// join. Dropping the handle therefore detaches the *result*, not the
-    /// task -- unlike an executor-level `spawn`, the work is still waited for.
+    /// [`Runtime::corun`] or leaves it to the implicit join. Dropping the
+    /// handle therefore detaches the *result*, not the task.
     ///
-    /// A panic out of `body` is caught by the wrapper this call builds and
-    /// reported from [`AsyncHandle::wait`] as
-    /// [`RunError::Panicked`]`(payload)`, exactly as the executor's `spawn`
-    /// reports one. So it does *not* fail this runtime task and does not
-    /// cancel its siblings: a caught panic never reaches the walk the module
-    /// docs describe. [`Runtime::silent_async`] is the form whose failure
-    /// does.
+    /// A panic out of `body` is reported from [`AsyncHandle::wait`] as the
+    /// executor's `spawn` reports one, so it does *not* fail this runtime
+    /// task and does not cancel its siblings -- a caught panic never reaches
+    /// the walk. [`Runtime::silent_async`] is the form whose failure does.
     ///
     /// ```
     /// use rustflow::prelude::*;
@@ -237,12 +98,10 @@ impl Runtime<'_> {
         R: Send + 'static,
         F: FnOnce() -> R + Send + 'static,
     {
-        // Upstream's `std::packaged_task<R()>` and the `get_future()` beside
-        // it, which is the crate's one construction site for a handle on a
-        // value: the node runs a plain body whatever `R` is.
-        let (wrapper, handle) = AsyncHandle::for_body(body);
-        self.spawn_child(AsyncWork::plain(wrapper), ESTATE_NONE);
-        handle
+        self.thread.shared.schedule_async_task(
+            Spawn::handled(body),
+            &Submission::under_node(self.job, &*self.thread),
+        )
     }
 
     /// Spawns `body` under this runtime task, handing it a [`Runtime`] of its
@@ -252,20 +111,13 @@ impl Runtime<'_> {
     /// The child is a runtime task in its own right, so it can spawn children
     /// of *its* own and corun on them -- which is how recursive parallelism
     /// is written, and what upstream's `Runtime.Fibonacci` is built out of.
-    /// Everything [`Runtime::spawn`] says about the join applies here too,
-    /// and the handle carries no value for
-    /// [`Executor::spawn_runtime`](crate::Executor::spawn_runtime)'s reason:
-    /// what there is to report about a runtime-shaped task is whether
-    /// anything under it failed.
-    ///
-    /// # What a caller sees
+    /// Everything [`Runtime::spawn`] says about the join applies here too.
     ///
     /// [`AsyncHandle::wait`] answers `Ok(())` once the child *and everything
-    /// it spawned* are done, and [`RunError::Panicked`] if the child's body
-    /// or anything under it panicked. The child's node is an explicit anchor
-    /// from the moment it is created, so a failure under it stops there
-    /// rather than reaching this runtime task -- which is also what keeps a
-    /// failing grandchild from cancelling this task's other children.
+    /// it spawned* are done, and an error if any of that panicked: the
+    /// child's node is an explicit anchor from the moment it is created, so a
+    /// failure under it stops there rather than reaching this runtime task or
+    /// cancelling its siblings.
     ///
     /// ```
     /// use rustflow::prelude::*;
@@ -290,32 +142,25 @@ impl Runtime<'_> {
     where
         F: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
     {
-        let (handle, complete) = completion();
-        self.spawn_child(
-            AsyncWork::reentrant(body, complete),
-            // Upstream's `ESTATE::EXPLICITLY_ANCHORED`: there is a waiter --
-            // whoever holds the handle -- for as long as the node exists.
-            Cancellable::EXPLICITLY_ANCHORED,
-        );
-        handle
+        self.thread.shared.schedule_async_task(
+            Spawn::handled_runtime(body),
+            &Submission::under_node(self.job, &*self.thread),
+        )
     }
 
     /// Spawns `body` under this runtime task with no handle at all:
     /// upstream's `Runtime::silent_async`.
     ///
-    /// The cheapest of the four and the one its own tests are written with:
-    /// there is no slot to deliver into, so a child costs the node, the body
-    /// and the parent. It is still joined -- [`Runtime::spawn`]'s paragraph
-    /// on that is the same here -- and what "silent" drops is the *result*,
-    /// not the wait.
+    /// The cheapest of the four and the one its own tests are written with.
+    /// It is still joined -- [`Runtime::spawn`]'s paragraph on that is the
+    /// same here -- and what "silent" drops is the *result*, not the wait.
     ///
     /// A panic out of `body` is this runtime task's failure, which is the one
     /// place the silent form says more than the handle-returning one: the
-    /// payload goes up the chain to the nearest anchor, which is this node,
-    /// where [`Runtime::try_corun`] returns it and [`Runtime::corun`]
-    /// re-raises it. It also cancels this task's other children, as a failure
-    /// inside any nested graph cancels the rest of that graph. A body that
-    /// never coruns drops it, which the module docs set out.
+    /// payload goes up the chain to the nearest anchor, this node, where
+    /// [`Runtime::try_corun`] returns it and [`Runtime::corun`] re-raises it,
+    /// and it cancels this task's other children. A body that never coruns
+    /// drops it.
     ///
     /// ```
     /// use std::sync::Arc;
@@ -350,7 +195,10 @@ impl Runtime<'_> {
     where
         F: FnOnce() + Send + 'static,
     {
-        self.spawn_child(AsyncWork::plain(body), ESTATE_NONE);
+        self.thread.shared.schedule_async_task(
+            Spawn::silent(body),
+            &Submission::under_node(self.job, &*self.thread),
+        );
     }
 
     /// Spawns `body` under this runtime task, handing it a [`Runtime`] of its
@@ -358,12 +206,12 @@ impl Runtime<'_> {
     /// `[](tf::Runtime&){}` body.
     ///
     /// The form recursive parallelism is actually written with, because the
-    /// recursion needs the child's `Runtime` and nothing needs the child's
-    /// handle: upstream's `Runtime.Fibonacci`, `MergeSort` and `QuickSort`
-    /// all spawn this way and let the join -- explicit through
-    /// [`Runtime::corun`], or implicit at the end of the body -- do the
-    /// waiting. [`Runtime::silent_async`]'s paragraph on where a panic goes
-    /// holds here too, for the child's body and for anything under it.
+    /// recursion needs the child's `Runtime` and nothing needs its handle:
+    /// upstream's `Runtime.Fibonacci`, `MergeSort` and `QuickSort` all spawn
+    /// this way and let the join -- explicit through [`Runtime::corun`], or
+    /// implicit at the end of the body -- do the waiting.
+    /// [`Runtime::silent_async`] on where a panic goes holds here too, for
+    /// the child's body and for anything under it.
     ///
     /// ```
     /// use std::sync::Arc;
@@ -403,7 +251,10 @@ impl Runtime<'_> {
     where
         F: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
     {
-        self.spawn_child(AsyncWork::runtime(body), ESTATE_NONE);
+        self.thread.shared.schedule_async_task(
+            Spawn::silent_runtime(body),
+            &Submission::under_node(self.job, &*self.thread),
+        );
     }
 
     /// Spawns `body` under this runtime task once every task in
@@ -411,12 +262,10 @@ impl Runtime<'_> {
     /// handle on its result: upstream's `Runtime::dependent_async`.
     ///
     /// [`Executor::dependent_async`](crate::Executor::dependent_async) with
-    /// the task parented to this runtime node, so everything that call says
-    /// about naming dependencies -- by handle, from any thread, an empty
-    /// handle skipped, a finished one not waited for -- holds here, and
-    /// everything [`Runtime::spawn`] says about the join holds too. The
-    /// dependencies may be tasks this body spawned or tasks from anywhere
-    /// else; what the parent decides is who waits for *this* one.
+    /// the task parented to this runtime node, so what that call says about
+    /// naming dependencies and what [`Runtime::spawn`] says about the join
+    /// both hold. The dependencies may be tasks this body spawned or tasks
+    /// from anywhere else; the parent decides who waits for *this* one.
     ///
     /// ```
     /// use std::sync::Arc;
@@ -456,9 +305,11 @@ impl Runtime<'_> {
         R: Send + 'static,
         F: FnOnce() -> R + Send + 'static,
     {
-        let (wrapper, handle) = AsyncHandle::for_body(body);
-        let task = self.spawn_dependent_child(AsyncWork::plain(wrapper), ESTATE_NONE, dependencies);
-        (task, handle)
+        self.thread.shared.schedule_dependent_async_task(
+            Spawn::handled(body),
+            &Submission::under_node(self.job, &*self.thread),
+            dependencies,
+        )
     }
 
     /// Spawns `body` under this runtime task once every task in
@@ -478,13 +329,11 @@ impl Runtime<'_> {
     where
         F: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
     {
-        let (handle, complete) = completion();
-        let task = self.spawn_dependent_child(
-            AsyncWork::reentrant(body, complete),
-            Cancellable::EXPLICITLY_ANCHORED,
+        self.thread.shared.schedule_dependent_async_task(
+            Spawn::handled_runtime(body),
+            &Submission::under_node(self.job, &*self.thread),
             dependencies,
-        );
-        (task, handle)
+        )
     }
 
     /// Spawns `body` under this runtime task once every task in
@@ -492,15 +341,12 @@ impl Runtime<'_> {
     /// `Runtime::silent_dependent_async`.
     ///
     /// The [`AsyncTask`] is still handed back, because that is what names
-    /// this task as a dependency of the next one -- which is how a chain is
-    /// built from inside a body, and what upstream's
-    /// `SilentDependentAsync.FromRuntime` does a thousand times over.
-    /// [`Runtime::silent_async`]'s paragraph on where a panic goes holds
-    /// here, with one addition that is
-    /// [`Executor::silent_dependent_async`](crate::Executor::silent_dependent_async)'s
-    /// too: the payload is also readable through
-    /// [`AsyncTask::take_panic`](crate::AsyncTask::take_panic), since the
-    /// handle names the node it was parked on.
+    /// this task as a dependency of the next one -- how a chain is built from
+    /// inside a body, and what upstream's `SilentDependentAsync.FromRuntime`
+    /// does a thousand times over. [`Runtime::silent_async`] on where a panic
+    /// goes holds here, with one addition: the payload is also readable
+    /// through [`AsyncTask::take_panic`](crate::AsyncTask::take_panic), the
+    /// handle naming the node it was parked on.
     ///
     /// ```
     /// use std::sync::Arc;
@@ -543,7 +389,14 @@ impl Runtime<'_> {
     where
         F: FnOnce() + Send + 'static,
     {
-        self.spawn_dependent_child(AsyncWork::plain(body), ESTATE_NONE, dependencies)
+        self.thread
+            .shared
+            .schedule_dependent_async_task(
+                Spawn::silent(body),
+                &Submission::under_node(self.job, &*self.thread),
+                dependencies,
+            )
+            .0
     }
 
     /// Spawns `body` under this runtime task once every task in
@@ -552,10 +405,10 @@ impl Runtime<'_> {
     /// over a `[](tf::Runtime&){}` body.
     ///
     /// [`Runtime::silent_dependent_async`] whose body can spawn and corun,
-    /// which is the fourth corner of the family. Upstream's own
-    /// `FromRuntime` cases alternate between this and the plain form along
-    /// one chain, which is what pins that the node kind decides the protocol
-    /// and the body shape decides only who is handed what.
+    /// the fourth corner of the family. Upstream's own `FromRuntime` cases
+    /// alternate between this and the plain form along one chain, which pins
+    /// that the node kind decides the protocol and the body shape decides
+    /// only who is handed what.
     pub fn silent_dependent_async_runtime<'t, F>(
         &mut self,
         body: F,
@@ -564,64 +417,14 @@ impl Runtime<'_> {
     where
         F: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
     {
-        self.spawn_dependent_child(AsyncWork::runtime(body), ESTATE_NONE, dependencies)
-    }
-
-    /// Submits one free node under this runtime task's own node: upstream's
-    /// `_executor._silent_async(..., _node->_topology, _node)`, which its
-    /// four methods differ in nothing but the arguments to.
-    ///
-    /// Through [`Shared`](crate::executor::Shared) rather than through an
-    /// [`Executor`], which is the one plumbing fact about this whole module:
-    /// a [`Runtime`] holds the worker's share of the shared state and no
-    /// `Executor` at all -- `src/runtime.rs` says why there is none to hold
-    /// -- so the submission hangs off what a worker has.
-    ///
-    /// The worker handed to that submission is this body's own, which is
-    /// upstream's `if(auto w = this_worker(); w)` branch and the whole of
-    /// #119: the child goes onto the queue of the worker running this body
-    /// rather than into the shared buffers, so the [`Runtime::corun`] below
-    /// this frame pops the child it has just spawned. The module docs'
-    /// "Where a child is queued" section has why a runtime handle is the one
-    /// submitter in the crate that can name a worker at all.
-    fn spawn_child(&self, work: AsyncWork, estate: u32) {
-        self.thread.shared.schedule_async_task(
-            work,
-            &self.child_parent(),
-            estate,
-            Some(&*self.thread),
-        );
-    }
-
-    /// [`Runtime::spawn_child`] for a node with dependencies: upstream's
-    /// `_executor._silent_dependent_async(..., _node->_topology, _node)`.
-    fn spawn_dependent_child<'t>(
-        &self,
-        work: AsyncWork,
-        estate: u32,
-        dependencies: impl IntoIterator<Item = &'t AsyncTask>,
-    ) -> AsyncTask {
-        self.thread.shared.schedule_dependent_async_task(
-            work,
-            &self.child_parent(),
-            estate,
-            dependencies,
-            Some(&*self.thread),
-        )
-    }
-
-    /// The parent one child of this runtime task is scheduled under:
-    /// upstream's `_node` as the `NodeBase* parent` argument.
-    ///
-    /// The job is cloned into it because that is what resumes the node -- the
-    /// last child to finish re-queues exactly this value -- and a fresh
-    /// [`Nested`] per child because there is nowhere to keep one; the module
-    /// docs have what that costs and why the alternative costs more. Every
-    /// one of them resolves to the same node, so they are the same parent in
-    /// every way the scheduler reads: [`Nested::base`] is that node's state
-    /// words, which is where the join counter and the `PREEMPTED` bit are.
-    fn child_parent(&self) -> Parent {
-        Nested::new(Some(self.job.clone())).as_parent()
+        self.thread
+            .shared
+            .schedule_dependent_async_task(
+                Spawn::silent_runtime(body),
+                &Submission::under_node(self.job, &*self.thread),
+                dependencies,
+            )
+            .0
     }
 }
 
@@ -633,21 +436,17 @@ impl Executor {
     /// Upstream's `dependent_async` over a `[](tf::Runtime&){}` body -- the
     /// `is_runtime_task_v<F>` branch of `_dependent_async` -- which is
     /// [`Executor::dependent_async`](crate::Executor::dependent_async)'s
-    /// dependencies and [`Executor::spawn_runtime`](crate::Executor::spawn_runtime)'s
-    /// body and second entry. It lives here rather than beside the plain form
-    /// because what is particular to it is the protocol that module docs set
-    /// out, and #91 left the pair for this issue for that reason.
-    ///
-    /// # What a caller sees
+    /// dependencies and
+    /// [`Executor::spawn_runtime`](crate::Executor::spawn_runtime)'s body and
+    /// second entry.
     ///
     /// [`AsyncHandle::wait`] answers `Ok(())` once the body and everything it
-    /// spawned are done, and [`RunError::Panicked`] if any of that panicked:
-    /// the node is an explicit anchor for its whole life, so the walk stops
-    /// there and `complete` hands the slot to the handle. The [`AsyncTask`]
-    /// is what names this task as a dependency of a later one, and
-    /// [`AsyncTask::is_done`](crate::AsyncTask::is_done) is true of it only
-    /// once the second entry has run -- which is to say once the children
-    /// are done too, since that is what the second entry waits for.
+    /// spawned are done, and an error if any of that panicked: the node is an
+    /// explicit anchor for its whole life, so the walk stops there and the
+    /// finishing entry hands the slot to the handle.
+    /// [`AsyncTask::is_done`](crate::AsyncTask::is_done) is true of the
+    /// [`AsyncTask`] only once that second entry has run, which is to say
+    /// once the children are done too.
     ///
     /// ```
     /// use std::sync::Arc;
@@ -687,17 +486,11 @@ impl Executor {
     where
         F: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
     {
-        let (handle, complete) = completion();
-        let task = self.schedule_dependent_async_task(
-            AsyncWork::reentrant(body, complete),
-            &Parent::Run,
-            // Upstream's `ESTATE::EXPLICITLY_ANCHORED | ESTATE::REFCOUNT_ONE`,
-            // minus the count the `Arc` already is: a failure under this node
-            // is the handle's to report, so the node is the anchor.
-            Cancellable::EXPLICITLY_ANCHORED,
+        self.shared.schedule_dependent_async_task(
+            Spawn::handled_runtime(body),
+            &Submission::parentless(),
             dependencies,
-        );
-        (task, handle)
+        )
     }
 
     /// Runs `body` on this executor once every task in `dependencies` has
@@ -705,19 +498,14 @@ impl Executor {
     ///
     /// Upstream's `silent_dependent_async` over a `[](tf::Runtime&){}` body,
     /// which is one call with one `ESTATE::NONE` there -- its
-    /// `_silent_dependent_async` does not branch on the body's shape at all,
-    /// because the shape decides only who is handed what and
-    /// [`AsyncWork`] is where that is said.
+    /// `_silent_dependent_async` does not branch on the body's shape at all.
     ///
-    /// # What a caller sees
-    ///
-    /// The [`AsyncTask`], and nothing else. A panic out of `body` or out of
-    /// anything it spawned lands in the node's own slot, where
-    /// [`AsyncTask::take_panic`](crate::AsyncTask::take_panic) reads it back
-    /// -- the node is *not* an explicit anchor here, so the walk stops at it
-    /// only because an entered runtime node is an implicit one, and nothing
-    /// is waiting to collect it. [`Executor::wait_for_all`] is what waits for
-    /// such a task, as it is for every free node.
+    /// The [`AsyncTask`] is what a caller sees, and nothing else. A panic out
+    /// of `body` or out of anything it spawned lands in the node's own slot,
+    /// where [`AsyncTask::take_panic`](crate::AsyncTask::take_panic) reads it
+    /// back: the node is *not* an explicit anchor here, so the walk stops at
+    /// it only because an entered runtime node is an implicit one.
+    /// [`Executor::wait_for_all`] is what waits for such a task.
     pub fn silent_dependent_async_runtime<'t, F>(
         &self,
         body: F,
@@ -726,12 +514,13 @@ impl Executor {
     where
         F: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
     {
-        self.schedule_dependent_async_task(
-            AsyncWork::runtime(body),
-            &Parent::Run,
-            ESTATE_NONE,
-            dependencies,
-        )
+        self.shared
+            .schedule_dependent_async_task(
+                Spawn::silent_runtime(body),
+                &Submission::parentless(),
+                dependencies,
+            )
+            .0
     }
 }
 
@@ -744,7 +533,7 @@ mod tests {
 
     use super::*;
     use crate::executor::queue::WorkerQueue;
-    use crate::executor::topology::{GraphOwner, Job, Topology, set_up_graph};
+    use crate::executor::topology::{GraphOwner, Job, Parent, Topology, set_up_graph};
     use crate::executor::worker::{WorkerThread, is_entered};
     use crate::prelude::*;
 
