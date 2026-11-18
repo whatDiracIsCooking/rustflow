@@ -1,0 +1,119 @@
+# The loom models (`tests/loom_*.rs`), which the gate deliberately does not
+# build: loom swaps the atomics for instrumented ones and re-runs each model
+# once per interleaving, so it needs a `cfg(loom)` build of the whole graph,
+# and `cfg(loom)` is set by `RUSTFLAGS` rather than by a Cargo feature (see the
+# comment on it in Cargo.toml). Nothing else tells us when a change to the
+# notifier or to the wake-after-last-release ordering breaks a model, so this
+# workflow runs them on a schedule.
+#
+# Deliberately NOT on `pull_request` or `push`: the gate stays the five
+# commands, and a model's cost grows with the interleavings it finds rather
+# than with the diff, so it is not a per-PR check. The failure it catches is
+# "a model stopped holding", which a week's latency is fine for.
+#
+# The toolchain pin lives in ONE place: `ARG RUST_VERSION` in the root
+# Dockerfile. The image below must be kept equal to it by hand, exactly as
+# ci.yml's must; when you bump one, bump all three.
+#
+# One GitHub rule worth knowing before you edit this on a branch:
+# `workflow_dispatch` only offers the copy of this file that is on the DEFAULT
+# branch, the same way automerge.yml's `workflow_run` does. A new or renamed
+# workflow is therefore undispatchable until it lands on main.
+name: loom
+
+on:
+  schedule:
+    # Mondays at 04:17 UTC. Off the hour on purpose: GitHub queues every cron
+    # that fires on the hour together, and this job is not urgent.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+# Nothing here reads or writes the repository beyond the checkout.
+permissions:
+  contents: read
+
+jobs:
+  loom:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.100-slim-bookworm
+    steps:
+      # ci.yml's first step, with `zstd` added: actions/cache below compresses
+      # with zstd when it is present and warns its way down to gzip when it is
+      # not. The rest is verbatim, for ci.yml's reason -- the slim image has no
+      # git, and actions/checkout silently falls back to a REST tarball without
+      # it, leaving no .git directory.
+      - name: Install container prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates pkg-config libssl-dev zstd
+          rm -rf /var/lib/apt/lists/*
+
+      - uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+
+      # Keyed `loom-`, separately from anything `ci` may cache later: a
+      # `cfg(loom)` build shares no artifact with a normal one, so a single
+      # cache would be two trees evicting each other. The registry path is
+      # /usr/local/cargo, not ~/.cargo, because that is where the official
+      # `rust` images put CARGO_HOME.
+      #
+      # Unlike `ci`, this job has a dependency tree worth restoring: `cfg(loom)`
+      # pulls in loom itself, and `cargo test` resolves the dev-dependencies
+      # (criterion, rayon) whether or not a benchmark is built.
+      - name: Cache the loom build
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+            target/loom
+          key: loom-rust1.100-${{ hashFiles('Cargo.lock') }}
+          restore-keys: loom-rust1.100-
+
+      - name: Run every loom model
+        env:
+          # What each model's `//!` header says to run, minus the target
+          # directory, which goes under the runner's workspace here so it
+          # cannot fight a normal build's. `target/` is this repo's ignored
+          # build output, so a subdirectory of it is also out of git's way.
+          RUSTFLAGS: "--cfg loom"
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/loom
+        run: |
+          set -euo pipefail
+
+          # Every model under tests/, found rather than listed: a workflow that
+          # names its models skips the next one silently, and silently skipping
+          # one is this job's whole failure mode (#128 was written when there
+          # was one model; #141 added the second).
+          models=$(find tests -maxdepth 1 -name 'loom_*.rs' -printf '%f\n' \
+            | sed 's/\.rs$//' | sort)
+          if [ -z "$models" ]; then
+            echo "::error::No tests/loom_*.rs found -- this job checks nothing."
+            exit 1
+          fi
+          echo "Models: $(echo $models | tr '\n' ' ')"
+
+          # One `cargo test` per model, so the count below is that model's.
+          for model in $models; do
+            log="$RUNNER_TEMP/$model.log"
+            echo "::group::$model"
+            cargo test --release --test "$model" 2>&1 | tee "$log"
+            echo "::endgroup::"
+
+            # `#![cfg(loom)]` makes a model built WITHOUT the cfg an empty test
+            # binary, and libtest then prints "0 passed" and exits 0. So a
+            # RUSTFLAGS that failed to reach the build is a green run that
+            # checked nothing -- the trap this job exists to avoid. Demand a
+            # non-zero passing count instead of trusting the exit status.
+            passed=$(sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' \
+              "$log" | head -n 1)
+            if [ "${passed:-0}" -lt 1 ]; then
+              echo "::error::$model ran no test -- cfg(loom) did not reach the build."
+              exit 1
+            fi
+            echo "$model: $passed loom model(s) passed."
+          done
