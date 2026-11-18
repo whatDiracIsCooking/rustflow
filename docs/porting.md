@@ -1,0 +1,169 @@
+# How the port was built
+
+The [`README`](../README.md) is the page a user of the crate wants and
+[`development.md`](development.md) the page a contributor wants. This is the
+page for someone asking how the port got here: the order the work ran in,
+what each step covers and deliberately leaves out, where the two `unsafe`
+modules came from, and the two performance results worth a paragraph each.
+The decisions themselves are in [`DESIGN.md`](../DESIGN.md), one entry per
+decision and each naming the issue that took it; this page is the map, not
+the record.
+
+## Order of work
+
+Each step is a milestone of PR-sized issues; the upstream unit tests under
+`unittests/` are the acceptance oracle, translated per module. The toolchain,
+container setup and CI gate the whole thing rides on were in place and
+verified before step 1. A milestone still open after the feature it names
+works is open on follow-ups rather than on the feature. All seven steps are
+in, and the port is at parity with upstream's user-facing surface at v4.1.0.
+
+1. **Static graph** — `Taskflow`, `Task`, the flow builder, DOT dump.
+2. **Executor** — workers, deque, notifier, `run`/`run_n`/`wait_for_all`.
+3. **Control flow** — condition tasks, cancellation, panic propagation.
+4. **Dynamic tasking** — subflows, runtime tasks, module composition.
+5. **Async** — async and dependent-async tasks submitted from the executor,
+   from a runtime task or from a task group, with and without a handle on the
+   result; task groups; and semaphores.
+6. **Observers and algorithms** — an `Observer` hook around every task a
+   worker runs, with a built-in Chrome trace-event writer and a `tfprof` one
+   over the same timeline; and `for_each`, `for_each_index`, `transform`,
+   `fill`, `generate`, `reduce`, `find`, `sort`, `scan` and `merge` over a
+   borrowed slice or an `IndexRange`, each with a choice of partitioner and a
+   `FlowBuilder` wrapper over owned data. This is the step that added
+   `Runtime::scope`, which the chunk loop under every one of those algorithms
+   spawns through.
+7. **Pipelines** — the one family with no Rust equivalent: a fixed chain of
+   `Pipe`s run over a bounded number of parallel lines, `DataPipeline`'s
+   typed builder over the same scheduler for pipes that pass data from each
+   to the next, and the `Composable` trait both compose into another graph
+   through. Deferred pipelines are not part of v4.1.0 and so are not ported:
+   there is no `defer` in `pipeline.hpp` at the pin, and while upstream's
+   `test_deferred_*.cpp` files exist, they are not in its own test
+   `CMakeLists`.
+
+**Three milestones have no step number.** A **consolidation** ran between
+steps 5 and 6, on what five steps had left behind: five milestones' worth of
+rationale collected in doc comments, an async family written three times over
+its three receivers, and the run's machinery one 2,352-line file over a dozen
+types, six of the previous milestone's seven post-merge bugs having been
+counter or share-lifecycle errors in it. It changed no public API; what it
+left is `executor::topology` as a module tree, an async family of one-line
+delegations onto a single core, every doc comment held to a written
+documentation contract, and the integration suites sharing one `tests/common`
+module. The **parity pass** after step 7 closed the remaining gap between the
+seven steps and upstream's own surface, and recorded what it declined; the
+README's "What is not ported" list is that record. A **second consolidation**
+ran after that pass, on what its own friction log
+([`api-friction.md`](api-friction.md)) collected, and this one did reach the
+surface: it settled what the crate root re-exports and what
+`rustflow::prelude` is for, collapsed the algorithm family's eight extension
+traits into one and completed the `make_*_task` factories behind them, gave
+every async submission a `_named` twin, and fixed two scheduler defects its
+own panic matrix found. All three keep their decisions in
+[`DESIGN.md`](../DESIGN.md), one entry per decision, in the subsystem
+section each belongs to rather than under the milestone that took it.
+
+So the step-to-milestone mapping is the seven steps with those three
+interleaved: step 6 is the sixth step and the seventh milestone, step 7 the
+eighth. A later step may do the same, and if one does it belongs in this list
+the same way, named here rather than renumbering the steps, since the numbers
+are what every issue and every `DESIGN.md` entry has been written against.
+
+## The examples, by step
+
+`examples/` is upstream's own directory, one file per example there, each
+ported under the same name and made to **print and assert** rather than only
+print. They are the first code in this crate shaped the way a caller writes
+it rather than the way a translated module does, which is also what they are
+*for*: because an example is the whole public surface at once, each example
+PR recorded what it found awkward getting there under a "Friction" heading in
+its own PR body — an import that had to be spelled out, a turbofish a type
+inference could not close, anything that rubbed. M9's closing issue collected
+those into [`api-friction.md`](api-friction.md), one entry per distinct item,
+as the input to the second consolidation.
+
+The directory's 44 files, by the step that ported them: step 1's static
+graph has `simple`, `run` and `visualization`; step 3's control flow has
+`condition`, `if_else`, `nested_if_else`, `multi_condition`, `switch_case`,
+`while_loop`, `do_while_loop`, `cancel` and `exception`; step 4's dynamic
+tasking has `subflow`, `subflow_exception`, `runtime`, `composition`,
+`async_module`, `task_visitor`, `attach_data` and `corun`; step 5's async
+family has `asyncs`, `dependent_async`, `runtime_async`, `fibonacci`,
+`limited_concurrency` and `tsp`; step 6's observers and algorithms have
+`observer`, `chrome_trace`, `worker_interface`, `parallel_for`, `for_loop`,
+`parallel_reduce`, `parallel_sort`, `inclusive_scan`, `exclusive_scan` and
+`dependent_async_algorithm`; and step 7's pipelines have `pipeline`,
+`scalable_pipeline`, `taskflow_pipeline`, `parallel_data_pipeline`,
+`parallel_graph_pipeline`, `data_scalable_parallel_pipeline` and
+`text_pipeline`. `tfprof` stands alone, for the `TFProfManager` decision
+under "What is not ported" in the README.
+
+## The two `unsafe` modules
+
+They are `src/executor/notifier.rs` and `src/executor/scope.rs`, and nothing
+else in the crate, which is worth saying out loud because a work-stealing
+scheduler is not where a reader expects to find that. In the notifier, a
+worker about to park publishes its thread handle into the lock-free waiter
+stack and the notifier that pops it reads it back. In `scope`, added in step
+6, `Runtime::scope` erases a borrowed child closure's lifetime to the
+`'static` bound `Runtime::silent_async` needs, sound only because `scope`
+joins every child — run to completion, panicked, or dropped unstarted —
+before it returns. The scheduler itself needs none: it was the ownership
+discipline described under "A run owns the graph it walks" in
+[`DESIGN.md`](../DESIGN.md) that removed the last one, and every slice of
+dynamic tasking, of the async family and of the two steps after it has
+stayed inside it.
+
+## Two performance results
+
+Every measured number is in [`BENCHMARKS.md`](../BENCHMARKS.md) — upstream's
+benchmarks ported to criterion with a rayon baseline in the role TBB's flow
+graph plays upstream, plus the pipeline (issue #187), which has no rayon
+equivalent and compares against an `mpsc` thread chain in the role TBB's own
+`parallel_pipeline` plays there — the machine and the load each ran under
+recorded beside them, and after the tables the per-decision measurements:
+#40 and #74 on what a job owns, the continuation #62 ported, the `Work`
+question, external submission (#60), a task body's own queue (#119), the
+spill-buffer count (#102), what a free async task costs (#125) and the boxed
+per-line slot a `DataPipeline` pays for over a `Pipeline` of the same shape
+(#186, measured in #188). They are kept there rather than repeated here, so
+each figure has one owner. Benchmarks are deliberately outside the gate: a
+benchmark answers "how fast", which is not a pass or a fail, so what CI holds
+the suite to is that it still compiles — and that it is still *run once*, the
+`examples` job executing every benchmark id a single untimed time in
+criterion's `--test` mode, which asks only whether it runs.
+
+One of those results is bad, and tracked rather than filed away, because the
+honest state of play is more useful than a table of the shapes that happen to
+look good. The other named below, #62, used to be the same kind of bad
+result and is now the fix for it:
+
+- **External submission** (issue #60). A graph submitted from a thread that is
+  not one of the executor's workers reaches the pool only through the shared
+  overflow buffers, and from there one steal at a time, so a graph that is
+  nothing but independent sources is distributed entirely by stealing:
+  `embarrassing_parallelism` at 65536 tasks and 24 workers measures about 5x
+  rayon on the same box in the same run. One obvious lever is **settled**:
+  more spill buffers are worth 4 to 6% here and the count stays
+  `bit_width(num_workers)` all the same, because it is also every worker's
+  victim space and the spin budget before one parks — at 48 buffers a
+  thousand-link chain costs 26% more and a task group's recursion 18%, and
+  there is no count in between that is a free win. #102 is that measurement;
+  it also found #60's *stated* reason for declining the change wrong, since
+  what pays is not the shapes that steal from worker queues but the shapes
+  with one source task and nothing to steal, which pay per run.
+  A free async task submitted the same way costs ~415 ns, 87% of it the node
+  it allocates (#125), and that too is the design rather than a tuning gap.
+  The one part of it that *was* a tuning gap is gone: the node's one-node
+  arena no longer carries a `Vec`'s spare capacity, which was 528 of the 848
+  bytes a task, 6 to 7% of this path and five times that on the one a *worker*
+  submits from (#144).
+- **The continuation optimisation** (issue #62, landed in PR #99). Upstream's
+  `_update_cache` / `TF_INVOKE_CONTINUATION` keeps one ready successor out of
+  the queue and resumes it on the worker that just finished its predecessor,
+  so a chain runs end to end where it started instead of being pushed and
+  re-stolen per link. It is in now, in `src/executor/worker.rs`: at 24 workers
+  a `linear_chain` costs half what it did before the change, and at one
+  worker the queueing round trip it skips is still 22 to 34 ns a task. "The
+  #62 measurement" in [`BENCHMARKS.md`](../BENCHMARKS.md) has the figures.

@@ -15,8 +15,8 @@ What is deliberately not here: the measured numbers, which are in
 [`BENCHMARKS.md`](BENCHMARKS.md) beside the machine and the load they were
 taken under, with the performance decisions that rest on them; the per-module
 provenance lines, which belong in the modules they describe; and the status of
-the work, which is the README's "Order of work" section and the milestones
-behind it.
+the work, which is the "Order of work" section of
+[`docs/porting.md`](docs/porting.md) and the milestones behind it.
 
 The contract below keeps a rationale in one place, and for a module that is a
 dozen lines of dispatch over machinery somebody else owns -- or a handful of

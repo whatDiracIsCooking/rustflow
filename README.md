@@ -1,130 +1,309 @@
 # rustflow
 
-A Rust port of [Taskflow](https://github.com/taskflow/taskflow), a C++
-task-parallel programming system built around task dependency graphs.
+[![ci](https://github.com/whatDiracIsCooking/rustflow/actions/workflows/ci.yml/badge.svg)](https://github.com/whatDiracIsCooking/rustflow/actions/workflows/ci.yml)
 
-**Status: all seven steps of "Order of work" are in, the port is at parity
-with upstream's user-facing surface at v4.1.0, and the consolidation
-milestone after that parity pass has closed** — every public class, free
-function and example `taskflow/` ships at the pin has a counterpart here, or
-a recorded reason it does not, and what the second consolidation settled
-about the surface a caller writes is in [`DESIGN.md`](DESIGN.md) under
-"Documentation and tooling", "Algorithms" and "Executor core". "Order of
-work", at the end of this file, is where that state is kept rather than
-duplicated up here: it says what each step covers and what it deliberately
-leaves out, and each step is a GitHub milestone, so its issues are what is
-merged and what is not.
+rustflow is a Rust port of [Taskflow](https://github.com/taskflow/taskflow),
+the C++ task-parallel programming system: you describe a program as a graph
+of tasks and the dependencies between them, and a work-stealing executor runs
+it. Static graphs, subflows spawned from inside a task, condition tasks that
+pick the next step at run time, composition of one graph into another, async
+tasks with and without dependencies, parallel algorithms over slices and
+ranges, and pipelines are all here, each behind the Rust shape of upstream's
+API rather than a binding to it.
 
-Two things are worth knowing before reading any of it:
+The port follows **Taskflow v4.1.0** and is at parity with its user-facing
+surface: every public class, free function and example upstream ships at that
+tag has a counterpart here, or a recorded reason it does not (see "What is
+not ported", below). It has two runtime dependencies, no `unsafe` outside two
+named modules, and every design decision written down with the issue that
+took it.
 
-- **No `unsafe` outside two modules** — `src/executor/notifier.rs` and
-  `src/executor/scope.rs`. The scheduler itself has none, which is worth
-  saying out loud because a work-stealing scheduler is not where a reader
-  expects to find that; "Order of work" says what each of the two buys.
-- **The decisions are written down.** [`DESIGN.md`](DESIGN.md) has one entry
-  per decision, grouped by the part of the port it decides and each naming the
-  issue that took it, beside the documentation contract every comment in this
-  crate is held to; its index is the ten sections. The measured ones are in
-  [`BENCHMARKS.md`](BENCHMARKS.md), which "Performance" indexes.
+## Start your first rustflow program
 
-## Building and testing
+The four-task graph upstream opens with, `A` before `B` and `C`, `D` after
+both:
 
-[`docs/development.md`](docs/development.md) is the contributor page: the
-pinned toolchain, the container both front ends build, the five-command gate
-`devtools/devcontainer.sh check` runs, and what CI runs beside it.
+```rust
+use rustflow::Executor;
+use rustflow::prelude::*;
 
-Four measurements of this crate's own documentation and tests sit beside that
-gate without being part of it, all four **reports** that exit 0 whatever they
-find: `devtools/doc-ratio.sh` (the documentation contract's prose ratio),
-`devtools/test-names.sh` (the test-name comparison a documentation pass is
-held to), `devtools/coverage.sh` (line and region coverage of `src/`) and
-`devtools/api-witness.py` (the public declarations no test, example, benchmark
-or doc example witnesses). What does decide a pass is the gate above plus
-`devtools/run-examples.sh`, which CI's `examples` job runs on every PR.
+fn main() {
+    let executor = Executor::default();
+    let mut taskflow = Taskflow::with_name("simple");
+
+    let a = taskflow.emplace(|| println!("TaskA"));
+    let b = taskflow.emplace(|| println!("TaskB"));
+    let c = taskflow.emplace(|| println!("TaskC"));
+    let d = taskflow.emplace(|| println!("TaskD"));
+
+    taskflow.task(a).name("A").precede([b, c]); // A runs before B and C
+    taskflow.task(d).name("D").succeed([b, c]); // D runs after  B and C
+
+    executor.run(&taskflow).wait().expect("no task panicked");
+}
+```
+
+`emplace` hands back a `Task`, an index into the graph; `taskflow.task(a)`
+is how the graph is edited through it. `Executor::run` hands back a
+`RunHandle`, and `wait` on it returns `Err(RunError::Panicked)` if any task
+panicked, so a run's failure is a value rather than an aborted process. This
+is `examples/simple.rs`; `cargo run --example simple` runs it.
+
+## Create a subflow
+
+A task can build and run a graph of its own while the parent graph is
+running. The body is handed a `Subflow`, which is a `FlowBuilder` over a
+subgraph the task owns, and the subgraph runs when the body returns or when
+it calls `join` explicitly:
+
+```rust
+let b = taskflow.emplace_subflow(|subflow: &mut Subflow<'_>| {
+    let b1 = subflow.emplace(|| println!("TaskB1"));
+    let b2 = subflow.emplace(|| println!("TaskB2"));
+    let b3 = subflow.emplace(|| println!("TaskB3"));
+    subflow.task(b1).precede([b3]);
+    subflow.task(b2).precede([b3]);
+});
+```
+
+`examples/subflow.rs` and `examples/run.rs` have the whole program, and
+`examples/fibonacci.rs` is the recursive case.
+
+## Integrate control flow into a task graph
+
+A condition task returns an index, and that index picks which of its
+successors runs next. Since a successor may be an earlier task, this is also
+how a graph loops:
+
+```rust
+let c = taskflow.emplace_condition(move || {
+    if counter.load(Ordering::Relaxed) != 5 { 0 } else { 1 }
+});
+taskflow.task(a).precede([b]);
+taskflow.task(b).precede([c]);
+taskflow.task(c).precede([b, d]); // 0 loops back to B, 1 goes on to D
+```
+
+A dependency on a condition task is *weak*: a task the conditioner may never
+choose cannot be waited for, which is what keeps the cycle above from being a
+deadlock. `emplace_multi_condition` returns a set of indices instead of one.
+`examples/condition.rs`, `if_else.rs`, `switch_case.rs`, `while_loop.rs`
+and `do_while_loop.rs` cover the shapes; `cancel.rs` and `exception.rs` show
+a run being cancelled and a panic reaching `wait`.
+
+## Compose task graphs
+
+A taskflow can run as a single task of another. The module task owns a
+share of its target, so one graph can be composed into as many others as the
+caller likes:
+
+```rust
+let f1 = Arc::new(f1);
+let module = f2.composed_of(Arc::clone(&f1));
+f2.task(f2c).precede([module]);
+f2.task(module).precede([f2d]);
+```
+
+`adopt` does the same for a graph with no other owner, and the `Composable`
+trait is what both accept, so a `Pipeline` composes the same way. See
+`examples/composition.rs`.
+
+## Launch asynchronous tasks
+
+The executor is also a thread pool. `spawn` hands back a handle on the
+result, `silent_async` hands back nothing, and the `dependent_async` family
+puts edges between async tasks as they are submitted, building a graph one
+task at a time while the tasks already submitted run:
+
+```rust
+let fu = executor.spawn(|| 1);
+executor.silent_async(|| println!("nobody waits for this"));
+
+let (a, _) = executor.dependent_async(|| println!("A"), []);
+let (b, _) = executor.dependent_async(|| println!("B"), [&a]);
+let (c, _) = executor.dependent_async(|| println!("C"), [&a]);
+let (_, fu_d) = executor.dependent_async(|| println!("D"), [&b, &c]);
+
+assert_eq!(fu.wait().expect("no panic"), 1);
+fu_d.wait().expect("no panic");
+```
+
+The same forms exist on a `Runtime` handed to a runtime task, on a
+`TaskGroup`, and with a `_runtime` body that can spawn work of its own.
+`Semaphore` is the one constraint that spans tasks instead of following
+edges: a task that cannot acquire every count it asks for is parked rather
+than run. See `examples/asyncs.rs`, `dependent_async.rs`,
+`runtime_async.rs` and `limited_concurrency.rs`.
+
+## Leverage parallel algorithms
+
+`for_each`, `for_each_index`, `transform`, `fill`, `generate`, `reduce`,
+`find_if`, `min_element`, `sort`, the two scans and `merge` come in three
+layers: a method on `Runtime` over a borrowed slice, a task on a
+`FlowBuilder` over owned data, and a `make_*_task` factory for a submission
+with no builder behind it. Each takes a partitioner, static, guided, dynamic
+or random:
+
+```rust
+use rustflow::algorithm::partitioner::DefaultPartitioner;
+
+let init = Arc::new(Mutex::new(i32::MAX));
+taskflow.reduce(
+    Arc::clone(&data),
+    Arc::clone(&init),
+    |a: &i32, b: &i32| (*a).min(*b),
+    DefaultPartitioner::default(),
+);
+```
+
+Pipelines are the family with no Rust equivalent to lean on. A `Pipeline` is
+a fixed chain of serial or parallel `Pipe`s run over a bounded number of
+lines, and it runs by being composed into a graph:
+
+```rust
+let pipeline = Pipeline::new(num_lines, vec![pipe0, pipe1, pipe2]);
+let task = taskflow.composed_of(&pipeline);
+```
+
+`DataPipeline` is a typed builder over the same scheduler for pipes that pass
+a value from each to the next. `examples/parallel_for.rs` through
+`text_pipeline.rs` cover both families; the lists under "Examples", below,
+name them all.
+
+## Run a taskflow through an executor
+
+`run`, `run_n` and `run_until` submit a graph once, a fixed number of times,
+or until a predicate says stop; each has a `_with` twin that takes a callback
+the last job of a run calls, and a `run_owned` twin that takes the taskflow
+by value. All are safe to call from any thread, workers included:
+
+```rust
+executor.run(&taskflow).wait()?;
+executor.run_n(&taskflow, 4).wait()?;
+executor.run_until(&taskflow, move || counter.fetch_add(1, Ordering::Relaxed) == 3).wait()?;
+executor.wait_for_all(); // nothing left in flight, async tasks included
+```
+
+`RunHandle` is also a `Future`, and `cancel` on it, or on the `Canceller` it
+hands out, stops a run from scheduling further tasks. `Executor::corun` lets
+a worker wait on a nested run by working on it rather than parking.
+`examples/run.rs` and `corun.rs` have the whole set.
+
+## Visualize a taskflow graph
+
+`dump` writes the graph as Graphviz DOT, with subflows and composed modules
+drawn as clusters:
+
+```rust
+println!("{}", taskflow.dump());
+```
+
+`examples/visualization.rs` writes one out, and the executor's observers do
+the same for a *run*: `ChromeObserver` writes the trace-event JSON
+`about://tracing` loads, and `TfProfObserver` the binary block upstream's
+own profiler viewer reads. See `examples/observer.rs`, `chrome_trace.rs`
+and `tfprof.rs`.
 
 ## Examples
 
-[`examples/`](examples/) is upstream's own directory, one file per example
-there, each ported here under the same name: `cargo run --example simple` and
-`cargo run --example run` build and run them directly. They are the first
-code in this crate shaped the way a caller writes it rather than the way a
-translated module does, which is also what they are *for*: upstream's
-examples only print, so the port's **print and assert** — every line upstream
-shows is checked with `assert!` or `assert_eq!`, making a non-zero exit the
-test. `devtools/run-examples.sh` runs every `examples/*.rs` this way, by
-glob rather than by a list it would need editing on each addition, and the
-`examples` job of [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs
-that script on every PR.
+[`examples/`](examples/) is upstream's own directory ported file for file,
+44 of them, under the same names: `cargo run --example <name>` builds and
+runs one. Upstream's examples only print; the port's **print and assert**.
+Every line upstream shows is checked with `assert!` or `assert_eq!`, so a
+non-zero exit is the test, `devtools/run-examples.sh` runs every
+`examples/*.rs` that way, and the `examples` job of
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs that script on
+every PR.
 
-Because an example is the whole public surface at once, each example PR
-records what it found awkward getting there under a "Friction" heading in
-its own PR body — an import that had to be spelled out, a turbofish a type
-inference could not close, anything that rubbed. M9's closing issue
-collected those into [`docs/api-friction.md`](docs/api-friction.md), one
-entry per distinct item, as the input to the consolidation milestone that
-follows it.
-
-The directory's 44 files, by the step that ported them: step 1's static
-graph has `simple`, `run` and `visualization`; step 3's control flow has
-`condition`, `if_else`, `nested_if_else`, `multi_condition`, `switch_case`,
-`while_loop`, `do_while_loop`, `cancel` and `exception`; step 4's dynamic
-tasking has `subflow`, `subflow_exception`, `runtime`, `composition`,
-`async_module`, `task_visitor`, `attach_data` and `corun`; step 5's async
-family has `asyncs`, `dependent_async`, `runtime_async`, `fibonacci`,
-`limited_concurrency` and `tsp`; step 6's observers and algorithms have
+By family: the static graph has `simple`, `run` and `visualization`; control
+flow has `condition`, `if_else`, `nested_if_else`, `multi_condition`,
+`switch_case`, `while_loop`, `do_while_loop`, `cancel` and `exception`;
+dynamic tasking has `subflow`, `subflow_exception`, `runtime`,
+`composition`, `async_module`, `task_visitor`, `attach_data` and `corun`;
+the async family has `asyncs`, `dependent_async`, `runtime_async`,
+`fibonacci`, `limited_concurrency` and `tsp`; observers and algorithms have
 `observer`, `chrome_trace`, `worker_interface`, `parallel_for`, `for_loop`,
 `parallel_reduce`, `parallel_sort`, `inclusive_scan`, `exclusive_scan` and
-`dependent_async_algorithm`; and step 7's pipelines have `pipeline`,
-`scalable_pipeline`, `taskflow_pipeline`, `parallel_data_pipeline`,
-`parallel_graph_pipeline`, `data_scalable_parallel_pipeline` and
-`text_pipeline`. `tfprof` stands alone, for the profiler decision under
-"What parity leaves out" in "Order of work", below.
+`dependent_async_algorithm`; pipelines have `pipeline`, `scalable_pipeline`,
+`taskflow_pipeline`, `parallel_data_pipeline`, `parallel_graph_pipeline`,
+`data_scalable_parallel_pipeline` and `text_pipeline`; and `tfprof` stands
+alone, for the reason under "What is not ported".
 
-## Provenance and attribution
+## Requirements
 
-This crate is a Rust reimplementation of Taskflow, not a binding. Both projects
-are MIT licensed, so there is no compatibility question — only an attribution
-one, and MIT answers it: the copyright notice *"shall be included in all copies
-or substantial portions of the Software."*
+- **Rust 1.100, edition 2024.** The toolchain is pinned by `RUST_VERSION` in
+  the [`Dockerfile`](Dockerfile), and [`docs/development.md`](docs/development.md)
+  is the contributor page: the container both front ends build, the
+  five-command gate `devtools/devcontainer.sh check` runs, and what CI runs
+  beside it. Four measurements of the crate's own documentation and tests
+  sit beside that gate without being part of it, all reports that exit 0
+  whatever they find: `devtools/doc-ratio.sh`, `devtools/test-names.sh`,
+  `devtools/coverage.sh` and `devtools/api-witness.py`. What decides a pass
+  is the gate plus `devtools/run-examples.sh`.
+- **Two runtime dependencies**, `crossbeam-deque` and `crossbeam-utils`, and
+  nothing else in the default build. "Dependency policy", below, is the rule
+  that keeps it there.
+- **No `unsafe` outside two modules**, `src/executor/notifier.rs` and
+  `src/executor/scope.rs`. The scheduler itself has none;
+  [`docs/porting.md`](docs/porting.md) says what each of the two buys.
 
-- [`LICENSE`](LICENSE) — this port's own copyright, covering the Rust code.
-- [`LICENSE-TASKFLOW`](LICENSE-TASKFLOW) — upstream's notice, byte-for-byte,
-  covering the design and any closely translated portions. It is kept as a
-  **separate** file on purpose: so that it stays unambiguous whose copyright
-  covers what, and so its non-standard `TASKFLOW MIT LICENSE` header does not
-  confuse license detection on this repo's own `LICENSE`.
+## What is not ported
 
-**The per-module rule:** any module translated closely from upstream names its
-source in its `//!` doc comment, on the first line:
+- `cuda/` and `3rd-party/`, out of scope from the start.
+- Deferred pipelines: `pipeline.hpp` at the pin has no `defer`, and
+  upstream's `test_deferred_*.cpp` files are not in its own test
+  `CMakeLists`.
+- `NonpreemptiveRuntime` as a user-facing type. The port keeps an internal
+  nonpreemptive node kind a pipeline's line task dispatches through rather
+  than a type a caller names; [`DESIGN.md`](DESIGN.md)'s entry on the
+  eleventh `Handle` variant has why.
+- `TFProfManager`. A library has no business installing a process-global
+  singleton whose destructor writes a file to a path an environment variable
+  names; [`DESIGN.md`](DESIGN.md)'s entry on `TFProfManager` has the
+  decision, and `TfProfObserver` is what is kept.
+- The serializer and the rest of upstream's `utility/` directory that `std`
+  already covers.
 
-```rust
-//! Translated from `taskflow/core/executor.hpp` (Taskflow v4.1.0).
-```
+Where the port's API differs from upstream's in shape rather than in
+coverage, [`DESIGN.md`](DESIGN.md) has one entry per decision, grouped by
+the part of the port it decides (graph and flow builder, executor core,
+control flow, dynamic tasking, the async family, observers, algorithms,
+pipelines, documentation and tooling) and each naming the issue that took
+it; [`docs/api-friction.md`](docs/api-friction.md) is
+the log of what writing the examples against that API found awkward, and
+what became of each item.
 
-The version is part of the line. Upstream rewrites its scheduler between major
-versions, so "translated from `executor.hpp`" without saying which one is not
-an auditable claim.
+## Performance
 
-Blanket attribution in a LICENSE file is the legal minimum and tells you
-nothing useful a year later. The per-module line is what makes it auditable —
-it records which modules were *translated* and which were *invented*, which is
-exactly the distinction that gets forgotten first. If a module is your own
-design that merely implements the same concept, say nothing; the absence is
-then meaningful.
-
-One thing not covered by any of the above: upstream's `3rd-party/` directory
-carries its own separate terms. Nothing ported out of there may ride on
-`LICENSE-TASKFLOW` — treat it as a fresh licensing question.
+Every measured number this port has is in [`BENCHMARKS.md`](BENCHMARKS.md):
+upstream's benchmarks ported to criterion with a rayon baseline in the role
+TBB plays upstream, the machine and load each ran under, and the
+per-decision measurements behind [`DESIGN.md`](DESIGN.md). One result there
+is bad and tracked rather than filed away: a graph submitted from outside
+the pool reaches it only by stealing, so a graph of nothing but independent
+sources runs several times slower than rayon on the same box. The
+continuation optimisation that halved a chain's cost is also measured there.
+[`docs/porting.md`](docs/porting.md) has the summary of both. Benchmarks are
+deliberately outside the gate, since "how fast" is not a pass or a fail; what
+CI holds the suite to is that it still compiles and still runs, the
+`examples` job executing every benchmark id once, untimed, in criterion's
+`--test` mode.
 
 ## Porting notes
+
+[`docs/porting.md`](docs/porting.md) is the record of how the port was
+built: the seven steps and three consolidation milestones it ran as, what
+each covers and what it left out, and where the two `unsafe` modules came
+from. The three rules below are the ones a contributor needs before touching
+anything.
 
 ### Upstream pin
 
 This port follows **Taskflow v4.1.0**, tag `v4.1.0`, commit
 `45366fe5bc4f2f8ec9aa590b40c504e296886865` (2026-06-19). Every "Translated
-from" line, every ported unit test and every benchmark comparison refers to that
-tree. Moving the pin is a deliberate, repo-wide change, not something one PR
-does on the side.
+from" line, every ported unit test and every benchmark comparison refers to
+that tree. Moving the pin is a deliberate, repo-wide change, not something
+one PR does on the side.
 
 The v4 line is what we port, not v3: it is C++20, splits `NodeBase` out of
 `Node`, schedules in bulk into the work-stealing queues, defaults to the
@@ -134,175 +313,60 @@ from `cuda/` or `3rd-party/` is in scope.
 ### Dependency policy
 
 Upstream's library core depends on nothing but the C++ standard library; its
-`3rd-party/` directory serves only tests, benchmarks and the profiler. We keep
-the same split:
+`3rd-party/` directory serves only tests, benchmarks and the profiler. We
+keep the same split:
 
-- A **runtime** dependency must replace something upstream hand-wrote *and* be
-  better tested than our own port of it would be. Today that admits
-  `crossbeam-deque` (the Chase-Lev deque behind `wsq.hpp`) and `crossbeam-utils`
-  (cache-line padding and backoff), and nothing else — both are in as of the
-  work-stealing queue layer, and the only other crate in the tree is
-  `crossbeam-epoch`, which `crossbeam-deque` pulls in itself. Anything optional
-  goes behind a Cargo feature so the default build stays at those two.
+- A **runtime** dependency must replace something upstream hand-wrote *and*
+  be better tested than our own port of it would be. Today that admits
+  `crossbeam-deque` (the Chase-Lev deque behind `wsq.hpp`) and
+  `crossbeam-utils` (cache-line padding and backoff), and nothing else; the
+  only other crate in the tree is `crossbeam-epoch`, which `crossbeam-deque`
+  pulls in itself. Anything optional goes behind a Cargo feature so the
+  default build stays at those two.
 - **Dev** dependencies need only be useful: `loom` for the lock-free parts
-  and for the cross-thread rules a machine-checked model states better than a
-  paragraph — eight models under `tests/loom_*.rs`, one per protocol or rule
-  and each named in [`docs/development.md`](docs/development.md),
-  `criterion` for the ported benchmarks, `rayon` as the baseline those
-  benchmarks compare against, in the role TBB plays upstream, and `proptest`
-  for the generated inputs `tests/properties.rs` checks the algorithms
-  against `std`'s own answer over.
+  and for the cross-thread rules a machine-checked model states better than
+  a paragraph (eight models under `tests/loom_*.rs`, each named in
+  [`docs/development.md`](docs/development.md)), `criterion` for the ported
+  benchmarks, `rayon` as the baseline those benchmarks compare against, in
+  the role TBB plays upstream, and `proptest` for the generated inputs
+  `tests/properties.rs` checks the algorithms against `std`'s own answer
+  over.
 
-### Design decisions already taken
+### Provenance and attribution
 
-They live in [`DESIGN.md`](DESIGN.md), one entry per decision and each still
-naming the issue that took it, grouped by the part of the port it decides --
-graph and flow builder, executor core, control flow and cancellation, dynamic
-tasking, the async family, observers, algorithms, pipelines, documentation and
-tooling -- beside the documentation contract this crate's comments are held
-to. The measured ones keep their numbers in
-[`BENCHMARKS.md`](BENCHMARKS.md), which "Performance", below, indexes.
+This crate is a Rust reimplementation of Taskflow, not a binding. Both
+projects are MIT licensed, so there is no compatibility question, only an
+attribution one, and MIT answers it: the copyright notice *"shall be
+included in all copies or substantial portions of the Software."*
 
-### Performance
+- [`LICENSE`](LICENSE) is this port's own copyright, covering the Rust code.
+- [`LICENSE-TASKFLOW`](LICENSE-TASKFLOW) is upstream's notice, byte for
+  byte, covering the design and any closely translated portions. It is kept
+  as a **separate** file on purpose: so that it stays unambiguous whose
+  copyright covers what, and so its non-standard `TASKFLOW MIT LICENSE`
+  header does not confuse license detection on this repo's own `LICENSE`.
 
-Every measured number this port has is in [`BENCHMARKS.md`](BENCHMARKS.md) —
-upstream's benchmarks ported to criterion with a rayon baseline in the role
-TBB's flow graph plays upstream, plus the pipeline (issue #187), which has no
-rayon equivalent and compares against an `mpsc` thread chain in the role TBB's
-own `parallel_pipeline` plays there — the machine and the load each ran under
-recorded beside them, and after the tables the per-decision measurements: #40
-and #74 on what a job owns, the continuation #62 ported, the `Work`
-question, external submission (#60), a task body's own queue (#119), the
-spill-buffer count (#102), what a free async task costs (#125) and the boxed
-per-line slot a `DataPipeline` pays for over a `Pipeline` of the same shape
-(#186, measured in #188). They are kept there rather than repeated here, so
-each figure has one owner. Benchmarks are deliberately outside the gate: a
-benchmark answers "how fast", which is not a pass or a fail, so what CI
-holds the suite to is that it still compiles — and that it is still *run
-once*, the `examples` job executing every benchmark id a single untimed time
-in criterion's `--test` mode, which asks only whether it runs.
+**The per-module rule:** any module translated closely from upstream names
+its source in its `//!` doc comment, on the first line:
 
-One of those results is bad, and tracked rather than filed away, because the
-honest state of play is more useful than a table of the shapes that happen to
-look good. The other named below, #62, used to be the same kind of bad
-result and is now the fix for it:
+```rust
+//! Translated from `taskflow/core/executor.hpp` (Taskflow v4.1.0).
+```
 
-- **External submission** (issue #60). A graph submitted from a thread that is
-  not one of the executor's workers reaches the pool only through the shared
-  overflow buffers, and from there one steal at a time, so a graph that is
-  nothing but independent sources is distributed entirely by stealing:
-  `embarrassing_parallelism` at 65536 tasks and 24 workers measures about 5x
-  rayon on the same box in the same run. One obvious lever is **settled**:
-  more spill buffers are worth 4 to 6% here and the count stays
-  `bit_width(num_workers)` all the same, because it is also every worker's
-  victim space and the spin budget before one parks — at 48 buffers a
-  thousand-link chain costs 26% more and a task group's recursion 18%, and
-  there is no count in between that is a free win. #102 is that measurement;
-  it also found #60's *stated* reason for declining the change wrong, since
-  what pays is not the shapes that steal from worker queues but the shapes
-  with one source task and nothing to steal, which pay per run.
-  A free async task submitted the same way costs ~415 ns, 87% of it the node
-  it allocates (#125), and that too is the design rather than a tuning gap.
-  The one part of it that *was* a tuning gap is gone: the node's one-node
-  arena no longer carries a `Vec`'s spare capacity, which was 528 of the 848
-  bytes a task, 6 to 7% of this path and five times that on the one a *worker*
-  submits from (#144).
-- **The continuation optimisation** (issue #62, landed in PR #99). Upstream's
-  `_update_cache` / `TF_INVOKE_CONTINUATION` keeps one ready successor out of
-  the queue and resumes it on the worker that just finished its predecessor,
-  so a chain runs end to end where it started instead of being pushed and
-  re-stolen per link. It is in now, in `src/executor/worker.rs`: at 24 workers
-  a `linear_chain` costs half what it did before the change, and at one
-  worker the queueing round trip it skips is still 22 to 34 ns a task. "The
-  #62 measurement" in [`BENCHMARKS.md`](BENCHMARKS.md) has the figures.
+The version is part of the line. Upstream rewrites its scheduler between
+major versions, so "translated from `executor.hpp`" without saying which one
+is not an auditable claim. Blanket attribution in a LICENSE file is the
+legal minimum and tells you nothing useful a year later; the per-module line
+records which modules were *translated* and which were *invented*, which is
+exactly the distinction that gets forgotten first. If a module is your own
+design that merely implements the same concept, say nothing; the absence is
+then meaningful.
 
-### Order of work
+One thing not covered by any of the above: upstream's `3rd-party/` directory
+carries its own separate terms. Nothing ported out of there may ride on
+`LICENSE-TASKFLOW`; treat it as a fresh licensing question.
 
-Each step is a milestone of PR-sized issues; the upstream unit tests under
-`unittests/` are the acceptance oracle, translated per module. The toolchain,
-container setup and CI gate the whole thing rides on were in place and
-verified before step 1. A milestone still open after the feature it names
-works is open on follow-ups rather than on the feature — the performance ones
-are named under "Performance", above.
+## License
 
-1. **Static graph** — `Taskflow`, `Task`, the flow builder, DOT dump.
-2. **Executor** — workers, deque, notifier, `run`/`run_n`/`wait_for_all`.
-3. **Control flow** — condition tasks, cancellation, panic propagation.
-4. **Dynamic tasking** — subflows, runtime tasks, module composition.
-5. **Async** — async and dependent-async tasks submitted from the executor,
-   from a runtime task or from a task group, with and without a handle on the
-   result; task groups; and semaphores.
-6. **Observers and algorithms** — an `Observer` hook around every task a
-   worker runs, with a built-in Chrome trace-event writer and a `tfprof` one
-   over the same timeline; and `for_each`, `for_each_index`, `transform`,
-   `fill`, `generate`, `reduce`, `find`, `sort`, `scan` and `merge` over a
-   borrowed slice or an `IndexRange`, each with a choice of partitioner and a
-   `FlowBuilder` wrapper over owned data. This is the step that added
-   `Runtime::scope`, which the chunk loop under every one of those algorithms
-   spawns through.
-7. **Pipelines** — the one family with no Rust equivalent: a fixed chain of
-   `Pipe`s run over a bounded number of parallel lines, `DataPipeline`'s
-   typed builder over the same scheduler for pipes that pass data from each
-   to the next, and the `Composable` trait both compose into another graph
-   through. Deferred pipelines are not part of v4.1.0 and so are not ported:
-   there is no `defer` in `pipeline.hpp` at the pin, and while upstream's
-   `test_deferred_*.cpp` files exist, they are not in its own test
-   `CMakeLists`.
-
-**The two `unsafe` modules**, and nothing else in the crate. One is
-`src/executor/notifier.rs`, where a worker about to park publishes its thread
-handle into the lock-free waiter stack and the notifier that pops it reads it
-back. The other is `src/executor/scope.rs`, added in step 6, where
-`Runtime::scope` erases a borrowed child closure's lifetime to the `'static`
-bound `Runtime::silent_async` needs, sound only because `scope` joins every
-child — run to completion, panicked, or dropped unstarted — before it
-returns. The scheduler itself needs none: it was the ownership discipline
-described under "A run owns the graph it walks" in [`DESIGN.md`](DESIGN.md)
-that removed the last one, and every slice of dynamic tasking, of the async
-family and of the two steps above has stayed inside it.
-
-**What parity leaves out.** A pass after step 7 closed the remaining gap
-between the seven steps and upstream's own surface, and recorded what it
-declined:
-
-- `cuda/` and `3rd-party/`, out of scope from the start — see "Upstream pin",
-  above.
-- Deferred pipelines, since `pipeline.hpp` at the pin has no `defer` (step 7,
-  above).
-- `NonpreemptiveRuntime` as a user-facing type. The port keeps an internal
-  nonpreemptive node kind a pipeline's line task dispatches through instead
-  of a type a caller names directly — [`DESIGN.md`](DESIGN.md)'s entry on the
-  eleventh `Handle` variant has why.
-- `TFProfManager`. A library has no business installing a process-global
-  singleton whose destructor writes a file to a path an environment variable
-  names — [`DESIGN.md`](DESIGN.md)'s entry on `TFProfManager` has the
-  decision and what is kept as documentation instead.
-- The serializer and the rest of upstream's `utility/` directory that `std`
-  already covers without a port.
-
-**Three milestones have no step number.** A **consolidation** ran between
-steps 5 and 6, on what five steps had left behind: five milestones' worth of
-rationale collected in doc comments, an async family written three times over
-its three receivers, and the run's machinery one 2,352-line file over a dozen
-types, six of the previous milestone's seven post-merge bugs having been
-counter or share-lifecycle errors in it. It changed no public API; what it
-left is `executor::topology` as a module tree, an async family of one-line
-delegations onto a single core, every doc comment held to a written
-documentation contract, and the integration suites sharing one `tests/common`
-module. The **parity pass** after step 7 is where "What parity leaves out",
-above, comes from. A **second consolidation** ran after that pass, on what
-its own friction log ([`docs/api-friction.md`](docs/api-friction.md))
-collected, and this one did reach the surface: it settled what the crate root
-re-exports and what `rustflow::prelude` is for, collapsed the algorithm
-family's eight extension traits into one and completed the `make_*_task`
-factories behind them, gave every async submission a `_named` twin, and fixed
-two scheduler defects its own panic matrix found. All three keep their
-decisions in [`DESIGN.md`](DESIGN.md), one entry per decision, in the
-subsystem section each belongs to rather than under the milestone that took
-it.
-
-So the step-to-milestone mapping is the seven steps with those three
-interleaved: step 6 is the sixth step and the seventh milestone, step 7 the
-eighth. A later step may do the same, and if one does it belongs in this list
-the same way, named here rather than renumbering the steps, since the numbers
-are what every issue and every `DESIGN.md` entry has been written against.
+MIT, for both the port ([`LICENSE`](LICENSE)) and the design it follows
+([`LICENSE-TASKFLOW`](LICENSE-TASKFLOW)).

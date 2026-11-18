@@ -135,13 +135,13 @@
 //!
 //! # Status
 //!
-//! All seven steps of the README's "Order of work" are in: everything above
-//! is built and tested against the upstream unit tests it was translated
-//! from, the observers, the algorithm family and the pipelines included. The
-//! port is at parity with upstream's user-facing surface at the pin -- every
-//! public class, free function and example `taskflow/` ships there has a
-//! counterpart here or a recorded reason it does not, which the README
-//! lists. Two consolidation milestones punctuate the steps, one between
+//! All seven steps of `docs/porting.md`'s "Order of work" are in: everything
+//! above is built and tested against the upstream unit tests it was
+//! translated from, the observers, the algorithm family and the pipelines
+//! included. The port is at parity with upstream's user-facing surface at
+//! the pin -- every public class, free function and example `taskflow/`
+//! ships there has a counterpart here or a recorded reason it does not,
+//! which the README's "What is not ported" section lists. Two consolidation milestones punctuate the steps, one between
 //! steps 5 and 6 and one after the parity pass, and both have run. Most of
 //! what they change is what a reader of the source meets: the async family's
 //! public methods are one-line delegations onto a single core on the
