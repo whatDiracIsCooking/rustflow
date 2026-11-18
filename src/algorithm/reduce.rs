@@ -86,7 +86,7 @@
 //! `T`, `T1`, `T2` needs `Clone` there.
 
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::Scope;
 use crate::algorithm::index_range::{IndexInt, IndexRange};
@@ -589,6 +589,218 @@ impl<'rt> Runtime<'rt> {
             *local = Some(lop(sub, taken));
         };
         fold_and_merge(self, n, fold, &gop, init, part);
+    }
+}
+
+/// Builds the runtime body of a [`Runtime::reduce`] task over owned `data`,
+/// folding into a shared `init`: upstream's `make_reduce_task(b, e, init,
+/// bop, part)`. `init` is locked once for the task's whole run, and the
+/// whole fold goes through that one guard.
+///
+/// `bop` and `part` are cloned on every run of the body -- relevant only for
+/// a task a cycle revisits -- matching upstream copying both into its own
+/// closure by value.
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+///
+/// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
+/// use rustflow::algorithm::reduce::make_reduce_task;
+/// use rustflow::prelude::*;
+/// use rustflow::Executor;
+///
+/// let data = Arc::new((1..=100).collect::<Vec<i32>>());
+/// let sum = Arc::new(Mutex::new(0));
+///
+/// let mut taskflow = Taskflow::new();
+/// taskflow.emplace_runtime(make_reduce_task(
+///     Arc::clone(&data),
+///     Arc::clone(&sum),
+///     |a: &i32, b: &i32| a + b,
+///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
+/// ));
+///
+/// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
+/// assert_eq!(*sum.lock().expect("uncontended"), 5050);
+/// ```
+pub fn make_reduce_task<T, O, P>(
+    data: Arc<Vec<T>>,
+    init: Arc<Mutex<T>>,
+    bop: O,
+    part: P,
+) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static
+where
+    T: Clone + Send + Sync + 'static,
+    O: Fn(&T, &T) -> T + Sync + Clone + Send + 'static,
+    P: ReducePartitioner + Clone + Send + 'static,
+{
+    move |rt: &mut Runtime<'_>| {
+        let mut guard = init.lock().unwrap_or_else(PoisonError::into_inner);
+        rt.reduce(&data, &mut *guard, bop.clone(), part.clone());
+    }
+}
+
+/// Builds the runtime body of a [`Runtime::transform_reduce`] task over
+/// owned `data`: upstream's single-input `make_transform_reduce_task(b, e,
+/// init, bop, uop, part)` overload. `init` is locked and the operators are
+/// cloned exactly as [`make_reduce_task`] does.
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+///
+/// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
+/// use rustflow::algorithm::reduce::make_transform_reduce_task;
+/// use rustflow::prelude::*;
+/// use rustflow::Executor;
+///
+/// let data = Arc::new((1..=10).collect::<Vec<i32>>());
+/// let sum_of_squares = Arc::new(Mutex::new(0));
+///
+/// let mut taskflow = Taskflow::new();
+/// taskflow.emplace_runtime(make_transform_reduce_task(
+///     Arc::clone(&data),
+///     Arc::clone(&sum_of_squares),
+///     |a: &i32, b: &i32| a + b,
+///     |x: &i32| x * x,
+///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
+/// ));
+///
+/// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
+/// assert_eq!(*sum_of_squares.lock().expect("uncontended"), 385);
+/// ```
+pub fn make_transform_reduce_task<T, R, O, U, P>(
+    data: Arc<Vec<T>>,
+    init: Arc<Mutex<R>>,
+    bop: O,
+    uop: U,
+    part: P,
+) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static
+where
+    T: Sync + Send + 'static,
+    R: Send + 'static,
+    O: Fn(&R, &R) -> R + Sync + Clone + Send + 'static,
+    U: Fn(&T) -> R + Sync + Clone + Send + 'static,
+    P: ReducePartitioner + Clone + Send + 'static,
+{
+    move |rt: &mut Runtime<'_>| {
+        let mut guard = init.lock().unwrap_or_else(PoisonError::into_inner);
+        rt.transform_reduce(&data, &mut *guard, bop.clone(), uop.clone(), part.clone());
+    }
+}
+
+/// Builds the runtime body of a [`Runtime::transform_reduce2`] task over
+/// owned `data1` and `data2`: upstream's two-input
+/// `make_transform_reduce_task(beg1, end1, beg2, init, bop_r, bop_t, part)`
+/// overload, carrying the `2` for the reason this module's `# Design`
+/// section gives for the method's own name. `init` is locked and the
+/// operators are cloned exactly as [`make_reduce_task`] does.
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+///
+/// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
+/// use rustflow::algorithm::reduce::make_transform_reduce2_task;
+/// use rustflow::prelude::*;
+/// use rustflow::Executor;
+///
+/// let a = Arc::new((1..=10).collect::<Vec<i32>>());
+/// let b = Arc::new((1..=10).rev().collect::<Vec<i32>>());
+/// let dot = Arc::new(Mutex::new(0));
+///
+/// let mut taskflow = Taskflow::new();
+/// taskflow.emplace_runtime(make_transform_reduce2_task(
+///     Arc::clone(&a),
+///     Arc::clone(&b),
+///     Arc::clone(&dot),
+///     |l: &i32, r: &i32| l + r,
+///     |x: &i32, y: &i32| x * y,
+///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
+/// ));
+///
+/// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
+/// assert_eq!(*dot.lock().expect("uncontended"), 220);
+/// ```
+pub fn make_transform_reduce2_task<T1, T2, R, O, U, P>(
+    data1: Arc<Vec<T1>>,
+    data2: Arc<Vec<T2>>,
+    init: Arc<Mutex<R>>,
+    bop: O,
+    uop: U,
+    part: P,
+) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static
+where
+    T1: Sync + Send + 'static,
+    T2: Sync + Send + 'static,
+    R: Send + 'static,
+    O: Fn(&R, &R) -> R + Sync + Clone + Send + 'static,
+    U: Fn(&T1, &T2) -> R + Sync + Clone + Send + 'static,
+    P: ReducePartitioner + Clone + Send + 'static,
+{
+    move |rt: &mut Runtime<'_>| {
+        let mut guard = init.lock().unwrap_or_else(PoisonError::into_inner);
+        rt.transform_reduce2(
+            &data1,
+            &data2,
+            &mut *guard,
+            bop.clone(),
+            uop.clone(),
+            part.clone(),
+        );
+    }
+}
+
+/// Builds the runtime body of a [`Runtime::reduce_by_index`] task over
+/// `range`: upstream's `make_reduce_by_index_task(range, init, lop, gop,
+/// part)`. `range` is a plain value, not `Arc`-wrapped, since [`IndexRange`]
+/// is `Copy`; `init` is locked and `lop`/`gop`/`part` are cloned exactly as
+/// [`make_reduce_task`] does.
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+///
+/// use rustflow::algorithm::index_range::IndexRange;
+/// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
+/// use rustflow::algorithm::reduce::make_reduce_by_index_task;
+/// use rustflow::prelude::*;
+/// use rustflow::Executor;
+///
+/// let sum = Arc::new(Mutex::new(0usize));
+///
+/// let mut taskflow = Taskflow::new();
+/// taskflow.emplace_runtime(make_reduce_by_index_task(
+///     IndexRange::new(0usize, 100, 1),
+///     Arc::clone(&sum),
+///     |sub: IndexRange<usize>, running: Option<usize>| {
+///         let mut total = running.unwrap_or(0);
+///         for i in (sub.begin()..sub.end()).step_by(sub.step_size()) {
+///             total += i;
+///         }
+///         total
+///     },
+///     |a: &usize, b: &usize| a + b,
+///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
+/// ));
+///
+/// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
+/// assert_eq!(*sum.lock().expect("uncontended"), 4950);
+/// ```
+pub fn make_reduce_by_index_task<I, T, L, G, P>(
+    range: IndexRange<I>,
+    init: Arc<Mutex<T>>,
+    lop: L,
+    gop: G,
+    part: P,
+) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static
+where
+    I: IndexInt + Sync + Send + 'static,
+    T: Send + 'static,
+    L: Fn(IndexRange<I>, Option<T>) -> T + Sync + Clone + Send + 'static,
+    G: Fn(&T, &T) -> T + Sync + Clone + Send + 'static,
+    P: ReducePartitioner + Clone + Send + 'static,
+{
+    move |rt: &mut Runtime<'_>| {
+        let mut guard = init.lock().unwrap_or_else(PoisonError::into_inner);
+        rt.reduce_by_index(range, &mut *guard, lop.clone(), gop.clone(), part.clone());
     }
 }
 
