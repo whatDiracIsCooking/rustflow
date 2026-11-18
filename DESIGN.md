@@ -115,7 +115,7 @@ follow are measured against those numbers.
 - **A failure inside a nested graph is delivered to whoever is waiting for
   that graph** (issue #48), not to the run. Upstream calls the thing that is
   waiting an *anchor* and finds it by walking the failing node's parent chain;
-  the walk is ported as it stands, including the priority — an explicit anchor
+  the walk is ported with one change of priority — an explicit anchor
   (a frame blocked right now in an `Executor::corun`, a `Subflow::join`, a
   `Runtime::corun` or a `TaskGroup::corun`, and since the async family also a
   free node whose runtime-shaped body hands back a handle, which is anchored
@@ -123,10 +123,10 @@ follow are measured against those numbers.
   implicit one (a node that preempted itself and means to read its payload
   slot when it is resumed — a runtime task, a free node with a runtime-shaped
   body, or a task group's anchor, which carries the bit from the moment the
-  group is opened) beats the run, which is every chain's root and is anchored
-  by definition. The one root that is *not* an anchor is the sentinel run a
-  free async task's job names; the entry on it below says why. Two decisions
-  came out of #48 that upstream does not have to make.
+  group is opened) beats the run, which is every chain's root. The one root
+  that is no destination at all is the sentinel run a free async task's job
+  names; the entry on it below says why. Two decisions came out of #48 that
+  upstream does not have to make, and the change of priority is #157's.
 
   The payload slot is **on the node**, as upstream's `_exception_ptr` is, even
   though a chain of parents in this port is a chain of `Nested` allocations
@@ -144,6 +144,34 @@ follow are measured against those numbers.
   that graph set the node up again. What the port keeps instead is the promise
   its thread-safety case pins: of a thousand tasks failing at once, exactly one
   payload reaches the caller and the rest are dropped by the run.
+
+  An **implicit anchor beats the run** (issue #157), where upstream's chain
+  ends at a topology it constructs `ESTATE::EXPLICITLY_ANCHORED` — its
+  `Topology` *is* a `NodeBase` — and which therefore outranks everything below
+  it. The two priorities differ only for a chain that has both, and that chain
+  is a runtime task of a graph whose body spawned silent children. Under
+  upstream's order the destination depends on *when* a child failed: the node
+  is explicitly anchored only from the moment its `corun` is entered, while a
+  child pushed onto a stealable queue can fail before the body gets there, so
+  the same program delivers to the body's `corun` or to the run depending on
+  which side was descheduled. Upstream has the window too, and does not run
+  the case that would see it: its `RuntimeAsync` test is commented out in
+  full, no reason given, with a note on its third phase that a `silent_async`
+  can finish before the `corun` does. This port declines to inherit the
+  window: what delivers is the node's `ENTERED` bit, which is
+  set before the body runs and cleared only once every child has been counted
+  off, so no child can observe the node unanchored.
+
+  That needs one companion, in `enter`: a node leaving `ENTERED` with a payload
+  still in its slot runs the walk again, from a node that is by then no anchor,
+  which hands the payload to the enclosing anchor or to the run. So a body that
+  never coruns still fails its run, exactly as it did under the other priority
+  and as it does upstream, and the two halves together are what make the
+  delivery independent of the order the body and its children finish in.
+  `tests/loom_anchor.rs` is the model of that pair, with the orderings it was
+  checked against in its header; the alternative of giving `ENTERED` the
+  explicit bit instead was rejected for needing the same companion while
+  blurring what "explicit" means, which is a frame blocked right now.
 - **Waiting on a nested graph comes in two shapes, `corun` and `try_corun`**
   (issue #48). Upstream has one `corun`, which rethrows: a failure of the inner
   graph is raised on the calling worker, where the task body that called it can

@@ -58,13 +58,19 @@
 //! the node's own parent and is a sibling rather than a child.
 //!
 //! Where a failure under each of the three shapes goes is one argument in
-//! `DESIGN.md` and one line of difference here: the node of a
-//! handle-returning async form is explicitly anchored from construction, so
-//! the walk stops there and `complete` hands the slot to the handle; a silent
-//! one is an anchor only in the implicit sense, only while it is entered, and
-//! its payload is dropped with the node; a runtime task of a graph is
-//! neither, so its failure goes up the chain to whatever is waiting for that
-//! graph.
+//! `DESIGN.md` and a few lines of difference here. All three are implicit
+//! anchors for exactly as long as they are entered -- the bit goes on before
+//! the body runs and comes off only once everything the body spawned has been
+//! counted off -- so a failure under any of them lands in the node's own
+//! slot, which is the slot [`Runtime::try_corun`] reads. What differs is what
+//! becomes of a payload the body never collected, and [`enter`] settles it on
+//! the way out: the handle-returning form is explicitly anchored from
+//! construction as well, so the payload stays on its node and `complete`
+//! hands it to the handle; for the other two the walk is run again from a
+//! node that is no longer an anchor, which delivers the payload to whatever
+//! is waiting for the node's own graph -- the run, for a runtime task of a
+//! graph -- or leaves it on the node to be dropped with it, for a free silent
+//! one whose chain roots at the sentinel.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
@@ -74,7 +80,7 @@ use crate::Runtime;
 use crate::executor::Executor;
 use crate::executor::r#async::{AsyncHandle, Spawn, Submission};
 use crate::executor::run_handle::RunError;
-use crate::executor::topology::Job;
+use crate::executor::topology::{Cancellable, Job};
 use crate::executor::worker::{Release, Worker, WorkerThread, is_entered};
 use crate::graph::{AsyncWork, Node, OnceWork, RuntimeWork, Task};
 
@@ -196,8 +202,31 @@ fn enter(
     // Upstream's two `_nstate &= ~(PREEMPTED | IMPLICITLY_ANCHORED)` sites,
     // which are the same line twice: the first entry that found itself last
     // clears the bits it set, and the second entry clears the ones the first
-    // one left behind.
+    // one left behind. It is also the one exit this node has from being an
+    // implicit anchor, which is what the forward below is about.
     node.nstate().fetch_and(!ENTERED, Ordering::Relaxed);
+
+    // A payload nobody came for goes on up: the walk is asked again from a
+    // node that has stopped being an anchor, which delivers it to the
+    // enclosing anchor or to the run -- and back to this node for the one
+    // shape that is an anchor for life, the handle-returning async form,
+    // whose finishing entry hands it to the handle. *After* the bits come
+    // off, which is why it is not two lines earlier: a walk that still found
+    // this node implicitly anchored would hand the payload straight back.
+    //
+    // `CAUGHT` before the lock, which is `set_up_graph`'s trick in
+    // `executor::topology`: a slot is only ever filled by a claimant that set
+    // that bit first, so a runtime task that failed at nothing pays a load
+    // rather than a mutex. Relaxed because the bit was published before the
+    // decrement this frame has already observed -- the `AcqRel` `fetch_sub`
+    // above on the first entry, the queue the resumed job came out of on the
+    // second.
+    if node.base().estate().load(Ordering::Relaxed) & Cancellable::CAUGHT != 0
+        && let Some(payload) = node.base().take_panic()
+    {
+        job.record_panic(payload);
+    }
+
     Some(Release::Strong)
 }
 
@@ -434,12 +463,15 @@ impl Runtime<'_> {
     /// floored decrement and the refused release [`Runtime::schedule`] points
     /// at.
     ///
-    /// The node is explicitly anchored for the length of the wait, which is
-    /// what makes a failure under it *this frame's*: the walk stops at the
-    /// first explicit anchor it meets, so the payload is handed to the thread
-    /// that is about to look for it rather than to the run. Taking it clears
-    /// the node's slot, as upstream's `_rethrow_exception` does, so a second
-    /// corun of the same body starts clean.
+    /// What makes a failure under this node *this frame's* is the node being
+    /// an anchor for the whole time it is entered, which is from before the
+    /// body ran: a child that fails before this call is reached delivers to
+    /// the same slot this call reads, and `DESIGN.md` has why the port puts
+    /// that ahead of the run where upstream does not. The explicit anchor
+    /// taken for the length of the wait is what gives a frame blocked *now*
+    /// priority over an implicit anchor nested under it. Taking the payload
+    /// clears the node's slot, as upstream's `_rethrow_exception` does, so a
+    /// second corun of the same body starts clean.
     ///
     /// # Errors
     ///

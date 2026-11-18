@@ -120,18 +120,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rustflow::prelude::*;
 use rustflow::{AsyncHandle, CorunError, Executor, JoinError, RunError, Semaphore};
 
-// All three topics: the matrix macro, the counting the cases assert on, and
-// the counting body most of them attach. The `AtomicBool` flags below are
-// not counters and stay where they are.
+// Four topics: the matrix macro, the counting the cases assert on, the
+// counting body most of them attach, and the one handshake in the file --
+// `RuntimeAsync`'s fourth phase, which waits for a child to finish. The
+// `AtomicBool` flags below are not counters and stay where they are.
 #[macro_use]
 mod common;
 #[path = "common/bodies.rs"]
 mod bodies;
 #[path = "common/counters.rs"]
 mod counters;
+#[path = "common/spin.rs"]
+mod spin;
 
 use bodies::bump;
 use counters::{Counter, count, counter};
+use spin::spin_until;
 
 /// Which handle kind the six tasks of a chain are built with.
 ///
@@ -1557,6 +1561,13 @@ worker_matrix! {
 ///   the body unwinds, and the payload is the run's -- so the successor never
 ///   runs and the flag stays at zero.
 ///
+/// A fourth phase is this port's own: the second one with the order between
+/// the child and the corun forced the other way round, the body waiting for
+/// the child to *finish* and only then coruning. The payload is still the
+/// corun's. A corun-first body and a children-first body have to agree about
+/// where a silent child's failure goes, or the delivery is a race that the
+/// second phase samples rather than checks.
+///
 /// Two adaptations, and the second is the one that changes a line rather than
 /// its spelling:
 ///
@@ -1566,11 +1577,17 @@ worker_matrix! {
 ///   case in the file that does not start at one;
 /// - upstream's third phase sleeps a second before its bare `corun` so that
 ///   the silent child has certainly failed by the time the corun looks. No
-///   sleep is needed here and none is used: the child's payload is recorded
-///   by `Job::record_panic` *before* its job releases the parent count the
-///   corun is waiting on, so a corun that has observed the counter has
-///   already observed the payload. The sleep would only make the case a
-///   second slower per worker count.
+///   sleep is needed here and none is used, and what makes that true is the
+///   *destination* rather than the visibility a sleep looks like it is
+///   buying. Visibility is never in question: a child's payload is recorded
+///   by `Job::record_panic` before its job releases the parent count the
+///   corun waits on, so a corun that has observed the counter has observed
+///   the payload. What a sleep would be covering is which anchor the payload
+///   was recorded *on*, and an entered runtime node is an anchor from before
+///   its body ran until after the last child has been counted off -- so a
+///   child that fails before the corun is reached delivers to the same slot
+///   as one that fails during it, which is the fourth phase's whole claim.
+///   Sleeping would only make the case a second slower per worker count.
 fn runtime_async_task(workers: usize) {
     let context = format!("{workers} worker(s)");
     let executor = Executor::new(workers);
@@ -1672,6 +1689,47 @@ fn runtime_async_task(workers: usize) {
         count(&flag),
         0,
         "{context}: neither the rest of the failing body nor its successor ran"
+    );
+
+    // This port's own fourth phase: the second one with the order between the
+    // child and the corun forced the other way round. The child is a
+    // dependent-async one so that the body's wait is a handshake rather than a
+    // margin -- `FINISHED` is set after the walk that delivers the payload, so
+    // a corun entered once `is_done` answers `true` is entered against a
+    // failure that has already been delivered somewhere, and the only question
+    // left is where it went.
+    flag.store(0, Ordering::Relaxed);
+    taskflow.clear();
+    let waited = taskflow.emplace_runtime({
+        let context = context.clone();
+        let flag = Arc::clone(&flag);
+        move |runtime: &mut Runtime<'_>| {
+            let child = runtime.silent_dependent_async(|| panic!("a"), []);
+            spin_until("the silent child to finish", || child.is_done());
+
+            let error = runtime
+                .try_corun()
+                .expect_err("a child that failed first still reports here");
+            assert_failed_with(&error, "a", &context);
+            flag.store(1, Ordering::Relaxed);
+        }
+    });
+    let after_waited = taskflow.emplace({
+        let flag = Arc::clone(&flag);
+        move || {
+            flag.store(2, Ordering::Relaxed);
+        }
+    });
+    taskflow.task(waited).precede([after_waited]);
+
+    executor
+        .run(&taskflow)
+        .wait()
+        .expect("the runtime body caught the child it had waited for");
+    assert_eq!(
+        count(&flag),
+        2,
+        "{context}: the successor of a body that caught its child ran"
     );
 }
 

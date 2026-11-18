@@ -936,11 +936,16 @@ mod tests {
 
     /// The second: with no explicit anchor anywhere on the chain, the
     /// innermost `IMPLICITLY_ANCHORED` base gets the payload -- the one
-    /// closest to the failure, not the outermost.
+    /// closest to the failure, not the outermost, and not the run the chain
+    /// roots at either.
     ///
-    /// The chain has to end without a run for this case to be reachable at
-    /// all, because a run is an anchor by definition; a parent with nothing
-    /// above it is a corun anchor's shape, which is what this builds.
+    /// Two chains, because the root is the half of this that `DESIGN.md`'s
+    /// priority is about and upstream answers the other way. The first ends
+    /// at a parent with nothing above it, which is a corun anchor's shape;
+    /// the second at a real run, which is the shape a graph makes whenever a
+    /// runtime task's body spawns children. The answer has to be the same
+    /// chain in both, or where a child's failure lands depends on which side
+    /// of it finished first.
     #[test]
     fn a_failure_with_no_explicit_anchor_goes_to_the_innermost_implicit_one() {
         let unanchored = Nested::new(None);
@@ -966,6 +971,38 @@ mod tests {
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
         assert!(chain.base(chain.root).take_panic().is_none());
         assert!(!chain.topology.cancelled());
+
+        // The same shape rooted at a real run. The run is waiting for the
+        // whole chain, but the frame that means to read its slot when it is
+        // resumed is closer to the failure, so the run is left with nothing
+        // to report -- which is what lets a runtime body collect its own
+        // child's failure and go on.
+        let rooted = Chain::new(1, &Parent::Run);
+        for task in [rooted.root, rooted.middle] {
+            rooted
+                .base(task)
+                .nstate()
+                .fetch_or(Node::IMPLICITLY_ANCHORED, Ordering::Relaxed);
+        }
+
+        rooted.jobs[0].record_panic(Box::new("boom"));
+
+        assert!(
+            rooted.caught(rooted.middle),
+            "the inner anchor did not catch"
+        );
+        assert!(!rooted.caught(rooted.root), "the outer anchor caught it");
+        let payload = rooted
+            .base(rooted.middle)
+            .take_panic()
+            .expect("the inner anchor has the payload");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
+        assert!(
+            !rooted.topology.cancelled(),
+            "the run outranked the anchor below it"
+        );
+        rooted.topology.finish();
+        assert!(rooted.topology.join().is_none(), "and took no payload");
     }
 
     /// The third: two failures under one anchor keep the first, which is the
