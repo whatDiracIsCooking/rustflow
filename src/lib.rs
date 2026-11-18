@@ -70,10 +70,22 @@
 //! task that cannot have every count it asked for is parked rather than run,
 //! to be rescheduled by whoever releases.
 //!
+//! # Status
+//!
+//! Steps 1 to 5 of the README's "Order of work" are in: everything above is
+//! built and tested against the upstream unit tests it was translated from.
+//! The consolidation milestone that ran next changed nothing a caller can
+//! see and three things a reader of the source meets -- the 24 public methods
+//! of the async family are one-line delegations onto a single core on the
+//! executor's shared state, the run's machinery is the `executor::topology`
+//! module tree rather than one file, and every doc comment in the crate is
+//! held to the documentation contract in `DESIGN.md`. Steps 6 and 7 --
+//! observers and algorithms, then pipelines -- are not started.
+//!
 //! The crate's only `unsafe` blocks are in
 //! [`notifier`](executor::notifier), in the lock-free waiter stack.
-//! `DESIGN.md` is why the port is shaped the way it is, and the README's
-//! "Order of work" section is what is still out.
+//! `DESIGN.md` is why the port is shaped the way it is, and its "Decisions
+//! taken in M6" section is the consolidation's record.
 //!
 //! The port follows **Taskflow v4.1.0** (commit `45366fe5`, 2026-06-19). See
 //! the README's "Upstream pin" section before translating anything.
