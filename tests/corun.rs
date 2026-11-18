@@ -2,8 +2,8 @@
 //!
 //! Upstream's case is three levels deep. A taskflow `C` whose second task runs
 //! a taskflow `B`, whose second task runs a taskflow `A`, every task bumping
-//! one shared counter -- 220200 bumps by the end, at one through sixteen
-//! workers. Two adaptations, and the first one is the reason this file exists:
+//! one shared counter, at one through sixteen workers. Three adaptations, and
+//! the first one is the reason this file exists:
 //!
 //! - **Upstream gives each level its own executor; here all three share one.**
 //!   Upstream's `A`, `B` and `C` each hold a `tf::Executor`, so its nested
@@ -17,6 +17,20 @@
 //! - **`run_n` is a later issue**, so `run_n(taskflow, n)` is spelled as `n`
 //!   runs of the same taskflow -- which is what it is: each run of a taskflow
 //!   finishes before the next one starts.
+//! - **The two outer levels run 40 times where upstream's run 100.**
+//!   Upstream's 10/100/100 is 110100 nested runs of a two-task graph, which a
+//!   C++ release build gets through in a moment and a debug build of this
+//!   port does not: it was most of this suite's wall clock, nearly all of it
+//!   in the 8- and 16-worker cases, where the cost is the executor's own
+//!   notify-and-steal machinery per topology rather than the 220200 bumps.
+//!   What the case checks is the arithmetic of nesting -- three levels, every
+//!   body run, every topology accounted for -- and no part of that depends on
+//!   how many times the outer two levels repeat; what repetition buys is
+//!   stress on the corun path, and 10/40/40 still nests 17640 runs per worker
+//!   count, with the one corun race this file knows of covered by
+//!   [`a_coruned_taskflow_is_editable_the_instant_corun_returns`] below, which
+//!   contends twelve executors rather than repeating one. The expected bump
+//!   count stays derived from the three levels the same way upstream's is.
 //!
 //! The counter is an `AtomicUsize` where upstream's is an `int&`. Upstream can
 //! get away with the plain `int` because its chains serialise every task that
@@ -76,7 +90,7 @@ fn run_a(executor: &Arc<Executor>, counter: &Arc<AtomicUsize>) {
 }
 
 /// Upstream's `B::run`: a two-task chain whose second task is a whole run of
-/// `A`, a hundred runs, 100 * (2 + 20) = 2200 bumps.
+/// `A`, forty runs, 40 * (2 + 20) = 880 bumps.
 fn run_b(executor: &Arc<Executor>, counter: &Arc<AtomicUsize>) {
     let mut taskflow = Taskflow::new();
     let b1 = taskflow.emplace(bump(counter));
@@ -91,11 +105,11 @@ fn run_b(executor: &Arc<Executor>, counter: &Arc<AtomicUsize>) {
     });
     taskflow.task(b1).precede([b2]);
 
-    run_n(executor, &taskflow, 100);
+    run_n(executor, &taskflow, 40);
 }
 
-/// Upstream's `C::run`: the same shape again over `B`, a hundred runs,
-/// 100 * (2 + 2200) = 220200 bumps.
+/// Upstream's `C::run`: the same shape again over `B`, forty runs,
+/// 40 * (2 + 880) = 35280 bumps.
 fn run_c(executor: &Arc<Executor>, counter: &Arc<AtomicUsize>) {
     let mut taskflow = Taskflow::new();
     let c1 = taskflow.emplace(bump(counter));
@@ -110,7 +124,7 @@ fn run_c(executor: &Arc<Executor>, counter: &Arc<AtomicUsize>) {
     });
     taskflow.task(c1).precede([c2]);
 
-    run_n(executor, &taskflow, 100);
+    run_n(executor, &taskflow, 40);
 }
 
 /// Upstream's `nested_runs(unsigned w)`.
@@ -118,15 +132,15 @@ fn nested_runs(workers: usize) {
     let executor = Arc::new(Executor::new(workers));
     let counter = Arc::new(AtomicUsize::new(0));
 
-    // What this family costs is iteration rather than waiting: the 10/100/100
-    // fan-out above is upstream's own, and it is 110100 nested runs of a
-    // two-task graph -- 220200 bodies, and a topology set up, coruned and torn
-    // down for each run -- with no sleep anywhere in it.
+    // What this family costs is iteration rather than waiting: the 10/40/40
+    // nesting above is 17640 nested runs of a two-task graph -- 35280 bodies,
+    // and a topology set up, coruned and torn down for each run -- with no
+    // sleep anywhere in it.
     run_c(&executor, &counter);
 
-    assert_eq!(counter.load(Ordering::Relaxed), 220_200);
+    assert_eq!(counter.load(Ordering::Relaxed), 35_280);
 
-    // Every one of those 110100 runs is accounted for, the inner ones
+    // Every one of those 17640 runs is accounted for, the inner ones
     // included: a `corun` counts its topology the way `run` does, so a leak
     // here would show up as a `wait_for_all` that never returns.
     executor.wait_for_all();

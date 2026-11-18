@@ -11,7 +11,7 @@
 //! are the model: every adaptation their own module docs state -- `Arc`s for
 //! upstream's by-reference captures, no in-graph "test" task, a fixed-seed
 //! generator standing in for an unseeded `rand()` -- applies here too, plus
-//! two specific to this file:
+//! three specific to this file:
 //!
 //! - **`Three.Parallel.DataPipelines` and `Three.Concatenated.DataPipelines`
 //!   do not share one pipeline builder the way `tests/pipelines_compose.rs`'s
@@ -38,6 +38,17 @@
 //!   which outer token it belongs to, the same simplification
 //!   `tests/pipelines_nested.rs`'s own `partial_sum` makes -- so every
 //!   sub-pipe checks the sub-pipeline's own index consistently instead.
+//! - **The token sweep of the two `Three.*` families is subsampled**, for
+//!   the reason `tests/pipelines_compose.rs`'s own module docs give at
+//!   length: a round's work grows with its token count, every fill shape
+//!   upstream's `0..=maxN` holds is settled by the counts up to two full
+//!   passes over the widest line count swept, and so [`token_sweep`] runs
+//!   every count up to 18 and then every tenth up to [`MAX_N`] -- 28 of the
+//!   101, upstream's own largest among them. The three other families here
+//!   keep the whole of their own sweeps: `Looping.DataPipelines` counts
+//!   rounds rather than tokens, and `Ifelse.DataPipelines` and
+//!   `PipelineinPipeline.DataPipelines` sweep ranges of their own that cost
+//!   well under a tenth of what the two families above did.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -71,6 +82,16 @@ use serialized::serialized;
 // `MAX_N` is the sweep for every family here but `Ifelse.DataPipelines` and
 // `PipelineinPipeline.DataPipelines`, which each sweep a range of their own.
 use tokens::{MAX_N, assert_consecutive_from};
+
+/// The token counts a round of the two three-pipeline families runs: every
+/// count up to twice the widest line sweep (`2 * 8 + 2`), then every tenth
+/// up to [`MAX_N`], which is the last count upstream sweeps.
+///
+/// The module docs above say why this is a subsample of upstream's own
+/// `0..=maxN` where every other sweep in this file is not.
+fn token_sweep() -> impl Iterator<Item = usize> {
+    (0..=18).chain((20..=MAX_N).step_by(10))
+}
 
 // ----------------------------------------------------------------------------
 // Three.Parallel.DataPipelines / Three.Concatenated.DataPipelines
@@ -318,7 +339,7 @@ fn three_parallel_data_pipelines(num_lines: usize, num_workers: usize) {
     serialized(|| {
         let executor = Executor::new(num_workers);
 
-        for n in 0..=MAX_N {
+        for n in token_sweep() {
             let mut taskflow = Taskflow::new();
             let (pl1, module1, [j1_1, j1_2, j1_3, j1_4]) =
                 build_pl1_int(&mut taskflow, num_lines, n);
@@ -433,7 +454,7 @@ fn three_concatenated_data_pipelines(num_lines: usize, num_workers: usize) {
     serialized(|| {
         let executor = Executor::new(num_workers);
 
-        for n in 0..=MAX_N {
+        for n in token_sweep() {
             let mut taskflow = Taskflow::new();
             let (pl1, module1, [j1_1, j1_2, j1_3, j1_4]) =
                 build_pl1_string_roundtrip(&mut taskflow, num_lines, n);
