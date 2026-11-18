@@ -40,6 +40,22 @@ use std::time::{Duration, Instant};
 use rustflow::prelude::*;
 use rustflow::{Executor, Node, RunError, RunHandle, TaskType};
 
+// The topics this file calls every item of: the matrix macro, the counting
+// body its `emplace` calls attach, and the spin its two leaked-handle cases
+// wait on. `common/counters.rs` is deliberately not among them -- some of the
+// counters here are read with `SeqCst` where `count` reads `Relaxed`, so it
+// would fit some of these assertions and not others, and a topic file pulled
+// for part of itself is the dead code `common`'s own docs are about.
+#[macro_use]
+mod common;
+#[path = "common/bodies.rs"]
+mod bodies;
+#[path = "common/spin.rs"]
+mod spin;
+
+use bodies::bump;
+use spin::spin_until;
+
 /// Adds a placeholder task, upstream's `taskflow.placeholder()`.
 fn placeholder(taskflow: &mut Taskflow, name: &str) -> Task {
     taskflow
@@ -631,18 +647,8 @@ fn run_and_wait_simple() {
     // The taskflow the main one runs: `A -> B`, each bumping the counter.
     let others = Arc::new({
         let mut others = Taskflow::new();
-        let a = {
-            let counter = Arc::clone(&counter);
-            emplace(&mut others, move || {
-                counter.fetch_add(1, Ordering::Relaxed);
-            })
-        };
-        let b = {
-            let counter = Arc::clone(&counter);
-            emplace(&mut others, move || {
-                counter.fetch_add(1, Ordering::Relaxed);
-            })
-        };
+        let a = emplace(&mut others, bump(&counter));
+        let b = emplace(&mut others, bump(&counter));
         others.task(a).precede([b]);
         others
     });
@@ -692,10 +698,7 @@ fn run_and_wait_complex() {
         .map(|_| {
             let mut taskflow = Taskflow::new();
             for _ in 0..T {
-                let counter = Arc::clone(&counter);
-                emplace(&mut taskflow, move || {
-                    counter.fetch_add(1, Ordering::Relaxed);
-                });
+                emplace(&mut taskflow, bump(&counter));
             }
             taskflow
         })
@@ -810,10 +813,7 @@ fn sequential_runs(workers: usize) {
 
     let mut taskflow = Taskflow::new();
     for _ in 0..NUM_TASKS {
-        let counter = Arc::clone(&counter);
-        emplace(&mut taskflow, move || {
-            counter.fetch_add(1, Ordering::Relaxed);
-        });
+        emplace(&mut taskflow, bump(&counter));
     }
 
     // SUBCASE("RunOnce")
@@ -885,44 +885,17 @@ fn sequential_runs(workers: usize) {
     assert_eq!(executor.num_topologies(), 0);
 }
 
-#[test]
-fn serial_runs_1_thread() {
-    sequential_runs(1);
-}
-
-#[test]
-fn serial_runs_2_threads() {
-    sequential_runs(2);
-}
-
-#[test]
-fn serial_runs_3_threads() {
-    sequential_runs(3);
-}
-
-#[test]
-fn serial_runs_4_threads() {
-    sequential_runs(4);
-}
-
-#[test]
-fn serial_runs_5_threads() {
-    sequential_runs(5);
-}
-
-#[test]
-fn serial_runs_6_threads() {
-    sequential_runs(6);
-}
-
-#[test]
-fn serial_runs_7_threads() {
-    sequential_runs(7);
-}
-
-#[test]
-fn serial_runs_8_threads() {
-    sequential_runs(8);
+worker_matrix! {
+    sequential_runs {
+        serial_runs_1_thread(1),
+        serial_runs_2_threads(2),
+        serial_runs_3_threads(3),
+        serial_runs_4_threads(4),
+        serial_runs_5_threads(5),
+        serial_runs_6_threads(6),
+        serial_runs_7_threads(7),
+        serial_runs_8_threads(8),
+    }
 }
 
 // --------------------------------------------------------
@@ -945,12 +918,6 @@ fn parallel_runs(workers: usize) {
     let make_taskflow = |counter: &Arc<AtomicUsize>| {
         let mut taskflow = Taskflow::new();
         for _ in 0..PAIRS {
-            let bump = |counter: &Arc<AtomicUsize>| {
-                let counter = Arc::clone(counter);
-                move || {
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }
-            };
             let (a, b) = taskflow.emplace_n((bump(counter), bump(counter)));
             taskflow.task(a).precede([b]);
         }
@@ -1011,44 +978,17 @@ fn parallel_runs(workers: usize) {
     }
 }
 
-#[test]
-fn parallel_runs_1_thread() {
-    parallel_runs(1);
-}
-
-#[test]
-fn parallel_runs_2_threads() {
-    parallel_runs(2);
-}
-
-#[test]
-fn parallel_runs_3_threads() {
-    parallel_runs(3);
-}
-
-#[test]
-fn parallel_runs_4_threads() {
-    parallel_runs(4);
-}
-
-#[test]
-fn parallel_runs_5_threads() {
-    parallel_runs(5);
-}
-
-#[test]
-fn parallel_runs_6_threads() {
-    parallel_runs(6);
-}
-
-#[test]
-fn parallel_runs_7_threads() {
-    parallel_runs(7);
-}
-
-#[test]
-fn parallel_runs_8_threads() {
-    parallel_runs(8);
+worker_matrix! {
+    parallel_runs {
+        parallel_runs_1_thread(1),
+        parallel_runs_2_threads(2),
+        parallel_runs_3_threads(3),
+        parallel_runs_4_threads(4),
+        parallel_runs_5_threads(5),
+        parallel_runs_6_threads(6),
+        parallel_runs_7_threads(7),
+        parallel_runs_8_threads(8),
+    }
 }
 
 // --------------------------------------------------------
@@ -1097,44 +1037,17 @@ fn worker_id(workers: usize) {
         .expect("a task reported a bad worker id");
 }
 
-#[test]
-fn worker_id_1_thread() {
-    worker_id(1);
-}
-
-#[test]
-fn worker_id_2_threads() {
-    worker_id(2);
-}
-
-#[test]
-fn worker_id_3_threads() {
-    worker_id(3);
-}
-
-#[test]
-fn worker_id_4_threads() {
-    worker_id(4);
-}
-
-#[test]
-fn worker_id_5_threads() {
-    worker_id(5);
-}
-
-#[test]
-fn worker_id_6_threads() {
-    worker_id(6);
-}
-
-#[test]
-fn worker_id_7_threads() {
-    worker_id(7);
-}
-
-#[test]
-fn worker_id_8_threads() {
-    worker_id(8);
+worker_matrix! {
+    worker_id {
+        worker_id_1_thread(1),
+        worker_id_2_threads(2),
+        worker_id_3_threads(3),
+        worker_id_4_threads(4),
+        worker_id_5_threads(5),
+        worker_id_6_threads(6),
+        worker_id_7_threads(7),
+        worker_id_8_threads(8),
+    }
 }
 
 // --------------------------------------------------------
@@ -1148,12 +1061,6 @@ fn worker_id_8_threads() {
 /// A graph of three tasks, each bumping `counter` once per run.
 fn counting_chain(counter: &Arc<AtomicUsize>) -> Taskflow {
     let mut taskflow = Taskflow::new();
-    let bump = |counter: &Arc<AtomicUsize>| {
-        let counter = Arc::clone(counter);
-        move || {
-            counter.fetch_add(1, Ordering::Relaxed);
-        }
-    };
     let (a, b, c) = taskflow.emplace_n((bump(counter), bump(counter), bump(counter)));
     taskflow.linearize([a, b, c]);
     taskflow
@@ -1456,10 +1363,7 @@ fn a_panicking_task_is_reported_and_cancels_what_had_not_started() {
     let mut after = Taskflow::new();
     let counter = Arc::new(AtomicUsize::new(0));
     for _ in 0..NUM_TASKS {
-        let counter = Arc::clone(&counter);
-        emplace(&mut after, move || {
-            counter.fetch_add(1, Ordering::Relaxed);
-        });
+        emplace(&mut after, bump(&counter));
     }
     executor
         .run(&after)
@@ -1479,18 +1383,13 @@ fn a_panicking_task_is_reported_and_cancels_what_had_not_started() {
 /// one starts in the loop below.
 fn diamond_chain(counter: &Arc<AtomicUsize>) -> Taskflow {
     let mut taskflow = Taskflow::new();
-    let bump = |taskflow: &mut Taskflow| {
-        let counter = Arc::clone(counter);
-        emplace(taskflow, move || {
-            counter.fetch_add(1, Ordering::Relaxed);
-        })
-    };
+    let counting_task = |taskflow: &mut Taskflow| emplace(taskflow, bump(counter));
 
-    let mut previous = bump(&mut taskflow);
+    let mut previous = counting_task(&mut taskflow);
     while taskflow.num_tasks() + 3 <= NUM_TASKS {
-        let left = bump(&mut taskflow);
-        let right = bump(&mut taskflow);
-        let join = bump(&mut taskflow);
+        let left = counting_task(&mut taskflow);
+        let right = counting_task(&mut taskflow);
+        let join = counting_task(&mut taskflow);
         taskflow.task(previous).precede([left, right]);
         taskflow.task(join).succeed([left, right]);
         previous = join;
@@ -1537,18 +1436,26 @@ fn a_thousand_runs_of_a_diamond_chain() {
 /// early would turn a slow machine into a failure.
 const GIVE_UP_AFTER: Duration = Duration::from_secs(10);
 
-/// Spins until `flag` is set, or until [`GIVE_UP_AFTER`] has passed.
+/// Waits until `flag` is set, or until [`GIVE_UP_AFTER`] has passed.
 ///
 /// A spin rather than a condvar because one end of every use of it is a task
 /// body: a worker that parked would be a worker not running the rest of the
 /// run, and these cases are about what the pool does while a run is in
 /// flight. Bounded, so that nothing here can hang a test binary -- including
 /// when the thread that would have set the flag is unwinding.
-fn spin_until(flag: &AtomicBool) {
-    let start = Instant::now();
-    while !flag.load(Ordering::Acquire) && start.elapsed() < GIVE_UP_AFTER {
-        std::hint::spin_loop();
-    }
+///
+/// [`spin_until`] with this file's own give-up folded into the predicate,
+/// which is the one part of it that cannot come from the shared spin: that
+/// one *fails* on its deadline, and a failure raised from inside a task body
+/// here would be a panic thrown during the very unwind the case below is
+/// about, in place of the assertions after the wait that are this file's
+/// diagnostic. The shared deadline is therefore never reached, and the
+/// message says what the wait was for in case a later edit drops the bound.
+fn wait_or_give_up(flag: &AtomicBool) {
+    let deadline = Instant::now() + GIVE_UP_AFTER;
+    spin_until("a flag the pool should have set", || {
+        flag.load(Ordering::Acquire) || Instant::now() >= deadline
+    });
 }
 
 /// Sets a flag when it is dropped, including during an unwind.
@@ -1594,13 +1501,13 @@ fn a_leaked_handle_leaks_rather_than_freeing_a_graph_under_the_pool() {
             // main thread below: that is what makes the overlap this case is
             // about a certainty rather than a race won on most machines.
             running.store(true, Ordering::Release);
-            spin_until(&released);
+            wait_or_give_up(&released);
             counter.fetch_add(1, Ordering::Relaxed);
         });
     }
 
     mem::forget(executor.run(&taskflow));
-    spin_until(&running);
+    wait_or_give_up(&running);
 
     // Both of the things the borrow was there to prevent, with the run
     // provably in flight: the taskflow is moved out of, which no job notices
@@ -1647,12 +1554,12 @@ fn editing_a_taskflow_whose_handle_was_leaked_panics_rather_than_racing() {
         let released = Arc::clone(&released);
         move || {
             running.store(true, Ordering::Release);
-            spin_until(&released);
+            wait_or_give_up(&released);
         }
     });
 
     mem::forget(executor.run(&taskflow));
-    spin_until(&running);
+    wait_or_give_up(&running);
 
     let _release = ReleaseOnDrop(Arc::clone(&released));
     taskflow.emplace(|| {});
@@ -1678,10 +1585,7 @@ fn a_taskflow_is_editable_the_instant_its_run_reports_done() {
 
         let mut taskflow = Taskflow::new();
         for _ in 0..8 {
-            let counter = Arc::clone(&counter);
-            taskflow.emplace(move || {
-                counter.fetch_add(1, Ordering::Relaxed);
-            });
+            taskflow.emplace(bump(&counter));
         }
 
         for round in 0..ROUNDS {
@@ -1692,10 +1596,7 @@ fn a_taskflow_is_editable_the_instant_its_run_reports_done() {
             taskflow.clear();
             assert_eq!(taskflow.num_tasks(), 0, "round {round} at {workers}w");
 
-            let counter = Arc::clone(&counter);
-            taskflow.emplace(move || {
-                counter.fetch_add(1, Ordering::Relaxed);
-            });
+            taskflow.emplace(bump(&counter));
         }
 
         // Eight tasks for the first run, then one per round after it.

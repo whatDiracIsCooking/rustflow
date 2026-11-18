@@ -70,6 +70,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use rustflow::prelude::*;
 use rustflow::{Executor, RunHandle, Semaphore};
 
+// The matrix macro, and the counting this file's cases are built on. Not
+// `common/bodies.rs`: every body here raises and lowers the gauge around its
+// increment, so `bump` would be a helper compiled and never called.
+#[macro_use]
+mod common;
+#[path = "common/counters.rs"]
+mod counters;
+
+use counters::{count, counter};
+
 // ----------------------------------------------------------------------------
 // What a counter cannot say
 // ----------------------------------------------------------------------------
@@ -117,20 +127,6 @@ impl Gauge {
     fn high_water(&self) -> usize {
         self.high_water.load(Ordering::Relaxed)
     }
-}
-
-/// A counter the task bodies share, as every case here counts: an atomic
-/// rather than upstream's plain integer, which the module docs explain.
-type Counter = Arc<AtomicUsize>;
-
-/// A counter at zero.
-fn counter() -> Counter {
-    Arc::new(AtomicUsize::new(0))
-}
-
-/// How many times the bodies have run.
-fn count(counter: &Counter) -> usize {
-    counter.load(Ordering::Relaxed)
 }
 
 // ----------------------------------------------------------------------------
@@ -193,34 +189,15 @@ fn critical_section(workers: usize) {
     assert_eq!(semaphore.max_value(), 1);
 }
 
-#[test]
-fn critical_section_1_worker() {
-    critical_section(1);
-}
-
-#[test]
-fn critical_section_2_workers() {
-    critical_section(2);
-}
-
-#[test]
-fn critical_section_3_workers() {
-    critical_section(3);
-}
-
-#[test]
-fn critical_section_7_workers() {
-    critical_section(7);
-}
-
-#[test]
-fn critical_section_11_workers() {
-    critical_section(11);
-}
-
-#[test]
-fn critical_section_16_workers() {
-    critical_section(16);
+worker_matrix! {
+    critical_section {
+        critical_section_1_worker(1),
+        critical_section_2_workers(2),
+        critical_section_3_workers(3),
+        critical_section_7_workers(7),
+        critical_section_11_workers(11),
+        critical_section_16_workers(16),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -279,24 +256,13 @@ fn overlapped_semaphores(workers: usize) {
     assert_eq!(semaphore4.value(), 4, "{workers} workers");
 }
 
-#[test]
-fn overlap_1_worker() {
-    overlapped_semaphores(1);
-}
-
-#[test]
-fn overlap_2_workers() {
-    overlapped_semaphores(2);
-}
-
-#[test]
-fn overlap_4_workers() {
-    overlapped_semaphores(4);
-}
-
-#[test]
-fn overlap_8_workers() {
-    overlapped_semaphores(8);
+worker_matrix! {
+    overlapped_semaphores {
+        overlap_1_worker(1),
+        overlap_2_workers(2),
+        overlap_4_workers(4),
+        overlap_8_workers(8),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -417,24 +383,13 @@ fn conflict_graph(workers: usize) {
     assert_eq!(conflict_ac.value(), 1, "{workers} workers");
 }
 
-#[test]
-fn conflict_graph_1_worker() {
-    conflict_graph(1);
-}
-
-#[test]
-fn conflict_graph_2_workers() {
-    conflict_graph(2);
-}
-
-#[test]
-fn conflict_graph_3_workers() {
-    conflict_graph(3);
-}
-
-#[test]
-fn conflict_graph_4_workers() {
-    conflict_graph(4);
+worker_matrix! {
+    conflict_graph {
+        conflict_graph_1_worker(1),
+        conflict_graph_2_workers(2),
+        conflict_graph_3_workers(3),
+        conflict_graph_4_workers(4),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -504,24 +459,13 @@ fn semaphore_in_module(workers: usize) {
     );
 }
 
-#[test]
-fn module_1_worker() {
-    semaphore_in_module(1);
-}
-
-#[test]
-fn module_2_workers() {
-    semaphore_in_module(2);
-}
-
-#[test]
-fn module_3_workers() {
-    semaphore_in_module(3);
-}
-
-#[test]
-fn module_4_workers() {
-    semaphore_in_module(4);
+worker_matrix! {
+    semaphore_in_module {
+        module_1_worker(1),
+        module_2_workers(2),
+        module_3_workers(3),
+        module_4_workers(4),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -599,44 +543,17 @@ fn semaphores_in_module(workers: usize) {
     }
 }
 
-#[test]
-fn modules_1_worker() {
-    semaphores_in_module(1);
-}
-
-#[test]
-fn modules_2_workers() {
-    semaphores_in_module(2);
-}
-
-#[test]
-fn modules_3_workers() {
-    semaphores_in_module(3);
-}
-
-#[test]
-fn modules_4_workers() {
-    semaphores_in_module(4);
-}
-
-#[test]
-fn modules_5_workers() {
-    semaphores_in_module(5);
-}
-
-#[test]
-fn modules_6_workers() {
-    semaphores_in_module(6);
-}
-
-#[test]
-fn modules_7_workers() {
-    semaphores_in_module(7);
-}
-
-#[test]
-fn modules_8_workers() {
-    semaphores_in_module(8);
+worker_matrix! {
+    semaphores_in_module {
+        modules_1_worker(1),
+        modules_2_workers(2),
+        modules_3_workers(3),
+        modules_4_workers(4),
+        modules_5_workers(5),
+        modules_6_workers(6),
+        modules_7_workers(7),
+        modules_8_workers(8),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -706,42 +623,15 @@ fn linear_chain(workers: usize) {
     }
 }
 
-#[test]
-fn linear_chain_1_worker() {
-    linear_chain(1);
-}
-
-#[test]
-fn linear_chain_2_workers() {
-    linear_chain(2);
-}
-
-#[test]
-fn linear_chain_3_workers() {
-    linear_chain(3);
-}
-
-#[test]
-fn linear_chain_4_workers() {
-    linear_chain(4);
-}
-
-#[test]
-fn linear_chain_5_workers() {
-    linear_chain(5);
-}
-
-#[test]
-fn linear_chain_6_workers() {
-    linear_chain(6);
-}
-
-#[test]
-fn linear_chain_7_workers() {
-    linear_chain(7);
-}
-
-#[test]
-fn linear_chain_8_workers() {
-    linear_chain(8);
+worker_matrix! {
+    linear_chain {
+        linear_chain_1_worker(1),
+        linear_chain_2_workers(2),
+        linear_chain_3_workers(3),
+        linear_chain_4_workers(4),
+        linear_chain_5_workers(5),
+        linear_chain_6_workers(6),
+        linear_chain_7_workers(7),
+        linear_chain_8_workers(8),
+    }
 }
