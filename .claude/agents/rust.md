@@ -128,6 +128,43 @@ would force `unsafe`, say so in the summary and propose the safe shape.
 Rough order of the work overall: static graph -> executor -> control flow
 (conditional/module tasks, subflows) -> the rest.
 
+## What a doc comment says, and what it does not
+
+The crate's docs are held to a contract, repeated in one paragraph at the top
+of `DESIGN.md` so a reader of the repo meets it too. It is a rule about where
+each kind of sentence goes, which is what keeps the same explanation from
+landing in four places:
+
+- **An item doc (`///`)** states what the item is, the upstream name it
+  translates (upstream's `Topology::_join_counter`), and any invariant a
+  caller must keep -- a locking order, a lifetime, "never held across a drop".
+  Nothing else.
+- **Rationale** -- why this port differs from upstream, which alternative was
+  rejected -- lives *once*: in the module's `//!` docs under a `# Design`
+  heading, or in `DESIGN.md` when more than one module shares it. A field or
+  type doc may point at it in half a line; it does not retell it.
+- **History** -- "before #109 this was an `Arc<Flow>`", "found by #93" --
+  belongs to the PR trail and the git log, not the source. Zero `#NNN`
+  citations in doc comments. A `DESIGN.md` entry names its issue, and that is
+  the one place that does.
+- **Trait impls** (`Hash`, `Debug`, `Drop`, `Display`) get one line on what is
+  non-obvious, or nothing.
+- **Inline `//` comments** explain a line a reader would otherwise question:
+  an `Ordering`, a deliberate leak, a lock taken out of order. Not narration.
+- The provenance `//!` line of the section above is untouched by all of this.
+  It stays, first line of the module docs, version and all.
+
+The target is a file's comment lines at or under **1.2x its code lines**,
+measured by `devtools/doc-ratio.sh` -- one row per `src/**/*.rs` file, then a
+tree total. It is a report, not a gate: it always exits 0, no CI step reads
+it, and a file whose subtlety earns its prose can argue past 1.2x in review.
+What it is for is the opposite case, the file that restates its own
+signatures, and for that the number is usually enough on its own.
+
+When you add a doc comment, write it to this contract. Do *not* rewrite
+neighbouring docs to it in a PR about something else -- a documentation pass
+is its own change, file by file, so that it can be reviewed as one.
+
 ## Conventions
 
 - Edition 2024. The toolchain is pinned by `ARG RUST_VERSION` in the root
