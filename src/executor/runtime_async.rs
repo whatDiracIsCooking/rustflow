@@ -50,9 +50,10 @@
 //! child to fail cancels its siblings. A child that is *itself* explicitly
 //! anchored stops the walk one step earlier, in its own slot. A body that
 //! never coruns is the case worth being plain about: the implicit join still
-//! waits for every child and the node then finishes **normally**, so a
-//! failure nobody collected is dropped by the next `set_up_graph` of that
-//! graph, which is upstream's behaviour too. Cancelling the run reaches the
+//! waits for every child, and the entry that then finishes the node hands a
+//! payload nobody collected on to whatever is waiting for the node's own
+//! graph -- so a child's failure the body ignored is the run's, exactly as it
+//! is for a body that left its `corun` bare. Cancelling the run reaches the
 //! children through the same chain, and a child skipped that way is still
 //! counted off its parent, so the node is still resumed and the run still
 //! finishes.
@@ -160,7 +161,8 @@ impl Runtime<'_> {
     /// payload goes up the chain to the nearest anchor, this node, where
     /// [`Runtime::try_corun`] returns it and [`Runtime::corun`] re-raises it,
     /// and it cancels this task's other children. A body that never coruns
-    /// drops it.
+    /// leaves it to the node's own tear-down, which hands it to whatever is
+    /// waiting for this task's graph.
     ///
     /// ```
     /// use std::sync::Arc;

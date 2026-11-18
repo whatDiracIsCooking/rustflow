@@ -176,18 +176,26 @@ impl Job {
     ///
     /// From the failing node upwards, every base on the parent chain is marked
     /// `EXCEPTION` -- which is what cancels the rest of each nested graph the
-    /// failure is inside of -- and the walk stops at the first base that is
-    /// explicitly anchored, failing that at the innermost implicitly anchored one,
-    /// failing that at the failing node itself. The run a chain roots at is an
-    /// anchor by definition, where upstream constructs its topology
-    /// `EXPLICITLY_ANCHORED`; the sentinel [`Topology::free_standing`] is the one
-    /// root that is not, so a chain rooted there ends like upstream's null
+    /// failure is inside of -- and the payload goes to the first of four
+    /// destinations there is one of: the first base on the chain that is
+    /// explicitly anchored, failing that the innermost implicitly anchored one,
+    /// failing that the run the chain roots at, failing that the failing node
+    /// itself. `DESIGN.md` has the priority among the four, and the third tier is
+    /// where this port departs from upstream, which constructs its topology
+    /// `EXPLICITLY_ANCHORED` and so lets the run outrank an implicit anchor.
+    /// The sentinel [`Topology::free_standing`] is the one root that is no
+    /// destination at all, so a chain rooted there ends like upstream's null
     /// `_topology`, with the payload on the node where
-    /// [`AsyncTask::take_panic`](crate::AsyncTask::take_panic) reads it.
-    /// `DESIGN.md` has the priority among the three and what the one departure
-    /// from upstream costs. The run the walk carries is the one of the job at the
-    /// *root* rather than this job's own, the two differing for exactly one shape:
-    /// a free node spawned under a node of a real run.
+    /// [`AsyncTask::take_panic`](crate::AsyncTask::take_panic) reads it. The run
+    /// the walk carries is the one of the job at the *root* rather than this job's
+    /// own, the two differing for exactly one shape: a free node spawned under a
+    /// node of a real run.
+    ///
+    /// An implicit anchor is a frame that means to read its slot when it is
+    /// resumed rather than one blocked on it now, so a payload left in that slot
+    /// has to be handed on if the frame never comes for it: `enter` in
+    /// [`executor::runtime`](crate::executor::runtime) calls this method again
+    /// from the one exit such a node has from the anchored state.
     ///
     /// Nothing here can dangle and nothing here is a pointer walk: a
     /// [`Parent::Nested`] owns the job of the parent node, which owns its own
@@ -204,14 +212,19 @@ impl Job {
         // chain rather than being read off `self` because the two are not
         // always the same run -- see the docs above.
         let mut topology: &Topology = &self.topology;
-        let mut implicit: Option<Anchor<'_>> = None;
+        let mut implicit: Option<&NodeBase> = None;
+        // The run the chain roots at, filled in by the walk that reaches it.
+        // Recorded rather than returned because it is the *lowest* of the
+        // three priorities here, where upstream's `_parent` chain ends at a
+        // topology that is explicitly anchored and therefore the highest.
+        let mut root: Option<&Topology> = None;
 
         // Upstream's `while(ea && !(ea->_estate & EXPLICITLY_ANCHORED))`, with
         // its `ea = ea->_parent` spelled as a step along this job's chain and
-        // its null pointer as the `None` two of the arms below produce.
+        // its null pointer as the `None` three of the arms below produce.
         let explicit = loop {
             if base.is_explicitly_anchored() {
-                break Some(Anchor::Base(base));
+                break Some(base);
             }
 
             base.estate()
@@ -219,7 +232,7 @@ impl Job {
             // Only the innermost one, as upstream's comment says: the first
             // implicit anchor the walk meets is the closest to the failure.
             if implicit.is_none() && base.is_implicitly_anchored() {
-                implicit = Some(Anchor::Base(base));
+                implicit = Some(base);
             }
 
             match parent {
@@ -232,8 +245,12 @@ impl Job {
                 // chain rooted at it ends with no anchor rather than with one
                 // nobody can read.
                 Some(Parent::Run) if topology.is_free_standing() => break None,
-                // The root, anchored for the length of the run.
-                Some(Parent::Run) => break Some(Anchor::Run(topology)),
+                // The root, which is waiting for the whole chain and is the
+                // destination of last resort for it.
+                Some(Parent::Run) => {
+                    root = Some(topology);
+                    break None;
+                }
                 Some(Parent::Nested(nested)) => {
                     base = nested.base();
                     match nested.resume() {
@@ -247,17 +264,18 @@ impl Job {
             }
         };
 
-        // Upstream's `if(ea) ... else if(ia)`, as one choice rather than two
-        // tests: an explicit anchor that has *already* caught a payload does
-        // not hand this one on to an implicit anchor, which two `if let`s in a
-        // row would lose.
-        let anchor = match (explicit, implicit) {
-            (Some(anchor), _) | (None, Some(anchor)) => anchor,
-            // Upstream's last line: no anchor anywhere on the chain, so there
-            // is nothing waiting -- an execution with no external control over
-            // it, which is upstream's own description. A *silent* async task
-            // submitted to the executor is exactly that.
-            (None, None) => Anchor::Base(node),
+        // Upstream's `if(ea) ... else if(ia)` with the run as a tier of its
+        // own between them, and as one choice rather than three tests: an
+        // anchor that has *already* caught a payload does not hand this one on
+        // to the next tier down, which three `if let`s in a row would lose.
+        let anchor = match (explicit, implicit, root) {
+            (Some(base), _, _) | (None, Some(base), _) => Anchor::Base(base),
+            (None, None, Some(topology)) => Anchor::Run(topology),
+            // Upstream's last line: no anchor and no run anywhere on the
+            // chain, so there is nothing waiting -- an execution with no
+            // external control over it, which is upstream's own description.
+            // A *silent* async task submitted to the executor is exactly that.
+            (None, None, None) => Anchor::Base(node),
         };
 
         // The first failure under this anchor is the one it reports. A later
@@ -366,8 +384,9 @@ impl Job {
 /// `wait` reads, so this names the two cases and gives them the one pair of
 /// operations the walk needs.
 enum Anchor<'a> {
-    /// A run somebody started, which is anchored by definition for as long as
-    /// it is running. Never the sentinel: nobody is waiting on that one.
+    /// A run somebody started, which is waiting for every chain rooted at it
+    /// and is the destination of last resort for one. Never the sentinel:
+    /// nobody is waiting on that one.
     Run(&'a Topology),
     /// A node waiting for its own nested graph, or the anchor a `corun` keeps
     /// on its frame.
