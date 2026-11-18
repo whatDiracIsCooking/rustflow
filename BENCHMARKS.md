@@ -85,6 +85,19 @@ noise is between runs rather than within one.
   target keeps its own sizes, its own criterion sample settings and its own
   one-off setup, which are what its table reports rather than what its
   neighbours share.
+- **An A/B between two builds is measured in interleaved rounds**, by
+  `devtools/bench-ab.sh <ref-A> <ref-B> --bench <name> [--rounds N]`, which is
+  the method every A/B section below hand-rolled and the one they use from here
+  on. It builds each side into its own worktree and its own
+  `CARGO_TARGET_DIR`, then alternates rounds -- A, B, A, B, ... -- so that a
+  load which drifts over the run lands on both sides instead of on whichever
+  was measured second, the mistake the `Work` decision and #102 each record
+  having made and undone. It prints each side's spread against its own rounds
+  before it prints the A-to-B ratio of medians, because the rule those sections
+  settled on is that a difference inside either side's own spread is not a
+  result; and it records `/proc/loadavg` at the start, after every round and at
+  the end, together with `nproc`, so that a table built from it can carry the
+  load it ran under the way the ones below do.
 
 ## The upstream C++ column is empty, and that is the finding
 
