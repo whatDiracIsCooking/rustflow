@@ -431,6 +431,18 @@ impl WorkerThread {
 
         self.observer_prologue(&job);
 
+        // The two free-standing node kinds call `observer_epilogue` for
+        // themselves, from inside `executor::async` and
+        // `executor::dependent_async`: each has its own tear-down --
+        // `Shared::finish_async`, a dependent task's successor release --
+        // that signals a waiter (`Executor::wait_for_all`,
+        // `Executor::drop`) from *inside* the dispatch below, before this
+        // match produces a value at all, so the generic call after it would
+        // run too late to order against that signal. Calling it there
+        // instead, right before each such signal, is what keeps "on_exit
+        // fires before anything the exit could unblock" true for them too.
+        let async_dispatch = matches!(node.handle(), Handle::Async(_) | Handle::DependentAsync(_));
+
         let release = match node.handle() {
             // Upstream's `_invoke_static_task`, whose
             // `TF_EXECUTOR_EXCEPTION_HANDLER` is this `catch_unwind` and whose
@@ -479,7 +491,9 @@ impl WorkerThread {
             Handle::DependentAsync(work) => dependent_async::invoke(self, &job, work),
         };
 
-        self.observer_epilogue(&job);
+        if !async_dispatch {
+            self.observer_epilogue(&job);
+        }
 
         // Upstream's `return true` out of its three preempting invokers, which
         // its `_invoke` turns into a bare `return`: this node is the parent of
@@ -628,7 +642,17 @@ impl WorkerThread {
     /// notifies every registered observer of the exit. Reached on the entry that
     /// *finishes* the node and on every entry that preempts it, the dispatch arm
     /// having returned either way.
-    fn observer_epilogue(&self, job: &Job) {
+    ///
+    /// Call this one yourself, from inside a dispatch arm, if that arm's own
+    /// tear-down can wake a waiter before this method's caller gets a chance
+    /// to -- `executor::async` and `executor::dependent_async` do, around
+    /// `Shared::finish_async` and a dependent task's successor release, each
+    /// of which can let `Executor::wait_for_all` or `Executor::drop` return
+    /// before the on_exit this call is for. `pub(crate)` for exactly that:
+    /// every other dispatch arm is finished by `WorkerThread::invoke_one`
+    /// itself, well after its own generic call, and has no reason to call
+    /// this directly.
+    pub(crate) fn observer_epilogue(&self, job: &Job) {
         if self.shared.observers.is_empty() {
             return;
         }

@@ -770,6 +770,10 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &AsyncWork) -> 
             "an async node cannot be run as part of a taskflow: \
              an async task is submitted to the executor, not built into a graph",
         ));
+        // `WorkerThread::invoke_one` skips its own generic call for this
+        // handle kind -- see its `async_dispatch` -- so every return out of
+        // this function makes its own, this one included.
+        worker.observer_epilogue(job);
         return Some(Release::Strong);
     }
 
@@ -802,6 +806,16 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &AsyncWork) -> 
             runtime::invoke_async(worker, job, work)
         }
     };
+
+    // Before `finish_async` below, not after: that call can wake an
+    // `Executor::wait_for_all` or an `Executor::drop` waiting on this being
+    // the last free task, on a thread with nothing else ordering it against
+    // this one's own observer call -- #167's `tests/observers.rs` caught
+    // this the other way round. Covers both outcomes of the match above:
+    // `None` (a runtime-shaped body that preempted its own node, the second
+    // entry still to come) gets exactly the one call `WorkerThread::invoke_one`
+    // would have, and `Some` (finished) gets it before the signal.
+    worker.observer_epilogue(job);
 
     // Upstream's parentless branch of `_tear_down_async`:
     // `if(node->_parent == nullptr) _decrement_topology();`, under the

@@ -298,6 +298,10 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &AsyncWork) -> 
              a dependent-async task is submitted to the executor, and its \
              dependencies are other async tasks rather than edges of a graph",
         ));
+        // `WorkerThread::invoke_one` skips its own generic call for this
+        // handle kind -- see its `async_dispatch` -- so every return out of
+        // this function makes its own, this one included.
+        worker.observer_epilogue(job);
         return Some(Release::Strong);
     }
 
@@ -329,8 +333,21 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &AsyncWork) -> 
     };
 
     // Upstream's bare `return` out of the arm: the node is preempted, so it
-    // has not finished and owes nothing yet.
-    let release = release?;
+    // has not finished and owes nothing yet. Still makes the one call this
+    // function owes `WorkerThread::invoke_one` -- see `async_dispatch`
+    // there -- the second entry being what actually releases anything.
+    let Some(release) = release else {
+        worker.observer_epilogue(job);
+        return None;
+    };
+
+    // Before `release_successors` and `finish_async` below, not after:
+    // both can let something waiting on this task -- a successor, an
+    // `Executor::wait_for_all`, an `Executor::drop` -- run before this call
+    // would otherwise have, on a thread with nothing else ordering it
+    // against this one's own. #167's `tests/observers.rs` caught the
+    // `finish_async` half of this the other way round.
+    worker.observer_epilogue(job);
 
     release_successors(worker, job);
 
