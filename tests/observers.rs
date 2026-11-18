@@ -145,6 +145,85 @@ worker_matrix! {
     }
 }
 
+/// Each dispatched task's own worker agrees with itself:
+/// [`WorkerView::queue_size`] reads zero exactly when
+/// [`WorkerView::is_queue_empty`] reports empty. With one worker there is no
+/// sibling to steal between the two reads, so the two methods describing the
+/// same queue cannot disagree -- unlike across workers, which
+/// `WorkerView::queue_size`'s own doc says not to expect.
+#[test]
+fn queue_size_agrees_with_is_queue_empty_on_one_worker() {
+    struct Checking;
+
+    impl Observer for Checking {
+        fn set_up(&self, _num_workers: usize) {}
+
+        fn on_entry(&self, worker: WorkerView<'_>, _task: TaskView<'_>) {
+            assert_eq!(
+                worker.queue_size() == 0,
+                worker.is_queue_empty(),
+                "queue_size and is_queue_empty disagree on worker {}",
+                worker.id()
+            );
+        }
+
+        fn on_exit(&self, _worker: WorkerView<'_>, _task: TaskView<'_>) {}
+    }
+
+    let executor = Executor::new(1);
+    let _observer = executor.make_observer(Checking);
+
+    let mut taskflow = Taskflow::new();
+    mixed_graph(&mut taskflow);
+    executor
+        .run(&taskflow)
+        .wait()
+        .expect("no task of the graph panicked");
+}
+
+/// A worker's `queue_size()` never exceeds the number of tasks this run
+/// could possibly have put in it, no matter how many workers are racing to
+/// steal from and push into that queue: a bound every reading must satisfy,
+/// rather than a specific count that scheduling luck could make or break.
+#[test]
+fn queue_size_never_exceeds_the_tasks_in_the_run() {
+    struct Bounding {
+        max_queue_size: AtomicUsize,
+        dispatched: AtomicUsize,
+    }
+
+    impl Observer for Bounding {
+        fn set_up(&self, _num_workers: usize) {}
+
+        fn on_entry(&self, worker: WorkerView<'_>, _task: TaskView<'_>) {
+            self.dispatched.fetch_add(1, Ordering::SeqCst);
+            self.max_queue_size
+                .fetch_max(worker.queue_size(), Ordering::SeqCst);
+        }
+
+        fn on_exit(&self, _worker: WorkerView<'_>, _task: TaskView<'_>) {}
+    }
+
+    let executor = Executor::new(4);
+    let observer = executor.make_observer(Bounding {
+        max_queue_size: AtomicUsize::new(0),
+        dispatched: AtomicUsize::new(0),
+    });
+
+    let mut taskflow = Taskflow::new();
+    let dispatched = mixed_graph(&mut taskflow);
+    executor
+        .run(&taskflow)
+        .wait()
+        .expect("no task of the graph panicked");
+
+    assert_eq!(observer.dispatched.load(Ordering::SeqCst), dispatched);
+    assert!(
+        observer.max_queue_size.load(Ordering::SeqCst) <= dispatched,
+        "a worker's queue can never hold more than the tasks this run dispatched"
+    );
+}
+
 /// Two observers registered at once both see every task, each counting on
 /// its own: neither's registration nor its counts can be the other's.
 #[test]
