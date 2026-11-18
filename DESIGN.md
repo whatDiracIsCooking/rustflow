@@ -1083,6 +1083,71 @@ entry above does.
   held, taken by an in-flight dispatch, asks. `tests/loom_dispatch_claim.rs`
   models the narrower, in-scope property on its own terms and names the
   limit again.
+- **A `DataPipe`'s callable has two shapes, not upstream's three, and the
+  slot between two pipes is a `Mutex<Option<Box<dyn Any + Send>>>`, 24 bytes
+  per line** (issue #186). Upstream's `DataPipeline::_on_pipe` picks one of
+  three callable shapes by `is_invocable_v`: `(Pipeflow&) -> O`, with no
+  input at all; `(I&) -> O`; and `(I&, Pipeflow&) -> O`. The first of those
+  is not a shape a pipe's *position* forces so much as a shape its *input
+  type* does -- it is only ever reachable for a pipeline's first pipe, the
+  one `DataPipe`'s own `input_t` is `void` for -- and Rust already has a
+  value for "no input" that upstream's template metaprogramming has to work
+  around: `()`. So [`serial_pipe_with_flow`](crate::pipeline::data_pipeline::serial_pipe_with_flow)
+  and [`parallel_pipe_with_flow`](crate::pipeline::data_pipeline::parallel_pipe_with_flow)
+  are `Fn(I, &mut Pipeflow) -> O`, and a pipeline's first pipe is simply one
+  of the two with `I = ()`, its callable's first parameter pattern-matched
+  away (`|(), pf| ...`) rather than omitted. [`serial_pipe`](crate::pipeline::data_pipeline::serial_pipe)
+  and [`parallel_pipe`](crate::pipeline::data_pipeline::parallel_pipe) are
+  the plain `Fn(I) -> O` shape for a pipe that never touches its
+  `Pipeflow`. Two shapes rather than three, with no loss of what upstream's
+  three let a pipe do.
+
+  The slot a `DataPipelineBuilder::pipe` call's erased closure reads from
+  and writes to is one `Mutex<Option<Box<dyn Any + Send>>>` per line --
+  upstream's `CachelineAligned<data_t>`, a `std::variant` over every pipe's
+  own output type fixed at compile time by the parameter pack. Rust has no
+  anonymous union of an open, heterogeneous type list without a
+  caller-supplied enum, and asking a `DataPipe` caller to write one defeats
+  the point of a typed builder that infers every pipe's types from its
+  callable. A type-erased box is what is left, and its cost is measured
+  rather than guessed: `size_of::<Mutex<Option<Box<dyn Any + Send>>>>()` is
+  24 bytes on a 64-bit target, checked by a test guarded on
+  `target_pointer_width = "64"` -- a 16-byte fat pointer for the
+  `Box<dyn Any + Send>` (data pointer plus vtable pointer, `Option`'s own
+  tag folded into the data pointer's niche since a `Box`'s data pointer is
+  never null) plus the `Mutex`'s own lock word rounded up to the slot's
+  8-byte alignment. On top of that fixed cost, every pipe invocation pays
+  one heap allocation for `Box::new(output)` and frees it when the next
+  pipe's `take` (or the following token's own overwrite, for a chain's last
+  pipe) drops the box -- the same per-token allocation upstream avoids with
+  its compile-time-sized `data_t`, and the one real price this port's typed
+  builder pays for not asking a caller to write a variant enum by hand.
+
+  The builder's own type-state, `DataPipelineBuilder<Prev>`, is what makes
+  the chain's own types line up without a parameter pack: `Prev` is the
+  output type the next `pipe` call must accept as `DataPipe<Prev, _>`'s own
+  input, carried in a zero-cost `PhantomData<Prev>` and advanced by each
+  `pipe` call's own generic parameter. A mismatched pair is a type error at
+  the `pipe` call itself, not a `downcast` failure discovered at run time --
+  `DataPipelineBuilder::pipe`'s own `compile_fail` doctest is the
+  acceptance check for that. The one place a `Prev`-typed value still has
+  to round-trip through `Any` despite the chain being fully typed is a
+  pipeline's first pipe: `DataPipelineBuilder::pipe`'s body is generic over
+  every pipe's own `Prev`, including the first one's, so it cannot write a
+  literal `()` of type `Prev` without a `Default` bound this method has no
+  business requiring of every later pipe's input type too. It downcasts a
+  freshly boxed `()` to `Prev` instead, sound because `pipes.is_empty()` is
+  true if and only if `Prev` is `()` -- the only way to reach that call with
+  an empty chain is through `DataPipeline::builder`'s own
+  `DataPipelineBuilder<()>` -- and the comment at that call names the
+  invariant rather than leaving it to be re-derived.
+
+  `DataPipeline` itself adds nothing to [`Pipeline`](crate::pipeline::scheduler::Pipeline)'s
+  own scheduling loop: every `DataPipe` becomes one `Pipe` whose callable
+  moves the slot's value through the user's typed callable, and the chain is
+  then handed to `Pipeline::new` unchanged, so the token loop upstream
+  duplicates between `Pipeline::_build` and `DataPipeline::_build` exists
+  here exactly once.
 
 ## Decisions taken in M9
 
