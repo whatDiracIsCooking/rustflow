@@ -6,8 +6,11 @@
 //! not here.
 //!
 //! [`Runtime::for_each`] is the runtime-task body upstream builds as a
-//! closure over `(b, e, c, part)`;
-//! [`AlgorithmBuilder::for_each`] is the owned-data wrapper over it.
+//! closure over `(b, e, c, part)`; [`make_for_each_task`] is upstream's
+//! factory of the same name, over owned data; and
+//! [`AlgorithmBuilder::for_each`] is the one line over that factory --
+//! `DESIGN.md`'s "Decisions taken in M10" entry on the three layers says
+//! why the port needs all three where upstream needs two.
 //!
 //! [`AlgorithmBuilder::for_each`]: crate::algorithm::AlgorithmBuilder::for_each
 //!
@@ -36,6 +39,8 @@
 //! [`Runtime::for_each`] still gets one: a `Mutex` is what turns the `Arc`'s
 //! shared ownership back into the exclusive `&mut` access the method
 //! needs, locked once per invocation rather than once per element.
+
+use std::sync::{Arc, Mutex};
 
 use crate::algorithm::SlicePartitioner;
 use crate::runtime::Runtime;
@@ -109,6 +114,53 @@ impl<'rt> Runtime<'rt> {
         self.scope(|s| {
             part.drive(s, data, n, w_total, &apply);
         });
+    }
+}
+
+/// Builds the runtime body of a [`Runtime::for_each`] task over owned
+/// `data`: upstream's `make_for_each_task`. `data` is locked once per run of
+/// the body, not once per element, and the whole slice is run through that
+/// one guard.
+///
+/// `f` and `part` are cloned on every run of the body -- relevant only for a
+/// task a cycle revisits -- matching upstream copying `c` and `part` into its
+/// own closure by value.
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+///
+/// use rustflow::algorithm::for_each::make_for_each_task;
+/// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
+/// use rustflow::prelude::*;
+/// use rustflow::Executor;
+///
+/// let data = Arc::new(Mutex::new(vec![0u32; 10]));
+///
+/// let mut taskflow = Taskflow::new();
+/// taskflow.emplace_runtime(make_for_each_task(
+///     Arc::clone(&data),
+///     |x: &mut u32| *x = 1,
+///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
+/// ));
+///
+/// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
+/// assert_eq!(data.lock().expect("uncontended").iter().sum::<u32>(), 10);
+/// ```
+pub fn make_for_each_task<T, F, P>(
+    data: Arc<Mutex<Vec<T>>>,
+    f: F,
+    part: P,
+) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static
+where
+    T: Send + 'static,
+    F: Fn(&mut T) + Sync + Clone + Send + 'static,
+    P: SlicePartitioner + Clone + Send + 'static,
+{
+    move |rt: &mut Runtime<'_>| {
+        let mut guard = data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        rt.for_each(&mut guard, f.clone(), part.clone());
     }
 }
 

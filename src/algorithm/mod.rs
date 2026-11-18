@@ -118,6 +118,7 @@ pub mod scan;
 pub mod sort;
 pub mod transform;
 
+pub use crate::algorithm::for_each::make_for_each_task;
 pub use crate::algorithm::for_each_index::{
     make_for_each_by_index_nd_task, make_for_each_by_index_task, make_for_each_index_task,
 };
@@ -133,6 +134,7 @@ pub use crate::algorithm::scan::{
     make_transform_exclusive_scan_task, make_transform_inclusive_scan_task,
     make_transform_inclusive_scan_with_init_task,
 };
+pub use crate::algorithm::sort::{make_sort_by_task, make_sort_task};
 
 /// Every algorithm's owned-data [`FlowBuilder`] wrapper: upstream's
 /// `FlowBuilder::for_each`, `for_each_index`, `transform`, `fill`,
@@ -206,12 +208,7 @@ pub trait AlgorithmBuilder: FlowBuilder {
         F: Fn(&mut T) + Sync + Clone + Send + 'static,
         P: SlicePartitioner + Clone + Send + 'static,
     {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = data
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runtime.for_each(&mut guard, f.clone(), part.clone());
-        })
+        self.emplace_runtime(make_for_each_task(data, f, part))
     }
 
     /// Creates a runtime task that walks `[beg, end)` in steps of `step`,
@@ -906,12 +903,7 @@ pub trait AlgorithmBuilder: FlowBuilder {
         T: Send + 'static,
         C: Fn(&T, &T) -> Ordering + Sync + Clone + Send + 'static,
     {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = data
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runtime.sort_by(&mut guard, cmp.clone());
-        })
+        self.emplace_runtime(make_sort_by_task(data, cmp))
     }
 
     /// Creates a runtime task that locks `data` and runs [`Runtime::sort`]
@@ -937,12 +929,7 @@ pub trait AlgorithmBuilder: FlowBuilder {
     where
         T: Ord + Send + 'static,
     {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = data
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runtime.sort(&mut guard);
-        })
+        self.emplace_runtime(make_sort_task(data))
     }
 
     /// Emplaces a runtime task that merges owned `a` and `b`, by `T`'s own
