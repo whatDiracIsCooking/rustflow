@@ -40,23 +40,17 @@
 //!
 //! Upstream sweeps `MaxDepth = 1..=8`, a hundred million leaves at the top.
 //! The sizes below stop at 4, and the limit is not the time a round takes but
-//! a **stack overflow** -- the one `fibonacci.rs` documents for this same
-//! `rustflow-group` shape. A corun keeps its worker in the work-stealing
-//! loop, so every job that worker picks up while waiting nests one frame
-//! deeper; and a [`TaskGroup`](rustflow::TaskGroup)'s children go into the
-//! shared buffers rather than onto the submitting worker's queue, so a corun
-//! is handed the oldest outstanding job in the pool -- somebody else's
-//! unfinished subtree -- instead of the child it is waiting for, and nests
-//! one frame per outstanding *child* rather than one per level of recursion.
-//! `src/task_group.rs`'s module docs have that argument in full.
+//! a **stack overflow**: the nested-corun stack bound, which `DESIGN.md`'s
+//! "Executor core" states once for the port and
+//! [`TaskGroup::corun`](rustflow::TaskGroup::corun)'s docs name for a caller.
 //!
 //! Measured in a release build rather than assumed: at one worker depth 4
 //! passes and depth 5 aborts, and at 24 workers depth 5 passes and depth 6
-//! aborts. One worker is the binding end, for the reason `fibonacci.rs`
-//! gives -- the one worker that coruns is the only worker there is to pick
-//! the outstanding children up -- so depth 4, a factor of ten in task count
-//! inside it, is what this id can carry. **Neither size is chosen for
-//! speed**, and if the cliff moves these move with it.
+//! aborts. One worker is the binding end -- at one worker the whole tree
+//! nests on the one stack there is, which `BENCHMARKS.md`'s "The #359
+//! measurement" counts -- so depth 4, a factor of ten in task count inside
+//! it, is what this id can carry. **Neither size is chosen for speed**, and
+//! if the cliff moves these move with it.
 //!
 //! # Departures from upstream
 //!

@@ -37,11 +37,10 @@
 //!
 //! Upstream sweeps `f = 1..=40` and its own unit test asserts `fib(25)`. The
 //! sizes below are smaller, and the limit is not the time a round takes but a
-//! **stack overflow**: a corun keeps its worker in the work-stealing loop, so
-//! every job that worker picks up while waiting nests one frame deeper, and a
-//! corun that is handed somebody else's unfinished subtree instead of the
-//! child it is waiting for nests one frame per outstanding *child* rather
-//! than one per level of recursion.
+//! **stack overflow** -- the nested-corun stack bound, which `DESIGN.md`'s
+//! "Executor core" states once for the port and `BENCHMARKS.md`'s "The #359
+//! measurement" measures: a group's corun nests one frame per outstanding
+//! *task* rather than one per level of recursion.
 //!
 //! #119 took that cost off the **runtime** variant: a
 //! [`Runtime`](rustflow::Runtime) hands its own worker to the submission,
@@ -57,15 +56,16 @@
 //! [`TaskGroup`](rustflow::TaskGroup) holds a worker *id* rather than the
 //! worker, and its `corun` waits on the stealing end of the queue in any
 //! case, so its children stay in the shared FIFO buffers;
-//! `src/task_group.rs`'s module docs have that argument in full. Measured in
-//! this profile rather than assumed, because the debug figure is not it: at
-//! one worker `fib(17)` passes and `fib(18)` aborts, and at 24 workers
-//! `fib(23)` passes and `fib(24)` aborts. One worker is the binding end --
-//! the one worker that coruns is the only worker there is to pick the
-//! outstanding children up -- so `fib(15)`, three levels inside it, is what
-//! the group id can carry. `BENCHMARKS.md`'s `fibonacci` section and its
-//! "#119 measurement" have both. **Neither size is chosen for speed**, and
-//! if the cliff moves, these move with it.
+//! [`TaskGroup::corun`](rustflow::TaskGroup::corun)'s own docs state the bound
+//! that follows. Measured in this profile rather than assumed, because the
+//! debug figure is not it: at one worker `fib(17)` passes and `fib(18)`
+//! aborts, and at 24 workers `fib(23)` passes and `fib(24)` aborts. One
+//! worker is the binding end -- the one worker that coruns is the only worker
+//! there is to pick the outstanding children up -- so `fib(15)`, three levels
+//! inside it, is what the group id can carry. `BENCHMARKS.md`'s `fibonacci`
+//! section and its "#119 measurement" have both, and "The #359 measurement"
+//! has the bound itself. **Neither size is chosen for speed**, and if the
+//! cliff moves, these move with it.
 
 use std::hint::black_box;
 use std::sync::Arc;

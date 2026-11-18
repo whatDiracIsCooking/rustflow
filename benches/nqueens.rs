@@ -48,24 +48,18 @@
 //!
 //! Upstream's `main.cpp` sweeps `q = 1..=14` by default. The sizes below stop
 //! at 8, and the limit is not the time a round takes but a **stack
-//! overflow** -- the one `fibonacci.rs` documents for this same
-//! `rustflow-group` shape. A corun keeps its worker in the work-stealing
-//! loop, so every job that worker picks up while waiting nests one frame
-//! deeper; and a [`TaskGroup`](rustflow::TaskGroup)'s children go into the
-//! shared buffers rather than onto the submitting worker's queue, so a corun
-//! is handed the oldest outstanding job in the pool -- somebody else's
-//! unfinished subtree -- instead of the child it is waiting for, and nests
-//! one frame per outstanding *child* rather than one per level of recursion.
-//! `src/task_group.rs`'s module docs have that argument in full.
+//! overflow**: the nested-corun stack bound, which `DESIGN.md`'s "Executor
+//! core" states once for the port and
+//! [`TaskGroup::corun`](rustflow::TaskGroup::corun)'s docs name for a caller.
 //!
 //! Measured in a release build rather than assumed: at one worker `q = 8`
 //! passes and `q = 9` aborts, and at 24 workers `q = 10` passes and
-//! `q = 11` aborts. One worker is the binding end, for the reason
-//! `fibonacci.rs` gives -- the one worker that coruns is the only worker
-//! there is to pick the outstanding children up -- so `q = 8`, a factor of
-//! four in task count inside it, is what this id can carry, which is the
-//! margin `fibonacci.rs`'s own sizes keep. **Neither size is chosen for
-//! speed**, and if the cliff moves these move with it.
+//! `q = 11` aborts. One worker is the binding end -- the one worker that
+//! coruns is the only worker there is to pick the outstanding children up,
+//! and `BENCHMARKS.md`'s "The #359 measurement" counts what that costs here
+//! -- so `q = 8`, a factor of four in task count inside it, is what this id
+//! can carry, which is the margin `fibonacci.rs`'s own sizes keep. **Neither
+//! size is chosen for speed**, and if the cliff moves these move with it.
 //!
 //! # Departures from upstream
 //!

@@ -444,6 +444,14 @@ impl Runtime<'_> {
     /// `_rethrow_exception` does, so a second corun of the same body starts
     /// clean.
     ///
+    /// A deep recursion is the caller's bound to respect, since an overflow of
+    /// the worker's stack aborts the process rather than reaching this `Err`:
+    /// a job picked up while waiting runs on the waiting frame, and this route
+    /// nests one such frame per level of *recursion*, a child submitted here
+    /// going onto this worker's own queue for the wait to pop straight back.
+    /// `DESIGN.md`'s "Executor core" has the bound, and what makes
+    /// [`TaskGroup::corun`](crate::TaskGroup::corun)'s a much lower one.
+    ///
     /// # Errors
     ///
     /// [`RunError::Panicked`] if work spawned by this runtime task panicked,
@@ -471,7 +479,8 @@ impl Runtime<'_> {
     ///
     /// [`Runtime::try_corun`] with the failure raised instead of returned,
     /// which is the shape that composes: the failure propagates out of the
-    /// body, where the executor catches it as this task's own.
+    /// body, where the executor catches it as this task's own. The stack bound
+    /// it states holds here too.
     ///
     /// # Panics
     ///

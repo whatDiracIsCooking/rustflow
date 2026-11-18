@@ -37,26 +37,25 @@
 //! intervals grows as `V^(4/3)`, which is 828 spawned tasks at `V = 1` and
 //! 1852 at `V = 2`. The task count is what binds here, and it binds well
 //! below upstream's own sweep: `V = 3` is 3478 spawned tasks and **overflows
-//! the stack of the one worker** that has to pick them up. That is the cliff
-//! `benches/fibonacci.rs`'s `rustflow-group` id and `benches/skynet.rs` both
-//! describe, for the same cause -- a [`TaskGroup`](rustflow::TaskGroup)'s
-//! `corun` waits on the stealing end of the queues, so a worker waiting for
-//! its own child may be handed an *ancestor's* outstanding subtree instead
-//! and nests a frame per outstanding task rather than one per level. Where it
-//! bites is a property of the tree and the frame rather than one task count;
-//! `src/task_group.rs`'s module docs have the argument in full, and #342 is
-//! where the resume that would raise it is measured.
+//! the stack of the one worker** that has to pick them up. That is the
+//! nested-corun stack bound, which `DESIGN.md`'s "Executor core" states once
+//! for the port and [`TaskGroup::corun`](rustflow::TaskGroup::corun)'s docs
+//! name for a caller; where it bites is a property of the tree and the frame
+//! rather than one task count, and `BENCHMARKS.md`'s "The #359 measurement"
+//! has this shape's own demand, 2.04 MiB of a worker's two at `V = 3`. #342
+//! is where the resume that would raise it is measured.
 //!
 //! **So the sizes are not points on upstream's sweep at all, and that is the
 //! finding rather than a shrink.** Upstream's `main.cpp` walks
 //! `v = 0, 100, .., 2000`, whose first non-degenerate point, `V = 100`, is
 //! some 390_000 spawned tasks (`v = 0` has `x1 == x2`, accepts immediately
 //! and integrates nothing). `V = 1` and `V = 2` are two orders of magnitude
-//! short of it, and they are what this shape completes at today: measured, at
-//! both worker counts, in a release build, with `V = 3` the first that
-//! aborts. `BENCHMARKS.md`'s section says it again where a reader of the
-//! table will be looking. **Neither size is chosen for speed**, and if the
-//! cliff moves, these move with it.
+//! short of it, and they are what this shape completes at today: measured in
+//! a release build at one worker, which is the binding end, with `V = 3` the
+//! first that aborts there. `BENCHMARKS.md`'s section says it again where a
+//! reader of the table will be looking, including what the other end does --
+//! at 24 workers this shape reaches `V = 24`. **Neither size is chosen for
+//! speed**, and if the cliff moves, these move with it.
 //!
 //! Correctness is checked twice before any id is timed, both outside every
 //! measured region, because the two checks catch different failures:
