@@ -119,6 +119,7 @@ pub mod executor;
 pub mod flow_builder;
 pub mod graph;
 pub mod observer;
+pub mod pipeline;
 pub mod runtime;
 pub mod semaphore;
 pub mod subflow;
