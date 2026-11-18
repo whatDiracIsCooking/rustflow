@@ -86,6 +86,16 @@
 //! with no protocol to resume it can be the target of
 //! [`Runtime::schedule`] at any point in its body's run, which is what the
 //! family above cannot promise.
+//!
+//! [`NonpreemptiveRuntime`]'s declared visibility is `pub` rather than the
+//! `pub(crate)` its real reachability would suggest, because
+//! [`FlowBuilder::emplace_nonpreemptive_runtime`](crate::FlowBuilder::emplace_nonpreemptive_runtime)
+//! is a genuinely public method whose bound names the type: `rustc`'s
+//! `private_bounds` lint checks a bound's own declared visibility against its
+//! caller's, not the full path's reachability, and a body closure never needs
+//! to write the type's path to satisfy that bound regardless -- the same way
+//! a closure passed to a bound of `Fn(&mut SomeType)` never has to spell
+//! `SomeType` to compile against it.
 
 use core::fmt;
 use std::panic::{self, AssertUnwindSafe};
@@ -109,14 +119,11 @@ const ENTERED: u32 = Node::PREEMPTED | Node::IMPLICITLY_ANCHORED;
 /// the `void(Runtime&)` overload of `_invoke_runtime_task_impl`.
 ///
 /// `None` means the node has been preempted -- work the body spawned is still
-/// running, and the last of it to finish will re-queue this job -- and is
-/// what keeps `WorkerThread::invoke` from re-arming the node or releasing
-/// successors that have the body's own children still to wait for.
-///
-/// A panic out of the body is recorded exactly as a static task's is, through
-/// [`Job::record_panic`], and the bookkeeping in [`enter`] still runs: the
-/// node has been entered and the counters have to balance whatever the body
-/// did, which is upstream's arrangement too.
+/// running, and the last of it to finish will re-queue this job -- which is
+/// what keeps `WorkerThread::invoke` from re-arming the node or releasing a
+/// successor that has the body's own children still to wait for. A panic out
+/// of the body is recorded as a static task's is, through
+/// [`Job::record_panic`], and the bookkeeping in [`enter`] still runs.
 pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &RuntimeWork) -> Option<Release> {
     // Called *through* the slot rather than taken out of it, which is the one
     // way a graph's runtime task differs from the two async shapes below: a
@@ -130,8 +137,7 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &RuntimeWork) -
 /// `_invoke_async_task`, which are the two `_invoke_runtime_task_impl`
 /// overloads over the body of a free-standing node.
 ///
-/// The answer is [`invoke`]'s and means the same thing, which is why both
-/// async dispatch arms can hand these two shapes straight here.
+/// The answer is [`invoke`]'s and means the same thing.
 pub(crate) fn invoke_async(
     worker: &mut WorkerThread,
     job: &Job,
@@ -174,11 +180,9 @@ pub(crate) fn invoke_async(
 
 /// Runs `body` on the node `job` is for under upstream's preemption protocol:
 /// the shared half of both `_invoke_runtime_task_impl` overloads, which differ
-/// in nothing else.
-///
-/// The module docs' `# Design` section is the argument for every line of
-/// this, and the answer is the `bool` upstream returns inverted into the
-/// `Option<Release>` the dispatch wants: `None` is upstream's `true`.
+/// in nothing else. The module docs' `# Design` section is the argument for
+/// every line of it; the answer is the `bool` upstream returns, inverted into
+/// the `Option<Release>` the dispatch wants, `None` being upstream's `true`.
 fn enter(
     worker: &mut WorkerThread,
     job: &Job,
@@ -222,13 +226,12 @@ fn enter(
     // implicit anchor, which is what the forward below is about.
     node.nstate().fetch_and(!ENTERED, Ordering::Relaxed);
 
-    // A payload nobody came for goes on up: the walk is asked again from a
-    // node that has stopped being an anchor, which delivers it to the
-    // enclosing anchor or to the run -- and back to this node for the one
-    // shape that is an anchor for life, the handle-returning async form,
-    // whose finishing entry hands it to the handle. *After* the bits come
-    // off, which is why it is not two lines earlier: a walk that still found
-    // this node implicitly anchored would hand the payload straight back.
+    // A payload nobody came for goes on up, the walk asked again from a node
+    // that has stopped being an anchor -- the `# Design` section has where
+    // each of the three shapes delivers it. *After* the
+    // bits come off, which is why it is not two lines earlier: a walk that
+    // still found this node implicitly anchored would hand the payload
+    // straight back.
     //
     // `CAUGHT` before the lock, which is `set_up_graph`'s trick in
     // `executor::topology`: a slot is only ever filled by a claimant that set
@@ -248,8 +251,7 @@ fn enter(
 
 /// Runs the body against a handle over `node`, recording a panic out of it as
 /// this job's failure: upstream's `TF_EXECUTOR_EXCEPTION_HANDLER(worker,
-/// node, { work(rt); })`, which `WorkerThread::invoke` spells the same way
-/// for a static task.
+/// node, { work(rt); })`.
 ///
 /// A function of its own so that the mutable borrow the handle takes of the
 /// worker's scheduling loop ends where the body does, which is before
@@ -279,18 +281,15 @@ fn run_body(
 
 /// The slot an async task's runtime-shaped body sits in until the one worker
 /// that runs it takes it out: [`AsyncWork::Runtime`]'s payload and the `body`
-/// half of [`AsyncWork::Reentrant`].
-///
-/// Spelled out rather than named, because `graph`'s own alias for it is
-/// private to that module.
+/// half of [`AsyncWork::Reentrant`]. Spelled out rather than named, `graph`'s
+/// own alias for it being private to that module.
 type AsyncRuntimeSlot = OnceWork<dyn for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static>;
 
 /// Takes an async task's body out of `slot` and runs it against `runtime`.
 ///
-/// Taken rather than called through, because an async body is a `FnOnce` and
-/// a `FnOnce` cannot be called through a shared reference -- the step the
-/// plain arm in `executor::async` takes, where `None` means what it means
-/// here: a body already spent, which one submission and one job cannot reach.
+/// Taken rather than called through, an async body being a `FnOnce`, as the
+/// plain arm in `executor::async` takes it: `None` is a body already spent,
+/// which one submission and one job cannot reach.
 fn take_and_run(slot: &AsyncRuntimeSlot, runtime: &mut Runtime<'_>) {
     if let Some(body) = slot.take() {
         body(runtime);
@@ -303,20 +302,18 @@ impl Executor {
     ///
     /// Upstream's `async` over a `[](tf::Runtime&){}` body -- the
     /// `is_runtime_task_v<F>` branch of `_async` -- under
-    /// [`Executor::spawn`]'s name. Everything that call says about where the
-    /// body runs, about dropping the handle to detach and about awaiting it
-    /// as a [`Future`] holds here too.
+    /// [`Executor::spawn`]'s name, whose docs hold here too: where the body
+    /// runs, dropping the handle to detach, awaiting it as a [`Future`].
     ///
-    /// What is different is the body and the answer. The body is handed a
-    /// [`Runtime`], so it can do what a runtime task of a graph can do --
-    /// [`Runtime::schedule`] has the one limit, and it can spawn children of
-    /// its own and [`Runtime::corun`] on them. The handle therefore carries
-    /// no value, because what there is to report about a runtime-shaped task
-    /// is **whether anything under it failed**: upstream's own shape, a
-    /// `std::promise<void>`, and what the second entry exists for.
-    /// [`AsyncHandle::wait`] answers `Ok(())` once the body *and* everything
-    /// it spawned are done, and [`RunError::Panicked`] -- the first such
-    /// failure only -- if any of that panicked.
+    /// The body is handed a [`Runtime`], so it can do what a runtime task of
+    /// a graph can do: spawn children of its own and [`Runtime::corun`] on
+    /// them, with [`Runtime::schedule`]'s one limit. The handle therefore
+    /// carries no value -- upstream's own `std::promise<void>` -- what there
+    /// is to report about a runtime-shaped task being **whether anything
+    /// under it failed**. [`AsyncHandle::wait`] answers `Ok(())` once the
+    /// body *and* everything it spawned are done, and
+    /// [`RunError::Panicked`], the first such failure only, if any of that
+    /// panicked.
     ///
     /// ```
     /// use rustflow::{Executor, Runtime};
@@ -353,9 +350,7 @@ impl Executor {
     /// `is_runtime_task_v<F>` branch of `_silent_async` -- and the cheaper
     /// half of the pair, for
     /// [`Executor::silent_async`](crate::Executor::silent_async)'s reason.
-    /// There is no second entry either, which is upstream's case 1 against
-    /// case 2: the node finishes when the body and everything under it are
-    /// done, and nothing is reported.
+    /// There is no second entry either, upstream's case 1 against case 2.
     ///
     /// A panic out of `body` -- or out of anything it spawned -- is
     /// **dropped**: the payload lands in the node's own slot and goes with
@@ -400,19 +395,16 @@ impl Runtime<'_> {
     ///
     /// `task` must be an *active* task -- a task of the taskflow this runtime
     /// task is itself part of -- and of **the same graph as the runtime
-    /// task**, the limit `DESIGN.md` argues for and the one that makes the
-    /// accounting answerable: the parent to count the scheduled task against
-    /// is this node's own parent. It is not fully checkable, a [`Task`] being
-    /// a bare index; what is checked is every index this graph does not have.
+    /// task**, the limit `DESIGN.md` argues for: the parent to count it
+    /// against is this node's own parent. Not fully checkable, a [`Task`]
+    /// being a bare index; what is checked is every index this graph lacks.
     ///
     /// Zeroing the target's join counter bypasses what it owes and does not
     /// remove the edges that made it owe anything, so a strong predecessor
     /// that has yet to run still releases the target onto that zero. The
     /// decrement floors at zero rather than wrapping, and a release onto a
-    /// node that has already *preempted* itself is refused rather than
-    /// delivered -- `DESIGN.md` has both halves of that decision and the
-    /// third ordering it leaves alone, a target that has finished and
-    /// re-armed its counter simply running a second time.
+    /// node that has already *preempted* itself is refused -- `DESIGN.md` has
+    /// both halves of that, and the third ordering it leaves alone.
     ///
     /// # Panics
     ///
@@ -422,18 +414,12 @@ impl Runtime<'_> {
     /// [`Graph::node`](crate::Graph::node)'s.
     ///
     /// Panics if `task` names a node that has already preempted itself, which
-    /// is the refusal above. [`Handle::NonpreemptiveRuntime`] is the one
-    /// callee this is always safe against, whatever its body is doing:
-    /// `preempts_itself` answers `false` for that handle kind, so
-    /// `is_entered` reads `false` for the whole of its body's run and this
-    /// call never mistakes "still running" for "already preempted". An
-    /// *ordinary* `Handle::Runtime` task is not safe against this call for
-    /// as long as its body merely runs, with no child spawned at all: `enter`
-    /// sets the bit before the body runs regardless of whether the body ever
-    /// spawns one, so the refusal above can fire against a node that was
-    /// never preempted -- only still inside its own first entry.
-    /// `DESIGN.md`'s "Decisions taken in M8" has the failure that reading led
-    /// to and the design this module settled on instead.
+    /// is the refusal above. An *ordinary* `Handle::Runtime` task is not safe
+    /// against this call for as long as its body merely runs, with no child
+    /// spawned at all, `enter` setting the bit before the body runs whether
+    /// the body ever spawns one or not; [`Handle::NonpreemptiveRuntime`] is
+    /// the one callee that is always safe, whatever its body is doing.
+    /// `DESIGN.md`'s "Decisions taken in M8" has why.
     ///
     /// Either reaches the caller as the failure of this runtime task, since
     /// it happens inside the body.
@@ -449,23 +435,14 @@ impl Runtime<'_> {
     ///
     /// The calling worker stays in the work-stealing loop while it waits, for
     /// the reason the [`corun`](crate::executor::corun) module docs give. The
-    /// predicate is upstream's -- the node's join counter back to one, that
-    /// one being this body's own reference -- so a body that has spawned
-    /// nothing returns immediately. Being an *equality* rather than a `<=`,
-    /// it is only as good as the guarantee that nothing drives the counter
-    /// below that reference, and the two halves of that guarantee are the
-    /// floored decrement and the refused release [`Runtime::schedule`] points
-    /// at.
+    /// predicate is the `# Design` section's -- the node's join counter back
+    /// to one -- so a body that has spawned nothing returns immediately; what
+    /// keeps that *equality* safe is the floored decrement and the refused
+    /// release [`Runtime::schedule`] points at.
     ///
-    /// What makes a failure under this node *this frame's* is the node being
-    /// an anchor for the whole time it is entered, which is from before the
-    /// body ran: a child that fails before this call is reached delivers to
-    /// the same slot this call reads, and `DESIGN.md` has why the port puts
-    /// that ahead of the run where upstream does not. The explicit anchor
-    /// taken for the length of the wait is what gives a frame blocked *now*
-    /// priority over an implicit anchor nested under it. Taking the payload
-    /// clears the node's slot, as upstream's `_rethrow_exception` does, so a
-    /// second corun of the same body starts clean.
+    /// Taking the payload clears the node's slot, as upstream's
+    /// `_rethrow_exception` does, so a second corun of the same body starts
+    /// clean.
     ///
     /// # Errors
     ///
@@ -493,15 +470,14 @@ impl Runtime<'_> {
     /// failure under it on this worker: upstream's `corun`.
     ///
     /// [`Runtime::try_corun`] with the failure raised instead of returned,
-    /// which is the shape that composes: a body that wrapped this call in
-    /// nothing has the failure propagate out of itself, where the executor
-    /// catches it as this task's own and the run reports it.
+    /// which is the shape that composes: the failure propagates out of the
+    /// body, where the executor catches it as this task's own.
     ///
     /// # Panics
     ///
     /// Panics with the payload of the first piece of work spawned by this
-    /// runtime task to panic. The payload keeps its identity, because it goes
-    /// to [`std::panic::resume_unwind`] rather than to a fresh `panic!`.
+    /// runtime task to panic. The payload keeps its identity, going to
+    /// [`std::panic::resume_unwind`] rather than to a fresh `panic!`.
     pub fn corun(&mut self) {
         match self.try_corun() {
             Ok(()) => {}
@@ -514,11 +490,9 @@ impl Runtime<'_> {
         }
     }
 
-    /// [`Runtime::corun`], under upstream's older name for it.
-    ///
-    /// Upstream's `corun_all` is one line -- `corun();` -- kept "just an
-    /// alias for legacy purpose", in its words, and it is ported because its
-    /// own tests and documentation still use it.
+    /// [`Runtime::corun`], under upstream's older name for it: `corun_all` is
+    /// one line there, kept "just an alias for legacy purpose", and ported
+    /// because upstream's own tests and documentation still use it.
     pub fn corun_all(&mut self) {
         self.corun();
     }
@@ -530,10 +504,9 @@ impl Runtime<'_> {
     /// The one query a long-running body can use to stop early, and the whole
     /// of what cancellation can do to a task that is already running: nothing
     /// interrupts a body, so a body that means to be cancellable has to ask.
-    /// Both terms of upstream's condition are here, as
-    /// `Job::is_parent_cancelled` has them -- the run's own cancellation bits
-    /// and the estate of every parent above this job -- so a runtime task
-    /// inside a nested graph sees a failure in that graph as well.
+    /// Both terms of upstream's condition are here -- the run's own
+    /// cancellation bits and the estate of every parent above this job -- so
+    /// a runtime task inside a nested graph sees a failure in that graph too.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.job.is_parent_cancelled()
@@ -543,24 +516,19 @@ impl Runtime<'_> {
     /// work-stealing loop until `predicate` returns `true`.
     ///
     /// Upstream's `rt.executor().corun_until(predicate)`: the same primitive
-    /// [`Executor::corun_until`] gives any thread, with the one check that
-    /// method makes dropped, because a runtime task's body is already
-    /// running on a worker and so cannot be the non-worker caller
-    /// [`CorunError::NotAWorker`](crate::CorunError::NotAWorker) is for. This
-    /// is the direct call onto the worker's own scheduling loop instead of
-    /// the view [`Executor::corun_until`] builds from a thread id, which is
-    /// what makes it infallible rather than a `Result`.
+    /// [`Executor::corun_until`] gives any thread, with that method's one
+    /// check dropped -- a runtime task's body is already running on a worker,
+    /// so it cannot be the non-worker caller
+    /// [`CorunError::NotAWorker`](crate::CorunError::NotAWorker) is for,
+    /// which is what makes this infallible rather than a `Result`.
     ///
     /// `scan.hpp`'s own comment on why the method is public rather than
     /// private to one algorithm is the reason this exists at all: "need to
-    /// do public corun because multiple workers can call this" -- a barrier
-    /// every worker's own runtime task waits at with its own call here,
-    /// rather than through one worker's handle shared across all of them.
+    /// do public corun because multiple workers can call this".
     ///
     /// `predicate` runs on the calling worker between jobs and may run many
-    /// times, as [`Executor::corun_until`]'s does; the same two rules hold --
-    /// it must not block, and it must eventually return `true`, this loop
-    /// having nothing else that ends it.
+    /// times; the two rules [`Executor::corun_until`] states hold here too --
+    /// it must not block, and it must eventually return `true`.
     ///
     /// ```
     /// use std::sync::Arc;
@@ -621,10 +589,7 @@ fn schedule_bypassing(job: &Job, thread: &mut WorkerThread, task: Task) {
     // drive it past zero rather than resume the node. Refused before
     // anything is written, so a body that schedules a node it should not
     // have fails *as a body* rather than leaving the hang the store would
-    // have. `is_entered` is the same question the successor arm asks before
-    // its own decrement, and it answers `false` unconditionally for a
-    // nonpreemptive target, which is the whole reason this function has two
-    // callers now rather than one.
+    // have.
     assert!(
         !is_entered(target),
         "a task that is already running cannot be scheduled: a bypassed \
@@ -641,18 +606,15 @@ fn schedule_bypassing(job: &Job, thread: &mut WorkerThread, task: Task) {
     // commits to scheduling the target at all.
     job.parent().count_queued(job.topology(), 1);
 
-    // Issue #245: `is_entered` above is the *only* guard that answers "is
-    // this node's nested run outstanding", and it says nothing about a
-    // target whose own callable is locked right now but which never sets
-    // `PREEMPTED` at all -- every non-preempting handle kind -- or has not
-    // set it yet -- a `Handle::Subflow` still building the subgraph that
-    // would make it preempt. `wake` is what answers that question instead:
-    // `true` means nothing holds the target's claim, so queueing now is
-    // exactly what this call always did; `false` means a dispatch is already
-    // running the target's callable, which has itself claimed the node and
-    // will queue this same job the instant it releases -- see
-    // `DispatchClaim`'s own docs for the ordering that makes a `false` here
-    // never a lost wake.
+    // `is_entered` above answers only "is this node's nested run
+    // outstanding", which says nothing about a target whose own callable is
+    // locked right now -- `DESIGN.md` has the handle kinds that leaves out.
+    // `wake` answers that question instead: `true` means nothing holds the
+    // target's claim, so queueing now is what this call always did; `false`
+    // means a dispatch is already running the target's callable and will
+    // queue this same job the instant it releases -- see `DispatchClaim`'s
+    // own docs for the ordering that makes a `false` here never a lost
+    // wake.
     if target.dispatch_claim().wake() {
         // Upstream's `_executor._schedule(_worker, node)`: this worker's own
         // queue. `Job::successor` is the job of a task of the same graph,
@@ -668,28 +630,19 @@ fn schedule_bypassing(job: &Job, thread: &mut WorkerThread, task: Task) {
 /// [`Runtime`] minus everything that could spawn work under this node --
 /// `silent_async`, `scope`, `corun_until` and the rest of
 /// [`crate::executor::runtime_async`]'s family -- which this type has no
-/// inherent `impl` block borrowing from, so a body cannot reach them: there
-/// is no protocol here to resume a node this handle preempted, because
-/// nothing ever sets this node `PREEMPTED` in the first place. What is left
-/// is [`NonpreemptiveRuntime::schedule`] and the read-only accessors a body
-/// needs to tell which of a pool's workers it is running on.
+/// inherent `impl` block borrowing from, so a body cannot reach them: nothing
+/// ever sets this node `PREEMPTED`, so there is no protocol here to resume
+/// one. What is left is [`NonpreemptiveRuntime::schedule`] and the read-only
+/// accessors a body needs to tell which of a pool's workers it is running on.
 ///
 /// Not nameable from outside the crate even though the keyword below is
-/// `pub`: `executor::runtime` is `pub(crate)`, so this struct's real
-/// reachability is the module's. The keyword is `pub` anyway, rather than
-/// `pub(crate)` to match, because [`FlowBuilder::emplace_nonpreemptive_runtime`](crate::FlowBuilder::emplace_nonpreemptive_runtime)
-/// is a genuinely public method whose bound names this type -- `rustc`'s
-/// `private_bounds` lint checks a bound's own declared visibility against
-/// its caller's, not the full path's reachability, and a body closure never
-/// needs to write this type's path to satisfy that bound regardless, the
-/// same way a closure passed to a bound of `Fn(&mut SomeType)` never has to
-/// spell `SomeType` to compile against it.
+/// `pub`, `executor::runtime` being `pub(crate)`; the `# Design` section has
+/// why the keyword is `pub` all the same.
 pub struct NonpreemptiveRuntime<'a> {
     /// The worker running the body, upstream's `_worker`.
     worker: &'a Worker,
     /// The job the node was dequeued as: what [`NonpreemptiveRuntime::schedule`]
-    /// reaches the graph, the parent and the topology through, exactly as
-    /// [`Runtime::schedule`] does.
+    /// reaches the graph, the parent and the topology through.
     job: &'a Job,
     /// The scheduling loop of the worker running the body, for
     /// [`NonpreemptiveRuntime::schedule`]'s one push onto it.
@@ -697,8 +650,7 @@ pub struct NonpreemptiveRuntime<'a> {
 }
 
 impl<'a> NonpreemptiveRuntime<'a> {
-    /// Builds the handle for a nonpreemptive runtime task running on the node
-    /// `job` is for.
+    /// Builds the handle for a nonpreemptive runtime task on `job`'s node.
     pub(crate) fn new(worker: &'a Worker, job: &'a Job, thread: &'a mut WorkerThread) -> Self {
         Self {
             worker,
@@ -707,17 +659,15 @@ impl<'a> NonpreemptiveRuntime<'a> {
         }
     }
 
-    /// Returns the worker running this task's body, upstream's `_worker`
-    /// read back: [`Runtime::worker`]'s read-only half, with no `executor()`
-    /// for the same reason that method has none.
+    /// Returns the worker running this task's body, upstream's `_worker` read
+    /// back: [`Runtime::worker`]'s read-only half, with no `executor()`.
     #[must_use]
     pub fn worker(&self) -> &'a Worker {
         self.worker
     }
 
     /// Returns the id of the worker running this task's body:
-    /// [`NonpreemptiveRuntime::worker`]`().id()` in one hop, as
-    /// [`Runtime::worker_id`] is for the full handle.
+    /// [`NonpreemptiveRuntime::worker`]`().id()` in one hop.
     #[must_use]
     pub fn worker_id(&self) -> usize {
         self.worker.id()
@@ -734,27 +684,26 @@ impl<'a> NonpreemptiveRuntime<'a> {
     /// graph's dependencies: upstream's `NonpreemptiveRuntime::schedule`,
     /// which is [`Runtime::schedule`]'s body under a second name. Every word
     /// of that method's doc applies here unchanged -- `task` must be an
-    /// active task of this runtime task's own graph -- with one difference
-    /// in what makes the call safe: this node is never `PREEMPTED` in the
-    /// first place, so a caller never needs to reason about whether this
-    /// node's own body has spawned anything before scheduling it.
+    /// active task of this runtime task's own graph -- with one difference in
+    /// what makes the call safe: this node is never `PREEMPTED`, so a caller
+    /// never has to reason about whether this node's own body has spawned
+    /// anything before scheduling it.
     ///
     /// # Panics
     ///
-    /// The same two panics [`Runtime::schedule`] has: [`Graph::node`](crate::Graph::node)'s,
-    /// if `task` is not a live task of this graph, and the refusal if `task`
-    /// names a node that has already preempted itself -- which a
-    /// nonpreemptive node itself can never be, but whatever `task` names
-    /// instead still can.
+    /// The same two panics [`Runtime::schedule`] has:
+    /// [`Graph::node`](crate::Graph::node)'s if `task` is not a live task of
+    /// this graph, and the refusal if `task` names a node that has already
+    /// preempted itself -- which a nonpreemptive node never is itself.
     pub fn schedule(&mut self, task: Task) {
         schedule_bypassing(self.job, self.thread, task);
     }
 }
 
 impl fmt::Debug for NonpreemptiveRuntime<'_> {
-    /// Names the worker, which is the whole of this handle's identity: unlike
-    /// [`Runtime`], it holds no node of its own to name -- upstream's class
-    /// holds no `Node*` either, only the executor and the worker.
+    /// Names the worker, this handle's whole identity: unlike [`Runtime`] it
+    /// holds no node of its own to name, as upstream's class holds no
+    /// `Node*`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NonpreemptiveRuntime")
             .field("worker", &self.worker.id())
@@ -767,18 +716,15 @@ impl fmt::Debug for NonpreemptiveRuntime<'_> {
 ///
 /// Unlike [`invoke`], there is no preemption protocol here at all: the body
 /// is simply called, with no bit set before it and no reference taken on the
-/// join counter, so this call always finishes the node on this one entry.
-/// `Release::Strong` always, which is why this returns the value rather than
-/// the `Option<Release>` [`invoke`] and [`invoke_async`] do -- there is no
-/// `None` case for the dispatch arm to fold in.
+/// join counter, so this call always finishes the node on this one entry --
+/// hence the bare `Release::Strong` rather than the `Option<Release>`
+/// [`invoke`] and [`invoke_async`] return, there being no `None` case for the
+/// dispatch arm to fold in. A panic out of the body is recorded as a static
+/// task's is, through [`Job::record_panic`].
 ///
-/// A panic out of the body is recorded exactly as a static task's is,
-/// through [`Job::record_panic`].
-///
-/// The dispatch claim's clearest case: `work.invoke` both takes and drops
-/// the one lock it stands in for, in one statement, so the claim here is
-/// taken immediately before that call and released immediately after it
-/// returns -- nothing between the two touches the callable at all.
+/// The dispatch claim's clearest case: `work.invoke` both takes and drops the
+/// one lock it stands in for, in one statement, so the claim here is taken
+/// immediately before that call and released immediately after it returns.
 pub(crate) fn invoke_nonpreemptive(
     worker: &mut WorkerThread,
     job: &Job,

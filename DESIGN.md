@@ -845,6 +845,37 @@ entry above does.
   scheduling for it, and a seam that let it try would be a second, uncounted
   way to reach exactly the double-dispatch hazard the entry below on
   `Runtime::schedule`'s hole exists to close.
+- **`src/executor/corun.rs` comes under the 1.2x guide and
+  `src/executor/runtime.rs` does not** (issue #276). The executor's
+  documentation pass took the two files #228's re-measured disposition marks
+  *pass*, and they end in different places.
+
+  `corun.rs` goes from 1.6x to 1.2x by moving three arguments into its own
+  module `# Design` section: that cancellation is not one of the ways a corun
+  fails, which `CorunError` carried; what `InnerRun`'s `Drop` is for, which
+  the struct doc carried; and that the anchor is taken before the graph is
+  scheduled, which `corun_graph`'s four-step recital carried. What its
+  private methods and that recital said about those a second time is cut.
+
+  `runtime.rs` goes from 2.3x to 2.0x and stops there, which the arithmetic
+  settles rather than a judgement about any one paragraph. 123 of its prose
+  lines are inline `//` comments at the atomics -- why both state bits go on
+  before the body runs, why the body's own reference is a `Release`
+  `fetch_add` and its spending an `AcqRel` `fetch_sub`, why the payload
+  forward waits for those bits to come off, why `CAUGHT` is read before the
+  lock -- and 17 more are the module header above the `# Design` section.
+  Against a budget of 1.2 x 187 code lines, that leaves 84 prose lines for 27
+  documented items, fourteen of them public and four carrying a `# Panics` or
+  `# Errors` section a caller is owed: three lines each. The file reaches the
+  figure only by moving an ordering argument away from the atomic it is
+  about, which is the move #276 refuses for `src/executor/scope.rs` and the
+  ground on which #228 marks `src/executor/dependent_async.rs` exempt. What
+  the pass did take are the redundancies that disposition named:
+  `Runtime::schedule`'s `# Panics` no longer re-derives the M8 failure the
+  "`Runtime::schedule`'s hole is closed in the scheduler" entry below argues,
+  `Runtime::try_corun` no longer makes the anchor argument a third time, and
+  `NonpreemptiveRuntime`'s `private_bounds` rationale is in the module's
+  `# Design` section rather than on the type.
 
 ## Decisions taken in M7
 
