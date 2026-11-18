@@ -64,31 +64,25 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
-use std::time::{Duration, Instant};
 
 use rustflow::prelude::*;
 use rustflow::{Executor, Xorshift32};
 
-/// How long a spin waits for what it is spinning on before it gives up.
-///
-/// Far longer than any rendezvous in this file needs, even pinned to a single
-/// core with eight workers sharing it: nothing here passes because of this
-/// number, and the only thing that reaches it is a worker that is never going
-/// to arrive.
-const GIVE_UP_AFTER: Duration = Duration::from_secs(120);
+// The matrix macro, the counting bodies this file's graphs are built from,
+// and the spin every rendezvous in it waits on. `common/counters.rs` is
+// deliberately not among them: three cases here name a local `count` and two
+// more build a second counter in a scope that already has one, so `count` and
+// `counter` would both be shadowed at the point of use -- [`shared_counter`]
+// below is the same `Arc<AtomicUsize>` under a name that is free everywhere.
+#[macro_use]
+mod common;
+#[path = "common/bodies.rs"]
+mod bodies;
+#[path = "common/spin.rs"]
+mod spin;
 
-/// Upstream's `while(!ready) std::this_thread::yield();`.
-///
-/// `what` is what the caller is waiting for, phrased to finish the sentence
-/// "gave up waiting for ...", because the assertion message is the whole
-/// diagnostic when a scheduling bug trips it.
-fn spin_until(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + GIVE_UP_AFTER;
-    while !ready() {
-        assert!(Instant::now() < deadline, "gave up waiting for {what}");
-        thread::yield_now();
-    }
-}
+use bodies::bump;
+use spin::spin_until;
 
 /// A seed per worker count, so that two cases at different worker counts do
 /// not draw the same sequence and any one of them re-runs on its own.
@@ -137,19 +131,11 @@ fn shared_counter() -> Arc<AtomicUsize> {
     Arc::new(AtomicUsize::new(0))
 }
 
-/// Upstream's `taskflow.emplace([&](){ counter.fetch_add(1, relaxed); })`.
-fn bump(taskflow: &mut Taskflow, counter: &Arc<AtomicUsize>) -> Task {
-    let counter = Arc::clone(counter);
-    taskflow.emplace(move || {
-        counter.fetch_add(1, Ordering::Relaxed);
-    })
-}
-
 /// Upstream's linear chain of counting tasks, and the handle of its last task.
 fn counting_chain(taskflow: &mut Taskflow, counter: &Arc<AtomicUsize>, length: usize) -> Task {
     let mut prev: Option<Task> = None;
     for _ in 0..length {
-        let curr = bump(taskflow, counter);
+        let curr = taskflow.emplace(bump(counter));
         if let Some(prev) = prev {
             taskflow.task(curr).succeed([prev]);
         }
@@ -197,7 +183,7 @@ fn starvation_branches(workers: usize) {
     let curr = counting_chain(&mut taskflow, &counter, 100);
 
     for _ in workers / 2..workers {
-        let branch = bump(&mut taskflow, &counter);
+        let branch = taskflow.emplace(bump(&counter));
         taskflow.task(branch).succeed([curr]);
     }
 
@@ -220,44 +206,17 @@ fn starvation_branches(workers: usize) {
     );
 }
 
-#[test]
-fn starvation_branches_1_worker() {
-    starvation_branches(1);
-}
-
-#[test]
-fn starvation_branches_2_workers() {
-    starvation_branches(2);
-}
-
-#[test]
-fn starvation_branches_3_workers() {
-    starvation_branches(3);
-}
-
-#[test]
-fn starvation_branches_4_workers() {
-    starvation_branches(4);
-}
-
-#[test]
-fn starvation_branches_5_workers() {
-    starvation_branches(5);
-}
-
-#[test]
-fn starvation_branches_6_workers() {
-    starvation_branches(6);
-}
-
-#[test]
-fn starvation_branches_7_workers() {
-    starvation_branches(7);
-}
-
-#[test]
-fn starvation_branches_8_workers() {
-    starvation_branches(8);
+worker_matrix! {
+    starvation_branches {
+        starvation_branches_1_worker(1),
+        starvation_branches_2_workers(2),
+        starvation_branches_3_workers(3),
+        starvation_branches_4_workers(4),
+        starvation_branches_5_workers(5),
+        starvation_branches_6_workers(6),
+        starvation_branches_7_workers(7),
+        starvation_branches_8_workers(8),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -296,7 +255,7 @@ fn starvation_branch_with_pivot(workers: usize, seed: u32) {
         // probability 0.1.
         let branch = if rng.next_u32().is_multiple_of(10) {
             target.fetch_add(1, Ordering::Relaxed);
-            bump(&mut taskflow, &counter)
+            taskflow.emplace(bump(&counter))
         } else {
             let executor = Arc::clone(&executor);
             let counter = Arc::clone(&counter);
@@ -321,44 +280,17 @@ fn starvation_branch_with_pivot(workers: usize, seed: u32) {
     );
 }
 
-#[test]
-fn starvation_branch_with_pivot_1_worker() {
-    starvation_branch_with_pivot(1, seed_for(1));
-}
-
-#[test]
-fn starvation_branch_with_pivot_2_workers() {
-    starvation_branch_with_pivot(2, seed_for(2));
-}
-
-#[test]
-fn starvation_branch_with_pivot_3_workers() {
-    starvation_branch_with_pivot(3, seed_for(3));
-}
-
-#[test]
-fn starvation_branch_with_pivot_4_workers() {
-    starvation_branch_with_pivot(4, seed_for(4));
-}
-
-#[test]
-fn starvation_branch_with_pivot_5_workers() {
-    starvation_branch_with_pivot(5, seed_for(5));
-}
-
-#[test]
-fn starvation_branch_with_pivot_6_workers() {
-    starvation_branch_with_pivot(6, seed_for(6));
-}
-
-#[test]
-fn starvation_branch_with_pivot_7_workers() {
-    starvation_branch_with_pivot(7, seed_for(7));
-}
-
-#[test]
-fn starvation_branch_with_pivot_8_workers() {
-    starvation_branch_with_pivot(8, seed_for(8));
+worker_matrix! {
+    starvation_branch_with_pivot {
+        starvation_branch_with_pivot_1_worker(1, seed_for(1)),
+        starvation_branch_with_pivot_2_workers(2, seed_for(2)),
+        starvation_branch_with_pivot_3_workers(3, seed_for(3)),
+        starvation_branch_with_pivot_4_workers(4, seed_for(4)),
+        starvation_branch_with_pivot_5_workers(5, seed_for(5)),
+        starvation_branch_with_pivot_6_workers(6, seed_for(6)),
+        starvation_branch_with_pivot_7_workers(7, seed_for(7)),
+        starvation_branch_with_pivot_8_workers(8, seed_for(8)),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -439,7 +371,7 @@ fn starvation_loop(workers: usize) {
         let curr = if l == 0 {
             taskflow.emplace(|| {})
         } else {
-            bump(&mut taskflow, &counter)
+            taskflow.emplace(bump(&counter))
         };
         if let Some(prev) = prev {
             taskflow.task(curr).succeed([prev]);
@@ -477,44 +409,17 @@ fn starvation_loop(workers: usize) {
     run(&executor, &taskflow);
 }
 
-#[test]
-fn starvation_loop_1_worker() {
-    starvation_loop(1);
-}
-
-#[test]
-fn starvation_loop_2_workers() {
-    starvation_loop(2);
-}
-
-#[test]
-fn starvation_loop_3_workers() {
-    starvation_loop(3);
-}
-
-#[test]
-fn starvation_loop_4_workers() {
-    starvation_loop(4);
-}
-
-#[test]
-fn starvation_loop_5_workers() {
-    starvation_loop(5);
-}
-
-#[test]
-fn starvation_loop_6_workers() {
-    starvation_loop(6);
-}
-
-#[test]
-fn starvation_loop_7_workers() {
-    starvation_loop(7);
-}
-
-#[test]
-fn starvation_loop_8_workers() {
-    starvation_loop(8);
+worker_matrix! {
+    starvation_loop {
+        starvation_loop_1_worker(1),
+        starvation_loop_2_workers(2),
+        starvation_loop_3_workers(3),
+        starvation_loop_4_workers(4),
+        starvation_loop_5_workers(5),
+        starvation_loop_6_workers(6),
+        starvation_loop_7_workers(7),
+        starvation_loop_8_workers(8),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -664,44 +569,17 @@ fn subflow_starvation(workers: usize) {
     run_n(&executor, &taskflow, 5);
 }
 
-#[test]
-fn subflow_starvation_1_worker() {
-    subflow_starvation(1);
-}
-
-#[test]
-fn subflow_starvation_2_workers() {
-    subflow_starvation(2);
-}
-
-#[test]
-fn subflow_starvation_3_workers() {
-    subflow_starvation(3);
-}
-
-#[test]
-fn subflow_starvation_4_workers() {
-    subflow_starvation(4);
-}
-
-#[test]
-fn subflow_starvation_5_workers() {
-    subflow_starvation(5);
-}
-
-#[test]
-fn subflow_starvation_6_workers() {
-    subflow_starvation(6);
-}
-
-#[test]
-fn subflow_starvation_7_workers() {
-    subflow_starvation(7);
-}
-
-#[test]
-fn subflow_starvation_8_workers() {
-    subflow_starvation(8);
+worker_matrix! {
+    subflow_starvation {
+        subflow_starvation_1_worker(1),
+        subflow_starvation_2_workers(2),
+        subflow_starvation_3_workers(3),
+        subflow_starvation_4_workers(4),
+        subflow_starvation_5_workers(5),
+        subflow_starvation_6_workers(6),
+        subflow_starvation_7_workers(7),
+        subflow_starvation_8_workers(8),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -754,44 +632,17 @@ fn embarrasing_starvation(workers: usize) {
     );
 }
 
-#[test]
-fn embarrasing_starvation_1_worker() {
-    embarrasing_starvation(1);
-}
-
-#[test]
-fn embarrasing_starvation_2_workers() {
-    embarrasing_starvation(2);
-}
-
-#[test]
-fn embarrasing_starvation_3_workers() {
-    embarrasing_starvation(3);
-}
-
-#[test]
-fn embarrasing_starvation_4_workers() {
-    embarrasing_starvation(4);
-}
-
-#[test]
-fn embarrasing_starvation_5_workers() {
-    embarrasing_starvation(5);
-}
-
-#[test]
-fn embarrasing_starvation_6_workers() {
-    embarrasing_starvation(6);
-}
-
-#[test]
-fn embarrasing_starvation_7_workers() {
-    embarrasing_starvation(7);
-}
-
-#[test]
-fn embarrasing_starvation_8_workers() {
-    embarrasing_starvation(8);
+worker_matrix! {
+    embarrasing_starvation {
+        embarrasing_starvation_1_worker(1),
+        embarrasing_starvation_2_workers(2),
+        embarrasing_starvation_3_workers(3),
+        embarrasing_starvation_4_workers(4),
+        embarrasing_starvation_5_workers(5),
+        embarrasing_starvation_6_workers(6),
+        embarrasing_starvation_7_workers(7),
+        embarrasing_starvation_8_workers(8),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -884,44 +735,17 @@ fn skewed_starvation(workers: usize, seed: u32) {
     run_n(&executor, &taskflow, 1024);
 }
 
-#[test]
-fn skewed_starvation_1_worker() {
-    skewed_starvation(1, seed_for(1));
-}
-
-#[test]
-fn skewed_starvation_2_workers() {
-    skewed_starvation(2, seed_for(2));
-}
-
-#[test]
-fn skewed_starvation_3_workers() {
-    skewed_starvation(3, seed_for(3));
-}
-
-#[test]
-fn skewed_starvation_4_workers() {
-    skewed_starvation(4, seed_for(4));
-}
-
-#[test]
-fn skewed_starvation_5_workers() {
-    skewed_starvation(5, seed_for(5));
-}
-
-#[test]
-fn skewed_starvation_6_workers() {
-    skewed_starvation(6, seed_for(6));
-}
-
-#[test]
-fn skewed_starvation_7_workers() {
-    skewed_starvation(7, seed_for(7));
-}
-
-#[test]
-fn skewed_starvation_8_workers() {
-    skewed_starvation(8, seed_for(8));
+worker_matrix! {
+    skewed_starvation {
+        skewed_starvation_1_worker(1, seed_for(1)),
+        skewed_starvation_2_workers(2, seed_for(2)),
+        skewed_starvation_3_workers(3, seed_for(3)),
+        skewed_starvation_4_workers(4, seed_for(4)),
+        skewed_starvation_5_workers(5, seed_for(5)),
+        skewed_starvation_6_workers(6, seed_for(6)),
+        skewed_starvation_7_workers(7, seed_for(7)),
+        skewed_starvation_8_workers(8, seed_for(8)),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1019,44 +843,17 @@ fn nary_starvation(workers: usize, seed: u32) {
     run_n(&executor, &taskflow, 5);
 }
 
-#[test]
-fn nary_starvation_1_worker() {
-    nary_starvation(1, seed_for(1));
-}
-
-#[test]
-fn nary_starvation_2_workers() {
-    nary_starvation(2, seed_for(2));
-}
-
-#[test]
-fn nary_starvation_3_workers() {
-    nary_starvation(3, seed_for(3));
-}
-
-#[test]
-fn nary_starvation_4_workers() {
-    nary_starvation(4, seed_for(4));
-}
-
-#[test]
-fn nary_starvation_5_workers() {
-    nary_starvation(5, seed_for(5));
-}
-
-#[test]
-fn nary_starvation_6_workers() {
-    nary_starvation(6, seed_for(6));
-}
-
-#[test]
-fn nary_starvation_7_workers() {
-    nary_starvation(7, seed_for(7));
-}
-
-#[test]
-fn nary_starvation_8_workers() {
-    nary_starvation(8, seed_for(8));
+worker_matrix! {
+    nary_starvation {
+        nary_starvation_1_worker(1, seed_for(1)),
+        nary_starvation_2_workers(2, seed_for(2)),
+        nary_starvation_3_workers(3, seed_for(3)),
+        nary_starvation_4_workers(4, seed_for(4)),
+        nary_starvation_5_workers(5, seed_for(5)),
+        nary_starvation_6_workers(6, seed_for(6)),
+        nary_starvation_7_workers(7, seed_for(7)),
+        nary_starvation_8_workers(8, seed_for(8)),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1126,7 +923,7 @@ fn wavefront_starvation(workers: usize) {
                     }
                 })
             } else {
-                bump(&mut taskflow, &count)
+                taskflow.emplace(bump(&count))
             };
             taskflow.task(task).name(format!("{i}, {j}"));
             row.push(task);
@@ -1154,44 +951,17 @@ fn wavefront_starvation(workers: usize) {
     );
 }
 
-#[test]
-fn wavefront_starvation_1_worker() {
-    wavefront_starvation(1);
-}
-
-#[test]
-fn wavefront_starvation_2_workers() {
-    wavefront_starvation(2);
-}
-
-#[test]
-fn wavefront_starvation_3_workers() {
-    wavefront_starvation(3);
-}
-
-#[test]
-fn wavefront_starvation_4_workers() {
-    wavefront_starvation(4);
-}
-
-#[test]
-fn wavefront_starvation_5_workers() {
-    wavefront_starvation(5);
-}
-
-#[test]
-fn wavefront_starvation_6_workers() {
-    wavefront_starvation(6);
-}
-
-#[test]
-fn wavefront_starvation_7_workers() {
-    wavefront_starvation(7);
-}
-
-#[test]
-fn wavefront_starvation_8_workers() {
-    wavefront_starvation(8);
+worker_matrix! {
+    wavefront_starvation {
+        wavefront_starvation_1_worker(1),
+        wavefront_starvation_2_workers(2),
+        wavefront_starvation_3_workers(3),
+        wavefront_starvation_4_workers(4),
+        wavefront_starvation_5_workers(5),
+        wavefront_starvation_6_workers(6),
+        wavefront_starvation_7_workers(7),
+        wavefront_starvation_8_workers(8),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1262,39 +1032,16 @@ fn oversubscription(workers: usize) {
     }
 }
 
-#[test]
-fn oversubscription_2_workers() {
-    oversubscription(2);
-}
-
-#[test]
-fn oversubscription_3_workers() {
-    oversubscription(3);
-}
-
-#[test]
-fn oversubscription_4_workers() {
-    oversubscription(4);
-}
-
-#[test]
-fn oversubscription_5_workers() {
-    oversubscription(5);
-}
-
-#[test]
-fn oversubscription_6_workers() {
-    oversubscription(6);
-}
-
-#[test]
-fn oversubscription_7_workers() {
-    oversubscription(7);
-}
-
-#[test]
-fn oversubscription_8_workers() {
-    oversubscription(8);
+worker_matrix! {
+    oversubscription {
+        oversubscription_2_workers(2),
+        oversubscription_3_workers(3),
+        oversubscription_4_workers(4),
+        oversubscription_5_workers(5),
+        oversubscription_6_workers(6),
+        oversubscription_7_workers(7),
+        oversubscription_8_workers(8),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1373,44 +1120,17 @@ fn waiter(workers: usize) {
     run(&executor, &taskflow);
 }
 
-#[test]
-fn waiter_1_worker() {
-    waiter(1);
-}
-
-#[test]
-fn waiter_2_workers() {
-    waiter(2);
-}
-
-#[test]
-fn waiter_3_workers() {
-    waiter(3);
-}
-
-#[test]
-fn waiter_4_workers() {
-    waiter(4);
-}
-
-#[test]
-fn waiter_5_workers() {
-    waiter(5);
-}
-
-#[test]
-fn waiter_6_workers() {
-    waiter(6);
-}
-
-#[test]
-fn waiter_7_workers() {
-    waiter(7);
-}
-
-#[test]
-fn waiter_8_workers() {
-    waiter(8);
+worker_matrix! {
+    waiter {
+        waiter_1_worker(1),
+        waiter_2_workers(2),
+        waiter_3_workers(3),
+        waiter_4_workers(4),
+        waiter_5_workers(5),
+        waiter_6_workers(6),
+        waiter_7_workers(7),
+        waiter_8_workers(8),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1485,42 +1205,15 @@ fn continuation(workers: usize) {
     );
 }
 
-#[test]
-fn continuation_1_worker() {
-    continuation(1);
-}
-
-#[test]
-fn continuation_2_workers() {
-    continuation(2);
-}
-
-#[test]
-fn continuation_3_workers() {
-    continuation(3);
-}
-
-#[test]
-fn continuation_4_workers() {
-    continuation(4);
-}
-
-#[test]
-fn continuation_5_workers() {
-    continuation(5);
-}
-
-#[test]
-fn continuation_6_workers() {
-    continuation(6);
-}
-
-#[test]
-fn continuation_7_workers() {
-    continuation(7);
-}
-
-#[test]
-fn continuation_8_workers() {
-    continuation(8);
+worker_matrix! {
+    continuation {
+        continuation_1_worker(1),
+        continuation_2_workers(2),
+        continuation_3_workers(3),
+        continuation_4_workers(4),
+        continuation_5_workers(5),
+        continuation_6_workers(6),
+        continuation_7_workers(7),
+        continuation_8_workers(8),
+    }
 }

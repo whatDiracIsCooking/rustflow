@@ -93,22 +93,21 @@ use std::time::{Duration, Instant};
 use rustflow::prelude::*;
 use rustflow::{Executor, RunError, Xorshift32};
 
-/// How long a handshake waits for the other side before it gives up.
-///
-/// The deadline-asserting spin the rest of the suite uses -- `spin_until`
-/// below is the one in `executor::run_handle`'s own cases -- rather than a
-/// bare loop: a scheduling defect here would otherwise hang the suite instead
-/// of failing one case.
-const GIVE_UP_AFTER: Duration = Duration::from_secs(120);
+// Only the spin: there is no numbered family here to want the matrix macro,
+// and what the cases count is a per-index value in the shared buffer below
+// rather than a tally `common/counters.rs` could carry.
+#[path = "common/spin.rs"]
+mod spin;
 
-/// Spins until `flag` is set, failing rather than hanging if it never is.
-fn spin_until(what: &str, flag: &AtomicBool) {
-    let deadline = Instant::now() + GIVE_UP_AFTER;
-    while !flag.load(Ordering::Acquire) {
-        assert!(Instant::now() < deadline, "gave up waiting for {what}");
-        thread::yield_now();
-    }
-}
+use spin::spin_until;
+
+/// How long the one handshake written out below waits before it gives up.
+///
+/// [`spin_until`] is what every other wait in this suite is, and it is not
+/// what that one can be: its loop sets the flag it is waiting on from inside
+/// itself. The number is the same 120 seconds for the same reason -- a
+/// scheduling defect should fail one case rather than hang the suite.
+const GIVE_UP_AFTER: Duration = Duration::from_secs(120);
 
 /// Upstream's `Runtime.Schedule.ModuleTask`.
 ///
@@ -225,7 +224,9 @@ fn a_runtime_body_stops_when_its_run_is_cancelled() {
 
         let executor = Executor::new(workers);
         let run = executor.run(&taskflow);
-        spin_until("the runtime body to start", &reached);
+        spin_until("the runtime body to start", || {
+            reached.load(Ordering::Acquire)
+        });
         assert!(run.cancel(), "the run had not finished");
 
         // A cancelled run completes normally, which is upstream's

@@ -53,27 +53,41 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
-use std::time::{Duration, Instant};
 
 use rustflow::prelude::*;
 use rustflow::{Executor, Node, RunHandle, SubflowWork};
 
+// Only the spin: no numbered family here wants the matrix macro, and the
+// three counting helpers below are this file's own for the reason given with
+// them.
+#[path = "common/spin.rs"]
+mod spin;
+
+use spin::spin_until;
+
 /// A counter shared with the task bodies that bump it.
 type Counter = Arc<AtomicUsize>;
 
+// The three below are `common/counters.rs`'s and `common/bodies.rs`'s idea
+// and deliberately not their code, which is what the `seq_` prefix is for:
+// every access here is `SeqCst` where the shared helpers are `Relaxed`, and
+// `seq_bump` hands back the count it replaced rather than a body, because
+// what this file asserts is the *order* two bodies ran in. Adapting the
+// shared pair to fit would make them fit nothing else.
+
 /// A fresh counter.
-fn counter() -> Counter {
+fn seq_counter() -> Counter {
     Arc::new(AtomicUsize::new(0))
 }
 
 /// Bumps `counter` and hands back what it was, which is how every ordering
 /// assertion below is phrased.
-fn bump(counter: &Counter) -> usize {
+fn seq_bump(counter: &Counter) -> usize {
     counter.fetch_add(1, Ordering::SeqCst)
 }
 
 /// What `counter` has counted.
-fn count(counter: &Counter) -> usize {
+fn seq_count(counter: &Counter) -> usize {
     counter.load(Ordering::SeqCst)
 }
 
@@ -95,8 +109,8 @@ fn count(counter: &Counter) -> usize {
 fn a_chain_of_nested_subflows_runs_in_order() {
     for workers in 1..=8 {
         let context = format!("{workers} worker(s)");
-        let fu3v = counter();
-        let fu3v_ = counter();
+        let fu3v = seq_counter();
+        let fu3v_ = seq_counter();
 
         let mut taskflow = Taskflow::new();
 
@@ -105,7 +119,7 @@ fn a_chain_of_nested_subflows_runs_in_order() {
         let subflow1 = taskflow.emplace_subflow({
             let fu3v = Arc::clone(&fu3v);
             move |subflow: &mut Subflow<'_>| {
-                bump(&fu3v);
+                seq_bump(&fu3v);
                 subflow.join().expect("a fresh subflow is joinable");
             }
         });
@@ -116,13 +130,13 @@ fn a_chain_of_nested_subflows_runs_in_order() {
         let subflow2 = taskflow.emplace_subflow({
             let fu3v = Arc::clone(&fu3v);
             move |subflow: &mut Subflow<'_>| {
-                bump(&fu3v);
+                seq_bump(&fu3v);
                 let fu3v = Arc::clone(&fu3v);
                 subflow.emplace_subflow(move |subflow: &mut Subflow<'_>| {
-                    bump(&fu3v);
+                    seq_bump(&fu3v);
                     let fu3v = Arc::clone(&fu3v);
                     subflow.emplace_subflow(move |subflow: &mut Subflow<'_>| {
-                        bump(&fu3v);
+                        seq_bump(&fu3v);
                         subflow.join().expect("a fresh subflow is joinable");
                     });
                 });
@@ -136,18 +150,18 @@ fn a_chain_of_nested_subflows_runs_in_order() {
             move |subflow: &mut Subflow<'_>| {
                 // Upstream's `REQUIRE(fu3v == 4)`: subflow1, subflow2 and the
                 // two subflows nested inside it have all finished.
-                assert_eq!(count(&fu3v), 4, "the subflows before this one ran");
-                bump(&fu3v);
-                bump(&fu3v_);
+                assert_eq!(seq_count(&fu3v), 4, "the subflows before this one ran");
+                seq_bump(&fu3v);
+                seq_bump(&fu3v_);
 
                 let subflow3_ = {
                     let fu3v = Arc::clone(&fu3v);
                     let fu3v_ = Arc::clone(&fu3v_);
                     subflow.emplace_subflow(move |subflow: &mut Subflow<'_>| {
                         // Its two predecessors inside this subgraph have run.
-                        assert_eq!(count(&fu3v_), 3, "s1 and s2 ran first");
-                        bump(&fu3v);
-                        bump(&fu3v_);
+                        assert_eq!(seq_count(&fu3v_), 3, "s1 and s2 ran first");
+                        seq_bump(&fu3v);
+                        seq_bump(&fu3v_);
                         subflow.join().expect("a fresh subflow is joinable");
                     })
                 };
@@ -155,24 +169,24 @@ fn a_chain_of_nested_subflows_runs_in_order() {
                     let fu3v = Arc::clone(&fu3v);
                     let fu3v_ = Arc::clone(&fu3v_);
                     subflow.emplace(move || {
-                        bump(&fu3v_);
-                        bump(&fu3v);
+                        seq_bump(&fu3v_);
+                        seq_bump(&fu3v);
                     })
                 };
                 let s2 = {
                     let fu3v = Arc::clone(&fu3v);
                     let fu3v_ = Arc::clone(&fu3v_);
                     subflow.emplace(move || {
-                        bump(&fu3v_);
-                        bump(&fu3v);
+                        seq_bump(&fu3v_);
+                        seq_bump(&fu3v);
                     })
                 };
                 let s3 = {
                     let fu3v = Arc::clone(&fu3v);
                     let fu3v_ = Arc::clone(&fu3v_);
                     subflow.emplace(move || {
-                        bump(&fu3v);
-                        assert_eq!(count(&fu3v_), 4, "the subflow before this one ran");
+                        seq_bump(&fu3v);
+                        assert_eq!(seq_count(&fu3v_), 4, "the subflow before this one ran");
                     })
                 };
 
@@ -182,7 +196,7 @@ fn a_chain_of_nested_subflows_runs_in_order() {
                 subflow.linearize([s2, subflow3_]);
                 subflow.linearize([subflow3_, s3]);
 
-                assert_eq!(count(&fu3v_), 1, "nothing of the subgraph has run");
+                assert_eq!(seq_count(&fu3v_), 1, "nothing of the subgraph has run");
             }
         });
         taskflow.task(subflow3).name("subflow3");
@@ -190,7 +204,7 @@ fn a_chain_of_nested_subflows_runs_in_order() {
         let subflow4 = taskflow.emplace({
             let fu3v = Arc::clone(&fu3v);
             move || {
-                bump(&fu3v);
+                seq_bump(&fu3v);
             }
         });
         taskflow.task(subflow4).name("subflow4");
@@ -204,8 +218,8 @@ fn a_chain_of_nested_subflows_runs_in_order() {
 
         // Upstream asserts these two totals in its detached twin, and they
         // are the same ten bodies and four orderings here.
-        assert_eq!(count(&fu3v), 10, "{context}");
-        assert_eq!(count(&fu3v_), 4, "{context}");
+        assert_eq!(seq_count(&fu3v), 10, "{context}");
+        assert_eq!(seq_count(&fu3v_), 4, "{context}");
     }
 }
 
@@ -223,7 +237,7 @@ fn a_subflow_orders_the_work_it_builds_against_itself() {
         let context = format!("{workers} worker(s)");
         let data: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
         let sum = Arc::new(AtomicU64::new(0));
-        let counted = counter();
+        let counted = seq_counter();
 
         let mut taskflow = Taskflow::new();
         let fill = taskflow.emplace({
@@ -269,7 +283,7 @@ fn a_subflow_orders_the_work_it_builds_against_itself() {
                 subflow.linearize([before, reduce, after]);
 
                 for _ in 0..10 {
-                    bump(&counted);
+                    seq_bump(&counted);
                 }
 
                 // The nested subflow, which every one of the ten tasks below
@@ -278,20 +292,20 @@ fn a_subflow_orders_the_work_it_builds_against_itself() {
                 let nested = {
                     let counted = Arc::clone(&counted);
                     subflow.emplace_subflow(move |subflow: &mut Subflow<'_>| {
-                        assert_eq!(count(&counted), 20, "the ten siblings ran");
-                        bump(&counted);
+                        assert_eq!(seq_count(&counted), 20, "the ten siblings ran");
+                        seq_bump(&counted);
 
                         let mut previous = {
                             let counted = Arc::clone(&counted);
                             subflow.emplace(move || {
-                                assert_eq!(bump(&counted), 21, "the chain starts at 21");
+                                assert_eq!(seq_bump(&counted), 21, "the chain starts at 21");
                             })
                         };
                         for i in 0..10 {
                             let next = {
                                 let counted = Arc::clone(&counted);
                                 subflow.emplace(move || {
-                                    assert_eq!(bump(&counted), 22 + i, "the chain is serial");
+                                    assert_eq!(seq_bump(&counted), 22 + i, "the chain is serial");
                                 })
                             };
                             subflow.linearize([previous, next]);
@@ -302,7 +316,7 @@ fn a_subflow_orders_the_work_it_builds_against_itself() {
                 for _ in 0..10 {
                     let counted = Arc::clone(&counted);
                     let sibling = subflow.emplace(move || {
-                        bump(&counted);
+                        seq_bump(&counted);
                     });
                     subflow.linearize([sibling, nested]);
                 }
@@ -315,7 +329,7 @@ fn a_subflow_orders_the_work_it_builds_against_itself() {
             .wait()
             .unwrap_or_else(|error| panic!("{context}: {error}"));
 
-        assert_eq!(count(&counted), 32, "{context}");
+        assert_eq!(seq_count(&counted), 32, "{context}");
         assert_eq!(sum.load(Ordering::SeqCst), 10, "{context}");
     }
 }
@@ -412,17 +426,17 @@ fn multiple_runs_diamond(taskflow: &mut Taskflow, counted: &Counter) -> (Task, T
     let a = {
         let counted = Arc::clone(counted);
         taskflow.emplace(move || {
-            bump(&counted);
+            seq_bump(&counted);
         })
     };
     let b = {
         let counted = Arc::clone(counted);
         taskflow.emplace_subflow(move |subflow: &mut Subflow<'_>| {
-            bump(&counted);
+            seq_bump(&counted);
             let mut child = || {
                 let counted = Arc::clone(&counted);
                 subflow.emplace(move || {
-                    bump(&counted);
+                    seq_bump(&counted);
                 })
             };
             let b1 = child();
@@ -435,13 +449,13 @@ fn multiple_runs_diamond(taskflow: &mut Taskflow, counted: &Counter) -> (Task, T
     let c = {
         let counted = Arc::clone(counted);
         taskflow.emplace(move || {
-            bump(&counted);
+            seq_bump(&counted);
         })
     };
     let d = {
         let counted = Arc::clone(counted);
         taskflow.emplace(move || {
-            bump(&counted);
+            seq_bump(&counted);
         })
     };
 
@@ -485,7 +499,7 @@ fn multiple_subflow_runs(workers: usize) {
     let context = format!("{workers} worker(s)");
     let executor = Executor::new(workers);
     let mut taskflow = Taskflow::new();
-    let counted = counter();
+    let counted = seq_counter();
     multiple_runs_diamond(&mut taskflow, &counted);
 
     let mut handles: Vec<RunHandle<'_>> = Vec::with_capacity(500);
@@ -505,7 +519,7 @@ fn multiple_subflow_runs(workers: usize) {
             let counted = Arc::clone(&counted);
             handles.push(executor.run_with(&taskflow, move || {
                 assert_eq!(
-                    count(&counted),
+                    seq_count(&counted),
                     (i + 1) * 7,
                     "{workers} worker(s): run {i} sees its own seven tasks and no more"
                 );
@@ -526,7 +540,7 @@ fn multiple_subflow_runs(workers: usize) {
             .unwrap_or_else(|error| panic!("{context}: handle {index}: {error}"));
     }
 
-    assert_eq!(count(&counted), 7000, "{context}");
+    assert_eq!(seq_count(&counted), 7000, "{context}");
 }
 
 /// Upstream's eight `MultipleSubflowRuns` cases, which are one helper at one
@@ -555,14 +569,18 @@ fn multiple_subflow_runs_with_changed_taskflow(workers: usize) {
     let context = format!("{workers} worker(s)");
     let executor = Executor::new(workers);
     let mut taskflow = Taskflow::new();
-    let counted = counter();
+    let counted = seq_counter();
     let (_, _, _, d) = multiple_runs_diamond(&mut taskflow, &counted);
 
     executor
         .run_n(&taskflow, 10)
         .wait()
         .unwrap_or_else(|error| panic!("{context}: {error}"));
-    assert_eq!(count(&counted), 70, "{context}: ten runs of seven tasks");
+    assert_eq!(
+        seq_count(&counted),
+        70,
+        "{context}: ten runs of seven tasks"
+    );
 
     let e = taskflow.emplace(|| {});
     taskflow.task(d).precede([e]);
@@ -570,7 +588,7 @@ fn multiple_subflow_runs_with_changed_taskflow(workers: usize) {
         .run_n(&taskflow, 10)
         .wait()
         .unwrap_or_else(|error| panic!("{context}: {error}"));
-    assert_eq!(count(&counted), 140, "{context}: ten more");
+    assert_eq!(seq_count(&counted), 140, "{context}: ten more");
 
     let f = taskflow.emplace(|| {});
     taskflow.task(e).precede([f]);
@@ -579,7 +597,7 @@ fn multiple_subflow_runs_with_changed_taskflow(workers: usize) {
     handle
         .wait()
         .unwrap_or_else(|error| panic!("{context}: {error}"));
-    assert_eq!(count(&counted), 210, "{context}: ten more again");
+    assert_eq!(seq_count(&counted), 210, "{context}: ten more again");
 }
 
 /// Upstream's eight `MultipleSubflowRuns.ChangedTaskflow` cases.
@@ -612,7 +630,11 @@ fn ten_runs() -> impl FnMut() -> bool + Send + 'static {
 fn seventy_then_reset(counted: &Counter, context: String) -> impl FnOnce() + Send + 'static {
     let counted = Arc::clone(counted);
     move || {
-        assert_eq!(count(&counted), 70, "{context}: ten runs of seven tasks");
+        assert_eq!(
+            seq_count(&counted),
+            70,
+            "{context}: ten runs of seven tasks"
+        );
         counted.store(0, Ordering::SeqCst);
     }
 }
@@ -636,7 +658,7 @@ fn multiple_subflow_runs_with_predicate(workers: usize) {
     let context = format!("{workers} worker(s)");
     let executor = Executor::new(workers);
     let mut taskflow = Taskflow::new();
-    let counted = counter();
+    let counted = seq_counter();
     multiple_runs_diamond(&mut taskflow, &counted);
 
     for round in 0..3 {
@@ -649,7 +671,7 @@ fn multiple_subflow_runs_with_predicate(workers: usize) {
             )
             .wait()
             .unwrap_or_else(|error| panic!("{context}: {error}"));
-        assert_eq!(count(&counted), 0, "{context}: the callback reset it");
+        assert_eq!(seq_count(&counted), 0, "{context}: the callback reset it");
     }
 }
 
@@ -680,7 +702,7 @@ fn a_predicate_stops_a_run_of_a_subflow_bearing_taskflow_after_ten() {
 fn a_re_entered_subflow_starts_from_clean_bits() {
     for workers in 1..=4 {
         let context = format!("{workers} worker(s)");
-        let entries = counter();
+        let entries = seq_counter();
 
         let mut taskflow = Taskflow::new();
         let init = taskflow.emplace(|| {});
@@ -689,7 +711,7 @@ fn a_re_entered_subflow_starts_from_clean_bits() {
             move |subflow: &mut Subflow<'_>| {
                 assert!(subflow.joinable(), "a fresh subflow is joinable");
                 assert!(!subflow.retain(), "a fresh subflow retains nothing");
-                bump(&entries);
+                seq_bump(&entries);
                 subflow.join().expect("a fresh subflow is joinable");
                 subflow.set_retain(true);
             }
@@ -712,7 +734,11 @@ fn a_re_entered_subflow_starts_from_clean_bits() {
             .wait()
             .unwrap_or_else(|error| panic!("{context}: {error}"));
 
-        assert_eq!(count(&entries), 101, "{context}: entries to the subflow");
+        assert_eq!(
+            seq_count(&entries),
+            101,
+            "{context}: entries to the subflow"
+        );
 
         // The last entry's bits are still there -- nothing clears them but
         // the next entry -- and the count field of the word is the one strong
@@ -808,7 +834,7 @@ fn a_retained_subgraph_survives_the_run_and_dumps() {
 fn a_subflow_runs_and_retains_one_graph_down() {
     for workers in 1..=4 {
         let context = format!("{workers} worker(s)");
-        let counted = counter();
+        let counted = seq_counter();
 
         // The composed form: a taskflow whose only task is a subflow task,
         // reached through a module node of another taskflow.
@@ -818,7 +844,7 @@ fn a_subflow_runs_and_retains_one_graph_down() {
             move |subflow: &mut Subflow<'_>| {
                 let counted = Arc::clone(&counted);
                 let child = subflow.emplace(move || {
-                    bump(&counted);
+                    seq_bump(&counted);
                 });
                 subflow.task(child).name("child");
                 subflow.set_retain(true);
@@ -835,7 +861,7 @@ fn a_subflow_runs_and_retains_one_graph_down() {
             .wait()
             .unwrap_or_else(|error| panic!("{context}: composed: {error}"));
 
-        assert_eq!(count(&counted), 1, "{context}: composed");
+        assert_eq!(seq_count(&counted), 1, "{context}: composed");
         assert!(
             target.dump().contains("Subflow: spawner"),
             "{context}: composed: the retained subgraph is in the target's node"
@@ -853,7 +879,7 @@ fn a_subflow_runs_and_retains_one_graph_down() {
                     move |subflow: &mut Subflow<'_>| {
                         let counted = Arc::clone(&counted);
                         let child = subflow.emplace(move || {
-                            bump(&counted);
+                            seq_bump(&counted);
                         });
                         subflow.task(child).name("child");
                         subflow.set_retain(true);
@@ -871,7 +897,7 @@ fn a_subflow_runs_and_retains_one_graph_down() {
             .wait()
             .unwrap_or_else(|error| panic!("{context}: adopted: {error}"));
 
-        assert_eq!(count(&counted), 2, "{context}: adopted");
+        assert_eq!(seq_count(&counted), 2, "{context}: adopted");
         let dot = taskflow.dump();
         assert!(
             dot.contains("Subflow: spawner"),
@@ -888,20 +914,16 @@ fn a_subflow_runs_and_retains_one_graph_down() {
 // A body that composes the taskflow it belongs to, which is issue #82's
 // ----------------------------------------------------------------------------
 
-/// How long a refused run is given to report before the case gives up.
-const GIVE_UP_AFTER: Duration = Duration::from_secs(120);
-
 /// Runs `taskflow` on a thread of its own and hands back what its `wait`
 /// reported, failing the case rather than hanging if it reports nothing.
 ///
 /// Every other case in this file waits on `wait` where it stands, which is
 /// right for a run that is meant to finish. A case about a *refusal* cannot:
 /// what it pins is a run that used to never end, so a wait on this thread
-/// would hang the suite instead of failing it. The deadline-asserting spin is
-/// `executor::run_handle`'s own shape, which `tests/cancellation.rs` carries a
-/// copy of too, and the run's thread is left detached on purpose -- if the
-/// refusal ever regresses, the case fails at the deadline and the parked
-/// workers go with the process.
+/// would hang the suite instead of failing it, so the wait is [`spin_until`]
+/// and the run's thread is left detached on purpose -- if the refusal ever
+/// regresses, the case fails at the deadline and the parked workers go with
+/// the process.
 fn refusal_of(taskflow: &Arc<Taskflow>, workers: usize) -> String {
     let reported: Arc<Mutex<Option<String>>> = Arc::default();
     let done = Arc::new(AtomicBool::new(false));
@@ -921,14 +943,7 @@ fn refusal_of(taskflow: &Arc<Taskflow>, workers: usize) -> String {
         });
     }
 
-    let deadline = Instant::now() + GIVE_UP_AFTER;
-    while !done.load(Ordering::Acquire) {
-        assert!(
-            Instant::now() < deadline,
-            "gave up waiting for the refused run to report"
-        );
-        thread::yield_now();
-    }
+    spin_until("the refused run to report", || done.load(Ordering::Acquire));
 
     reported
         .lock()
@@ -953,7 +968,7 @@ fn refusal_of(taskflow: &Arc<Taskflow>, workers: usize) -> String {
 fn a_subflow_that_composes_its_own_taskflow_is_refused() {
     for workers in 1..=4 {
         let context = format!("{workers} worker(s)");
-        let entries = counter();
+        let entries = seq_counter();
         let slot: Arc<OnceLock<Weak<Taskflow>>> = Arc::default();
 
         let mut taskflow = Taskflow::new();
@@ -961,7 +976,7 @@ fn a_subflow_that_composes_its_own_taskflow_is_refused() {
             let entries = Arc::clone(&entries);
             let slot = Arc::clone(&slot);
             move |subflow: &mut Subflow<'_>| {
-                bump(&entries);
+                seq_bump(&entries);
                 let own = slot
                     .get()
                     .expect("filled before the run")
@@ -983,7 +998,7 @@ fn a_subflow_that_composes_its_own_taskflow_is_refused() {
         // The observable of the defect, and the reason this is more than a
         // message check: the second entry to the subflow node was the node
         // being re-armed under the run that had preempted it.
-        assert_eq!(count(&entries), 1, "{context}: the body ran once");
+        assert_eq!(seq_count(&entries), 1, "{context}: the body ran once");
     }
 }
 
@@ -998,7 +1013,7 @@ fn a_subflow_that_composes_its_own_taskflow_is_refused() {
 fn two_taskflows_that_compose_each_other_are_refused() {
     for workers in 1..=4 {
         let context = format!("{workers} worker(s)");
-        let entries = counter();
+        let entries = seq_counter();
         let slot: Arc<OnceLock<Weak<Taskflow>>> = Arc::default();
 
         // The inner taskflow's one task is a subflow task whose body
@@ -1008,7 +1023,7 @@ fn two_taskflows_that_compose_each_other_are_refused() {
             let entries = Arc::clone(&entries);
             let slot = Arc::clone(&slot);
             move |subflow: &mut Subflow<'_>| {
-                bump(&entries);
+                seq_bump(&entries);
                 let outer = slot
                     .get()
                     .expect("filled before the run")
@@ -1029,7 +1044,7 @@ fn two_taskflows_that_compose_each_other_are_refused() {
             reported.contains("may not run a graph it is already inside of"),
             "{context}: {reported}"
         );
-        assert_eq!(count(&entries), 1, "{context}: the body ran once");
+        assert_eq!(seq_count(&entries), 1, "{context}: the body ran once");
     }
 }
 
@@ -1069,7 +1084,7 @@ fn a_subflow_bearing_taskflow_is_editable_the_instant_its_run_reports_done() {
     let editors: Vec<thread::JoinHandle<()>> = (0..THREADS)
         .map(|_| {
             thread::spawn(|| {
-                let counted = counter();
+                let counted = seq_counter();
                 let executor = Executor::new(2);
 
                 for round in 0..ROUNDS {
@@ -1079,7 +1094,7 @@ fn a_subflow_bearing_taskflow_is_editable_the_instant_its_run_reports_done() {
                         taskflow.emplace_subflow(move |subflow: &mut Subflow<'_>| {
                             let counted = Arc::clone(&counted);
                             subflow.emplace(move || {
-                                bump(&counted);
+                                seq_bump(&counted);
                             });
                         })
                     };
@@ -1092,7 +1107,7 @@ fn a_subflow_bearing_taskflow_is_editable_the_instant_its_run_reports_done() {
                         .wait()
                         .unwrap_or_else(|error| panic!("round {round}: {error}"));
                     assert_eq!(
-                        count(&counted),
+                        seq_count(&counted),
                         3,
                         "round {round}: three runs of a one-task subgraph"
                     );

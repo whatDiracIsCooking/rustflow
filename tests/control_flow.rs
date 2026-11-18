@@ -54,13 +54,18 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use rustflow::prelude::*;
 use rustflow::{Executor, RunError, Xorshift32};
 
-/// How many times a task body has run, shared with that body.
-type Counter = Arc<AtomicUsize>;
+// The matrix macro and the counting every case here asserts on.
+// `common/bodies.rs` is not among them: a counting task is added by
+// [`counted`] below, which hands its callers back the task they then order,
+// where `bump` hands back a body. The `AtomicI64` loop counters of
+// `loop_cond` and `hierarchical_loop` are upstream's own signed `int`s and
+// are read where they are, since `count` is over the unsigned share.
+#[macro_use]
+mod common;
+#[path = "common/counters.rs"]
+mod counters;
 
-/// A fresh counter.
-fn counter() -> Counter {
-    Arc::new(AtomicUsize::new(0))
-}
+use counters::{Counter, count, counter};
 
 /// Adds a static task that does nothing but count its own invocations.
 fn counted(taskflow: &mut Taskflow, counter: &Counter) -> Task {
@@ -181,24 +186,13 @@ fn loop_cond(workers: usize) {
     );
 }
 
-#[test]
-fn loop_cond_1_worker() {
-    loop_cond(1);
-}
-
-#[test]
-fn loop_cond_2_workers() {
-    loop_cond(2);
-}
-
-#[test]
-fn loop_cond_3_workers() {
-    loop_cond(3);
-}
-
-#[test]
-fn loop_cond_4_workers() {
-    loop_cond(4);
+worker_matrix! {
+    loop_cond {
+        loop_cond_1_worker(1),
+        loop_cond_2_workers(2),
+        loop_cond_3_workers(3),
+        loop_cond_4_workers(4),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -247,8 +241,8 @@ fn flip_coin_cond(workers: usize, seed: u32) {
 
     // Upstream's `steps`, reset by `A` once per round, and its `total_steps`,
     // accumulated by `G` across rounds.
-    let steps = Arc::new(AtomicUsize::new(0));
-    let total_steps = Arc::new(AtomicUsize::new(0));
+    let steps = counter();
+    let total_steps = counter();
 
     // One generator per coin task, all drawn from one seed rather than
     // hand-picked, so that no two of the five are accidentally in step.
@@ -274,7 +268,7 @@ fn flip_coin_cond(workers: usize, seed: u32) {
         let steps = Arc::clone(&steps);
         let total_steps = Arc::clone(&total_steps);
         taskflow.emplace(move || {
-            total_steps.fetch_add(steps.load(Ordering::Relaxed), Ordering::Relaxed);
+            total_steps.fetch_add(count(&steps), Ordering::Relaxed);
         })
     };
 
@@ -295,7 +289,7 @@ fn flip_coin_cond(workers: usize, seed: u32) {
     // integers: the mean is within one of 32 exactly when the total is within
     // `ROUNDS` of `32 * ROUNDS`, and an integer comparison says so without
     // asking what a `usize` rounds to.
-    let total = total_steps.load(Ordering::Relaxed);
+    let total = count(&total_steps);
     assert!(
         total.abs_diff(32 * ROUNDS) < ROUNDS,
         "seed {seed}, {workers} worker(s): {total} attempts over {ROUNDS} rounds \
@@ -303,24 +297,13 @@ fn flip_coin_cond(workers: usize, seed: u32) {
     );
 }
 
-#[test]
-fn flip_coin_cond_1_worker() {
-    flip_coin_cond(1, seed_for(1));
-}
-
-#[test]
-fn flip_coin_cond_2_workers() {
-    flip_coin_cond(2, seed_for(2));
-}
-
-#[test]
-fn flip_coin_cond_3_workers() {
-    flip_coin_cond(3, seed_for(3));
-}
-
-#[test]
-fn flip_coin_cond_4_workers() {
-    flip_coin_cond(4, seed_for(4));
+worker_matrix! {
+    flip_coin_cond {
+        flip_coin_cond_1_worker(1, seed_for(1)),
+        flip_coin_cond_2_workers(2, seed_for(2)),
+        flip_coin_cond_3_workers(3, seed_for(3)),
+        flip_coin_cond_4_workers(4, seed_for(4)),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -351,7 +334,7 @@ fn cyclic_cond(workers: usize) {
 
     let s = flow.emplace(|| {});
 
-    let num_iterations = Arc::new(AtomicUsize::new(0));
+    let num_iterations = counter();
     let a = {
         let num_iterations = Arc::clone(&num_iterations);
         flow.emplace(move || {
@@ -374,7 +357,7 @@ fn cyclic_cond(workers: usize) {
         let pass_t = Arc::clone(&pass_t);
         flow.emplace(move || {
             assert_eq!(
-                num_iterations.load(Ordering::Relaxed),
+                count(&num_iterations),
                 TOTAL_ITERATION,
                 "`T` runs only after the cycle is spent"
             );
@@ -404,7 +387,7 @@ fn cyclic_cond(workers: usize) {
                     "branch {index} was taken twice"
                 );
                 // 0 is `A`, which closes the cycle; 1 is `T`, which leaves it.
-                i32::from(num_iterations.load(Ordering::Relaxed) >= TOTAL_ITERATION)
+                i32::from(count(&num_iterations) >= TOTAL_ITERATION)
             })
         };
         flow.task(branch).precede([branch_task]);
@@ -425,44 +408,17 @@ fn cyclic_cond(workers: usize) {
     }
 }
 
-#[test]
-fn cyclic_cond_1_worker() {
-    cyclic_cond(1);
-}
-
-#[test]
-fn cyclic_cond_2_workers() {
-    cyclic_cond(2);
-}
-
-#[test]
-fn cyclic_cond_3_workers() {
-    cyclic_cond(3);
-}
-
-#[test]
-fn cyclic_cond_4_workers() {
-    cyclic_cond(4);
-}
-
-#[test]
-fn cyclic_cond_5_workers() {
-    cyclic_cond(5);
-}
-
-#[test]
-fn cyclic_cond_6_workers() {
-    cyclic_cond(6);
-}
-
-#[test]
-fn cyclic_cond_7_workers() {
-    cyclic_cond(7);
-}
-
-#[test]
-fn cyclic_cond_8_workers() {
-    cyclic_cond(8);
+worker_matrix! {
+    cyclic_cond {
+        cyclic_cond_1_worker(1),
+        cyclic_cond_2_workers(2),
+        cyclic_cond_3_workers(3),
+        cyclic_cond_4_workers(4),
+        cyclic_cond_5_workers(5),
+        cyclic_cond_6_workers(6),
+        cyclic_cond_7_workers(7),
+        cyclic_cond_8_workers(8),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -514,51 +470,24 @@ fn btree_condition(workers: usize) {
         run(&executor, &flow);
 
         assert_eq!(
-            counter.load(Ordering::Relaxed),
+            count(&counter),
             (1_usize << ((level + 1) / 2)) - 1,
             "{workers} worker(s), {level} level(s)"
         );
     }
 }
 
-#[test]
-fn btree_condition_1_worker() {
-    btree_condition(1);
-}
-
-#[test]
-fn btree_condition_2_workers() {
-    btree_condition(2);
-}
-
-#[test]
-fn btree_condition_3_workers() {
-    btree_condition(3);
-}
-
-#[test]
-fn btree_condition_4_workers() {
-    btree_condition(4);
-}
-
-#[test]
-fn btree_condition_5_workers() {
-    btree_condition(5);
-}
-
-#[test]
-fn btree_condition_6_workers() {
-    btree_condition(6);
-}
-
-#[test]
-fn btree_condition_7_workers() {
-    btree_condition(7);
-}
-
-#[test]
-fn btree_condition_8_workers() {
-    btree_condition(8);
+worker_matrix! {
+    btree_condition {
+        btree_condition_1_worker(1),
+        btree_condition_2_workers(2),
+        btree_condition_3_workers(3),
+        btree_condition_4_workers(4),
+        btree_condition_5_workers(5),
+        btree_condition_6_workers(6),
+        btree_condition_7_workers(7),
+        btree_condition_8_workers(8),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -641,50 +570,23 @@ fn dynamic_btree_condition(workers: usize) {
         .expect("a task of this taskflow panicked");
 
     assert_eq!(
-        counter.load(Ordering::Relaxed),
+        count(&counter),
         ((1_usize << (MAX_DEPTH + 1)) - 1) * RUNS,
         "{workers} worker(s)"
     );
 }
 
-#[test]
-fn dynamic_btree_condition_1_worker() {
-    dynamic_btree_condition(1);
-}
-
-#[test]
-fn dynamic_btree_condition_2_workers() {
-    dynamic_btree_condition(2);
-}
-
-#[test]
-fn dynamic_btree_condition_3_workers() {
-    dynamic_btree_condition(3);
-}
-
-#[test]
-fn dynamic_btree_condition_4_workers() {
-    dynamic_btree_condition(4);
-}
-
-#[test]
-fn dynamic_btree_condition_5_workers() {
-    dynamic_btree_condition(5);
-}
-
-#[test]
-fn dynamic_btree_condition_6_workers() {
-    dynamic_btree_condition(6);
-}
-
-#[test]
-fn dynamic_btree_condition_7_workers() {
-    dynamic_btree_condition(7);
-}
-
-#[test]
-fn dynamic_btree_condition_8_workers() {
-    dynamic_btree_condition(8);
+worker_matrix! {
+    dynamic_btree_condition {
+        dynamic_btree_condition_1_worker(1),
+        dynamic_btree_condition_2_workers(2),
+        dynamic_btree_condition_3_workers(3),
+        dynamic_btree_condition_4_workers(4),
+        dynamic_btree_condition_5_workers(5),
+        dynamic_btree_condition_6_workers(6),
+        dynamic_btree_condition_7_workers(7),
+        dynamic_btree_condition_8_workers(8),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -799,51 +701,20 @@ fn nested_cond(workers: usize) {
 
     let per_run = usize::try_from((INNER_LOOP + 1) * (MID_LOOP + 1) * (OUTER_LOOP + 1))
         .expect("a small product");
-    assert_eq!(
-        counter.load(Ordering::Relaxed),
-        per_run * REPEAT,
-        "{workers} worker(s)"
-    );
+    assert_eq!(count(&counter), per_run * REPEAT, "{workers} worker(s)");
 }
 
-#[test]
-fn nested_cond_1_worker() {
-    nested_cond(1);
-}
-
-#[test]
-fn nested_cond_2_workers() {
-    nested_cond(2);
-}
-
-#[test]
-fn nested_cond_3_workers() {
-    nested_cond(3);
-}
-
-#[test]
-fn nested_cond_4_workers() {
-    nested_cond(4);
-}
-
-#[test]
-fn nested_cond_5_workers() {
-    nested_cond(5);
-}
-
-#[test]
-fn nested_cond_6_workers() {
-    nested_cond(6);
-}
-
-#[test]
-fn nested_cond_7_workers() {
-    nested_cond(7);
-}
-
-#[test]
-fn nested_cond_8_workers() {
-    nested_cond(8);
+worker_matrix! {
+    nested_cond {
+        nested_cond_1_worker(1),
+        nested_cond_2_workers(2),
+        nested_cond_3_workers(3),
+        nested_cond_4_workers(4),
+        nested_cond_5_workers(5),
+        nested_cond_6_workers(6),
+        nested_cond_7_workers(7),
+        nested_cond_8_workers(8),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -883,8 +754,8 @@ fn cond2cond(workers: usize) {
 
     // Upstream's two `int`s, shared because `D` resets what the conditioners
     // bump.
-    let iteration_c1 = Arc::new(AtomicUsize::new(0));
-    let iteration_c2 = Arc::new(AtomicUsize::new(0));
+    let iteration_c1 = counter();
+    let iteration_c2 = counter();
 
     let s = flow.emplace(|| {});
     let a = counted(&mut flow, &num_visit_a);
@@ -936,60 +807,33 @@ fn cond2cond(workers: usize) {
         .expect("a task of this taskflow panicked");
 
     assert_eq!(
-        num_visit_a.load(Ordering::Relaxed),
+        count(&num_visit_a),
         3 * REPEAT,
         "{workers} worker(s): visits of `A`"
     );
     assert_eq!(
-        num_visit_c1.load(Ordering::Relaxed),
+        count(&num_visit_c1),
         4 * REPEAT,
         "{workers} worker(s): visits of `cond1`"
     );
     assert_eq!(
-        num_visit_c2.load(Ordering::Relaxed),
+        count(&num_visit_c2),
         3 * REPEAT,
         "{workers} worker(s): visits of `cond2`"
     );
 }
 
-#[test]
-fn cond2cond_1_worker() {
-    cond2cond(1);
-}
-
-#[test]
-fn cond2cond_2_workers() {
-    cond2cond(2);
-}
-
-#[test]
-fn cond2cond_3_workers() {
-    cond2cond(3);
-}
-
-#[test]
-fn cond2cond_4_workers() {
-    cond2cond(4);
-}
-
-#[test]
-fn cond2cond_5_workers() {
-    cond2cond(5);
-}
-
-#[test]
-fn cond2cond_6_workers() {
-    cond2cond(6);
-}
-
-#[test]
-fn cond2cond_7_workers() {
-    cond2cond(7);
-}
-
-#[test]
-fn cond2cond_8_workers() {
-    cond2cond(8);
+worker_matrix! {
+    cond2cond {
+        cond2cond_1_worker(1),
+        cond2cond_2_workers(2),
+        cond2cond_3_workers(3),
+        cond2cond_4_workers(4),
+        cond2cond_5_workers(5),
+        cond2cond_6_workers(6),
+        cond2cond_7_workers(7),
+        cond2cond_8_workers(8),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1179,44 +1023,17 @@ fn hierarchical_condition(workers: usize) {
     }
 }
 
-#[test]
-fn hier_condition_1_worker() {
-    hierarchical_condition(1);
-}
-
-#[test]
-fn hier_condition_2_workers() {
-    hierarchical_condition(2);
-}
-
-#[test]
-fn hier_condition_3_workers() {
-    hierarchical_condition(3);
-}
-
-#[test]
-fn hier_condition_4_workers() {
-    hierarchical_condition(4);
-}
-
-#[test]
-fn hier_condition_5_workers() {
-    hierarchical_condition(5);
-}
-
-#[test]
-fn hier_condition_6_workers() {
-    hierarchical_condition(6);
-}
-
-#[test]
-fn hier_condition_7_workers() {
-    hierarchical_condition(7);
-}
-
-#[test]
-fn hier_condition_8_workers() {
-    hierarchical_condition(8);
+worker_matrix! {
+    hierarchical_condition {
+        hier_condition_1_worker(1),
+        hier_condition_2_workers(2),
+        hier_condition_3_workers(3),
+        hier_condition_4_workers(4),
+        hier_condition_5_workers(5),
+        hier_condition_6_workers(6),
+        hier_condition_7_workers(7),
+        hier_condition_8_workers(8),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1248,7 +1065,7 @@ fn condition_subflow(workers: usize) {
     let executor = Executor::new(workers);
 
     let data: Arc<Vec<AtomicUsize>> = Arc::new((0..I).map(|_| AtomicUsize::new(0)).collect());
-    let i = Arc::new(AtomicUsize::new(0));
+    let i = counter();
 
     let mut taskflow = Taskflow::new();
 
@@ -1265,7 +1082,7 @@ fn condition_subflow(workers: usize) {
             // Upstream's `[&, i]`: the index is captured by value as it
             // stands when the *body* runs, which is what makes each entry's
             // subgraph a different one.
-            let index = i.load(Ordering::Relaxed);
+            let index = count(&i);
             let data = Arc::clone(&data);
             let child = subflow.emplace(move || {
                 assert!(index < I, "the conditioner stops at I");
@@ -1335,44 +1152,17 @@ fn condition_subflow(workers: usize) {
     }
 }
 
-#[test]
-fn cond_subflow_1_worker() {
-    condition_subflow(1);
-}
-
-#[test]
-fn cond_subflow_2_workers() {
-    condition_subflow(2);
-}
-
-#[test]
-fn cond_subflow_3_workers() {
-    condition_subflow(3);
-}
-
-#[test]
-fn cond_subflow_4_workers() {
-    condition_subflow(4);
-}
-
-#[test]
-fn cond_subflow_5_workers() {
-    condition_subflow(5);
-}
-
-#[test]
-fn cond_subflow_6_workers() {
-    condition_subflow(6);
-}
-
-#[test]
-fn cond_subflow_7_workers() {
-    condition_subflow(7);
-}
-
-#[test]
-fn cond_subflow_8_workers() {
-    condition_subflow(8);
+worker_matrix! {
+    condition_subflow {
+        cond_subflow_1_worker(1),
+        cond_subflow_2_workers(2),
+        cond_subflow_3_workers(3),
+        cond_subflow_4_workers(4),
+        cond_subflow_5_workers(5),
+        cond_subflow_6_workers(6),
+        cond_subflow_7_workers(7),
+        cond_subflow_8_workers(8),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1422,29 +1212,18 @@ fn multiple_branches(workers: usize, seed: u32) {
 
     assert_eq!(
         2 * answer,
-        counter.load(Ordering::Relaxed),
+        count(&counter),
         "seed {seed}, {workers} worker(s), branches {selected:?}"
     );
 }
 
-#[test]
-fn multiple_branches_1_worker() {
-    multiple_branches(1, seed_for(1));
-}
-
-#[test]
-fn multiple_branches_2_workers() {
-    multiple_branches(2, seed_for(2));
-}
-
-#[test]
-fn multiple_branches_3_workers() {
-    multiple_branches(3, seed_for(3));
-}
-
-#[test]
-fn multiple_branches_4_workers() {
-    multiple_branches(4, seed_for(4));
+worker_matrix! {
+    multiple_branches {
+        multiple_branches_1_worker(1, seed_for(1)),
+        multiple_branches_2_workers(2, seed_for(2)),
+        multiple_branches_3_workers(3, seed_for(3)),
+        multiple_branches_4_workers(4, seed_for(4)),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1504,50 +1283,23 @@ fn multiple_loops(workers: usize) {
     run(&executor, &taskflow);
 
     assert_eq!(
-        counter.load(Ordering::Relaxed),
+        count(&counter),
         40,
         "{workers} worker(s): ten counted iterations of each of the four loops"
     );
 }
 
-#[test]
-fn multiple_loops_1_worker() {
-    multiple_loops(1);
-}
-
-#[test]
-fn multiple_loops_2_workers() {
-    multiple_loops(2);
-}
-
-#[test]
-fn multiple_loops_3_workers() {
-    multiple_loops(3);
-}
-
-#[test]
-fn multiple_loops_4_workers() {
-    multiple_loops(4);
-}
-
-#[test]
-fn multiple_loops_5_workers() {
-    multiple_loops(5);
-}
-
-#[test]
-fn multiple_loops_6_workers() {
-    multiple_loops(6);
-}
-
-#[test]
-fn multiple_loops_7_workers() {
-    multiple_loops(7);
-}
-
-#[test]
-fn multiple_loops_8_workers() {
-    multiple_loops(8);
+worker_matrix! {
+    multiple_loops {
+        multiple_loops_1_worker(1),
+        multiple_loops_2_workers(2),
+        multiple_loops_3_workers(3),
+        multiple_loops_4_workers(4),
+        multiple_loops_5_workers(5),
+        multiple_loops_6_workers(6),
+        multiple_loops_7_workers(7),
+        multiple_loops_8_workers(8),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1599,30 +1351,19 @@ fn binary_tree(workers: usize) {
         .expect("a task of this taskflow panicked");
 
     assert_eq!(
-        counter.load(Ordering::Relaxed),
+        count(&counter),
         ((1_usize << BINARY_TREE_LEVELS) - 1) * BINARY_TREE_LEVELS,
         "{workers} worker(s): every node of the tree runs once per run"
     );
 }
 
-#[test]
-fn multi_cond_binary_tree_1_worker() {
-    binary_tree(1);
-}
-
-#[test]
-fn multi_cond_binary_tree_2_workers() {
-    binary_tree(2);
-}
-
-#[test]
-fn multi_cond_binary_tree_3_workers() {
-    binary_tree(3);
-}
-
-#[test]
-fn multi_cond_binary_tree_4_workers() {
-    binary_tree(4);
+worker_matrix! {
+    binary_tree {
+        multi_cond_binary_tree_1_worker(1),
+        multi_cond_binary_tree_2_workers(2),
+        multi_cond_binary_tree_3_workers(3),
+        multi_cond_binary_tree_4_workers(4),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1689,24 +1430,13 @@ fn multi_cond_multiple_runs(workers: usize) {
     }
 }
 
-#[test]
-fn multi_cond_multiple_runs_1_worker() {
-    multi_cond_multiple_runs(1);
-}
-
-#[test]
-fn multi_cond_multiple_runs_2_workers() {
-    multi_cond_multiple_runs(2);
-}
-
-#[test]
-fn multi_cond_multiple_runs_3_workers() {
-    multi_cond_multiple_runs(3);
-}
-
-#[test]
-fn multi_cond_multiple_runs_4_workers() {
-    multi_cond_multiple_runs(4);
+worker_matrix! {
+    multi_cond_multiple_runs {
+        multi_cond_multiple_runs_1_worker(1),
+        multi_cond_multiple_runs_2_workers(2),
+        multi_cond_multiple_runs_3_workers(3),
+        multi_cond_multiple_runs_4_workers(4),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1742,12 +1472,12 @@ fn an_out_of_range_index_runs_no_successor() {
             run(&executor, &taskflow);
 
             assert_eq!(
-                conditioner.load(Ordering::Relaxed),
+                count(&conditioner),
                 1,
                 "index {condition}, {workers} worker(s)"
             );
             assert_eq!(
-                branches.load(Ordering::Relaxed),
+                count(&branches),
                 0,
                 "index {condition} names no successor, so neither branch runs"
             );
@@ -1792,12 +1522,7 @@ fn the_same_graph_run_twice_behaves_identically() {
             "`e` waits for both `a` and the selected branch"
         );
 
-        let snapshot = |counters: &[Counter; 5]| {
-            counters
-                .iter()
-                .map(|counter| counter.load(Ordering::Relaxed))
-                .collect::<Vec<_>>()
-        };
+        let snapshot = |counters: &[Counter; 5]| counters.iter().map(count).collect::<Vec<_>>();
 
         run(&executor, &taskflow);
         let first = snapshot(&counters);
@@ -1852,7 +1577,7 @@ fn a_panicking_conditioner_selects_nothing() {
             panic!("unexpected error: {error:?}");
         }
         assert_eq!(
-            branches.load(Ordering::Relaxed),
+            count(&branches),
             0,
             "{workers} worker(s): a panicking conditioner selects no successor"
         );
@@ -1877,7 +1602,7 @@ fn a_multi_condition_can_select_every_successor() {
         run(&executor, &taskflow);
 
         assert_eq!(
-            branches.load(Ordering::Relaxed),
+            count(&branches),
             8,
             "{workers} worker(s): every selected successor runs once"
         );

@@ -24,6 +24,12 @@ use std::time::Duration;
 
 use rustflow::{Executor, Worker, WorkerInterface};
 
+// Only the matrix macro: the counters here are `SeqCst` fields of a worker
+// interface rather than the `Relaxed` shares `common/counters.rs` hands to a
+// task body, and the one handshake below is a condvar rather than a spin.
+#[macro_use]
+mod common;
+
 /// How long a handshake in this file waits before it gives up and lets an
 /// assertion report what went missing. Generous: it is only ever reached when
 /// the test is about to fail, and it is what keeps a bug in the worker
@@ -101,44 +107,17 @@ fn worker_interface_basics(workers: usize) {
     );
 }
 
-#[test]
-fn worker_interface_basics_1_thread() {
-    worker_interface_basics(1);
-}
-
-#[test]
-fn worker_interface_basics_2_threads() {
-    worker_interface_basics(2);
-}
-
-#[test]
-fn worker_interface_basics_3_threads() {
-    worker_interface_basics(3);
-}
-
-#[test]
-fn worker_interface_basics_4_threads() {
-    worker_interface_basics(4);
-}
-
-#[test]
-fn worker_interface_basics_5_threads() {
-    worker_interface_basics(5);
-}
-
-#[test]
-fn worker_interface_basics_6_threads() {
-    worker_interface_basics(6);
-}
-
-#[test]
-fn worker_interface_basics_7_threads() {
-    worker_interface_basics(7);
-}
-
-#[test]
-fn worker_interface_basics_8_threads() {
-    worker_interface_basics(8);
+worker_matrix! {
+    worker_interface_basics {
+        worker_interface_basics_1_thread(1),
+        worker_interface_basics_2_threads(2),
+        worker_interface_basics_3_threads(3),
+        worker_interface_basics_4_threads(4),
+        worker_interface_basics_5_threads(5),
+        worker_interface_basics_6_threads(6),
+        worker_interface_basics_7_threads(7),
+        worker_interface_basics_8_threads(8),
+    }
 }
 
 /// What one worker saw when it asked who it was.
