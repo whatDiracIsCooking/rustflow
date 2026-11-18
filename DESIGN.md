@@ -876,6 +876,25 @@ entry above does.
   `Runtime::try_corun` no longer makes the anchor argument a third time, and
   `NonpreemptiveRuntime`'s `private_bounds` rationale is in the module's
   `# Design` section rather than on the type.
+- **The `graph/` submodules keep their own rationale, and this file keeps
+  what they share** (issue #277). `handle.rs`, `node.rs` and `work.rs` are
+  private modules behind the public `graph` facade, so a `# Design` section
+  of one of them is read in the source rather than in the rendered docs.
+  That is still where the documentation pass moved the rationale out of
+  their item docs, because each piece of it belongs to exactly one of the
+  three modules -- what a conditioner's `i32` buys, why a subflow's subgraph
+  sits behind a `Mutex`, why the dispatch claim is independent of
+  `PREEMPTED`, what one `Work<R>` folds together -- and an entry per variant
+  here would split one module's reasoning across two files.
+  `src/graph/mod.rs`'s own section carries the tree's shared decisions, the
+  arena and the tombstone; what an item doc keeps is the half-line pointer
+  the contract allows. The one fact three modules do share is that the
+  restricted `NonpreemptiveRuntime` handle is not part of the public
+  surface: a body closure is handed one with its parameter's type inferred,
+  so `graph::Handle`'s variant, `graph::work`'s `NonpreemptiveRuntimeWork`
+  and `FlowBuilder::emplace_nonpreemptive_runtime` each state the one
+  consequence they meet -- no type annotation in a doctest, no type to link
+  to -- and none of them re-derives the rest.
 
 ## Decisions taken in M7
 

@@ -12,6 +12,22 @@
 //! rather than a concrete `Arc<Taskflow>`, are under "Rationale moved out" in
 //! `DESIGN.md`.
 //!
+//! **One named method per node kind, where upstream overloads one.**
+//! Upstream's `emplace` picks a node kind from the callable's signature
+//! through SFINAE; with no overloading here, each kind is its own
+//! `emplace_*` method and [`FlowBuilder::emplace`] is the static task. The
+//! same absence is why [`FlowBuilder::emplace_nonpreemptive_runtime`] is a
+//! method of its own rather than a second shape of
+//! [`FlowBuilder::emplace_runtime`], as upstream's twin overload over
+//! `tf::NonpreemptiveRuntime&` is.
+//!
+//! **The restricted runtime handle is not public, so no doctest can name
+//! it.** [`FlowBuilder::emplace_nonpreemptive_runtime`]'s example writes its
+//! closure with the parameter's type inferred, where
+//! [`FlowBuilder::emplace_runtime`]'s annotates it; that compiles against
+//! the bound the same way a closure handed to any other generic `Fn` bound
+//! does.
+//!
 //! **What `FnMut + Send + 'static` costs a captured value.** A node owns its
 //! body as a `Box<dyn FnMut(..) + Send + 'static>` ([`Work`] and the three
 //! wrappers beside it), so [`FlowBuilder::emplace`] and every `emplace_*`
@@ -106,10 +122,9 @@ pub trait FlowBuilder {
 
     /// Creates a static task running `callable`, and returns its handle.
     ///
-    /// Upstream overloads `emplace` on the callable's signature to pick a
-    /// node kind; with no overloading here each kind is a named method, and
-    /// this is the static task. `Box<dyn FnMut() + Send>` satisfies the
-    /// bound as `FnMut()` does, upstream's `std::function<void()>` case.
+    /// Upstream's `emplace` overload for a plain callable.
+    /// `Box<dyn FnMut() + Send>` satisfies the bound as `FnMut()` does,
+    /// upstream's `std::function<void()>` case.
     fn emplace<C>(&mut self, callable: C) -> Task
     where
         C: FnMut() + Send + 'static,
@@ -179,9 +194,7 @@ pub trait FlowBuilder {
     /// what the children left behind itself with
     /// [`Subflow::join`](crate::Subflow::join). The node owns the graph the
     /// body builds -- see [`Handle::Subflow`] -- fresh on every entry, which
-    /// is what makes a subflow inside a loop behave. What `FnMut + Send +
-    /// 'static` asks of a value this body captures is in this module's
-    /// `# Design` section, which every `emplace_*` method shares.
+    /// is what makes a subflow inside a loop behave.
     ///
     /// ```
     /// use rustflow::prelude::*;
@@ -212,10 +225,7 @@ pub trait FlowBuilder {
     /// of its own graph, spawn work under its own node and wait for it.
     /// Upstream's second runtime shape, over `tf::NonpreemptiveRuntime&`, is
     /// [`FlowBuilder::emplace_nonpreemptive_runtime`] rather than a second
-    /// overload of this method, with no SFINAE here to pick between them by
-    /// the callable's own signature. What `FnMut + Send + 'static` asks of a
-    /// value this body captures is in this module's `# Design` section, which
-    /// every `emplace_*` method shares.
+    /// overload of this method.
     ///
     /// ```
     /// use rustflow::prelude::*;
@@ -247,13 +257,6 @@ pub trait FlowBuilder {
     /// type gives a body nothing that would need one. `DESIGN.md`'s
     /// "Decisions taken in M8" has why this node kind exists at all, and
     /// [`Handle::NonpreemptiveRuntime`] has the dispatch it runs under.
-    ///
-    /// The restricted handle's own type is not part of this crate's public
-    /// surface, which is why no doctest here can name it in a type
-    /// annotation the way [`FlowBuilder::emplace_runtime`]'s does: `callable`
-    /// is written with its parameter's type inferred instead, which compiles
-    /// against the bound below the same way a closure handed to any other
-    /// generic `Fn` bound does.
     ///
     /// ```
     /// use rustflow::prelude::*;

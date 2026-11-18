@@ -16,6 +16,22 @@
 //! [`OnceWork`] locks to *arbitrate* instead: a free async node is reachable
 //! through an [`AsyncTask`](crate::AsyncTask) handle a caller holds, so two
 //! callers can race to take the one body and exactly one is given it.
+//!
+//! **One [`Work`] covers three of upstream's node kinds.** Upstream stores a
+//! different `std::function` per kind, and the return type is all that
+//! differs between three of them -- `void()` for a static task, `int()` for
+//! a condition, `SmallVector<int>()` for a multi-condition -- so one type
+//! parameter covers all three.
+//!
+//! **An async body is moved out of its node to be run.** Upstream's async
+//! bodies are a `std::packaged_task` or a `mutable` lambda that is moved
+//! into the node and called once, where a static task's `std::function` is
+//! called afresh on every run of its graph; a `FnOnce` says that, and cannot
+//! be called through a shared reference, so [`OnceWork::take`] hands the
+//! body out instead. Upstream needs no equivalent, its async node being
+//! recycled by the worker that ran it; here the node lives as long as the
+//! last handle on it, and the taking is what keeps a body from running
+//! twice.
 
 use core::fmt;
 use std::any::Any;
@@ -25,13 +41,10 @@ use crate::executor::runtime::NonpreemptiveRuntime;
 use crate::runtime::Runtime;
 use crate::subflow::Subflow;
 
-/// The callable behind a task, returning `R`.
-///
-/// Upstream stores a different `std::function` per node kind, and the return
-/// type is all that differs between three of them -- `void()` for a static
-/// task, `int()` for a condition, `SmallVector<int>()` for a multi-condition
-/// -- so one type parameter covers all three, defaulting to `()` so that
-/// `Work` on its own means the static case.
+/// The callable behind a task, returning `R`, which defaults to `()` so that
+/// `Work` on its own means the static case: upstream's per-node-kind
+/// `std::function`, three of which this one type covers -- the module's
+/// `# Design` section says which three.
 ///
 /// The `Mutex` is what lets a `&Node` shared across workers invoke the work
 /// at all, where upstream calls the function through a `Node*`; the module
@@ -64,18 +77,12 @@ impl<R> Work<R> {
 ///
 /// # Panics
 ///
-/// Panics if the work is already running on another thread. Before the
-/// per-node dispatch claim closed `Runtime::schedule`'s hole, this could be
-/// tripped from outside the scheduler: a
-/// [`Runtime::schedule`](crate::Runtime::schedule) bypass had no way to see
-/// that a non-preempting target -- or a preempting one still building what
-/// would make it preempt -- was genuinely running, and could queue a second
-/// job onto a callable the first had not finished with. Every dispatch arm
-/// that can be such a target now takes this node's own [`DispatchClaim`]
-/// before it gets here, and `schedule`'s bypass defers onto a held claim
-/// instead of queueing, so a trip here is the scheduler's own invariant
-/// failing -- a dispatch arm that forgot to claim, not a caller of
-/// `schedule`.
+/// Panics if the work is already running on another thread. Every dispatch
+/// arm a [`Runtime::schedule`](crate::Runtime::schedule) bypass can target
+/// takes that node's own dispatch claim before it gets here, and the bypass
+/// defers onto a held claim instead of queueing, so a trip here is the
+/// scheduler's own one-worker-per-node invariant failing -- a dispatch arm
+/// that forgot to claim, not a caller of `schedule`.
 fn lock_callable<F: ?Sized>(callable: &Mutex<Box<F>>) -> MutexGuard<'_, Box<F>> {
     match callable.try_lock() {
         Ok(callable) => callable,
@@ -231,13 +238,9 @@ impl<R> fmt::Debug for Work<R> {
 /// A body that runs **once**, in the slot the one worker that runs it takes
 /// it out of.
 ///
-/// The three [`AsyncWork`] shapes are built out of this. Upstream's async
-/// bodies are a `std::packaged_task` or a `mutable` lambda that is moved into
-/// the node and called once, where a static task's `std::function` is called
-/// afresh on every run of its graph; a `FnOnce` says that, and cannot be
-/// called through a shared reference, so the body is *moved out* of the node
-/// to be run -- which is what [`OnceWork::take`] is. The module docs say why
-/// this lock arbitrates where [`Work`]'s asserts.
+/// The three [`AsyncWork`] shapes are built out of this; the module's
+/// `# Design` section has why the body is moved out of the node to be run,
+/// and why this lock arbitrates where [`Work`]'s asserts.
 pub struct OnceWork<F: ?Sized>(Mutex<Option<Box<F>>>);
 
 impl<F: ?Sized> OnceWork<F> {
@@ -252,10 +255,6 @@ impl<F: ?Sized> OnceWork<F> {
 
     /// Takes the body out, leaving the slot empty: `Some` for the one caller
     /// that got there first, `None` for every caller after it.
-    ///
-    /// Upstream needs no equivalent, its async node being recycled by the
-    /// worker that ran it. Here the node lives as long as the last handle on
-    /// it, and this is what keeps a body from being run twice.
     pub fn take(&self) -> Option<Box<F>> {
         self.lock().take()
     }
