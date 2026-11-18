@@ -166,6 +166,7 @@ pub mod prelude {
     pub use crate::algorithm::for_each::ForEachBuilder;
     pub use crate::algorithm::for_each_index::ForEachIndexBuilder;
     pub use crate::algorithm::merge::MergeBuilder;
+    pub use crate::algorithm::reduce::ReduceBuilder;
     pub use crate::algorithm::scan::ScanBuilder;
     pub use crate::algorithm::sort::SortBuilder;
     pub use crate::algorithm::transform::ElementwiseBuilder;
