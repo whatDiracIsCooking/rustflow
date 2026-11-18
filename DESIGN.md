@@ -89,6 +89,20 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   test-name set is asking for the item paths with ` (line N)` stripped, and a
   PR that claims one says which it compared.
 
+  `devtools/test-names.sh` is that comparison, so that the issues which
+  promise an unchanged set do not each invent one: `snapshot <file>` writes the
+  sorted item paths from `cargo test --all-features -- --list` — every test
+  binary and the doctests — with ` (line N)` stripped, and
+  `diff <before> <after>` prints what was removed and what was added and exits
+  non-zero if either list is non-empty. It compares **multisets** rather than
+  sets, because an integration test's item path does not name the binary it
+  lives in — `basics` and `future` are each several different tests in this
+  tree, and one item carrying two examples lists its path twice — so folding
+  the duplicates would let a renamed twin cancel against its sibling and read
+  as unchanged. Nothing is stored in the repo: a snapshot is of a tree its
+  reader has in front of them, and a committed one would be a second copy of
+  the test list to keep in step with the tests (#262).
+
 ## Design decisions already taken
 
 - **Graph as an arena.** The upstream API hands out `tf::Task` handles that
