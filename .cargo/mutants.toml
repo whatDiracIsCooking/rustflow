@@ -1,0 +1,29 @@
+# Mutants `cargo mutants` must not report, because no test should kill them:
+# each is equivalent to the original, or pins a value the design leaves free.
+# The argument for every one of them is in `DESIGN.md`, under "Decisions taken
+# in M10" -- in particular that the third mutant of `partitioner.rs:429:22`,
+# `q > chunk_size`, is *not* here and is killed by
+# `the_guided_loop_shrinks_its_chunks_with_the_remaining_work`.
+#
+# A pattern names one mutant by `file:line:col` and by its operator pair, so a
+# line that moves makes it stop matching -- re-deriving the argument from
+# `DESIGN.md` -- rather than quietly hiding whatever moved onto the line. Single
+# quotes because these are regexes: a TOML basic string would eat the
+# backslashes.
+exclude_re = [
+    # `EXCEPTION | CAUGHT` over two disjoint bits, where `a | b == a ^ b`.
+    'graph/node\.rs:132:43: replace \| with \^ in NodeBase::claim_panic',
+    'graph/node\.rs:162:47: replace \| with \^ in NodeBase::take_panic',
+    # `if b1 > b2 { swap(b1, b2) }`: swapping equal bounds is a no-op.
+    'algorithm/partitioner\.rs:679:15: replace > with >= in RandomPartitioner<C>::chunk_size_range',
+    # The guided loop's floor clamp, whose condition its own branch makes false.
+    'algorithm/partitioner\.rs:429:22: replace < with <= in <impl DynamicLoop for GuidedPartitioner<C>>::loop_dynamic_until',
+    'algorithm/partitioner\.rs:429:22: replace < with == in <impl DynamicLoop for GuidedPartitioner<C>>::loop_dynamic_until',
+    # `p1`, which picks the atomic that hands out the next chunk, not its size.
+    'algorithm/partitioner\.rs:408:20: replace \* with \+ in <impl DynamicLoop for GuidedPartitioner<C>>::loop_dynamic_until',
+    'algorithm/partitioner\.rs:408:20: replace \* with / in <impl DynamicLoop for GuidedPartitioner<C>>::loop_dynamic_until',
+    'algorithm/partitioner\.rs:408:24: replace \* with \+ in <impl DynamicLoop for GuidedPartitioner<C>>::loop_dynamic_until',
+    'algorithm/partitioner\.rs:408:24: replace \* with / in <impl DynamicLoop for GuidedPartitioner<C>>::loop_dynamic_until',
+    'algorithm/partitioner\.rs:408:38: replace \+ with \* in <impl DynamicLoop for GuidedPartitioner<C>>::loop_dynamic_until',
+    'algorithm/partitioner\.rs:408:38: replace \+ with - in <impl DynamicLoop for GuidedPartitioner<C>>::loop_dynamic_until',
+]

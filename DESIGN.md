@@ -1891,3 +1891,89 @@ entry above does.
   `tests/`, a type the code never names goes in backticks, since `cargo doc`
   does not build those targets and the `use` an intra-doc link would need is
   `unused_imports` under `clippy --all-targets`.
+
+- **The eleven mutants of #274's run that no test should kill are
+  dispositioned rather than tested: `.cargo/mutants.toml` skips them and the
+  argument for each is here** (issue #309).
+
+  #274's run over `src/graph/`, `src/semaphore.rs` and
+  `src/algorithm/partitioner.rs` left 69 survivors, 53 of them killed by the
+  twelve tests its own PR added. Eleven of the rest are mutants no test should
+  kill: each is the same program as the original, or differs from it only in a
+  value nothing promises. A test written for one of those pins the mutation
+  instead of the behaviour, which is the one kind of test #274's acceptance
+  refuses, so what they are owed is a disposition. Both forms are written.
+  `exclude_re` in `.cargo/mutants.toml` keeps the next `cargo mutants` over
+  these two files from reporting them at all, and this entry carries the
+  reasoning, because the two rot differently: the regex is keyed on
+  `file:line:col`, so an edit above any of these lines makes a pattern stop
+  matching and the mutant comes back as a survivor pointing at an entry that
+  still explains it. That fail-open is the reason the patterns are not keyed on
+  the looser pair, function name plus operator, which would hide genuine `+`
+  and `*` mutants on `loop_dynamic_until`'s other lines for as long as nobody
+  looked. `cargo mutants 27.1.0` does read the key: its listing over the two
+  files goes from 242 mutants to 231, and the eleven that disappear are exactly
+  these.
+
+  **Two `|`s over disjoint bits.** `NodeBase::claim_panic` and
+  `NodeBase::take_panic` each build `Cancellable::EXCEPTION |
+  Cancellable::CAUGHT` out of two distinct single-bit constants
+  (`0x1000_0000` and `0x2000_0000`), and `a | b == a ^ b` whenever
+  `a & b == 0`. Mutating that `|` to `^` leaves the same constant, so it is
+  the same program. The `&` mutant of the same two expressions is a different
+  program and is killed.
+
+  **A swap guard that fires only on equal bounds.**
+  `RandomPartitioner::chunk_size_range` ends with
+  `if b1 > b2 { swap(&mut b1, &mut b2) }`, and `>=` for `>` swaps when the
+  two bounds are equal as well, which leaves them where they were. The other
+  two mutants of that comparison, `==` and `<`, change the range whenever
+  `alpha > beta` and are killed.
+
+  **A floor clamp its own branch condition makes unreachable.** The guided
+  loop's `if q < chunk_size { q = chunk_size }` sits in the `r >= p1` arm,
+  where `p1 == 2 * w * (chunk_size + 1)` and `q == r / (2 * w)`, so
+  `q >= chunk_size + 1` on every path that reaches it; `<=` and `==` for `<`
+  are false there exactly as `<` is. The third mutant of that comparison,
+  `>`, is always *true* there and is killed by
+  `the_guided_loop_shrinks_its_chunks_with_the_remaining_work`. The clamp is
+  upstream's and stays: it is dead in the unmutated program only, and it is
+  what makes the next group equivalent.
+
+  **Six mutants of `p1`, the threshold that picks the atomic rather than the
+  chunk size.** `let p1 = 2 * w * (chunk_size + 1)` chooses which arm hands
+  out the next chunk: below `p1` remaining, a `fetch_add(chunk_size)` loop; at
+  or above it, a compare-exchange of `q = max(r / (2 * w), chunk_size)`. Every
+  arithmetic mutant of that line -- `2 + w * (c + 1)`, `(2 / w) * (c + 1)`,
+  `2 * w + (c + 1)`, `2 * w / (c + 1)`, `2 * w * (c * 1)` and
+  `2 * w * (c - 1)`, writing `c` for the chunk size -- is at most `p1` for
+  every `w >= 1` and `c >= 1`, and `c >= 1` is what the loop's own
+  `if self.chunk_size == 0` guarantees. So the only remainders that change arm
+  are the `r` with `p1' <= r < p1`, and there `r / (2 * w) <= c`: the clamp of
+  the group above raises `q` back to `c` and the body is handed a chunk of
+  exactly the size the `fetch_add` arm would have handed it, with the same
+  boundaries, the same order and the same early exit, for one caller and for
+  `w` racing ones alike. Deleting the clamp as dead code would end that, and
+  these six patterns with it.
+
+  What does differ is the final value of the shared cursor, the `fetch_add`
+  arm overshooting `n` by one chunk where the compare-exchange arm stops at
+  `n`. Nothing pins that: every caller in the crate --
+  `find::drive_find_dynamic`, `reduce::drive_reduce_dynamic`,
+  `for_each_index`'s own loop and the `partition_dynamic` the slice
+  algorithms share -- drops its cursor unread once the loops return, and a
+  loop only ever compares it against `n`. The one cursor claim that *is* a contract, "a loop that arrives
+  at an exhausted cursor hands out no chunk and does not move it", is asserted
+  by `a_dynamic_loop_over_an_exhausted_cursor_hands_out_no_chunk`, and no
+  mutant of `p1` can reach it, the `while curr_b < n` loop never being
+  entered.
+
+  Those last two groups argue over the inputs the unmutated loop is defined
+  on: `w >= 1`, and a `2 * w * (chunk_size + 1)` that does not overflow.
+  Outside them the original panics -- `r / (2 * w)` divides by zero for
+  `w == 0`, `chunk_size + 1` overflows a debug build -- and a mutant that
+  moves where the panic happens, or gets past it, differs from the original in
+  nothing else. The crate's own callers are well inside the range: an executor
+  has at least one worker (`Executor::new` asserts it), and each algorithm's
+  driver has already returned for `n == 0` and taken the serial path for
+  `w_total <= 1` before a partitioner sees either number.
