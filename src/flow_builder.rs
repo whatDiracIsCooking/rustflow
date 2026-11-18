@@ -13,6 +13,17 @@
 //! [`FlowBuilder`] asks implementors for one thing -- the graph they build
 //! into, borrowed either way -- and builds everything else on top, which is
 //! how `Subflow` reuses the whole API by answering that one question.
+//!
+//! [`FlowBuilder::composed_of`] takes anything [`Composable`] rather than an
+//! `Arc<Taskflow>` outright, for the same reason upstream's own `composed_of`
+//! is a template over its `GraphLike` concept rather than a `Taskflow`
+//! overload: a pipeline composes its own graph the same way a plain taskflow
+//! does, and the port gets that for free once the one thing `composed_of`
+//! needs -- a share of the target's [`Taskflow`] -- is asked for through a
+//! trait instead of a concrete type. [`Composable`] is implemented for
+//! [`Arc<Taskflow>`] so every caller from before the trait existed is
+//! unaffected; a pipeline's own graph is the other implementor, landing with
+//! the pipeline scheduler.
 
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +32,47 @@ use crate::runtime::Runtime;
 use crate::subflow::Subflow;
 use crate::task::{TaskMut, TaskRef};
 use crate::taskflow::Taskflow;
+
+/// Something [`FlowBuilder::composed_of`] can compose into a module task:
+/// upstream's `GraphLike` concept, standing in for a `Graph&` taken by
+/// reference there.
+///
+/// [`Composable::taskflow`] borrows `self` rather than consuming it, so the
+/// implementor keeps whatever it owns after handing out a share of it --
+/// composing it again, or into another taskflow, needs nothing further.
+///
+/// ```
+/// use std::sync::Arc;
+/// use rustflow::flow_builder::Composable;
+/// use rustflow::prelude::*;
+///
+/// struct Library(Arc<Taskflow>);
+///
+/// impl Composable for Library {
+///     fn taskflow(&self) -> Arc<Taskflow> {
+///         Arc::clone(&self.0)
+///     }
+/// }
+///
+/// let mut inner = Taskflow::with_name("library");
+/// inner.emplace(|| println!("shared work"));
+/// let library = Library(Arc::new(inner));
+///
+/// let mut taskflow = Taskflow::new();
+/// let module = taskflow.composed_of(library);
+///
+/// assert!(taskflow.graph().node(module).handle().is_module());
+/// ```
+pub trait Composable {
+    /// Returns a share of the taskflow this composes into a module task.
+    fn taskflow(&self) -> Arc<Taskflow>;
+}
+
+impl Composable for Arc<Taskflow> {
+    fn taskflow(&self) -> Arc<Taskflow> {
+        Arc::clone(self)
+    }
+}
 
 /// The task-building half of a taskflow: upstream's `tf::FlowBuilder`.
 ///
@@ -199,12 +251,13 @@ pub trait FlowBuilder {
     /// another: running this task runs the whole of `target`'s graph, and this
     /// task's successors wait for all of it.
     ///
-    /// The target is an [`Arc`] the module shares, where upstream takes
-    /// anything graph-like by reference and leaves the caller to keep it
-    /// alive -- `DESIGN.md` on a module task sharing its target. Composing
-    /// one taskflow into two others, or twice into one, hands out more shares
-    /// of the same graph rather than copying it; the owned form is
-    /// [`FlowBuilder::adopt`].
+    /// `target` is anything [`Composable`], which is this port's answer to
+    /// upstream's `GraphLike` concept: whatever it is, the module keeps the
+    /// [`Arc`] it hands back, where upstream takes anything graph-like by
+    /// reference and leaves the caller to keep it alive -- `DESIGN.md` on a
+    /// module task sharing its target. Composing one taskflow into two
+    /// others, or twice into one, hands out more shares of the same graph
+    /// rather than copying it; the owned form is [`FlowBuilder::adopt`].
     ///
     /// What the share does *not* buy is permission to run one target twice at
     /// once: a graph's per-node counters belong to one run at a time, which
@@ -233,8 +286,11 @@ pub trait FlowBuilder {
     /// assert!(taskflow.graph().node(first).handle().is_module());
     /// assert_eq!(Arc::strong_count(&library), 3);
     /// ```
-    fn composed_of(&mut self, target: Arc<Taskflow>) -> Task {
-        self.graph_mut().add_node(Handle::Module(target))
+    fn composed_of<C>(&mut self, target: C) -> Task
+    where
+        C: Composable,
+    {
+        self.graph_mut().add_node(Handle::Module(target.taskflow()))
     }
 
     /// Creates a module task owning `graph`, and returns its handle.
