@@ -86,6 +86,7 @@ pub mod index_range;
 pub mod merge;
 pub mod module;
 pub mod partitioner;
+pub mod scan;
 pub mod sort;
 pub mod transform;
 
