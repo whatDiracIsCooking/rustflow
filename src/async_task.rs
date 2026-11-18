@@ -1,28 +1,20 @@
 //! Translated from `taskflow/core/async_task.hpp` (Taskflow v4.1.0).
 //!
 //! One type, and it is a smart pointer: upstream's `tf::AsyncTask` is a
-//! `Node*` plus a hand-rolled reference count packed into the low 24 bits of
-//! the node's `_estate`, with `_incref`/`_decref` on every copy, move and
-//! destruction and a `recycle(_node)` when the count reaches zero. The whole
-//! of that is an `Option<Arc<AsyncNode>>` here, which is why this module is
-//! short where upstream's header is not: `Clone` and `Drop` are the counting,
-//! and the node going back to its allocator when the last share goes is
-//! `Arc`'s own business.
-//!
-//! What the packing bought upstream is worth saying, because the port gives
-//! it up on purpose. Sharing the estate word means a count that costs no
-//! extra cache line and needs no `std::get_if` on the handle's hot path, at
-//! the price of a 24-bit ceiling on owners and of a count only a
-//! `DEPENDENT_ASYNC` node may be asked for. An `Arc`'s count is a word of its
-//! own in the same allocation as the node, which is the same cache line in
-//! practice, has no ceiling, and is the one mechanism in the crate every
-//! reader already knows.
+//! `Node*` plus a reference count packed into the low 24 bits of the node's
+//! `_estate`, with `_incref`/`_decref` on every copy, move and destruction
+//! and a `recycle(_node)` when it reaches zero. All of that is an
+//! `Option<Arc<AsyncNode>>` here -- `Clone` and `Drop` are the counting.
 //!
 //! The handle exists for the ABA problem upstream's own docs name: a
 //! dependent-async task named as the dependency of a *later* submission has
-//! to still be there when the later one looks at it, and a count held by the
-//! caller is what guarantees that. [`AsyncTask::use_count`] is therefore the
-//! number of shares and not the number of handles -- see its docs.
+//! to still be there when the later one looks at it.
+//!
+//! # Design
+//!
+//! What the packing bought upstream and what giving it up costs is
+//! `DESIGN.md`'s entry on the handle being that `Arc`; the consequence a
+//! caller sees is [`AsyncTask::use_count`].
 
 use core::fmt;
 use core::hash::{Hash, Hasher};
@@ -36,45 +28,33 @@ use crate::executor::async_node::AsyncNode;
 /// `tf::AsyncTask`.
 ///
 /// Empty by default, which is upstream's `_node == nullptr`, and otherwise a
-/// share of the free-standing node the task is. Cheap to clone -- one atomic
-/// increment -- and compares, hashes and prints by node identity, so two
-/// clones of one handle are one task and two handles on two tasks are never
-/// equal.
+/// share of the free-standing node the task is. It compares, hashes and
+/// prints by node identity, so two clones of one handle are one task.
 ///
-/// What it is *not* is a way to reach the task's body or its result. Upstream
-/// has no such accessor either: a value-returning `async` hands back a
-/// `std::future` and this handle is what `silent_dependent_async` hands back,
-/// so the handle answers only the questions that are about the task's
-/// *identity and state* -- is it done, how many owners are there, and did it
-/// fail silently.
+/// What it is *not* is a way to reach the task's body or its result, and
+/// upstream has no such accessor either: it answers only what is about
+/// *identity and state* -- is it done, how many owners, did it fail silently.
 #[derive(Default)]
 pub struct AsyncTask(Option<Arc<AsyncNode>>);
 
 impl AsyncTask {
-    /// The handle on `node`, taking a share of it.
-    ///
-    /// Crate-private, as upstream's `explicit AsyncTask(Node*)` is private to
-    /// its `friend class Executor`: a handle is only ever minted by the
-    /// submission that created the task, because a handle on a node nobody
-    /// submitted would be a task that is never going to finish and whose
-    /// [`AsyncTask::is_done`] would never become `true`.
+    /// The handle on `node`, taking a share of it. Crate-private, as
+    /// upstream's `explicit AsyncTask(Node*)` is to its `friend class
+    /// Executor`: only the submission that created a task mints a handle on
+    /// it, one on an unsubmitted node never becoming [`AsyncTask::is_done`].
     pub(crate) fn new(node: Arc<AsyncNode>) -> Self {
         Self(Some(node))
     }
 
-    /// The free-standing node this handle shares, `None` for an empty
-    /// handle.
+    /// The free-standing node this handle shares, `None` for an empty handle:
+    /// upstream's `task._node`, reached from `_process_dependent_async`
+    /// through its `friend class Executor`.
     ///
-    /// Crate-private for the reason [`AsyncTask::new`] is: upstream reaches
-    /// `task._node` from `_process_dependent_async` through its `friend class
-    /// Executor` and exposes nothing of the kind to a caller. This is that
-    /// access and has that one caller -- `executor::dependent_async`, which
-    /// pushes the job of a new task onto the successor list of every
-    /// dependency named -- and `None` is upstream's `task.empty()` branch,
-    /// the dependency it counts off instead of waiting for.
-    ///
-    /// The share rather than a borrow of the node, because what the caller
-    /// does with it is build a [`Job`](crate::executor) that keeps it alive.
+    /// The one caller is `executor::dependent_async`, pushing the job of a
+    /// new task onto the successor list of every dependency named, and `None`
+    /// is upstream's `task.empty()` branch -- the dependency it counts off
+    /// instead of waiting for. A share rather than a borrow, that caller
+    /// building a [`Job`](crate::executor) that keeps the node alive.
     pub(crate) fn node(&self) -> Option<&Arc<AsyncNode>> {
         self.0.as_ref()
     }
@@ -89,9 +69,9 @@ impl AsyncTask {
     /// Releases the task this handle manages, if any: upstream's `reset()`.
     ///
     /// Afterwards the handle is [`AsyncTask::empty`] and the share is gone,
-    /// which for the last owner of a task that has already run is what frees
-    /// the node. A task that has *not* run yet is not cancelled by this and
-    /// is not freed either -- the job queued for it holds a share of its own.
+    /// which for the last owner of a task that has run frees the node. A task
+    /// that has *not* run is neither cancelled nor freed: the job queued for
+    /// it holds a share of its own.
     pub fn reset(&mut self) {
         self.0 = None;
     }
@@ -99,19 +79,12 @@ impl AsyncTask {
     /// How many shares of this task are outstanding: upstream's
     /// `use_count()`, which is `0` for an empty handle.
     ///
-    /// **Handles plus the executor's own shares**, and the distinction
-    /// matters for anyone reading the number: a task that is queued or
+    /// **Handles plus the executor's own shares**: a task that is queued or
     /// running is named by a [`Job`](crate::executor) the scheduler holds,
-    /// which is a share like any other. Upstream's count includes exactly the
-    /// same thing -- it is incremented when the node is created for the queue
-    /// and decremented by the worker that finishes it, which is what its own
-    /// docs mean by "when a worker completes an async task, it will remove the
-    /// task from the executor, decrementing the number of shared owners by
-    /// one". So two clones of a handle on a task still in the queue read
-    /// three, not two, and the number is a liveness fact rather than a count
-    /// of your own variables.
-    ///
-    /// Relaxed, as upstream's load is.
+    /// which is a share like any other, so two clones of a handle on a task
+    /// still in the queue read three. Upstream's count includes the same
+    /// thing, which its own docs say from the other side. The number is a
+    /// liveness fact rather than a count of your own variables.
     #[must_use]
     pub fn use_count(&self) -> usize {
         self.0.as_ref().map_or(0, Arc::strong_count)
@@ -120,26 +93,22 @@ impl AsyncTask {
     /// Whether the task has finished: upstream's `is_done()`, which is `true`
     /// for an empty handle.
     ///
-    /// `true` for an empty handle is upstream's answer and is the useful one:
-    /// a handle that has been [`reset`](AsyncTask::reset) is no longer
-    /// waiting for anything, so a caller spinning on this gets out rather
-    /// than spinning for ever. It says nothing about whether the task
-    /// *succeeded* -- [`AsyncTask::take_panic`] is that question.
+    /// `true` for an empty handle is upstream's answer and the useful one, a
+    /// handle that has been [`reset`](AsyncTask::reset) waiting for nothing.
+    /// It says nothing about whether the task *succeeded* --
+    /// [`AsyncTask::take_panic`] is that question.
     #[must_use]
     pub fn is_done(&self) -> bool {
         self.0.as_ref().is_none_or(|node| node.is_finished())
     }
 
     /// The hash of this handle's task identity: upstream's `hash_value()`,
-    /// which is `std::hash<Node*>{}(_node)` and therefore hashes the null
-    /// pointer for an empty handle.
-    ///
-    /// A `u64` where upstream's is a `size_t`, because that is what Rust's
-    /// [`Hasher`] produces on every target. The value is this port's
-    /// [`Hash`] impl run through the default hasher, so it agrees with
-    /// whatever a [`HashMap`](std::collections::HashMap) of handles computes
-    /// -- which is the only promise a hash of an address can keep, since
-    /// neither upstream's nor this one is stable across runs.
+    /// which is `std::hash<Node*>{}(_node)` and so hashes the null pointer
+    /// for an empty handle. A `u64` where upstream's is a `size_t`, that
+    /// being what Rust's [`Hasher`] produces, and it is this port's [`Hash`]
+    /// impl run through the default hasher -- so it agrees with what a
+    /// [`HashMap`](std::collections::HashMap) of handles computes, which is
+    /// the only promise a hash of an address can keep.
     #[must_use]
     pub fn hash_value(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
@@ -150,59 +119,47 @@ impl AsyncTask {
     /// Takes the payload of the task's own failure, if it failed and nothing
     /// above it collected the failure: upstream's `exception_ptr()`.
     ///
-    /// This is the one accessor on the handle that reads the *node* rather
-    /// than its state word, and the case it exists for is upstream's own: a
-    /// **silent** async task has no future and no frame waiting on it, so a
-    /// panic out of its body has nowhere to be delivered and is parked on the
-    /// node -- `Job::record_panic`'s last case, which such a task is the one
-    /// thing that reaches. This hands it back to whoever still holds a
-    /// handle.
+    /// The one accessor that reads the *node* rather than its state word, for
+    /// upstream's own case: a **silent** async task has no future and no
+    /// frame waiting on it, so a panic out of its body is parked on the node,
+    /// and this hands it back to whoever still holds a handle.
     ///
-    /// It is not the `Task::exception_ptr` the README declines to port, and
-    /// the difference is which failure the slot holds. A *graph* node's slot
-    /// is an anchor's: several tasks under one anchor can fail at once, only
-    /// the first claims it, and handing back a race loser would be reporting
-    /// an arbitrary one of several failures. A free node's slot holds the one
-    /// failure of the one task that node is, so there is no race to lose and
-    /// nothing arbitrary to report.
+    /// It is not the `Task::exception_ptr` the README declines to port: a
+    /// *graph* node's slot is an anchor's, where only the first of several
+    /// failures claims it, so handing one back would report an arbitrary one
+    /// of them. A free node's slot holds the one failure of the one task it
+    /// is.
     ///
     /// Takes rather than peeks, as [`RunHandle::wait`](crate::RunHandle)
-    /// does: the payload is a `Box<dyn Any + Send>` that only one caller can
-    /// own, so a second call hands back `None`. `None` is also the answer for
-    /// an empty handle and for a task that has not failed.
+    /// does, the payload being a `Box<dyn Any + Send>` only one caller can
+    /// own: a second call hands back `None`, as do an empty handle and a task
+    /// that has not failed.
     #[must_use]
     pub fn take_panic(&self) -> Option<Box<dyn Any + Send>> {
         self.0.as_ref().and_then(|node| node.take_panic())
     }
 
     /// The address this handle's identity is: the node, or null for an empty
-    /// handle.
-    ///
-    /// Upstream compares and hashes `Node*` directly, and a null pointer for
-    /// an empty handle is what makes two empty handles equal to each other
-    /// without a case of its own.
+    /// handle, which is what makes two empty handles equal without a case of
+    /// their own. Upstream compares and hashes `Node*` directly.
     fn identity(&self) -> *const AsyncNode {
         self.0.as_ref().map_or(core::ptr::null(), Arc::as_ptr)
     }
 }
 
 impl Clone for AsyncTask {
-    /// Upstream's copy constructor, whose `_incref` this is.
-    ///
-    /// Hand-written rather than derived only so that this doc comment can say
-    /// that; `Option<Arc<_>>` clones exactly the same way.
+    /// Upstream's copy constructor, whose `_incref` this is; hand-written
+    /// only so that the comment can say so, `Option<Arc<_>>` cloning the
+    /// same way.
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
 impl PartialEq for AsyncTask {
-    /// By node identity, which is upstream's `_node == rhs._node` -- the
-    /// comparison its `std::hash<Node*>` is the hash of.
-    ///
-    /// Upstream declares no `operator==` at all; the port has one because a
-    /// handle that hashes has to agree with how it compares, and because
-    /// naming dependencies means putting handles in sets.
+    /// By node identity, upstream's `_node == rhs._node`. Upstream declares
+    /// no `operator==`; this one exists because a handle that hashes has to
+    /// agree with how it compares.
     fn eq(&self, other: &Self) -> bool {
         core::ptr::eq(self.identity(), other.identity())
     }
@@ -219,9 +176,8 @@ impl Hash for AsyncTask {
 }
 
 impl fmt::Debug for AsyncTask {
-    /// Hand-written because the derived one would print the node, and through
-    /// it the one-node graph and whatever the body captured. The address and
-    /// the two state questions are what identifies a handle.
+    /// Hand-written because the derived one would print the node, and
+    /// through it whatever the body captured.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = f.debug_struct("AsyncTask");
         match &self.0 {

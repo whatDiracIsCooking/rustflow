@@ -2,69 +2,27 @@
 //!
 //! Only the shell of upstream's `tf::Runtime` is here: what the handle holds,
 //! and the two things it can answer without reaching into the scheduler.
-//! Everything the type exists *for* -- `schedule`, `corun` and
-//! `is_cancelled` -- needs the executor, and lives in a second
-//! `impl Runtime` block in `src/executor/runtime.rs`, beside the dispatch arm
-//! that builds one. An inherent `impl` may sit anywhere in the defining
-//! crate, which is how this port keeps the graph-side and executor-side
-//! halves of one type in the modules that own them.
+//! `schedule`, `corun` and `is_cancelled` need the executor and live in a
+//! second `impl Runtime` block in `src/executor/runtime.rs`, an inherent
+//! `impl` being able to sit anywhere in the defining crate.
 //!
-//! # Why there is no `executor()`
+//! # Design
 //!
-//! Upstream's `Runtime` holds an `Executor&` and hands it back. This port
-//! cannot, and the reason is ownership rather than taste: a `Runtime` is
-//! built by the runtime dispatch arm, which runs on a worker thread, and **a
-//! worker thread holds the executor's shared state rather than the
-//! `Executor` value**. Upstream's executor *is* that state; here an
-//! [`Executor`](crate::Executor) is a handle over an `Arc` of it plus the
-//! join handles of the pool, and it is owned by value, with no
-//! `Arc<Executor>` anywhere in the crate for a worker to keep a `Weak` of.
-//! So reproducing the member would take a raw back-pointer from the shared
-//! state to the value that owns it, and the executor has had no `unsafe`
-//! since issue #40.
+//! There is no `executor()`, where upstream's `Runtime` holds an `Executor&`
+//! and hands it back: a worker thread holds the executor's shared state
+//! rather than the `Executor` value, and `DESIGN.md` has why a runtime or
+//! subflow handle therefore cannot reproduce the member.
+//! [`Runtime::num_workers`] stands in its place, and a body that genuinely
+//! needs the executor captures an `Arc<Executor>` as this crate's
+//! [`corun`](crate::Executor::corun) doctests do.
 //!
-//! What upstream's own callers ask `rt.executor()` for is nearly always the
-//! worker count -- `taskflow/algorithm/find.hpp` asks three times, which is
-//! milestone 6 here -- and that *is* reachable from a worker, so
-//! [`Runtime::num_workers`] stands in its place. A body that genuinely needs
-//! the executor captures an `Arc<Executor>`, which is how upstream's own
-//! `Runtime.ExternalGraph.Simple` reaches it -- by reference, out of the
-//! enclosing scope -- and what this crate's
-//! [`corun`](crate::Executor::corun) doctests already do.
-//!
-//! # Which bodies are handed one, and what they can do with it
-//!
-//! Two kinds of node, and `executor::runtime` runs both: a runtime task of a
-//! graph, through
-//! [`FlowBuilder::emplace_runtime`](crate::FlowBuilder::emplace_runtime), and
-//! a *free* node whose body is runtime-shaped, which is upstream's
-//! `is_runtime_task_v<F>` branch of `_async`, `_silent_async`,
-//! `_dependent_async` and `_silent_dependent_async`. There are rather more
-//! ways to submit one of those than there are kinds of them: four on the
-//! [`Executor`](crate::Executor) --
-//! [`spawn_runtime`](crate::Executor::spawn_runtime),
-//! [`silent_async_runtime`](crate::Executor::silent_async_runtime) and the
-//! two dependent forms -- and the same four on a `Runtime`, which is what
-//! makes a child's body able to spawn children of its own. What differs
-//! between them is who waits for the task and what the task waits for, never
-//! what its body is handed.
-//!
-//! The second of upstream's two body shapes, `void(Runtime&, bool)`, is the
-//! handle-returning one of those: it is called again when the node finishes
-//! so that it can report what failed under it, and `executor::runtime` is
-//! where that second entry is argued.
-//!
-//! What a body can do in the other direction is spawn work *under* its own
-//! node, which is upstream's `rt.async`, `rt.silent_async`,
-//! `rt.dependent_async` and `rt.silent_dependent_async` and is
-//! `executor::runtime_async` (#92): eight methods, because each of the four
-//! takes either body shape. Such a child is the only work a
-//! [`Runtime::corun`] can wait for and the only thing the implicit join at
-//! the end of the body is a join *of* -- where a task a body
-//! [`schedule`](Runtime::schedule)s is a sibling, counted against this node's
-//! parent rather than against the node, which is why `schedule` is not a way
-//! to spawn anything. Upstream's `NonpreemptiveRuntime` is outside this
-//! milestone altogether.
+//! Which nodes are handed one -- a runtime task of a graph, or a free node
+//! whose body is runtime-shaped -- is `executor::runtime`, and the eight
+//! forms a body has for spawning work *under* its own node are
+//! `executor::runtime_async`. Such a child is the only work a
+//! [`Runtime::corun`] waits for; a task the body
+//! [`schedule`](Runtime::schedule)s is a sibling, counted against this
+//! node's parent instead. Upstream's `NonpreemptiveRuntime` is not ported.
 
 use core::fmt;
 
@@ -74,58 +32,40 @@ use crate::graph::Node;
 
 /// The scheduler, as a runtime task's body sees it: upstream's `tf::Runtime`.
 ///
-/// A runtime task is a task handed the thing that is running it, which is what
-/// lets a body schedule work of its own and wait for it. The handle borrows
-/// the worker running the body, the node the body is running on and the job
-/// that node was dequeued as, so it lives exactly as long as that one
+/// A runtime task is a task handed the thing that is running it, which is
+/// what lets a body schedule work of its own and wait for it. The handle
+/// borrows everything it names, so it lives exactly as long as the one
 /// invocation and is not meant to be stored -- upstream's is a stack object
-/// its body is handed by reference, for the same reason.
-///
-/// What this module can answer is where the body is running. The scheduling
-/// half -- `schedule`, `corun`, `corun_all` and `is_cancelled` -- is the
-/// `impl` block in `src/executor/runtime.rs`, which is also where the arm
-/// that builds one of these lives.
+/// its body is handed by reference, for the same reason. What this module
+/// answers is where the body is running.
 pub struct Runtime<'a> {
     /// The worker running the body, upstream's `_worker`.
     pub(crate) worker: &'a Worker,
-    /// The node the body is running on, upstream's `_node`. It is the anchor
-    /// a `corun` waits on and the node whose join counter work spawned by the
-    /// body counts down, which is why the handle holds it before anything
-    /// reads it.
-    ///
-    /// It is `job`'s own node, resolved once by whoever builds the handle
-    /// rather than on each access: a job of a nested graph resolves its task
-    /// index along a path of owners, so that lookup is a walk and not a field
-    /// read.
+    /// The node the body is running on, upstream's `_node`: the anchor a
+    /// `corun` waits on, and the node whose join counter work spawned by the
+    /// body counts down. It is `job`'s own node, resolved once by whoever
+    /// builds the handle rather than on each access, a job of a nested graph
+    /// resolving its task index along a path of owners.
     pub(crate) node: &'a Node,
     /// The job the node was dequeued as, which is what upstream reaches
     /// through `_node->_parent` and `_node->_topology`: the run this task is
-    /// part of, the graph its siblings live in, and the parent that a task
-    /// this body schedules is counted against. The crate-private
-    /// `executor::topology` says why all of that travels with the job here
-    /// rather than sitting on the node.
+    /// part of, the graph its siblings live in, and the parent a task this
+    /// body schedules is counted against. `executor::topology` says why all
+    /// of that travels with the job rather than sitting on the node.
     pub(crate) job: &'a Job,
     /// The scheduling loop of the worker running the body: upstream's
-    /// `Worker&` wherever it hands one to `_schedule` or `_corun_until`.
-    ///
-    /// Held mutably because a corun re-enters that loop, and the owning end
-    /// of a worker's queue is the one thing a shared [`Worker`] cannot lend
-    /// out -- the crate-private `executor::worker` says why a worker is two
-    /// types here and one upstream.
+    /// `Worker&` wherever it hands one to `_schedule` or `_corun_until`, held
+    /// mutably because a corun re-enters that loop and the owning end of a
+    /// worker's queue is the one thing a shared [`Worker`] cannot lend out --
+    /// `executor::worker` says why a worker is two types here.
     pub(crate) thread: &'a mut WorkerThread,
 }
 
 impl<'a> Runtime<'a> {
-    /// Builds the handle for a runtime task running on `node`, which is the
-    /// node `job` is for.
-    ///
-    /// Upstream's constructor is private, with `friend class Executor` to let
-    /// the scheduler reach it; `pub(crate)` is the same statement in the one
-    /// vocabulary Rust has for it. It was public while the handle held
-    /// nothing but shared borrows a caller already had. What it holds now is
-    /// the job and the worker's own scheduling loop, both crate-private, so a
-    /// public constructor could not be written without leaking them into the
-    /// public API -- which the `private_interfaces` lint is right to refuse.
+    /// Builds the handle for a runtime task running on `node`, the node
+    /// `job` is for. `pub(crate)` where upstream's constructor is private
+    /// with `friend class Executor`: the job and the worker's scheduling loop
+    /// are crate-private types a public constructor would leak.
     pub(crate) fn new(
         worker: &'a Worker,
         node: &'a Node,
@@ -148,15 +88,10 @@ impl<'a> Runtime<'a> {
     }
 
     /// How many workers the executor running this task has: the part of
-    /// upstream's `executor()` that a runtime body can actually see.
-    ///
-    /// Upstream writes `rt.executor().num_workers()`, and the callers that
-    /// matter are its partitioners -- `taskflow/algorithm/find.hpp` sizes its
-    /// chunks with exactly this number. The module docs say why the executor
-    /// itself is not reachable from a worker and this is.
-    ///
-    /// The same answer [`Executor::num_workers`](crate::Executor::num_workers)
-    /// gives, read out of the state the worker shares with it.
+    /// upstream's `executor()` that a runtime body can see, written
+    /// `rt.executor().num_workers()` there. The same answer
+    /// [`Executor::num_workers`](crate::Executor::num_workers) gives, read
+    /// out of the state the worker shares with it.
     #[must_use]
     pub fn num_workers(&self) -> usize {
         self.thread.shared.workers.len()
@@ -165,9 +100,7 @@ impl<'a> Runtime<'a> {
 
 impl fmt::Debug for Runtime<'_> {
     /// Names the node and the worker, which is the whole of a runtime task's
-    /// identity. The run behind it has no small rendering and a handle that
-    /// printed one would be unreadable where it is most useful, inside a
-    /// failing body.
+    /// identity; the run behind it has no small rendering.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Runtime")
             .field("node", &self.node.name())

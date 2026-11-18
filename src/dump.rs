@@ -10,9 +10,8 @@
 //!
 //! # Identifier substitution
 //!
-//! * A node is `p<arena index>`, so `p0`, `p1`, ... in creation order. This is
-//!   the substitution the issue asks for, and it is what makes the output
-//!   stable enough to assert on.
+//! * A node is `p<arena index>`, so `p0`, `p1`, ... in creation order, which
+//!   is what makes the output stable enough to assert on.
 //! * A graph cluster is `cluster_p<graph id>`, where the graph id is the small
 //!   integer upstream's own `Dumper` already assigns each graph it visits
 //!   (`dumper.visited[top] = dumper.id++`). The top-level graph is therefore 0,
@@ -30,9 +29,8 @@
 //!   `cluster_p0_sub` and holds `p0_sub_0`, `p0_sub_1`, ... The `_sub`
 //!   component is what keeps those two families apart -- without it the
 //!   children of the top graph's `p1` and the nodes of module graph 1 would
-//!   both be `p1_0`, and `cluster_p1` would name two different clusters -- and
-//!   the top-level graph keeps the bare `p<index>` form, so the goldens the
-//!   static graph was pinned with in #11 read exactly as they did.
+//!   both be `p1_0`, and `cluster_p1` would name two different clusters. The
+//!   top-level graph keeps the bare `p<index>` form.
 //!
 //! Names are written through exactly as upstream writes them, with no DOT
 //! escaping: upstream does not escape them either, and quietly diverging would
@@ -40,7 +38,7 @@
 //!
 //! # Nested graphs
 //!
-//! The two kinds of nesting go in opposite directions, and that is upstream's
+//! The two kinds of nesting go in opposite directions, which is upstream's
 //! distinction rather than this port's.
 //!
 //! A module task's target is dumped as a *sibling* cluster. Upstream numbers
@@ -93,19 +91,14 @@
 //! subgraph is cleared when it is joined and an empty one puts no children in
 //! the document.
 //!
-//! # What is not here yet
+//! # Coverage
 //!
-//! Nothing of upstream's four functions, as of #46: every [`Handle`] this
-//! crate has now dumps. The `match` arms below name every variant rather than
+//! Every [`Handle`] this crate has dumps, which is the whole of upstream's
+//! four functions. The `match` arms below name every variant rather than
 //! defaulting, so the next variant to arrive stops compiling until its format
-//! is decided, and that is how the arms already here were filled. The
-//! conditioner handles landed in #28 with each arm a `todo!()` naming #30,
-//! which wrote the diamond shape and the dashed, position-labelled edge; the
-//! four dynamic-tasking handles landed in #45 the same way, with each arm a
-//! `todo!()` naming this issue, which wrote the clusters above. The handles
-//! upstream has and this crate does not -- `Async`, `DependentAsync`,
-//! `NonpreemptiveRuntime` -- never sit in a taskflow's own graph, so
-//! upstream's dump has nothing to say about them either.
+//! is decided. The handles upstream has and this crate does not --
+//! `NonpreemptiveRuntime` above all -- never sit in a taskflow's own graph,
+//! so upstream's dump has nothing to say about them either.
 //!
 //! What is unchecked rather than unwritten is the syntax of the output: the
 //! development container has no `graphviz`, so nothing here has been through
@@ -389,34 +382,79 @@ fn write_cluster(
     label: ClusterLabel<'_>,
     dumper: &mut Dumper,
 ) -> fmt::Result {
-    indent(out, depth)?;
-    writeln!(out, "subgraph cluster_p{id} {{")?;
+    let (label_prefix, name, fallback) = match label {
+        ClusterLabel::Taskflow(name) => ("Taskflow: ", name, format!("p{TOP_GRAPH_ID}")),
+        ClusterLabel::Module(name) => ("", name, format!("m{id}")),
+    };
 
-    indent(out, depth + 1)?;
-    out.write_str("label=\"")?;
-    match label {
-        ClusterLabel::Taskflow(name) => {
-            out.write_str("Taskflow: ")?;
-            if name.is_empty() {
-                write!(out, "p{TOP_GRAPH_ID}")?;
-            } else {
-                out.write_str(name)?;
-            }
-        }
-        ClusterLabel::Module(name) => {
-            if name.is_empty() {
-                write!(out, "m{id}")?;
-            } else {
-                out.write_str(name)?;
-            }
-        }
-    }
-    out.write_str("\";\n")?;
-
+    open_cluster(
+        out,
+        depth,
+        &format!("cluster_p{id}"),
+        label_prefix,
+        name,
+        &fallback,
+    )?;
     dump_graph(graph, out, depth + 1, &node_prefix(id), dumper)?;
+    close_cluster(out, depth)
+}
 
-    indent(out, depth)?;
+/// Writes the `subgraph <cluster> {` line at `level` and the `label` line one
+/// level in: how both kinds of cluster begin, upstream's two `ind` writes.
+fn open_cluster(
+    out: &mut impl fmt::Write,
+    level: usize,
+    cluster: &str,
+    label_prefix: &str,
+    name: &str,
+    fallback: &str,
+) -> fmt::Result {
+    indent(out, level)?;
+    writeln!(out, "subgraph {cluster} {{")?;
+
+    indent(out, level + 1)?;
+    write!(out, "label=\"{label_prefix}")?;
+    write_name(out, name, fallback)?;
+    out.write_str("\";\n")
+}
+
+/// Writes the closing brace of a cluster opened at `level`.
+fn close_cluster(out: &mut impl fmt::Write, level: usize) -> fmt::Result {
+    indent(out, level)?;
     out.write_str("}\n")
+}
+
+/// Writes `name`, or `fallback` when there is no name: upstream falls back to
+/// the address it is printing anyway, and this port to the id that replaced
+/// it.
+fn write_name(out: &mut impl fmt::Write, name: &str, fallback: &str) -> fmt::Result {
+    out.write_str(if name.is_empty() { fallback } else { name })
+}
+
+/// Writes one `<from> -> <to>;` line per successor of `node`, each with
+/// whatever [`edge_attributes`] gives an edge leaving that handle.
+///
+/// Upstream writes a module task's edges without the `_is_conditioner()`
+/// question its per-node `_dump` asks, which comes to the same answer: a
+/// module task is not a conditioner, so its edges carry no attributes.
+fn write_edges(
+    out: &mut impl fmt::Write,
+    node: &Node,
+    id: &str,
+    level: usize,
+    prefix: &str,
+) -> fmt::Result {
+    for (position, &successor) in node.successors().iter().enumerate() {
+        indent(out, level)?;
+        writeln!(
+            out,
+            "{id} -> {}{};",
+            node_id(prefix, successor),
+            edge_attributes(node.handle(), position)
+        )?;
+    }
+
+    Ok(())
 }
 
 /// Dumps every node of `graph` at `level`, upstream's per-graph `_dump`.
@@ -462,11 +500,7 @@ fn dump_module_node(
 
     indent(out, level)?;
     write!(out, "{id}[shape=box3d, color=blue, label=\"")?;
-    if node.name().is_empty() {
-        out.write_str(&id)?;
-    } else {
-        out.write_str(node.name())?;
-    }
+    write_name(out, node.name(), &id)?;
 
     // Upstream numbers the target between writing the label and writing the
     // `[m<id>]` that reports the number, so an unnamed module task reports the
@@ -480,16 +514,7 @@ fn dump_module_node(
     }
     out.write_str("\"];\n")?;
 
-    // Upstream writes a module task's edges without the `_is_conditioner()`
-    // question the per-node `_dump` asks, which comes to the same answer -- a
-    // module task is not a conditioner -- and is why this does not share
-    // [`edge_attributes`].
-    for &successor in node.successors() {
-        indent(out, level)?;
-        writeln!(out, "{id} -> {};", node_id(prefix, successor))?;
-    }
-
-    Ok(())
+    write_edges(out, node, &id, level, prefix)
 }
 
 /// Dumps one node and its outgoing edges, upstream's per-node `_dump`.
@@ -509,22 +534,10 @@ fn dump_node(
 
     indent(out, level)?;
     write!(out, "{id}[label=\"")?;
-    if node.name().is_empty() {
-        out.write_str(&id)?;
-    } else {
-        out.write_str(node.name())?;
-    }
+    write_name(out, node.name(), &id)?;
     writeln!(out, "\" {}];", node_shape(node.handle()))?;
 
-    for (position, &successor) in node.successors().iter().enumerate() {
-        indent(out, level)?;
-        writeln!(
-            out,
-            "{id} -> {}{};",
-            node_id(prefix, successor),
-            edge_attributes(node.handle(), position)
-        )?;
-    }
+    write_edges(out, node, &id, level, prefix)?;
 
     // Upstream follows the edges with the nested cluster of the two handles
     // that own a graph of their own. A subflow's is the one this dump has to
@@ -598,25 +611,21 @@ fn dump_subgraph(
     let cluster = format!("cluster_{parent_id}{SUBGRAPH_MARKER}");
     let prefix = format!("{parent_id}{SUBGRAPH_MARKER}_");
 
-    indent(out, level)?;
-    writeln!(out, "subgraph {cluster} {{")?;
-
-    indent(out, level + 1)?;
-    write!(out, "label=\"{kind}: ")?;
-    if parent_name.is_empty() {
-        out.write_str(parent_id)?;
-    } else {
-        out.write_str(parent_name)?;
-    }
-    out.write_str("\";\n")?;
+    open_cluster(
+        out,
+        level,
+        &cluster,
+        &format!("{kind}: "),
+        parent_name,
+        parent_id,
+    )?;
 
     indent(out, level + 1)?;
     out.write_str("color=blue;\n")?;
 
     dump_graph(subgraph, out, level + 1, &prefix, dumper)?;
 
-    indent(out, level)?;
-    out.write_str("}\n")?;
+    close_cluster(out, level)?;
 
     // Upstream's single cluster-level join edge: one dashed arrow from the
     // subgraph's first node to the node that owns it, clipped at the cluster
@@ -638,8 +647,8 @@ fn node_id(prefix: &str, task: Task) -> String {
 
 /// The prefix every node id inside one graph cluster carries.
 ///
-/// The top-level graph keeps the bare `p<index>` of #11's scheme; any other
-/// graph with an id is a module graph, whose nodes are `p<graph id>_<index>`.
+/// The top-level graph keeps the bare `p<index>`; any other graph with an id
+/// is a module graph, whose nodes are `p<graph id>_<index>`.
 fn node_prefix(graph_id: usize) -> String {
     if graph_id == TOP_GRAPH_ID {
         TOP_NODE_PREFIX.to_owned()

@@ -1,21 +1,18 @@
 //! Translated from `taskflow/core/flow_builder.hpp` and the editing half of
 //! `taskflow/core/taskflow.hpp` (Taskflow v4.1.0).
 //!
+//! One group of upstream `FlowBuilder` members is deliberately absent: the
+//! algorithm builders (`for_each`, `reduce`, `sort`, ...), with nothing
+//! standing in for them. Everything else upstream builds is here.
+//!
+//! # Design
+//!
 //! Upstream's `tf::FlowBuilder` is a base class holding a `Graph&`, which
 //! `tf::Taskflow` and `tf::Subflow` inherit to get the task-building API.
 //! Inheritance for code reuse translates to a trait with provided methods, so
-//! here [`FlowBuilder`] asks implementors for one thing -- the graph they
-//! build into, borrowed either way -- and builds everything else on top. M4's
-//! `Subflow` then reuses the whole trait by answering that one question,
-//! exactly as upstream reuses the base.
-//!
-//! One group of upstream `FlowBuilder` members is deliberately absent: the
-//! algorithm builders (`for_each`, `reduce`, `sort`, ...), which are M6.
-//! Nothing stands in for them. Everything else upstream builds is here,
-//! including the four dynamic-tasking builders --
-//! [`FlowBuilder::emplace_subflow`], [`FlowBuilder::emplace_runtime`],
-//! [`FlowBuilder::composed_of`] and [`FlowBuilder::adopt`] -- whose node kinds
-//! the executor does not run yet.
+//! [`FlowBuilder`] asks implementors for one thing -- the graph they build
+//! into, borrowed either way -- and builds everything else on top, which is
+//! how `Subflow` reuses the whole API by answering that one question.
 
 use std::sync::{Arc, Mutex};
 
@@ -30,11 +27,10 @@ use crate::taskflow::Taskflow;
 /// Implementors supply the graph, as [`FlowBuilder::graph`] and
 /// [`FlowBuilder::graph_mut`]; every other method is provided. The trait is
 /// generic over the callable types it takes, so it is not usable as
-/// `dyn FlowBuilder` -- nothing in this port needs that, and upstream's base
-/// class is likewise only ever used statically.
+/// `dyn FlowBuilder`, as upstream's base class is only ever used statically.
 ///
-/// [`Taskflow`] and [`Subflow`] are the two implementors, which is upstream's
-/// pair of derived classes. [`Runtime`] is deliberately not one and so has no
+/// [`Taskflow`] and [`Subflow`] are the two implementors, upstream's pair of
+/// derived classes. [`Runtime`] is deliberately not one and so has no
 /// [`task`](FlowBuilder::task): the graph a runtime task runs in is the
 /// enclosing one, which it schedules into but never edits.
 ///
@@ -50,31 +46,25 @@ use crate::taskflow::Taskflow;
 /// assert_eq!(taskflow.graph().successors(a), [b].as_slice());
 /// ```
 pub trait FlowBuilder {
-    /// Returns the graph this builder builds into.
-    ///
-    /// Upstream's `FlowBuilder::_graph` member, read-only. Both borrows are
-    /// required because a provided method that only queries --
-    /// [`FlowBuilder::task_ref`] -- must not ask for `&mut`, and both
-    /// implementors have an inherent `graph()` of this shape already.
+    /// Returns the graph this builder builds into: upstream's
+    /// `FlowBuilder::_graph` member, read-only. Both borrows are required
+    /// because a provided method that only queries --
+    /// [`FlowBuilder::task_ref`] -- must not ask for `&mut`.
     fn graph(&self) -> &Graph;
 
-    /// Returns the graph this builder builds into, mutably.
-    ///
-    /// This is upstream's `FlowBuilder::_graph` member again, and the
-    /// requirement the building methods below are written against.
+    /// Returns the graph this builder builds into, mutably: the requirement
+    /// the building methods below are written against.
     fn graph_mut(&mut self) -> &mut Graph;
 
     /// Creates a static task running `callable`, and returns its handle.
     ///
-    /// Upstream overloads `emplace` on the callable's signature to pick a node
-    /// kind (static, condition, subflow, ...). Rust has no overloading, so each
-    /// kind arrives as a named method instead: this one is the static task, and
-    /// [`FlowBuilder::emplace_condition`] and
-    /// [`FlowBuilder::emplace_multi_condition`] are the two conditioners.
+    /// Upstream overloads `emplace` on the callable's signature to pick a
+    /// node kind (static, condition, subflow, ...); with no overloading here
+    /// each kind is a named method of its own, and this is the static task.
     ///
-    /// The `Send + 'static` bound is what lets the executor own the closure and
-    /// run it on a worker thread. An already-boxed closure satisfies it --
-    /// `Box<dyn FnMut() + Send>` is itself `FnMut()` -- which is upstream's
+    /// The `Send + 'static` bound is what lets the executor own the closure
+    /// and run it on a worker thread. An already-boxed closure satisfies it,
+    /// `Box<dyn FnMut() + Send>` being itself `FnMut()`, which is upstream's
     /// `std::function<void()>` case.
     fn emplace<C>(&mut self, callable: C) -> Task
     where
@@ -87,13 +77,10 @@ pub trait FlowBuilder {
     /// Creates a condition task running `callable`, and returns its handle.
     ///
     /// Upstream's `emplace` overload for a `ConditionTaskLike` callable. The
-    /// `i32` it returns indexes this task's own successor list, so `0` runs the
-    /// first successor and nothing else; a negative or out-of-range value
-    /// selects nothing, which is how a branch ends.
-    ///
-    /// Nothing schedules on that yet -- the conditional branch belongs to the
-    /// executor -- so what this builds today is a graph citizen that reports
-    /// [`crate::TaskType::Condition`] and makes a dependency on it weak.
+    /// `i32` it returns indexes this task's own successor list, so `0` runs
+    /// the first successor and nothing else; a negative or out-of-range value
+    /// selects nothing, which is how a branch ends. A dependency on a
+    /// conditioner is weak, as [`crate::Handle::is_conditioner`] says.
     ///
     /// ```
     /// use rustflow::prelude::*;
@@ -119,10 +106,9 @@ pub trait FlowBuilder {
     /// handle.
     ///
     /// Upstream's `emplace` overload for a `MultiConditionTaskLike` callable.
-    /// Where [`FlowBuilder::emplace_condition`] names one successor, this names
-    /// as many as it likes -- `vec![0, 2]` runs the first and third -- and the
-    /// same out-of-range rule applies to each index independently, so a list
-    /// may select none of them.
+    /// Where [`FlowBuilder::emplace_condition`] names one successor, this
+    /// names as many as it likes -- `vec![0, 2]` runs the first and third --
+    /// under the same out-of-range rule per index, so a list may select none.
     ///
     /// ```
     /// use rustflow::prelude::*;
@@ -145,18 +131,16 @@ pub trait FlowBuilder {
 
     /// Creates a subflow task running `callable`, and returns its handle.
     ///
-    /// Upstream's `emplace` overload for a `SubflowTaskLike` callable. The body
-    /// is handed the [`Subflow`] it builds into, so what the task spawns can
-    /// depend on anything known only while it runs; the executor then runs
-    /// that child graph before this task's own successors.
+    /// Upstream's `emplace` overload for a `SubflowTaskLike` callable. The
+    /// body is handed the [`Subflow`] it builds into, so what the task spawns
+    /// can depend on anything known only while it runs; the executor then
+    /// runs that child graph before this task's own successors, unless the
+    /// body ran it itself with [`Subflow::join`](crate::Subflow::join) to
+    /// read what the children left behind.
     ///
     /// The node owns the graph the body builds -- see [`Handle::Subflow`] --
     /// and a fresh entry to the same node starts from an empty one, which is
     /// what makes a subflow inside a loop behave.
-    ///
-    /// The body may also run its subgraph itself, with
-    /// [`Subflow::join`](crate::Subflow::join), and read what the children
-    /// left behind before it returns.
     ///
     /// ```
     /// use rustflow::prelude::*;
@@ -182,26 +166,20 @@ pub trait FlowBuilder {
 
     /// Creates a runtime task running `callable`, and returns its handle.
     ///
-    /// Upstream's `emplace` overload for a `RuntimeTaskLike` callable. The body
-    /// is handed the [`Runtime`] it is running on, which is upstream's way of
-    /// giving a task the scheduler itself: it can schedule a task of its own
-    /// graph outright and wait for work it spawned.
+    /// Upstream's `emplace` overload for a `RuntimeTaskLike` callable. The
+    /// body is handed the [`Runtime`] it is running on, which is upstream's
+    /// way of giving a task the scheduler itself: it can schedule a task of
+    /// its own graph outright, spawn work under its own node and wait for it.
     ///
     /// Upstream's second runtime shape, the one taking a
-    /// `tf::NonpreemptiveRuntime&`, is outside this milestone; it would be a
-    /// third method here rather than an overload of this one.
-    ///
-    /// Running one is issue #51, and [`Runtime`]'s scheduling methods land with
-    /// it: today this builds a graph citizen that reports
-    /// [`crate::TaskType::Runtime`], and a run that reaches it is refused.
+    /// `tf::NonpreemptiveRuntime&`, is not ported; it would be a third method
+    /// here rather than an overload of this one.
     ///
     /// ```
     /// use rustflow::prelude::*;
     ///
     /// let mut taskflow = Taskflow::new();
     /// let task = taskflow.emplace_runtime(|runtime: &mut Runtime<'_>| {
-    ///     // What a body does with the handle is #51's; where it is running
-    ///     // it can already ask.
     ///     let _ = runtime.worker().id();
     /// });
     ///
@@ -221,24 +199,22 @@ pub trait FlowBuilder {
     /// another: running this task runs the whole of `target`'s graph, and this
     /// task's successors wait for all of it.
     ///
-    /// Upstream takes anything graph-like by reference, as
-    /// `taskflow.composed_of(other)`, and leaves the caller to keep `other`
-    /// alive for as long as any run of the composing taskflow may be in
-    /// flight. A safe Rust API cannot state
-    /// that obligation, so the target is an [`Arc`] and the module shares it;
-    /// composing one taskflow into two others, or twice into one, hands out
-    /// more shares of the same graph rather than copying it. The owned form of
-    /// the same thing is [`FlowBuilder::adopt`].
+    /// The target is an [`Arc`] the module shares, where upstream takes
+    /// anything graph-like by reference and leaves the caller to keep it
+    /// alive -- `DESIGN.md` on a module task sharing its target. Composing
+    /// one taskflow into two others, or twice into one, hands out more shares
+    /// of the same graph rather than copying it; the owned form is
+    /// [`FlowBuilder::adopt`].
     ///
     /// What the share does *not* buy is permission to run one target twice at
-    /// once: a graph's per-node counters belong to one run at a time, which is
-    /// upstream's rule too (`composed_of` is "thread-safe as long as the target
-    /// is not concurrently ran by two or more threads"). Two module tasks over
-    /// one target are therefore fine when nothing can run them at the same
+    /// once: a graph's per-node counters belong to one run at a time, which
+    /// is upstream's rule too (`composed_of` is "thread-safe as long as the
+    /// target is not concurrently ran by two or more threads"). Two module
+    /// tasks over one target are fine when nothing can run them at the same
     /// time -- an edge between them is enough -- and a caller's error when
-    /// they can. Runs of one taskflow serialise, so queueing several runs of a
-    /// composition is not that error; `executor::module` sets out both sides,
-    /// and the failure a worker reports if the rule is broken.
+    /// they can. Runs of one taskflow serialise, so queueing several runs of
+    /// a composition is not that error; `executor::module` has both sides and
+    /// the failure a worker reports if the rule is broken.
     ///
     /// ```
     /// use std::sync::Arc;
@@ -266,14 +242,12 @@ pub trait FlowBuilder {
     /// Upstream's `adopt(Graph&&)`: the same composition as
     /// [`FlowBuilder::composed_of`] with the ownership question settled the
     /// other way -- the graph is moved into the task, so there is no target to
-    /// keep alive and no share to count. It is the form to reach for when the
+    /// keep alive and no share to count. The form to reach for when the
     /// composed graph has no other owner.
     ///
     /// Running one runs the whole of `graph` before this task's successors,
-    /// exactly as a composed target runs: the two forms differ only in who
-    /// owns the target graph, which is a question the scheduler answers for
-    /// all four kinds of nested graph in one place (#74) and
-    /// `executor::module` says how for these two.
+    /// exactly as a composed target runs; the two differ only in who owns the
+    /// target graph, which `executor::module` answers for both.
     ///
     /// ```
     /// use rustflow::prelude::*;
@@ -293,10 +267,10 @@ pub trait FlowBuilder {
     /// Creates one static task per callable in a tuple, and returns a tuple of
     /// their handles in the same order.
     ///
-    /// This is upstream's variadic `emplace` returning a `std::tuple`, which
-    /// structured binding then unpacks. Rust has no variadics, so the tuple is
-    /// the *argument* as well as the result and [`Callables`] carries the
-    /// mapping; destructuring the result reads the same as upstream:
+    /// Upstream's variadic `emplace` returning a `std::tuple` that structured
+    /// binding unpacks. Rust has no variadics, so the tuple is the *argument*
+    /// as well as the result and [`Callables`] carries the mapping;
+    /// destructuring the result reads the same as upstream:
     ///
     /// ```
     /// use rustflow::prelude::*;
@@ -308,8 +282,8 @@ pub trait FlowBuilder {
     /// ```
     ///
     /// Implemented for tuples of two to eight callables. Upstream's variadic
-    /// has no such ceiling, but past a handful of closures a loop over an array
-    /// of them reads better than either spelling, so the cap costs nothing.
+    /// has no such ceiling, but past a handful of closures a loop over an
+    /// array reads better than either spelling.
     fn emplace_n<C>(&mut self, callables: C) -> C::Tasks
     where
         C: Callables,
@@ -320,9 +294,9 @@ pub trait FlowBuilder {
     /// Creates a task with no work attached yet, and returns its handle.
     ///
     /// Upstream's `placeholder()`: a real node in the graph, distinct from an
-    /// empty `tf::Task` handle that points at no node at all. This port has no
-    /// empty handle to confuse it with -- a [`Task`] always names a slot -- so
-    /// the distinction shows up as [`Handle::is_placeholder`] instead.
+    /// empty `tf::Task` handle that points at no node. This port has no empty
+    /// handle to confuse it with -- a [`Task`] always names a slot -- so the
+    /// distinction is [`Handle::is_placeholder`] instead.
     fn placeholder(&mut self) -> Task {
         self.graph_mut().add_node(Handle::Placeholder)
     }
@@ -330,10 +304,8 @@ pub trait FlowBuilder {
     /// Removes a task and every dependency touching it.
     ///
     /// A handle that names nothing live -- out of range, or erased already --
-    /// does nothing, as upstream's `erase` does nothing for a task outside the
-    /// graph. The index stays spent: see [`Graph::erase`] for why erasing
-    /// tombstones the slot rather than compacting the arena, and what that
-    /// means for the handles that remain.
+    /// does nothing, as upstream's `erase` does nothing for a task outside
+    /// the graph. The index stays spent: [`Graph::erase`] says why.
     fn erase(&mut self, task: Task) {
         self.graph_mut().erase(task);
     }
@@ -342,8 +314,8 @@ pub trait FlowBuilder {
     /// `[a, b, c]` becomes `a -> b -> c`.
     ///
     /// Upstream overloads `linearize` for `std::vector<Task>&` and for an
-    /// initializer list; one `IntoIterator` covers both, and a slice, an array
-    /// or any iterator besides.
+    /// initializer list; one `IntoIterator` covers both, and a slice, an
+    /// array or any iterator besides.
     ///
     /// # Panics
     ///
@@ -366,11 +338,9 @@ pub trait FlowBuilder {
     /// Removes every `from -> to` dependency, leaving both tasks in the graph.
     ///
     /// Upstream's `Taskflow::remove_dependency`, which lives on `Taskflow`
-    /// rather than on `FlowBuilder` there. It belongs with the rest of the
-    /// editing API, and putting it on the trait means `Subflow` gets it too.
-    ///
-    /// Duplicate dependencies all go: a task preceded twice and then released
-    /// once is released outright, as upstream's `_remove_successors` does.
+    /// rather than on `FlowBuilder` there; on the trait, `Subflow` gets it
+    /// too. Duplicate dependencies all go, as upstream's
+    /// `_remove_successors` does.
     ///
     /// # Panics
     ///
@@ -384,12 +354,11 @@ pub trait FlowBuilder {
     /// Upstream's `emplace` hands the handle straight back, and it goes on
     /// aliasing the graph the caller keeps mutating. Here the lasting handle
     /// is the [`Task`] index `emplace` returns and the fluent methods live on
-    /// [`TaskMut`], a short-lived borrow of the builder -- which is why they
-    /// are reached through this method rather than being the return value
-    /// (README's "Graph as an arena").
-    ///
-    /// Being on the trait is what makes a subflow body read like the taskflow
-    /// half of the same program. Upstream's subflow example ports as:
+    /// [`TaskMut`], a short-lived borrow of the builder, so naming a task is
+    /// two statements rather than upstream's `emplace(..).name("B")` chain:
+    /// `DESIGN.md` has that decision and this accessor being on the trait,
+    /// which is what makes a subflow body read like the taskflow half of the
+    /// same program. Upstream's subflow example ports as:
     ///
     /// ```
     /// use rustflow::prelude::*;
@@ -409,10 +378,6 @@ pub trait FlowBuilder {
     /// Executor::new(2).run(&taskflow).wait().unwrap();
     /// ```
     ///
-    /// Naming a task is two statements rather than upstream's
-    /// `emplace(..).name("B")` chain, and that is a decision rather than a
-    /// gap: README's "Design decisions already taken" has the reason.
-    ///
     /// # Panics
     ///
     /// Panics if `task` does not address a task of this builder's graph.
@@ -422,11 +387,9 @@ pub trait FlowBuilder {
 
     /// Returns a read-only handle to `task`, the query half of the pair.
     ///
-    /// This is upstream's `tf::TaskView` as much as its `tf::Task`; the two
-    /// differ only in the editing methods, which are on [`TaskMut`].
-    ///
-    /// The trait is all it takes to reach either handle, so importing it is
-    /// enough -- with or without the rest of the prelude:
+    /// Upstream's `tf::TaskView` as much as its `tf::Task`, the two differing
+    /// only in the editing methods, which are on [`TaskMut`]. The trait is
+    /// all it takes to reach either handle, with or without the prelude:
     ///
     /// ```
     /// use rustflow::{FlowBuilder, Taskflow};
@@ -451,8 +414,8 @@ pub trait FlowBuilder {
 /// A tuple of callables that [`FlowBuilder::emplace_n`] can turn into a tuple
 /// of task handles.
 ///
-/// Implemented for tuples of two to eight callables, which is as far as
-/// upstream's variadic `emplace` is worth following. One callable is
+/// Implemented for tuples of two to eight callables, as far as upstream's
+/// variadic `emplace` is worth following; one callable is
 /// [`FlowBuilder::emplace`].
 pub trait Callables {
     /// The tuple of [`Task`] handles emplacing this tuple produces: one handle
@@ -463,9 +426,9 @@ pub trait Callables {
     fn emplace_all(self, graph: &mut Graph) -> Self::Tasks;
 }
 
-/// Expands to `Task`, discarding the identifier it is handed. The macro below
-/// needs one `Task` per callable type in a type position, and this is the way
-/// to spell "repeat this type once per element of that list".
+/// Expands to `Task`, discarding the identifier it is handed: the macro below
+/// needs one `Task` per callable type in a type position, which is how to
+/// spell "repeat this type once per element of that list".
 macro_rules! task_handle {
     ($ignored:ident) => {
         Task
@@ -502,14 +465,13 @@ impl_callables!(C0 c0, C1 c1, C2 c2, C3 c3, C4 c4, C5 c5, C6 c6, C7 c7);
 
 impl FlowBuilder for Taskflow {
     fn graph(&self) -> &Graph {
-        // As below: the inherent accessor, not a recursive call into the
-        // trait.
         Taskflow::graph(self)
     }
 
     fn graph_mut(&mut self) -> &mut Graph {
-        // Inherent methods win over trait methods in resolution, so this is
-        // `Taskflow`'s own accessor and not a recursive call into the trait.
+        // Inherent methods win over trait methods in resolution, so this and
+        // the one above are `Taskflow`'s own accessors rather than recursive
+        // calls into the trait.
         Taskflow::graph_mut(self)
     }
 }
@@ -518,12 +480,11 @@ impl Taskflow {
     /// Applies `visitor` to the handle of every task in this taskflow, in
     /// creation order.
     ///
-    /// Upstream's `Taskflow::for_each_task`, which walks `_graph` and hands the
-    /// visitor a `tf::Task`. Erased tasks are not visited -- [`Graph::iter`]
-    /// skips the tombstones they leave.
-    ///
-    /// The visitor takes a handle rather than a `&Node` because a handle is
-    /// what the editing API consumes; `self.graph().iter()` is the nodes.
+    /// Upstream's `Taskflow::for_each_task`, which walks `_graph` and hands
+    /// the visitor a `tf::Task`. Erased tasks are not visited, [`Graph::iter`]
+    /// skipping the tombstones they leave, and the visitor takes a handle
+    /// rather than a `&Node` because a handle is what the editing API
+    /// consumes -- `self.graph().iter()` is the nodes.
     pub fn for_each_task<V>(&self, mut visitor: V)
     where
         V: FnMut(Task),
