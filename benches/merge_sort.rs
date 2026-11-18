@@ -45,11 +45,11 @@
 //! spawned tasks at `N = 10_000`, 10 levels and ~1023 at `N = 1_000_000` --
 //! and the tasks outstanding at any moment are bounded by that count. That
 //! is what makes this shape safe where `benches/fibonacci.rs`'s
-//! `rustflow-group` id is not: there a `corun` on the one worker that has to
-//! pick its own children up nests a frame per outstanding child, and the
-//! cliff sits between `fib(17)` and `fib(18)`, some thousands of nodes. A
-//! thousand `msort` frames is inside it, measured at both worker counts
-//! rather than assumed.
+//! `rustflow-group` id is not: the nested-corun stack bound that `DESIGN.md`'s
+//! "Executor core" states costs a frame per outstanding task, about a
+//! kilobyte of a worker's two megabytes in a release build, so a thousand
+//! `msort` frames is inside it -- measured at both worker counts rather than
+//! assumed.
 //!
 //! **Two departures from upstream beyond the array's type.** Upstream wraps
 //! the recursion in *two* nested `executor.async` calls --

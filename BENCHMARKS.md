@@ -859,17 +859,14 @@ line for line; `rustflow-runtime` is the same recursion through a runtime task
 rather than its benchmark; `rayon` is `rayon::join`.
 
 **`n` is 12 and 15 where upstream's unit test asserts `fib(25)` and its
-benchmark sweeps to `fib(40)`, and `rustflow-group` is why.** A corun keeps its
-worker in the work-stealing loop, so every job that worker picks up while
-waiting nests one frame deeper, and a corun handed the oldest outstanding job
-in the pool -- somebody else's unfinished subtree -- rather than its own newest
-child nests one frame per outstanding *child* instead of one per level of
-recursion, until a worker's 2 MiB stack runs out. That was both variants when
-#96 measured them; #119 gave the **runtime** variant upstream's
-`if(auto w = this_worker(); w)` branch, so its children go onto the submitting
-worker's LIFO queue and its corun pops them straight back. The cliff was then
-re-measured in this profile, with a release build of both recursions driven
-straight (no criterion):
+benchmark sweeps to `fib(40)`, and `rustflow-group` is why.** What bounds it is
+the nested-corun stack bound, which the #359 section below measures once for
+the whole file: a group's corun nests a frame per outstanding *task* rather
+than one per level of recursion. That was both variants when #96 measured them;
+#119 gave the **runtime** variant upstream's `if(auto w = this_worker(); w)`
+branch, so its children go onto the submitting worker's LIFO queue and its
+corun pops them straight back. The cliff was then re-measured in this profile,
+with a release build of both recursions driven straight (no criterion):
 
 | variant | workers | largest `n` that passes | smallest `n` that aborts |
 |---|---|---|---|
@@ -887,11 +884,11 @@ nested coruns in this profile reaches 2400 levels before a worker's stack
 gives out (2800 overflows); the figure for the debug profile the test suite
 runs under is 500 levels, which `src/executor/runtime_async.rs` records.
 
-**One worker is the binding end for the group variant, and that is the
-mechanism showing itself**: the one worker that coruns is the only worker there
-is to pick the outstanding children up, so it nests a frame for every one of
-them, while 24 workers spread the same tree over 24 stacks and reach six levels
-further. Since both variants measure the same `n`, the group's one-worker cliff
+**One worker is the binding end for the group variant**, measured as such in
+the #359 section below -- the one worker that coruns is the only worker there
+is to pick the outstanding children up, while 24 workers spread the same tree
+over 24 stacks and reach six levels further. Since both variants measure the
+same `n`, the group's one-worker cliff
 is what sets the sizes: `fib(15)` is 986 spawned children and sits three
 levels, a factor of four in task count, inside it. `tests/runtimes.rs` -- all
 runtime tasks -- now asserts upstream's own `fib(25)` and sorts to ten
@@ -1053,10 +1050,191 @@ Re-measured rather than assumed, in both profiles, because they differ:
 The "nested coruns" rows are the useful ones for the runtime route, because
 `fib` stops being stack-bound there: a body that spawns one child and coruns,
 to a given depth, is the shape that measures frames per level directly -- about
-4 KiB in debug and 870 bytes in release. A `fib` recursion nests one such
+4 KiB in debug and 870 bytes in release, bisected in steps of 400 here and
+pinned to the byte by the #359 section below. A `fib` recursion nests one such
 level per level of recursion now, so its own bound is thousands of levels deep
 and its task count (1.6^n) runs out of clock first. The group rows are what
 `tests/task_group.rs` and this benchmark's sizes are chosen inside.
+
+## The #359 measurement: a nested corun costs ~1 KiB of stack a level
+
+This is the one place the nested-corun stack bound is measured, and the
+sections that used to each explain the cliff in their own words -- `fibonacci`,
+`skynet`, `nqueens`, `merge_sort`, `integrate` and the #119 subsection above --
+point here instead. `DESIGN.md`'s "Executor core" carries the decision that
+rests on it: the stack stays at std's default and the bound is a documented
+property of the port, named where a caller writes the wait.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0 |
+| Profile | `--release`, and `dev` where a row says so |
+| `ulimit -s` | 8192 KiB |
+| Date | 2026-11-18 |
+| **Load average** | **this run's own: no sibling agent was on the box** |
+
+**The method** is a probe binary outside the repo with a path dependency on the
+crate, driving two recursions straight rather than under criterion: a *chain* of
+nested coruns, one child per level so that the nesting is the depth and nothing
+else, and the three shapes themselves. Three instruments, two of them reading
+the same quantity, so that the per-level figure rests on more than one of them:
+
+- **A frame's size, by its address.** Every level records the address of one
+  local; the differences are the per-level cost. The chain's deltas are uniform
+  to the byte over twelve levels, so this is a frame size rather than an
+  average over a mixture.
+- **The cliff, by bisection against `RUST_MIN_STACK`.** std takes a spawned
+  thread's stack size from that variable when the spawn names none, so the
+  deepest chain that completes can be bisected at several stack sizes without
+  touching the crate -- and the slope of the cliff against the stack size is an
+  independent reading of the frame size above.
+- **A shape's demand, by instrumenting the recursion.** A guard in each body
+  counts the bodies live on the calling thread and the span from the outermost
+  of them down to this frame, both maxed into globals. Driven under a 512 MiB
+  stack it reports what a shape *would* need, not only whether it fits.
+
+### What a level costs
+
+| route | profile | bytes/level by frame address | by the cliff |
+|---|---|---|---|
+| `TaskGroup::corun` | release | 992 | 992.0 |
+| `TaskGroup::corun` | debug | 3616 | -- |
+| `Runtime::corun` | release | 928 | 931 |
+| `Runtime::corun` | debug | 4512 | -- |
+
+The last column is a slope over three stack sizes for the group route and a
+single cliff divided by its stack size for the runtime one, which is why the
+group figure has the extra digit.
+
+The group-route cliff rows the slope is taken from, at one worker:
+
+| `RUST_MIN_STACK` | deepest chain that completes | first that aborts |
+|---|---|---|
+| 1 MiB | 1051 | 1052 |
+| 2 MiB, and unset, which is identical | 2108 | 2109 |
+| 4 MiB | 4222 | 4223 |
+
+3171 levels over 3 MiB is 992.0 bytes a level, the frame-address figure to four
+digits, and the ~6 KiB each row falls short of its stack size by is the fixed
+part below the first level: the worker loop's own frames. That unset reads
+identically to 2 MiB is the other thing this table pins -- a worker gets std's
+default, nothing in the crate names a size, and `RUST_MIN_STACK` is therefore a
+live knob for a caller who needs a deeper recursion than the default carries.
+These rows also supersede the #119 subsection's coarser 870 bytes and 2400
+levels for the runtime route, which were bisected in steps of 400. The debug
+column is not a footnote: the test suite runs there, so its ceiling is a
+quarter of the release one.
+
+### Why one worker is the binding end, confirmed against the code
+
+The code answers whose stack a stolen sub-task runs on.
+`WorkerThread::corun_until` takes a job from `pop` or `explore_task` and calls
+`invoke` on it, which runs that body on the waiting frame. A `TaskGroup`'s
+children are pushed to the shared buffers rather than onto the submitting
+worker's queue -- its corun loop runs on a `corun_view`, which holds no owning
+queue end -- so the job a waiting worker is handed is the oldest outstanding one
+in the pool, somebody's unfinished subtree, and that job is itself a parent that
+submits children and coruns. The instrumentation counts the consequence:
+
+| shape | workers | deepest nesting on one thread | the stack span it cost |
+|---|---|---|---|
+| `skynet` `MaxDepth = 4` | 1 | 1112 bodies | 1.12 MiB |
+| `skynet` `MaxDepth = 4` | 2 | 559 | 576 KiB |
+| `skynet` `MaxDepth = 4` | 4 | 344 | 354 KiB |
+| `skynet` `MaxDepth = 4` | 24 | 77 | 78 KiB |
+| `nqueens` `q = 8` | 1 | 1322 | 1.35 MiB |
+| `nqueens` `q = 8` | 24 | 90 | 93 KiB |
+| `integrate` `V = 3` | 1 | 3479 | 2.04 MiB |
+| `integrate` `V = 3` | 24 | 241 | 134 KiB |
+
+1112 is `(10^4 - 1) / 9` interior nodes plus the root body, and the same run
+reports exactly one nesting chain started: at one worker the **whole tree** is
+one chain of nested frames and there is nothing else on that stack. #359's
+reading -- a stolen sub-task runs on its stealer's stack, so the depth is
+spread across workers -- is therefore confirmed rather than assumed, and the
+1112 / 559 / 344 / 77 column is the shape of the spreading: roughly 1/N,
+because what is spread is the *outstanding set* and not the depth of the
+recursion.
+
+### What a shape demands, and why no stack size is a bound
+
+One worker, under a stack large enough that nothing aborts:
+
+| shape | size | bodies live | demand | per body |
+|---|---|---|---|---|
+| `skynet` | `MaxDepth = 4` | 1112 | 1.12 MiB | 1055 B |
+| `skynet` | 5 | 11112 | 11.2 MiB | 1056 B |
+| `skynet` | 6 | 111112 | 112 MiB | 1056 B |
+| `nqueens` | `q = 8` | 1322 | 1.35 MiB | 1071 B |
+| `nqueens` | 9 | 5459 | 5.58 MiB | 1072 B |
+| `nqueens` | 10 | 22766 | 23.3 MiB | 1072 B |
+| `nqueens` | 11 | 105851 | 108 MiB | 1072 B |
+| `integrate` | `V = 1` | 829 | 497 KiB | 614 B |
+| `integrate` | 2 | 1853 | 1.09 MiB | 615 B |
+| `integrate` | 3 | 3479 | 2.04 MiB | 616 B |
+| `integrate` | 4 | 5065 | 2.97 MiB | 616 B |
+
+The demand predicts the cliff, checked three ways: `skynet 5` aborts at an
+8 MiB stack and completes at 12, `nqueens 9` aborts at 4 MiB and completes at 6,
+and `integrate`'s `V = 3` overshoots the default 2 MiB stack by 44 KiB, which
+is the whole of why that size aborts where `V = 2`, at 1.09 MiB, does not. The
+per-body column is the chain's 992 bytes plus what each shape's own body holds,
+and `integrate`'s is smaller because half of its recursion is the right half it
+refines inline rather than a body picked up off a queue.
+
+What the demand column says is that it is **geometric in the shape's size**: ten
+times per `skynet` level, four and a half per `nqueens` column. Upstream's own
+sweeps top out at `MaxDepth = 8` and `q = 14`, which at one worker through this
+route is on the order of 11 GiB and 10 GiB of stack. No constant reaches that,
+and the constant a raise would plausibly pick buys one notch of two shapes and
+none of the third: 8 MiB -- what `ulimit -s` gives a C++ `std::thread` on this
+box, four times what std gives a Rust one -- takes `nqueens` from 8 to 9 and
+`integrate` from 2 to 8, and leaves `skynet` at 4. Costing, for every executor
+and not only the recursive ones, 6 MiB of address space a worker: measured at 24
+workers as `VmSize` 1625600 kB against 1773068 kB, with `VmRSS` moving 2476 kB
+to 2568 kB, since the pages are reserved and never touched.
+
+### The route is what the bound is about
+
+The same ten-way tree at one worker, submitted through `Runtime` instead:
+
+| `skynet` `MaxDepth` | deepest nesting on one thread | stack span | time |
+|---|---|---|---|
+| 4 | 5 bodies | 4 KiB | -- |
+| 5 | 6 | 5 KiB | -- |
+| 6 | 7 | 6 KiB | -- |
+| 7 | 8 | 7 KiB | 2.0 s |
+| 8, upstream's top | 9 | 8 KiB | 20.2 s |
+
+A `Runtime`'s child goes onto the submitting worker's own LIFO queue, which is
+what #119 changed, so its corun pops the child it is waiting for and nests one
+frame per *level of recursion*. The whole of upstream's skynet sweep then runs
+on one worker in eight kilobytes of stack -- a hundred million leaves and 11.1
+million interior nodes -- where the same tree through a `TaskGroup` wants 11 GiB.
+That is the measurement behind what `TaskGroup::corun`'s own docs tell a caller,
+and it is why the bound belongs to a queue destination rather than to `corun`.
+
+### The cliffs at the default stack, and one correction
+
+| shape | 1 worker: passes / aborts | 24 workers: passes / aborts |
+|---|---|---|
+| `skynet` `MaxDepth` | 4 / 5 | 5 / 6 |
+| `nqueens` `q` | 8 / 9 | 10 / 11 |
+| `integrate` `V` | 2 / 3 | 24 / 32 |
+
+The one-worker column reproduces #340's and #341's figures exactly, which is
+what makes the probe trustworthy for the rest of this section. The 24-worker
+cell for `integrate` does not reproduce: `V = 3` completed ten times out of ten
+here, and so did 4, 6, 8, 12, 16 and 24, with 32 the first to abort (one pass in
+three). The `integrate` section itself records that three sibling agents were
+building on this box while it was written, and 24 workers is the end a load
+moves while one worker is not -- the demand table says why, a
+24-worker run needing 134 KiB for `V = 3` against the one worker's 2.04 MiB. The
+one-worker end is what every size in this file is chosen inside, so no size
+changes on account of this: #352 is where the figures and any resizing are
+taken.
 
 ## The #102 decision: 5 spill buffers stay, and here is what 48 costs
 
@@ -2478,24 +2656,23 @@ on. `benches/skynet.rs`'s module docs list that and the two other departures.
 apart, the smaller where the fixed cost of a round still shows against the
 tree and the larger where the per-task cost dominates it. **Both are below
 upstream's own sweep, which runs `MaxDepth = 1..=8`, and what bounds them is
-the stack rather than the clock**: this is the cliff the `fibonacci` section
-above describes for the same group shape, measured here the same way, with a
-release build driven straight rather than under criterion.
+the stack rather than the clock**: this is the nested-corun stack bound, which
+the #359 section above measures once for the whole file, and the rows below are
+its reading of this shape -- a release build driven straight rather than under
+criterion.
 
 | id | workers | largest `MaxDepth` that passes | smallest that aborts |
 |---|---|---|---|
 | `rustflow-group` | 1 | 4 | 5 |
 | `rustflow-group` | 24 | 5 | 6 |
 
-One worker is the binding end, for the reason `fibonacci`'s own table gives:
-a corun keeps its worker in the work-stealing loop, a group's children go into
-the shared buffers rather than onto the submitting worker's queue, so a corun
-is handed the oldest outstanding job in the pool instead of the child it
-waits for and nests a frame per outstanding *child*. The one worker that
-coruns is the only worker there is to pick those children up. `MaxDepth = 4`
-is therefore a factor of ten in task count inside the one-worker ceiling, and
-each of the four sizes-by-workers combinations above was run ten times to
-check that it sits inside it rather than on it.
+One worker is the binding end, and #359 counted what that costs here: the
+whole tree, all 1111 interior nodes of `MaxDepth = 4`, nests on the one stack
+there is, for 1.12 MiB of the 2 MiB a worker gets, where 24 workers spread the
+same tree and the deepest of them reaches 78 KiB. `MaxDepth = 4` is therefore a
+factor of ten in task count inside the one-worker ceiling -- `MaxDepth = 5`
+demands 11.2 MiB -- and each of the four sizes-by-workers combinations above
+was run ten times to check that it sits inside it rather than on it.
 
 **The answer is checked outside the measured region.** The leaves are exactly
 the integers below `n = 10^MaxDepth`, each counted once, so the sum is
@@ -2557,7 +2734,8 @@ is what makes the pair worth measuring rather than either one alone.
 **Sizes are `q = 6` and `8`** -- 152 spawned tasks and 2056, a factor of
 thirteen apart, with the same split of roles the other tables use. **Both are
 below upstream's own default sweep, which runs `q = 1..=14`, and what bounds
-them is the stack rather than the clock**, exactly as for `skynet`:
+them is the stack rather than the clock**, exactly as for `skynet` and for the
+reason the #359 section above measures:
 
 | id | workers | largest `q` that passes | smallest that aborts |
 |---|---|---|---|
@@ -2567,7 +2745,9 @@ them is the stack rather than the clock**, exactly as for `skynet`:
 `q = 8` is a factor of four in task count inside the one-worker ceiling,
 which is the margin `fibonacci`'s own sizes keep against its cliff, and each
 size-by-workers combination was run ten times to check it sits inside rather
-than on it. One worker is the binding end here too, and for the same reason.
+than on it. One worker is the binding end here too: #359 measured `q = 8`
+nesting 1322 bodies and 1.35 MiB onto that one stack against the deepest
+worker's 93 KiB at 24, with `q = 9` demanding 5.58 MiB.
 
 **The answer is checked outside the measured region**, against upstream's own
 `answers` table from `nqueens.hpp`: `answers[6]` is 4 and `answers[8]` is 92.
@@ -2743,12 +2923,11 @@ per-task cost dominates.
 out of it is what makes this shape safe where `fibonacci`'s `rustflow-group`
 id is not.** A range is halved until it is at most 1024 long, so the
 recursion is `ceil(log2(N / 1024))` levels and the tasks outstanding at any
-moment are bounded by the 1023 of the larger size. The `fibonacci` section's
-own cliff -- a `TaskGroup::corun` nests a frame per *outstanding child*
-rather than one per level, because it waits on the stealing end of the queues
--- sits some thousands of nodes up, between `fib(17)` and `fib(18)` at one
-worker. A thousand `msort` frames is inside it, checked at both worker counts
-in a release build rather than assumed -- which is what makes this one of the
+moment are bounded by the 1023 of the larger size. That is what the #359
+section above measures the bound against: a `TaskGroup::corun` nests a frame
+per outstanding *task*, about a kilobyte of stack each in a release build, so a
+thousand `msort` frames is a megabyte of the 2 MiB a worker gets -- inside it,
+checked at both worker counts in a release build rather than assumed -- which is what makes this one of the
 five nested shapes #342 can A/B the preempted-parent resume on without having
 to shrink first, where the `integrate` section below is the one that could
 not.
@@ -2827,28 +3006,25 @@ intervals grows as `V^(4/3)` -- 828 spawned tasks at `V = 1`, 1852 at
 `v = 0, 100, .., 2000`, and its first non-degenerate point, `V = 100`, is
 some 390_000 spawned tasks; measured in a release build on this box,
 **`V = 3` -- 3478 spawned tasks -- overflows the stack of the one worker that
-has to pick them up**, and `V = 1` and `V = 2` are what completes, at both
-worker counts. So the sizes here are not points on upstream's sweep at all,
-and that is the finding rather than a quiet shrink.
+has to pick them up**, and `V = 1` and `V = 2` are what completes there. So the
+sizes here are not points on upstream's sweep at all, and that is the finding
+rather than a quiet shrink.
 
-The cliff is the one the `fibonacci` and `skynet` sections describe, for the
-same reason: a `TaskGroup::corun` waits on the stealing end of the queues, so
-the worker waiting for its own child may be handed an *ancestor's*
-outstanding subtree instead, and nests one frame per outstanding task rather
-than one per level of recursion. Where exactly it bites is a property of the
-tree and of the frame, not a single task count -- `skynet` passes 11110
-spawned tasks at one worker with a frame of three `f64`s and an array slot,
-this recursion carries five `f64`s and a slot per level and stops between
-1852 and 3478 -- and what the three shapes agree on is the direction: one
-worker is the binding end, because the one worker that coruns is the only
-worker there is to pick the outstanding children up. `fibonacci`'s group id
-stops at `fib(15)` for it while its *runtime* id -- whose child goes onto the
-waiting worker's own LIFO queue, which #119 changed -- carries upstream's
-whole sweep to `fib(40)`. This shape has no runtime variant: upstream's
-`integrate/taskflow.cpp` is written on `task_group()` and the port follows
-it, so what #352 will tabulate is a `TaskGroup` column and the ceiling above
-is `TaskGroup`'s. #342 is where the resume that would raise it is measured,
-and if that work moves the cliff the sizes here move with it.
+The cliff is the nested-corun stack bound the #359 section above measures, and
+that section carries this shape's reading of it: `V = 3` demands 2.04 MiB of a
+worker's 2 MiB at one worker, which it misses by 45 KiB, where `V = 2` demands
+1.09 MiB and fits. At 24 workers the same tree asks 134 KiB of the deepest
+stack, and #359 found `V = 3` through `V = 24` all completing there, with 32 the
+first to abort -- so **the 24-worker end of this shape is not what the sizes are
+chosen against**; the one-worker end is, as it is for every shape in this file.
+The demand is a property of the tree and of the frame rather than of one task
+count: this recursion carries five `f64`s and a slot and costs 616 bytes a
+node, where `skynet`'s ten-slot frame costs 1055. This shape has no runtime
+variant, which is the route that would lift it -- upstream's
+`integrate/taskflow.cpp` is written on `task_group()` and the port follows it,
+so what #352 will tabulate is a `TaskGroup` column and the ceiling above is
+`TaskGroup`'s. #342 is where the resume that would raise it is measured, and if
+that work moves the cliff the sizes here move with it.
 
 The answer is checked twice before any id is timed, both outside every
 measured region, because the two checks catch different failures. **Against

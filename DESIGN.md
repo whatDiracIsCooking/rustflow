@@ -627,6 +627,50 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   so its panic is raised to that caller and no observer is registered,
   which `tests/observers.rs` pinned before this change and still does.
 
+- **A nested corun is bounded by the worker's stack, and the bound stays the
+  OS default** (issue #359). A `corun` keeps its worker in the work-stealing
+  loop, and `WorkerThread::corun_until` runs the job it picks up by calling
+  `invoke` on it -- on the waiting frame. So a job that is itself a parent
+  which submits children and coruns adds another level, and the depth that
+  reaches is a property of *which queue a child was pushed to* rather than of
+  the recursion: a `TaskGroup`'s children go to the shared buffers, because a
+  group's corun loop runs on a `corun_view` that holds no owning queue end, so
+  the waiting worker is handed the oldest outstanding job in the pool and nests
+  one frame per outstanding **task**; a `Runtime`'s children go onto the
+  worker's own LIFO queue (#119), so its corun pops the child it is waiting for
+  and nests one frame per level of **recursion**. One worker is therefore the
+  binding end of the group route rather than its easy case: with nobody else to
+  pick the outstanding children up, the whole subtree becomes one chain of
+  frames on one stack, and adding workers spreads that set over their stacks
+  instead. All of it is measured in [`BENCHMARKS.md`](BENCHMARKS.md) under "The
+  #359 measurement", which is the one place the figures and the method live --
+  about a kilobyte a level in a release build, three and a half in a debug one.
+
+  **The stack stays at std's default** rather than being set with
+  `thread::Builder::stack_size`, and the measurements are the argument. The
+  group route's demand is geometric in the shape's size -- ten times per level
+  of the ten-way `skynet` tree -- so no constant is a bound: raising a worker
+  to 8 MiB, which is what `ulimit -s` gives a C++ `std::thread` on the
+  measurement box and four times what std gives a Rust one, buys one notch of
+  two of the three benchmark shapes and none of the third, while upstream's own
+  sweeps would want gigabytes. It would also
+  cost every executor 6 MiB of reserved address space a worker, recursive or
+  not, and take away the one control a caller has today, since an explicit size
+  overrides `RUST_MIN_STACK` and the executor has no configuration surface to
+  put a replacement knob on. What actually lifts the ceiling is the route: the
+  runtime route already carries upstream's whole `skynet` sweep on one worker
+  in eight kilobytes of stack, and #342 is where the preempted-parent resume
+  that would lower the group route's demand is measured.
+
+  So the bound is a documented property of the port. An overflow is an abort
+  rather than a `RunError`, which is the one failure in the crate a caller
+  cannot catch, so `TaskGroup::corun`, `TaskGroup::try_corun`, `Runtime::corun`
+  and `Runtime::try_corun` each name it where a caller writes the wait, with
+  the three things that keep a recursion inside it: bound the tasks outstanding
+  under one corun, submit through a `Runtime` rather than a `TaskGroup` where
+  the shape allows, or raise `RUST_MIN_STACK`. Nothing here changes how `corun`
+  nests.
+
 ## Control flow and cancellation
 
 - **A failure inside a nested graph is delivered to whoever is waiting for

@@ -670,6 +670,19 @@ impl<'a> TaskGroup<'a> {
     /// [`Executor::corun`]'s reason. May be called any number of times, each
     /// waiting for whatever is outstanding when it starts.
     ///
+    /// **A recursion of groups is bounded by the worker's stack, and
+    /// overflowing it aborts the process rather than failing this call.** A
+    /// job this worker picks up while waiting runs on the waiting frame, and a
+    /// group's children are queued where any worker can take them, so the wait
+    /// nests one frame -- about a kilobyte in a release build -- per task still
+    /// outstanding in the pool, which at one worker is the whole subtree. That
+    /// bound is the caller's to respect, in one of three ways: keep the tasks
+    /// outstanding under one corun bounded, submit through
+    /// [`Runtime::silent_async_runtime`] where the shape allows, that route
+    /// nesting one frame per level of recursion instead, or raise the stack
+    /// with `RUST_MIN_STACK`. `DESIGN.md`'s "Executor core" has the decision
+    /// behind it and `BENCHMARKS.md` the measurements.
+    ///
     /// # Panics
     ///
     /// Panics with the payload of the first child of this group to fail with
@@ -691,6 +704,9 @@ impl<'a> TaskGroup<'a> {
     /// Waits for every task of this group, reporting a failed child as an
     /// error rather than raising it: [`TaskGroup::corun`] with the one
     /// difference the name says.
+    ///
+    /// The stack bound [`TaskGroup::corun`] states holds here too, and is the
+    /// one failure this shape does not turn into an `Err`: an overflow aborts.
     ///
     /// # Errors
     ///
