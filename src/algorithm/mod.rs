@@ -118,6 +118,7 @@ pub mod scan;
 pub mod sort;
 pub mod transform;
 
+pub use crate::algorithm::fill::{make_fill_n_task, make_fill_task};
 pub use crate::algorithm::find::{
     make_find_if_not_task, make_find_if_task, make_max_element_task, make_min_element_task,
 };
@@ -125,6 +126,7 @@ pub use crate::algorithm::for_each::make_for_each_task;
 pub use crate::algorithm::for_each_index::{
     make_for_each_by_index_nd_task, make_for_each_by_index_task, make_for_each_index_task,
 };
+pub use crate::algorithm::generate::{make_generate_n_task, make_generate_task};
 pub use crate::algorithm::index_range::{IndexRange, IndexRanges};
 pub use crate::algorithm::merge::{make_merge_task, make_merge_task_by};
 pub use crate::algorithm::module::make_module_task;
@@ -138,6 +140,7 @@ pub use crate::algorithm::scan::{
     make_transform_inclusive_scan_with_init_task,
 };
 pub use crate::algorithm::sort::{make_sort_by_task, make_sort_task};
+pub use crate::algorithm::transform::{make_transform_task, make_transform2_task};
 
 /// Every algorithm's owned-data [`FlowBuilder`] wrapper: upstream's
 /// `FlowBuilder::for_each`, `for_each_index`, `transform`, `fill`,
@@ -300,12 +303,7 @@ pub trait AlgorithmBuilder: FlowBuilder {
         F: Fn(&A) -> B + Sync + Clone + Send + 'static,
         P: SlicePartitioner + Clone + Send + 'static,
     {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = out
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runtime.transform(&input, &mut guard, f.clone(), part.clone());
-        })
+        self.emplace_runtime(make_transform_task(input, out, f, part))
     }
 
     /// The two-input half of the owned-data wrapper: upstream's two-input
@@ -349,12 +347,7 @@ pub trait AlgorithmBuilder: FlowBuilder {
         F: Fn(&A, &B) -> C + Sync + Clone + Send + 'static,
         P: SlicePartitioner + Clone + Send + 'static,
     {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = out
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runtime.transform2(&a, &b, &mut guard, f.clone(), part.clone());
-        })
+        self.emplace_runtime(make_transform2_task(a, b, out, f, part))
     }
 
     /// Creates a runtime task that locks `out` and runs
@@ -384,12 +377,7 @@ pub trait AlgorithmBuilder: FlowBuilder {
         T: Clone + Send + Sync + 'static,
         P: SlicePartitioner + Clone + Send + 'static,
     {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = out
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runtime.fill(&mut guard, value.clone(), part.clone());
-        })
+        self.emplace_runtime(make_fill_task(out, value, part))
     }
 
     /// Creates a runtime task that locks `out` and runs
@@ -420,12 +408,7 @@ pub trait AlgorithmBuilder: FlowBuilder {
         T: Clone + Send + Sync + 'static,
         P: SlicePartitioner + Clone + Send + 'static,
     {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = out
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runtime.fill_n(&mut guard, count, value.clone(), part.clone());
-        })
+        self.emplace_runtime(make_fill_n_task(out, count, value, part))
     }
 
     /// Creates a runtime task that locks `out` and runs
@@ -461,12 +444,7 @@ pub trait AlgorithmBuilder: FlowBuilder {
         G: FnMut() -> T + Send + Clone + 'static,
         P: SlicePartitioner + Clone + Send + 'static,
     {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = out
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runtime.generate(&mut guard, generator.clone(), part.clone());
-        })
+        self.emplace_runtime(make_generate_task(out, generator, part))
     }
 
     /// Creates a runtime task that locks `out` and runs
@@ -504,12 +482,7 @@ pub trait AlgorithmBuilder: FlowBuilder {
         G: FnMut() -> T + Send + Clone + 'static,
         P: SlicePartitioner + Clone + Send + 'static,
     {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = out
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runtime.generate_n(&mut guard, count, generator.clone(), part.clone());
-        })
+        self.emplace_runtime(make_generate_n_task(out, count, generator, part))
     }
 
     /// Creates a runtime task that runs [`Runtime::reduce`] over `data`,

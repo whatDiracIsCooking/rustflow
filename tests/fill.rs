@@ -1,19 +1,18 @@
 //! Translated from `unittests/test_fill.cpp` (Taskflow v4.1.0): `ParallelFill.*`,
-//! `ParallelFillN.*`, `ParallelFillStateful.4`, `ParallelFillStatefulMixed.4`
-//! and `ParallelFillNStateful.4`.
+//! `ParallelFillN.*`, `ParallelFillAsync.*`, `ParallelFillNAsync.*`,
+//! `ParallelFillStateful.4`, `ParallelFillStatefulMixed.4` and
+//! `ParallelFillNStateful.4`.
 //!
-//! Two adaptations, both forced by the port rather than chosen:
+//! Two adaptations:
 //!
-//! - **No `ParallelFillAsync`/`ParallelFillNAsync`.** Both call
-//!   `executor.async(tf::make_fill_task(...))` directly, over the
-//!   free-standing function upstream builds. This port collapses
-//!   `make_fill_task` into [`rustflow::Runtime::fill`] itself --
-//!   `src/algorithm/fill.rs`'s own doc comment says why, following the same
-//!   choice `src/algorithm/for_each.rs`/`tests/for_each.rs` already made for
-//!   `make_for_each_task` -- so there is no free function left to hand
-//!   `Executor::spawn`/`silent_async` directly; a caller after the same
-//!   effect reaches `Runtime::fill` through `Executor::spawn_runtime`
-//!   instead, already covered by `tests/asyncs.rs`.
+//! - **`ParallelFillAsync`/`ParallelFillNAsync` submit the factory through
+//!   the dependent-async forms**, not upstream's `executor.async`: both
+//!   upstream cases hand `tf::make_fill_task(...)` to an async submission
+//!   and wait for it with `wait_for_all`, and what the port adds over
+//!   `tests/asyncs.rs`'s coverage of `Executor::spawn_runtime` is a
+//!   submission the `AlgorithmBuilder` wrapper cannot reach at all, since a
+//!   wrapper builds through `FlowBuilder::emplace_runtime` and a
+//!   dependent-async task is never queued into a `Taskflow`.
 //! - **One sweep per worker count, not upstream's fixed four.** Upstream's
 //!   suite is one `TEST_CASE` per worker count (1 to 4) and element type
 //!   (`int`, `long double`); this file's `every_element_is_filled_exactly_once`
@@ -22,11 +21,14 @@
 //!   element type does not interact with the partitioning logic this port
 //!   is checking, so one representative type covers it.
 
+use std::sync::{Arc, Mutex};
+
 use rustflow::algorithm::SlicePartitioner;
 use rustflow::algorithm::partitioner::{
     DefaultClosureWrapper, DefaultPartitioner, DynamicPartitioner, GuidedPartitioner,
     RandomPartitioner, StaticPartitioner,
 };
+use rustflow::algorithm::{make_fill_n_task, make_fill_task};
 use rustflow::prelude::*;
 
 #[macro_use]
@@ -35,8 +37,8 @@ mod common;
 mod slice_graphs;
 
 use slice_graphs::{
-    assert_all, assert_filled_to, bounded_by_a_setup_task, from_a_setup_task, over_lengths,
-    over_owned_data, wrapper_runs_once_per_worker,
+    LENGTHS, assert_all, assert_filled_to, bounded_by_a_setup_task, from_a_setup_task,
+    over_lengths, over_owned_data, wrapper_runs_once_per_worker,
 };
 
 // ----------------------------------------------------------------------------
@@ -286,4 +288,58 @@ fn closure_wrapper_runs_once_per_worker() {
         runtime.fill(data, 1, part);
         assert!(data.iter().all(|&v| v == 1));
     });
+}
+
+// ----------------------------------------------------------------------------
+// ParallelFillAsync / ParallelFillNAsync
+// ----------------------------------------------------------------------------
+
+/// Upstream's `fill_async<T>(W, N, val)`: [`make_fill_task`] handed straight
+/// to a submission with no handle of its own and waited for through
+/// [`Executor::wait_for_all`], which is how upstream waits for the future it
+/// discards too.
+#[test]
+fn make_fill_task_runs_from_a_silent_dependent_async_body() {
+    let executor = Executor::new(3);
+
+    for n in LENGTHS {
+        let data = Arc::new(Mutex::new(vec![0i64; n]));
+        let _task = executor.silent_dependent_async_runtime(
+            make_fill_task(
+                Arc::clone(&data),
+                12,
+                GuidedPartitioner::<DefaultClosureWrapper>::default(),
+            ),
+            [],
+        );
+        executor.wait_for_all();
+
+        assert_all(&data, 12);
+    }
+}
+
+/// Upstream's `fill_n_async<T>(W, N, val)`, over the handled flavour:
+/// [`make_fill_n_task`] waited for through the submission's own handle
+/// rather than the whole executor, the other half of the pair
+/// `tests/sort.rs` covers for `sort`.
+#[test]
+fn make_fill_n_task_runs_from_a_dependent_async_body() {
+    let executor = Executor::new(3);
+
+    for n in LENGTHS {
+        let count = n / 2;
+        let data = Arc::new(Mutex::new(vec![0i64; n]));
+        let (_task, done) = executor.dependent_async_runtime(
+            make_fill_n_task(
+                Arc::clone(&data),
+                count,
+                12,
+                GuidedPartitioner::<DefaultClosureWrapper>::default(),
+            ),
+            [],
+        );
+        done.wait().expect("no task panicked");
+
+        assert_filled_to(&data, count, 12, 0);
+    }
 }

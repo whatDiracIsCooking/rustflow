@@ -1,11 +1,15 @@
 //! Translated from `taskflow/algorithm/generate.hpp` (Taskflow v4.1.0).
 //!
 //! [`Runtime::generate`] is upstream's `make_generate_task`/
-//! `FlowBuilder::generate`; [`Runtime::generate_n`] is the `_n` sibling,
-//! upstream's `make_generate_n_task`/`FlowBuilder::generate_n`. The
-//! owned-data wrappers over both are [`AlgorithmBuilder::generate`] and
+//! `FlowBuilder::generate` over a borrowed slice; [`Runtime::generate_n`] is
+//! the `_n` sibling, upstream's `make_generate_n_task`/
+//! `FlowBuilder::generate_n`. [`make_generate_task`] and
+//! [`make_generate_n_task`] are those same two over owned data, and the
+//! wrappers one line over each -- [`AlgorithmBuilder::generate`] and
 //! [`AlgorithmBuilder::generate_n`], on the one extension trait the whole
-//! algorithm family shares.
+//! algorithm family shares. `DESIGN.md`'s "Decisions taken in M10" entry on
+//! the three layers says why the port needs all three where upstream needs
+//! two.
 //!
 //! [`AlgorithmBuilder::generate`]: crate::algorithm::AlgorithmBuilder::generate
 //! [`AlgorithmBuilder::generate_n`]: crate::algorithm::AlgorithmBuilder::generate_n
@@ -41,7 +45,7 @@
 //! [`crate::Runtime::fill_n`]'s is -- see that module's
 //! `# Design` section.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::algorithm::SlicePartitioner;
 use crate::runtime::Runtime;
@@ -141,6 +145,100 @@ impl<'rt> Runtime<'rt> {
         P: SlicePartitioner,
     {
         self.generate(&mut out[..count], generator, part);
+    }
+}
+
+/// Builds the runtime body of a [`Runtime::generate`] task over owned
+/// `out`: upstream's `make_generate_task`. `out` is locked once per run of
+/// the body, not once per element, and the whole slice is generated through
+/// that one guard.
+///
+/// `generator` and `part` are cloned on every run of the body -- relevant
+/// only for a task a cycle revisits -- matching upstream copying `gen` and
+/// `part` into its own closure by value. Within one run, the clone is the
+/// single generator every worker shares, which is this module's `# Design`
+/// section's departure from upstream.
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+///
+/// use rustflow::algorithm::generate::make_generate_task;
+/// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
+/// use rustflow::prelude::*;
+/// use rustflow::Executor;
+///
+/// let out = Arc::new(Mutex::new(vec![0; 5]));
+///
+/// let mut taskflow = Taskflow::new();
+/// taskflow.emplace_runtime(make_generate_task(
+///     Arc::clone(&out),
+///     || 9,
+///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
+/// ));
+///
+/// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
+/// assert_eq!(*out.lock().expect("uncontended"), vec![9; 5]);
+/// ```
+pub fn make_generate_task<T, G, P>(
+    out: Arc<Mutex<Vec<T>>>,
+    generator: G,
+    part: P,
+) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static
+where
+    T: Send + 'static,
+    G: FnMut() -> T + Send + Clone + 'static,
+    P: SlicePartitioner + Clone + Send + 'static,
+{
+    move |rt: &mut Runtime<'_>| {
+        let mut guard = out
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        rt.generate(&mut guard, generator.clone(), part.clone());
+    }
+}
+
+/// Builds the runtime body of a [`Runtime::generate_n`] task over owned
+/// `out`: upstream's `make_generate_n_task`. A `count` past the end of `out`
+/// panics when the body runs, for the reason
+/// [`crate::Runtime::fill_n`]'s `# Design` section gives.
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+///
+/// use rustflow::algorithm::generate::make_generate_n_task;
+/// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
+/// use rustflow::prelude::*;
+/// use rustflow::Executor;
+///
+/// let out = Arc::new(Mutex::new(vec![0; 5]));
+///
+/// let mut taskflow = Taskflow::new();
+/// taskflow.emplace_runtime(make_generate_n_task(
+///     Arc::clone(&out),
+///     3,
+///     || 9,
+///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
+/// ));
+///
+/// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
+/// assert_eq!(*out.lock().expect("uncontended"), vec![9, 9, 9, 0, 0]);
+/// ```
+pub fn make_generate_n_task<T, G, P>(
+    out: Arc<Mutex<Vec<T>>>,
+    count: usize,
+    generator: G,
+    part: P,
+) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static
+where
+    T: Send + 'static,
+    G: FnMut() -> T + Send + Clone + 'static,
+    P: SlicePartitioner + Clone + Send + 'static,
+{
+    move |rt: &mut Runtime<'_>| {
+        let mut guard = out
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        rt.generate_n(&mut guard, count, generator.clone(), part.clone());
     }
 }
 

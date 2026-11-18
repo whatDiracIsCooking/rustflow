@@ -1,7 +1,7 @@
 //! Translated from `unittests/test_transform.cpp` (Taskflow v4.1.0):
 //! `ParallelTransform.*`, `ParallelTransform2.*` and `ClosureWrapper.transform.*`.
 //!
-//! Three adaptations, each forced by the port rather than chosen:
+//! Three differences from upstream's file:
 //!
 //! - **One element type, one container.** Upstream's `parallel_transform<T,
 //!   P>`/`parallel_transform2<T, P>` run over both `std::vector<int>` and
@@ -19,9 +19,14 @@
 //!   [`FlowBuilder::emplace_runtime`], so a second test of the same
 //!   partitioning logic through a different entry point adds no coverage
 //!   `parallel_transform`/`parallel_transform2` do not already give it.
-//! - **No `ParallelTransformAsync`/`*2Async`.** No `make_transform_task`
-//!   free function survives the port -- see `tests/fill.rs`'s identical
-//!   note.
+//! - **A dependent-async case upstream has none of.**
+//!   `unittests/test_transform.cpp` submits every case through a graph task,
+//!   with no `executor.async(tf::make_transform_task(...))` counterpart of
+//!   `test_fill.cpp`'s `ParallelFillAsync`; the two cases at the end of this
+//!   file submit `make_transform_task`/`make_transform2_task` through the
+//!   dependent-async forms anyway, since that is the submission the
+//!   `AlgorithmBuilder` wrapper cannot reach -- `tests/fill.rs`'s own docs
+//!   say why.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,6 +36,7 @@ use rustflow::algorithm::partitioner::{
     DefaultClosureWrapper, DynamicPartitioner, GuidedPartitioner, RandomPartitioner,
     StaticPartitioner,
 };
+use rustflow::algorithm::{make_transform_task, make_transform2_task};
 use rustflow::prelude::*;
 use rustflow::{Executor, Runtime};
 
@@ -335,6 +341,71 @@ fn closure_wrapper_transform_dynamic() {
         assert!(
             wrapper_called.load(Ordering::Relaxed) <= tc,
             "tc={tc}: the dynamic family is not obliged to use every worker"
+        );
+    }
+}
+
+// ----------------------------------------------------------------------------
+// The factory, submitted outside a graph
+// ----------------------------------------------------------------------------
+
+/// `make_transform_task` handed straight to a submission with no handle of
+/// its own and waited for through [`Executor::wait_for_all`]: the shape
+/// `test_fill.cpp`'s `ParallelFillAsync` has and `test_transform.cpp` does
+/// not, over the one-input overload.
+#[test]
+fn make_transform_task_runs_from_a_silent_dependent_async_body() {
+    let executor = Executor::new(3);
+
+    for n in LENGTHS {
+        let input = Arc::new((0..i64::try_from(n).expect("n fits in an i64")).collect::<Vec<_>>());
+        let out = Arc::new(Mutex::new(vec![-1i64; n]));
+        let _task = executor.silent_dependent_async_runtime(
+            make_transform_task(
+                Arc::clone(&input),
+                Arc::clone(&out),
+                |x: &i64| x * 2,
+                GuidedPartitioner::<DefaultClosureWrapper>::default(),
+            ),
+            [],
+        );
+        executor.wait_for_all();
+
+        let guard = out.lock().expect("uncontended");
+        assert!(
+            guard.iter().enumerate().all(|(i, &v)| v == 2 * input[i]),
+            "n={n}"
+        );
+    }
+}
+
+/// The same submission over the two-input overload, waited for through the
+/// pair's own handle rather than the whole executor -- the other
+/// dependent-async flavour, the way `tests/fill.rs` pairs them too.
+#[test]
+fn make_transform2_task_runs_from_a_dependent_async_body() {
+    let executor = Executor::new(3);
+
+    for n in LENGTHS {
+        let a = Arc::new((0..i64::try_from(n).expect("n fits in an i64")).collect::<Vec<_>>());
+        let b = Arc::new(a.iter().map(|x| x * 10).collect::<Vec<_>>());
+        let out = Arc::new(Mutex::new(vec![-1i64; n]));
+        let (_task, done) = executor.dependent_async_runtime(
+            make_transform2_task(
+                Arc::clone(&a),
+                Arc::clone(&b),
+                Arc::clone(&out),
+                |x: &i64, y: &i64| x + y,
+                GuidedPartitioner::<DefaultClosureWrapper>::default(),
+            ),
+            [],
+        );
+        done.wait().expect("no task panicked");
+
+        let guard = out.lock().expect("uncontended");
+        assert!(
+            guard.iter().enumerate().all(|(i, &v)| v == a[i] + b[i]),
+            "n={n}"
         );
     }
 }
