@@ -544,6 +544,67 @@ impl Runtime<'_> {
     pub fn is_cancelled(&self) -> bool {
         self.job.is_parent_cancelled()
     }
+
+    /// Keeps the worker running this runtime task's body in the
+    /// work-stealing loop until `predicate` returns `true`.
+    ///
+    /// Upstream's `rt.executor().corun_until(predicate)`: the same primitive
+    /// [`Executor::corun_until`] gives any thread, with the one check that
+    /// method makes dropped, because a runtime task's body is already
+    /// running on a worker and so cannot be the non-worker caller
+    /// [`CorunError::NotAWorker`](crate::CorunError::NotAWorker) is for. This
+    /// is the direct call onto the worker's own scheduling loop instead of
+    /// the view [`Executor::corun_until`] builds from a thread id, which is
+    /// what makes it infallible rather than a `Result`.
+    ///
+    /// `scan.hpp`'s own comment on why the method is public rather than
+    /// private to one algorithm is the reason this exists at all: "need to
+    /// do public corun because multiple workers can call this" -- a barrier
+    /// every worker's own runtime task waits at with its own call here,
+    /// rather than through one worker's handle shared across all of them.
+    ///
+    /// `predicate` runs on the calling worker between jobs and may run many
+    /// times, as [`Executor::corun_until`]'s does; the same two rules hold --
+    /// it must not block, and it must eventually return `true`, this loop
+    /// having nothing else that ends it.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    ///
+    /// use rustflow::prelude::*;
+    /// use rustflow::{Executor, Runtime};
+    ///
+    /// // A barrier every one of four runtime tasks reaches before any of
+    /// // them is allowed past it: `scan.hpp`'s own shape for a prefix pass.
+    /// const WORKERS: usize = 4;
+    /// let arrived = Arc::new(AtomicUsize::new(0));
+    /// let past = Arc::new(AtomicUsize::new(0));
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// for _ in 0..WORKERS {
+    ///     let arrived = Arc::clone(&arrived);
+    ///     let past = Arc::clone(&past);
+    ///     taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
+    ///         if arrived.fetch_add(1, Ordering::AcqRel) + 1 == WORKERS {
+    ///             // The last one through releases everybody else.
+    ///             arrived.store(0, Ordering::Release);
+    ///         } else {
+    ///             runtime.corun_until(|| arrived.load(Ordering::Acquire) == 0);
+    ///         }
+    ///         past.fetch_add(1, Ordering::Relaxed);
+    ///     });
+    /// }
+    ///
+    /// Executor::new(WORKERS)
+    ///     .run(&taskflow)
+    ///     .wait()
+    ///     .expect("no task panicked");
+    /// assert_eq!(past.load(Ordering::Relaxed), WORKERS);
+    /// ```
+    pub fn corun_until(&mut self, predicate: impl FnMut() -> bool) {
+        self.thread.corun_until(predicate);
+    }
 }
 
 #[cfg(test)]
