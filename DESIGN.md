@@ -464,3 +464,30 @@ follow are measured against those numbers.
 Nothing yet: this heading is where M6's own decisions are appended as its
 issues land, so that the list above stays the record of what was decided
 before the milestone opened.
+
+- **The run splits into three modules and the ownership quartet stays four**
+  (issue #131). `executor::topology` was one 2,352-line file over a dozen
+  types, and six of M5's seven post-merge bugs were counter or share-lifecycle
+  errors in it, so it is now a module tree: `run` for `Topology`, `RunPolicy`,
+  `Completion`, `Cancellable` and `set_up_graph`, `job` for `Job`, `Finished`
+  and `Anchor`, and `ownership` for `GraphOwner`, `Storage`, `Inside`,
+  `Parent` and `Nested`. The split is by what owns what rather than by size,
+  which is why the file's one `//!` became three `# Design` sections and why
+  the lock orderings -- spread over field docs before -- are one list in
+  `ownership`'s.
+
+  The quartet was the question the issue asked, and the answer is that **four
+  stay four**, with one of the three candidate merges available on cost and
+  two forbidden outright. `Storage` into `Inside` share only "an `Arc` with a
+  `Drop`". `GraphOwner::Run` into `GraphOwner::Flow` *is* possible, an ungated
+  hold behaving exactly as a bare share of the storage does, and is declined
+  because every module task would then allocate a hold whose only property is
+  that it gates nothing, on the hottest resolution in the crate. `Nested` into
+  `Parent` is forbidden by an invariant: the state words a nested graph's jobs
+  count down have to be one allocation shared by every job under that parent,
+  and `Parent` is `Clone` and travels by value on every job, so an inline
+  payload would hand each child a counter of its own. Nothing merged, nothing
+  weakened, no behaviour changed -- the unchanged test-name set and
+  `tests/loom_storage.rs` are what says so -- and `Worker::invoke_one` gained
+  two named empty seams, `observer_prologue` and `observer_epilogue`, so that
+  the observers of step 6 add a call rather than a reading of that function.
