@@ -820,3 +820,55 @@ entry above does.
   `floor_to_usize` helper that had covered both sites was deleted once that
   site moved off it. `chunk_size_range`'s is, for now, the one instance the
   rule admits.
+
+## Decisions taken in M8
+
+- **A pipeline's lines are ordinary runtime tasks, so no eleventh `Handle`
+  variant** (issue #180). Upstream hands each line's pipe callable a
+  `NonpreemptiveRuntime&` -- a second runtime shape next to its ordinary
+  `Runtime`, whose one method, `schedule`, stores a dependency count rather
+  than decrementing one, exactly the port's own `Runtime::schedule`
+  contract. Issue #181 read that contract against the port's own machinery
+  first and found the one refusal that could have mattered, "already
+  preempted itself" on an entered target, unreachable for a line task: a
+  line task never spawns a child of its own graph, so it never preempts
+  and never reaches that check, which is why `Runtime::schedule`'s own doc
+  now names the pipeline as a safe caller. A pipeline line is therefore an
+  ordinary runtime task on the port's `Runtime`, which already has
+  upstream's `NonpreemptiveRuntime::schedule` semantics for the join
+  counter, and the family needs no eleventh `Handle` variant to get them.
+  Upstream's second pipe-callable shape, `(Pipeflow&, NonpreemptiveRuntime&)`,
+  is therefore not ported either: `NonpreemptiveRuntime` is unported by the
+  same reasoning, and its one method is a shape `Runtime::schedule` already
+  covers.
+- **A pipe callable is `Fn + Send + Sync`, and a pipeline's own mutable
+  state lives behind an `Arc` of atomics** (issue #180). Upstream's line
+  task captures `this` -- the `Pipeline` or `ScalablePipeline` object
+  itself -- so every line reads and writes the same counters and token
+  buffers through a bare pointer the object's own lifetime backs. `Fn`
+  rather than `FnMut` is forced by the same fact `Pipe`'s own docs give for
+  the bound: a `PipeType::Parallel` pipe runs its callable on more than one
+  line's worker at once, so the callable has to be callable through one
+  shared reference from more than one thread at the same time. What
+  upstream reaches through `this`, the scheduler reaches instead through an
+  `Arc` of atomics shared by every line's runtime task, so that the state a
+  pipe callable closes over and the state the scheduler mutates between
+  lines are the same shared allocation rather than two different answers
+  to "what does a line own".
+- **One `Pipeline` type covers upstream's `Pipeline` and
+  `ScalablePipeline`** (issue #180). The two upstream class templates
+  differ only in template mechanics -- `Pipeline<Ps...>` is a fixed tuple
+  of pipe types fixed at compile time, `ScalablePipeline<P>` a
+  runtime-sized range of one pipe type -- and in the `reset` overloads that
+  follow from that difference, not in anything the scheduling logic itself
+  does. A `Vec<Pipe>` covers both shapes here, so one `Pipeline` type is
+  what upstream's two become, and `ScalablePipeline`'s `move` test, which
+  exists to prove a pipeline's identity survives a C++ move constructor,
+  has no Rust counterpart to port: there is nothing left for it to prove
+  once a `Pipeline` is an ordinary owned value.
+
+  **Deferred pipelines are out of scope.** `pipeline.hpp` at the pinned
+  v4.1.0 tag has no `defer`, and while `test_deferred_*.cpp` exists
+  upstream, it is not wired into upstream's own test `CMakeLists` -- so
+  there is no upstream test this port is on the hook for, and nothing here
+  builds toward one.
