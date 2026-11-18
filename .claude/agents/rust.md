@@ -159,13 +159,17 @@ explanation from landing in four places:
   It stays, first line of the module docs, version and all.
 
 The figure is a file's **prose** lines at or under **1.2x its code lines**,
-and **a doc example is not prose**: the examples a public API carries are
-required by this contract, so charging them to the budget they obey would
-charge a file for obeying the rule. `devtools/doc-ratio.sh` measures it, one
-row per production file (`src/**/*.rs`, the text above the test module) with
-columns `prose`, `examples`, `code`, `ratio` and `#NNN`, then a tree total;
-`ratio` is prose over code with examples held out, and a crate root is
-reported as `(crate root)` and never flagged. It is a report, not a gate: it
+and neither **a doc example** nor **a module's `# Design` section** is prose:
+the examples a public API carries and the rationale this contract sends to
+`# Design` are both required by it, so charging either to the budget it obeys
+would charge a file for obeying the rule. `devtools/doc-ratio.sh` measures it,
+one row per production file (`src/**/*.rs`, the text above the test module)
+with columns `prose`, `examples`, `design`, `code`, `ratio` and `#NNN`, then a
+tree total; `ratio` is prose over code with examples and the `# Design`
+section held out -- that section running from the `//! # Design` heading to the
+next top-level `//! #` heading or the end of the `//!` block, with a `//! ##`
+sub-heading staying inside it -- and a crate root is reported as
+`(crate root)` and never flagged. It is a report, not a gate: it
 always exits 0, no CI step reads it, and **1.2x is a guide for prose-heavy
 implementation files rather than a bar** -- a file over it is one a reviewer
 looks at, and a reason stated in its PR is an answer. What it is for is the

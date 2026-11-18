@@ -37,13 +37,18 @@ line a reader would otherwise question — an `Ordering`, a deliberate leak, a
 lock taken out of order — rather than narrating what the line does. The
 provenance `//!` line on a translated module is untouched by all of this and
 stays. The target is a file's **prose** lines at or under **1.2× its code
-lines**, prose being every comment line that is not part of a doc example.
+lines**, prose being every comment line that is neither part of a doc example
+nor inside a module's `# Design` section — the section running from the
+`//! # Design` heading to the next top-level `//! #` heading or the end of the
+`//!` block, whichever comes first, with a `//! ##` sub-heading staying inside
+it (#228).
 
 `devtools/doc-ratio.sh` measures that last part: one row per production file
 (`src/**/*.rs`, counting the text above the test module) with its prose lines,
-example lines, code lines, ratio and `#NNN`-in-doc-comment count, then a tree
-total. It is a **report and not a gate** — it always exits 0 — because which
-comments go is a reviewer's judgement, and a ratio cannot make it. The tree
+example lines, `# Design` lines, code lines, ratio and
+`#NNN`-in-doc-comment count, then a tree total. It is a **report and not a
+gate** — it always exits 0 — because which comments go is a reviewer's
+judgement, and a ratio cannot make it. The tree
 stood at **2.2× overall** when this contract was written (#126) — examples
 counted as prose, as they then were — with 2.6× in the single
 `executor::topology` file #131 has since split, 4.8× in
@@ -1607,3 +1612,123 @@ entry above does.
   as upstream, and `Graph::add_named_node` already took the name a free
   node's one-node arena is built with -- nothing in `src/graph/` moved for
   this.
+
+- **A module's `# Design` section is not prose, and the eleven files still
+  over the figure are disposed of here** (issue #228).
+
+  The question the doc-ratio issue asked last -- whether a 1.2x bar measured
+  per file is the right instrument at all -- is answered the way the examples
+  column answered it once already. This contract sends a module's rationale to
+  a `# Design` heading and nowhere else, so a file that obeyed it was charged
+  for obeying it: `src/executor/scope.rs` stood at 3.2x and
+  `src/algorithm/module.rs` at 3.0x, and in both the section the contract put
+  there was most of the numerator. `devtools/doc-ratio.sh` therefore prints a
+  fourth column, `design`, and computes `ratio` on what is left.
+
+  The section is the `//! # Design` heading and the lines under it, up to the
+  next top-level `//! #` heading or the end of the `//!` block, whichever
+  comes first. A `//! ##` sub-heading stays inside it, which is what keeps
+  `src/executor/topology/ownership.rs`'s "The locks, and the order they are
+  taken in" with the argument it is part of; a fenced example inside the
+  section is still an example, the fence being read before the heading; and
+  only the heading spelled exactly `# Design` opens one, so `src/dump.rs`'s
+  four topic headings and `src/executor/notifier.rs`'s "The one real departure
+  from upstream" stay prose. Widening the rule to any module heading would
+  make the column mean "module docs" rather than "the rationale this contract
+  relocated", and neither of those two files needs it: both are well under the
+  figure as prose. Nothing else about the instrument moved -- it still exits 0,
+  no CI step reads it, and 1.2x is still a guide for prose-heavy
+  implementation files rather than a bar.
+
+  The tree went from **24 files flagged of 55 at a crate total of 1.0** to
+  **11 flagged at 0.8**: 1,615 of the 10,371 lines the old column called prose
+  are `# Design` sections, and the thirteen files the change clears were over
+  by less than their own section. Each disposition below cites the split that
+  decided it -- doc prose (item plus module, examples and `# Design` held out)
+  against inline `//` prose, both over the file's code lines -- because that
+  split is what says whether a pass has anything to move.
+
+  **pass**, meaning a doc pass moves the prose to `# Design` or to this file,
+  or cuts it:
+
+  - `src/executor/runtime.rs` (2.3x) -- 305 doc lines over 187 of code is
+    1.6x before an inline comment is counted, and what is retold is
+    identifiable: `Runtime::schedule`'s `# Panics` re-derives the M8 failure
+    the module's own `# Design` and this file already argue, and
+    `try_corun`'s "what makes a failure under this node *this frame's*"
+    paragraph is the anchor argument a third time. The 130 inline lines at
+    the atomics are not the problem and stay.
+  - `src/executor/corun.rs` (1.6x) -- 179 doc lines over 133 of code.
+    `InnerRun`'s private-method docs restate a step of the module's
+    `# Design` each (the hold taken out of the topology, the second wait, the
+    idempotent `end`), and `CorunError`'s variant docs carry the cancellation
+    rationale that belongs once in the section above them.
+  - `src/algorithm/module.rs` (1.6x) -- a 22-line module with one public
+    function whose 22-line item doc is half rationale: the
+    `FnMut`-not-`FnOnce` paragraph, and the `composed_of` promise restated
+    from the `# Design` section twelve lines above it.
+  - `src/async_task.rs` (1.4x) -- 97 doc lines over 67 of code, for ten
+    accessors of one to three lines each, with a five-line `# Design` section
+    nothing was ever put in. `use_count`'s explanation of what the number
+    counts, `take_panic`'s comparison with the `Task::exception_ptr` the
+    README declines to port, and the three trait-impl notes are what that
+    section is for.
+  - `src/graph/handle.rs` (2.2x) -- no `# Design` section at all, and 121 doc
+    lines over 54 of code: an eleven-variant enum where a variant is one code
+    line and its doc up to ten. The per-variant rationale moves (the
+    `Vec<i32>` small-vector note, the `NonpreemptiveRuntime` protocol, who
+    owns a module's target); the eleven one-line `is_*` docs are the
+    `missing_docs` floor and stay.
+  - `src/graph/node.rs` (1.2x, twelve lines over) -- also no `# Design`
+    section, so the `NodeBase` type doc carries three rationale paragraphs:
+    atomic words where upstream's are plain, where a failure inside a nested
+    graph is delivered, why the payload `Mutex` is uncontended. The
+    per-method invariant statements -- "call it only after `claim_panic` has
+    answered `true`" -- stay where the caller meets them.
+  - `src/graph/work.rs` (1.3x, nine lines over) -- the `# Design` section is
+    eleven lines and the item docs re-derive it: `Work`'s "upstream stores a
+    different `std::function` per node kind" paragraph, and `lock_callable`'s
+    `# Panics`, seven lines of which are the history of how the dispatch
+    claim came to exist and belong to the PR trail rather than to the
+    function.
+  - `src/flow_builder.rs` (1.2x, under three lines over) -- the marginal
+    case, and nothing in it restates a signature. The one movable paragraph
+    is `emplace`'s "upstream overloads on the callable's signature"
+    rationale, which is a `# Design` line; #216 moves both numbers anyway, so
+    a pass that reads through and leaves it at 1.2 has answered this.
+
+  **exempt**, meaning the prose is an invariant or a soundness argument that
+  belongs at the code:
+
+  - `src/executor/scope.rs` (2.0x) -- 48 code lines whose whole job is two
+    `transmute` erasures and the join that makes them sound. Eighteen prose
+    lines are the two `// SAFETY:` blocks and the notes at the `catch_unwind`
+    and the unconditional join; of the 77 doc lines, `Scope`'s three-lifetime
+    paragraph and its two field docs are the invariants that argument leans
+    on (the `RefCell` is what makes `Scope` `!Sync`), and `Runtime::scope`'s
+    `# Panics` plus the panic-attribution sentences on `spawn` and
+    `spawn_runtime` are caller-facing text a public API owes. What is left to
+    move is a few pointer sentences against a gap of 37 lines, so the figure
+    is unreachable without moving the soundness argument away from the
+    `unsafe` -- which is what #276 says to refuse.
+  - `src/executor/dependent_async.rs` (1.3x) -- 118 doc lines over 161 of
+    code is 0.7x; the file is over on its 94 inline lines, and those are the
+    ordering argument at each atomic: why the `SUBMITTING` guard is raised
+    before the dependencies are named, why each increment precedes its push,
+    and why one `fetch_sub` pays the guard and every met dependency together.
+    That is the contract's own example of what an inline comment is for, and
+    there is nowhere else it can be read.
+  - `src/pipeline/mod.rs` (2.1x) -- a family front door whose nine code lines
+    are three `pub mod` and a `pub use` list: exactly the denominator the
+    crate-root exemption exists for, on a file that exemption does not name.
+    Its nineteen lines are the family's vocabulary and the re-export rule,
+    pointing at #256's entry above, and it has no item doc at all. If a later
+    change wants arithmetic here rather than this line, the rule to widen is
+    the crate-root one.
+
+  By directory that leaves #275 with `src/algorithm/module.rs` alone -- the
+  five candidates its own scope lists fall to one -- #276 with `corun.rs` and
+  `runtime.rs` out of twelve, and #277 with `async_task.rs`,
+  `flow_builder.rs` and the three `graph/` files. `src/pipeline/mod.rs`
+  belongs to none of the three, which the exempt verdict settles rather than
+  needing a fourth pass.

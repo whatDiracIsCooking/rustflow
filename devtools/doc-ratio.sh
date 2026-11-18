@@ -13,11 +13,19 @@
 #
 # What is counted, per file, in the text ABOVE the test module:
 #
-#   prose     comment lines (///, //! or //) that are not part of a doc
-#             example -- the text a reader reads
+#   prose     comment lines (///, //! or //) that are neither part of a doc
+#             example nor inside a module's `# Design` section -- the text a
+#             reader reads
 #   examples  comment lines inside a ```-fenced block in a doc comment, plus
-#             the two fences themselves; prose + examples is every comment
-#             line, which is what this column's absence used to report
+#             the two fences themselves
+#   design    a module's `# Design` section: the `//! # Design` heading itself
+#             and the lines under it, up to the next top-level `//! #` heading
+#             or the end of the `//!` block, whichever comes first. A `//! ##`
+#             sub-heading stays inside the section, and a fenced example
+#             inside it counts as an example rather than as design; only the
+#             heading spelled exactly `# Design` opens one. prose + examples +
+#             design is every comment line, which is what this file reported
+#             as prose alone before either column existed
 #   code      every other non-blank line, except a line that is only an
 #             attribute (#[...] / #![...]) -- those are neither prose a reader
 #             reads nor logic a reader follows, and counting them as code
@@ -28,12 +36,17 @@
 #             contract puts at zero; the same citation in an inline // is not
 #             counted, nor is one below the test module
 #
-# Examples are out of the ratio because the contract requires a public API to
-# carry them, so a file that keeps its doctests was being charged for obeying
-# the rule the ratio exists to serve (#134 settles that; DESIGN.md's
-# "Documentation contract" is where the decision is written). They are counted
-# and shown rather than skipped, because a file whose examples have drifted
-# from its code is a thing a reader of this report wants to see.
+# Examples and the `# Design` section are both out of the ratio for the same
+# reason, the second following the first (#134, then #228; DESIGN.md's
+# "Documentation contract" is where both decisions are written). The contract
+# requires a public API to carry examples, and requires a module's rationale
+# to live under `# Design` and nowhere else, so charging either to a file's
+# budget charged it for obeying a rule the ratio exists to serve --
+# `src/executor/scope.rs` at 3.2x and `src/algorithm/module.rs` at 3.0x were
+# each over on little else. Both are counted and shown rather than skipped,
+# because a file whose examples have drifted from its code, or whose `# Design`
+# section has outgrown the module it explains, is a thing a reader of this
+# report wants to see.
 #
 # A crate root is reported but never flagged: its code lines are a `pub mod`
 # and `pub use` list, so the denominator measures nothing a ratio can judge.
@@ -69,33 +82,38 @@ fi | awk -v root="$root" '
     { paths[++files] = $0 }
 
     END {
-        fmt = "%8s %9s %8s %7s %6s  %s\n"
-        printf fmt, "prose", "examples", "code", "ratio", "#NNN", "file"
+        fmt = "%8s %9s %7s %8s %7s %6s  %s\n"
+        printf fmt, "prose", "examples", "design", "code", "ratio", "#NNN",
+            "file"
         for (i = 1; i <= files; i++) {
             count(paths[i])
             name = shorten(paths[i])
-            printf fmt, prose, examples, code, ratio(prose, code), cites,
+            printf fmt, prose, examples, design, code, ratio(prose, code),
+                cites,
                 name (is_root(name) ? "  (crate root)" : mark(prose, code))
             tp += prose
             tx += examples
+            td += design
             tk += code
             ti += cites
         }
         # A total over one file is that row again, so a single-file report is
         # just the one row.
         if (files > 1) {
-            printf fmt, tp, tx, tk, ratio(tp, tk), ti,
+            printf fmt, tp, tx, td, tk, ratio(tp, tk), ti,
                 "TOTAL (" files " files)" mark(tp, tk)
         }
     }
 
-    # Sets the globals prose, examples, code and cites for one file.
-    function count(path,    line, rest, body, in_example) {
+    # Sets the globals prose, examples, design, code and cites for one file.
+    function count(path,    line, rest, body, in_example, in_design) {
         prose = 0
         examples = 0
+        design = 0
         code = 0
         cites = 0
         in_example = 0
+        in_design = 0
         while ((getline line < path) > 0) {
             if (line ~ /^#\[cfg\(test\)\]/) { break }
             sub(/^[ \t]+/, "", line)
@@ -115,16 +133,31 @@ fi | awk -v root="$root" '
                     examples++
                     continue
                 }
-                prose++
+                # A `///` item doc ends the module block the section lives in,
+                # and so does any heading that is not `# Design` itself or a
+                # sub-heading of it. The heading test runs outside a fence,
+                # because a hidden doctest line also starts with `#`.
+                if (line !~ /^\/\/!/) {
+                    in_design = 0
+                } else if (body ~ /^#+([ \t]|$)/) {
+                    if (body ~ /^#[ \t]+Design[ \t]*$/) {
+                        in_design = 1
+                    } else if (body !~ /^##/) {
+                        in_design = 0
+                    }
+                }
+                if (in_design) { design++ } else { prose++ }
                 rest = line
                 while (match(rest, /#[0-9]+/)) {
                     cites++
                     rest = substr(rest, RSTART + RLENGTH)
                 }
             } else if (line ~ /^\/\//) {
+                in_design = 0
                 prose++
-            } else if (line !~ /^#!?\[/) {
-                code++
+            } else {
+                in_design = 0
+                if (line !~ /^#!?\[/) { code++ }
             }
         }
         close(path)
