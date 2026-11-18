@@ -9,7 +9,7 @@
 //! same way the port itself is organised.
 //!
 //! Three shapes, one per section below: a scalar index one at a time
-//! ([`ForEachIndexBuilder::for_each_index`]), a 1D sub-range per chunk
+//! ([`AlgorithmBuilder::for_each_index`]), a 1D sub-range per chunk
 //! ([`Runtime::for_each_by_index`]), and an N-dimensional sub-box per chunk
 //! ([`Runtime::for_each_by_index_nd`]). The first uses the owned-data
 //! `FlowBuilder` wrapper, closest to upstream's own
@@ -21,6 +21,8 @@
 //! print *and* **assert**: every line upstream shows is also checked with
 //! `assert!` or `assert_eq!`, so a non-zero exit from the binary is itself
 //! the test. See the README's "Examples" section.
+//!
+//! [`AlgorithmBuilder::for_each_index`]: rustflow::algorithm::AlgorithmBuilder::for_each_index
 
 use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -46,7 +48,7 @@ fn main() {
 }
 
 /// Upstream's `demo_for_each_index`'s forward traversal: indices `0, 2, 4,
-/// ..., < N`, via [`ForEachIndexBuilder::for_each_index`] queued onto a
+/// ..., < N`, via `AlgorithmBuilder::for_each_index` queued onto a
 /// `Taskflow` -- the owned-data wrapper, closest to upstream's own call.
 fn for_each_index_visits_every_even_index_forward() {
     let visited = Arc::new(Mutex::new(vec![false; usize::try_from(N).expect("N >= 0")]));

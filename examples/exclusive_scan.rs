@@ -5,17 +5,20 @@
 //! associative, not commutative, the honest witness for what
 //! [`Runtime::exclusive_scan`] actually relies on.
 //!
-//! [`ScanBuilder::exclusive_scan`] runs first, the owned-data `FlowBuilder`
-//! wrapper closest to upstream's own `taskflow.exclusive_scan(beg, end,
-//! d_first, init, bop)`. [`Runtime::transform_exclusive_scan`] runs second,
-//! from inside a runtime task body, over slices it borrows from its own
-//! frame -- upstream's `transform_exclusive_scan(first, last, d_first, init,
-//! bop, uop)`, the shape with no `Arc` or lock at all.
+//! [`AlgorithmBuilder::exclusive_scan`] runs first, the owned-data
+//! `FlowBuilder` wrapper closest to upstream's own
+//! `taskflow.exclusive_scan(beg, end, d_first, init, bop)`.
+//! [`Runtime::transform_exclusive_scan`] runs second, from inside a runtime
+//! task body, over slices it borrows from its own frame -- upstream's
+//! `transform_exclusive_scan(first, last, d_first, init, bop, uop)`, the
+//! shape with no `Arc` or lock at all.
 //!
 //! Upstream's program only *prints* its timings and a correctness line. This
 //! milestone's examples print *and* **assert**: the parallel result is
 //! checked against the sequential one with `assert_eq!`, so a non-zero exit
 //! from the binary is itself the test. See the README's "Examples" section.
+//!
+//! [`AlgorithmBuilder::exclusive_scan`]: rustflow::algorithm::AlgorithmBuilder::exclusive_scan
 
 use std::sync::{Arc, Mutex};
 
@@ -47,7 +50,7 @@ fn main() {
     runtime_transform_exclusive_scan_matches_the_sequential_fold();
 }
 
-/// Upstream's plain `exclusive_scan`, via [`ScanBuilder::exclusive_scan`].
+/// Upstream's plain `exclusive_scan`, via `AlgorithmBuilder::exclusive_scan`.
 fn scan_builder_matches_the_sequential_fold() {
     let elements: Vec<String> = (0..N).map(|i| i.to_string()).collect();
     let init = String::from("INIT-");

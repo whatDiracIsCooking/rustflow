@@ -90,10 +90,11 @@
 //! `min_element`, `sort`, the inclusive and exclusive scans, and `merge` --
 //! and it reaches a caller in layers rather than in one shape. A method on
 //! [`Runtime`] is the borrowed form, called from a body that already holds
-//! the `&mut [T]`; a wrapper on [`FlowBuilder`], in one of eight extension
-//! traits, makes a task of the same algorithm over data it owns; and a
-//! `make_*_task` factory hands back the `'static` callable upstream treats
-//! as the primitive, for a submission with no builder behind it such as a
+//! the `&mut [T]`; a wrapper on [`FlowBuilder`], carried by the one
+//! [`AlgorithmBuilder`](algorithm::AlgorithmBuilder) extension trait, makes
+//! a task of the same algorithm over data it owns; and a `make_*_task`
+//! factory hands back the `'static` callable upstream treats as the
+//! primitive, for a submission with no builder behind it such as a
 //! dependent-async task. All of them carve `[0, n)` into chunks through a
 //! [`Partitioner`](algorithm::partitioner::Partitioner) -- static, guided,
 //! dynamic or random -- and spawn those chunks under a [`Scope`] rather than
@@ -238,19 +239,11 @@ pub use crate::taskflow::Taskflow;
 /// ```
 /// use rustflow::prelude::*;
 ///
-/// // Building: `Taskflow` implements `FlowBuilder`, and each algorithm's
-/// // wrappers come from an extension trait over the same builder.
+/// // Building: `Taskflow` implements `FlowBuilder`, and every algorithm's
+/// // wrapper comes from one extension trait over the same builder.
 /// fn builds_everything<B>(_builder: &B)
 /// where
-///     B: FlowBuilder
-///         + FindBuilder
-///         + ForEachBuilder
-///         + ForEachIndexBuilder
-///         + MergeBuilder
-///         + ReduceBuilder
-///         + ScanBuilder
-///         + SortBuilder
-///         + ElementwiseBuilder,
+///     B: FlowBuilder + AlgorithmBuilder,
 /// {
 /// }
 ///
@@ -281,14 +274,7 @@ pub use crate::taskflow::Taskflow;
 /// assert!(outcome.is_ok());
 /// ```
 pub mod prelude {
-    pub use crate::algorithm::find::FindBuilder;
-    pub use crate::algorithm::for_each::ForEachBuilder;
-    pub use crate::algorithm::for_each_index::ForEachIndexBuilder;
-    pub use crate::algorithm::merge::MergeBuilder;
-    pub use crate::algorithm::reduce::ReduceBuilder;
-    pub use crate::algorithm::scan::ScanBuilder;
-    pub use crate::algorithm::sort::SortBuilder;
-    pub use crate::algorithm::transform::ElementwiseBuilder;
+    pub use crate::algorithm::AlgorithmBuilder;
     pub use crate::executor::Executor;
     pub use crate::executor::run_handle::{Canceller, RunError, RunHandle};
     pub use crate::flow_builder::FlowBuilder;

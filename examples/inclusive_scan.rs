@@ -8,16 +8,19 @@
 //! concatenation instead -- associative, and *not* commutative, the honest
 //! witness for the property actually being relied on.
 //!
-//! [`ScanBuilder::inclusive_scan`] runs first, the owned-data `FlowBuilder`
-//! wrapper closest to upstream's own `taskflow.inclusive_scan(beg, end,
-//! d_first, bop)`. [`Runtime::inclusive_scan_with_init`] runs second, from
-//! inside a runtime task body, over slices it borrows from its own frame --
-//! the shape with no `Arc` or lock at all.
+//! [`AlgorithmBuilder::inclusive_scan`] runs first, the owned-data
+//! `FlowBuilder` wrapper closest to upstream's own
+//! `taskflow.inclusive_scan(beg, end, d_first, bop)`.
+//! [`Runtime::inclusive_scan_with_init`] runs second, from inside a runtime
+//! task body, over slices it borrows from its own frame -- the shape with
+//! no `Arc` or lock at all.
 //!
 //! Upstream's program only *prints* its timings and a correctness line. This
 //! milestone's examples print *and* **assert**: the parallel result is
 //! checked against the sequential one with `assert_eq!`, so a non-zero exit
 //! from the binary is itself the test. See the README's "Examples" section.
+//!
+//! [`AlgorithmBuilder::inclusive_scan`]: rustflow::algorithm::AlgorithmBuilder::inclusive_scan
 
 use std::sync::{Arc, Mutex};
 
@@ -49,7 +52,7 @@ fn main() {
     runtime_inclusive_scan_with_init_matches_the_sequential_fold();
 }
 
-/// Upstream's plain `inclusive_scan`, via [`ScanBuilder::inclusive_scan`].
+/// Upstream's plain `inclusive_scan`, via `AlgorithmBuilder::inclusive_scan`.
 fn scan_builder_matches_the_sequential_fold() {
     let elements: Vec<String> = (0..N).map(|i| i.to_string()).collect();
     let expected = sequential_inclusive_scan(&elements, None);

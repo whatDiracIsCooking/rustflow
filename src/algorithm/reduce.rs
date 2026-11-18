@@ -8,9 +8,12 @@
 //! since Rust has no overload resolution to pick it by arity the way
 //! upstream's `requires` clause on `BOP_T` does, and upstream's own test
 //! names already call it `TransformReduce2`. [`Runtime::reduce_by_index`] is
-//! `make_reduce_by_index_task`. [`ReduceBuilder`] is the owned-data wrapper
-//! over all four, in [`crate::prelude`] alongside
-//! [`crate::algorithm::for_each::ForEachBuilder`].
+//! `make_reduce_by_index_task`. The owned-data wrappers over all four are
+//! on [`AlgorithmBuilder`], the one extension trait the whole algorithm
+//! family shares, in [`crate::prelude`] alongside [`FlowBuilder`].
+//!
+//! [`AlgorithmBuilder`]: crate::algorithm::AlgorithmBuilder
+//! [`FlowBuilder`]: crate::FlowBuilder
 //!
 //! # Design
 //!
@@ -79,7 +82,7 @@
 //! `T`, `T1`, `T2` needs `Clone` there.
 
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError};
 
 use crate::Scope;
 use crate::algorithm::index_range::{IndexInt, IndexRange};
@@ -87,8 +90,6 @@ use crate::algorithm::partitioner::{
     ClosureWrapper, DynamicLoop, DynamicPartitioner, GuidedPartitioner, Partitioner,
     RandomPartitioner, StaticLoop, StaticPartitioner,
 };
-use crate::flow_builder::FlowBuilder;
-use crate::graph::Task;
 use crate::runtime::Runtime;
 
 /// Closes [`ReducePartitioner`] against implementations outside this crate,
@@ -587,145 +588,10 @@ impl<'rt> Runtime<'rt> {
     }
 }
 
-/// The owned-data half of [`Runtime::reduce`], [`Runtime::transform_reduce`],
-/// [`Runtime::transform_reduce2`] and [`Runtime::reduce_by_index`]: upstream's
-/// `FlowBuilder::reduce` and friends. See
-/// [`crate::algorithm::for_each::ForEachBuilder`]'s own `# Design` section
-/// for why this is a separate, blanket-implemented trait rather than a
-/// second `trait FlowBuilder` block, and [`crate::prelude`] for why it sits
-/// in the prelude alongside [`FlowBuilder`] itself.
-pub trait ReduceBuilder: FlowBuilder {
-    /// Creates a runtime task that runs [`Runtime::reduce`] over `data`,
-    /// locking `init` for the task's whole run: upstream's `reduce(beg, end,
-    /// init, bop, part)`, over a shared owned `Vec` and a shared,
-    /// lock-guarded `init` rather than iterator and reference parameters a
-    /// caller must otherwise keep alive.
-    ///
-    /// `bop` and `part` are cloned on every run of the task -- relevant only
-    /// for a task revisited by a cycle -- matching upstream copying both into
-    /// the closure by value.
-    ///
-    /// ```
-    /// use std::sync::{Arc, Mutex};
-    ///
-    /// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
-    /// use rustflow::prelude::*;
-    /// use rustflow::Executor;
-    ///
-    /// let mut taskflow = Taskflow::new();
-    /// let data = Arc::new((1..=100).collect::<Vec<i32>>());
-    /// let sum = Arc::new(Mutex::new(0));
-    /// taskflow.reduce(
-    ///     Arc::clone(&data),
-    ///     Arc::clone(&sum),
-    ///     |a: &i32, b: &i32| a + b,
-    ///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
-    /// );
-    ///
-    /// Executor::new(4).run(&taskflow).wait().expect("no task panicked");
-    /// assert_eq!(*sum.lock().expect("uncontended"), 5050);
-    /// ```
-    fn reduce<T, O, P>(&mut self, data: Arc<Vec<T>>, init: Arc<Mutex<T>>, bop: O, part: P) -> Task
-    where
-        T: Clone + Send + Sync + 'static,
-        O: Fn(&T, &T) -> T + Sync + Clone + Send + 'static,
-        P: ReducePartitioner + Clone + Send + 'static,
-    {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = init.lock().unwrap_or_else(PoisonError::into_inner);
-            runtime.reduce(&data, &mut *guard, bop.clone(), part.clone());
-        })
-    }
-
-    /// The owned-data half of [`Runtime::transform_reduce`]: see
-    /// [`ReduceBuilder::reduce`] for why this is a separate trait and what is
-    /// cloned on every run.
-    fn transform_reduce<T, R, O, U, P>(
-        &mut self,
-        data: Arc<Vec<T>>,
-        init: Arc<Mutex<R>>,
-        bop: O,
-        uop: U,
-        part: P,
-    ) -> Task
-    where
-        T: Sync + Send + 'static,
-        R: Send + 'static,
-        O: Fn(&R, &R) -> R + Sync + Clone + Send + 'static,
-        U: Fn(&T) -> R + Sync + Clone + Send + 'static,
-        P: ReducePartitioner + Clone + Send + 'static,
-    {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = init.lock().unwrap_or_else(PoisonError::into_inner);
-            runtime.transform_reduce(&data, &mut *guard, bop.clone(), uop.clone(), part.clone());
-        })
-    }
-
-    /// The owned-data half of [`Runtime::transform_reduce2`]: see
-    /// [`ReduceBuilder::reduce`] for why this is a separate trait and what is
-    /// cloned on every run.
-    fn transform_reduce2<T1, T2, R, O, U, P>(
-        &mut self,
-        data1: Arc<Vec<T1>>,
-        data2: Arc<Vec<T2>>,
-        init: Arc<Mutex<R>>,
-        bop: O,
-        uop: U,
-        part: P,
-    ) -> Task
-    where
-        T1: Sync + Send + 'static,
-        T2: Sync + Send + 'static,
-        R: Send + 'static,
-        O: Fn(&R, &R) -> R + Sync + Clone + Send + 'static,
-        U: Fn(&T1, &T2) -> R + Sync + Clone + Send + 'static,
-        P: ReducePartitioner + Clone + Send + 'static,
-    {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = init.lock().unwrap_or_else(PoisonError::into_inner);
-            runtime.transform_reduce2(
-                &data1,
-                &data2,
-                &mut *guard,
-                bop.clone(),
-                uop.clone(),
-                part.clone(),
-            );
-        })
-    }
-
-    /// The owned-data half of [`Runtime::reduce_by_index`]: see
-    /// [`ReduceBuilder::reduce`] for why this is a separate trait and what is
-    /// cloned on every run. `range` is a plain value, not `Arc`-wrapped,
-    /// since [`IndexRange`] is `Copy` -- [`crate::algorithm::for_each_index`]'s
-    /// own `FlowBuilder` wrapper over an `IndexRange` takes it the same way.
-    fn reduce_by_index<I, T, L, G, P>(
-        &mut self,
-        range: IndexRange<I>,
-        init: Arc<Mutex<T>>,
-        lop: L,
-        gop: G,
-        part: P,
-    ) -> Task
-    where
-        I: IndexInt + Sync + Send + 'static,
-        T: Send + 'static,
-        L: Fn(IndexRange<I>, Option<T>) -> T + Sync + Clone + Send + 'static,
-        G: Fn(&T, &T) -> T + Sync + Clone + Send + 'static,
-        P: ReducePartitioner + Clone + Send + 'static,
-    {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = init.lock().unwrap_or_else(PoisonError::into_inner);
-            runtime.reduce_by_index(range, &mut *guard, lop.clone(), gop.clone(), part.clone());
-        })
-    }
-}
-
-impl<B: FlowBuilder + ?Sized> ReduceBuilder for B {}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::algorithm::partitioner::{
@@ -1107,7 +973,7 @@ mod tests {
 
     /// The owned-data wrapper: upstream's plain, non-stateful `reduce` over
     /// a `tf::Taskflow::reduce` call -- exercised through `rustflow::prelude`
-    /// alone, with no direct `use` of [`ReduceBuilder`] itself, proving the
+    /// alone, with no direct `use` of `AlgorithmBuilder` itself, proving the
     /// trait is reachable the way the prelude promises.
     #[test]
     fn flow_builder_reduce_locks_and_runs_over_owned_data() {

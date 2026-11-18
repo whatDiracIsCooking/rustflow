@@ -4,10 +4,12 @@
 //! directly rather than building a second closure -- [`for_each`]'s own
 //! module docs give the reason, and it holds here unchanged. [`Runtime::sort`]
 //! is the `T: Ord` overload upstream spells with no `cmp` argument at all,
-//! and [`SortBuilder::sort_by`]/[`SortBuilder::sort`] are the owned-data
-//! wrappers over both: upstream's `FlowBuilder::sort` overloads.
+//! and [`AlgorithmBuilder::sort_by`]/[`AlgorithmBuilder::sort`] are the
+//! owned-data wrappers over both: upstream's `FlowBuilder::sort` overloads.
 //!
 //! [`for_each`]: crate::algorithm::for_each
+//! [`AlgorithmBuilder::sort`]: crate::algorithm::AlgorithmBuilder::sort
+//! [`AlgorithmBuilder::sort_by`]: crate::algorithm::AlgorithmBuilder::sort_by
 //!
 //! # Design
 //!
@@ -47,11 +49,8 @@
 
 use std::cmp::Ordering;
 use std::mem::size_of;
-use std::sync::{Arc, Mutex};
 
 use crate::Scope;
-use crate::flow_builder::FlowBuilder;
-use crate::graph::Task;
 use crate::runtime::Runtime;
 
 /// Below this many elements a partition is sorted serially rather than split
@@ -311,85 +310,10 @@ impl<'rt> Runtime<'rt> {
     }
 }
 
-/// The owned-data half of [`Runtime::sort_by`] and [`Runtime::sort`]:
-/// upstream's `FlowBuilder::sort` overloads. See this module's `# Design`
-/// section for why this is a separate, blanket-implemented trait rather than
-/// a second `trait FlowBuilder` block, and [`crate::prelude`] for why it is
-/// there alongside [`FlowBuilder`] itself.
-pub trait SortBuilder: FlowBuilder {
-    /// Creates a runtime task that locks `data` and runs [`Runtime::sort_by`]
-    /// over it: upstream's `sort(beg, end, cmp)`, over a shared owned `Vec`
-    /// rather than an iterator pair a caller must otherwise keep alive.
-    ///
-    /// `cmp` is cloned on every run of the task -- relevant only for a task
-    /// revisited by a cycle -- matching upstream copying `cmp` into the
-    /// closure by value.
-    ///
-    /// ```
-    /// use std::sync::{Arc, Mutex};
-    ///
-    /// use rustflow::prelude::*;
-    /// use rustflow::Executor;
-    ///
-    /// let mut taskflow = Taskflow::new();
-    /// let data = Arc::new(Mutex::new(vec![5i32, 3, 1, 4, 1, 5, 9, 2, 6]));
-    /// taskflow.sort_by(Arc::clone(&data), |a: &i32, b: &i32| b.cmp(a));
-    ///
-    /// Executor::new(4).run(&taskflow).wait().expect("no task panicked");
-    /// assert_eq!(
-    ///     *data.lock().expect("uncontended"),
-    ///     vec![9, 6, 5, 5, 4, 3, 2, 1, 1]
-    /// );
-    /// ```
-    fn sort_by<T, C>(&mut self, data: Arc<Mutex<Vec<T>>>, cmp: C) -> Task
-    where
-        T: Send + 'static,
-        C: Fn(&T, &T) -> Ordering + Sync + Clone + Send + 'static,
-    {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = data
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runtime.sort_by(&mut guard, cmp.clone());
-        })
-    }
-
-    /// Creates a runtime task that locks `data` and runs [`Runtime::sort`]
-    /// over it: upstream's `sort(beg, end)`.
-    ///
-    /// ```
-    /// use std::sync::{Arc, Mutex};
-    ///
-    /// use rustflow::prelude::*;
-    /// use rustflow::Executor;
-    ///
-    /// let mut taskflow = Taskflow::new();
-    /// let data = Arc::new(Mutex::new(vec![5i32, 3, 1, 4, 1, 5, 9, 2, 6]));
-    /// taskflow.sort(Arc::clone(&data));
-    ///
-    /// Executor::new(4).run(&taskflow).wait().expect("no task panicked");
-    /// assert_eq!(
-    ///     *data.lock().expect("uncontended"),
-    ///     vec![1, 1, 2, 3, 4, 5, 5, 6, 9]
-    /// );
-    /// ```
-    fn sort<T>(&mut self, data: Arc<Mutex<Vec<T>>>) -> Task
-    where
-        T: Ord + Send + 'static,
-    {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = data
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runtime.sort(&mut guard);
-        })
-    }
-}
-
-impl<B: FlowBuilder + ?Sized> SortBuilder for B {}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use crate::prelude::*;
     use crate::{Executor, Runtime};

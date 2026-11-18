@@ -623,8 +623,8 @@ worker_matrix! {
     }
 }
 
-/// The owned-data [`ReduceBuilder`] wrappers, exercised through
-/// `rustflow::prelude` alone -- no direct `use` of `ReduceBuilder` itself --
+/// The owned-data `AlgorithmBuilder` wrappers, exercised through
+/// `rustflow::prelude` alone -- no direct `use` of `AlgorithmBuilder` itself --
 /// over every one of the four algorithms.
 #[test]
 fn flow_builder_reduce_wrappers_coverage() {

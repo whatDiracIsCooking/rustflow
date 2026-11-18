@@ -35,7 +35,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use rustflow::Executor;
-use rustflow::algorithm::for_each_index::{ForEachIndexBuilder, IndexDispatch};
+use rustflow::algorithm::AlgorithmBuilder;
+use rustflow::algorithm::for_each_index::IndexDispatch;
 use rustflow::algorithm::index_range::{IndexRange, IndexRanges, distance};
 use rustflow::algorithm::partitioner::{
     DefaultClosureWrapper, DefaultPartitioner, DynamicPartitioner, GuidedPartitioner,

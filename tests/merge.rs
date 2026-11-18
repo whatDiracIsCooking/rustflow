@@ -233,7 +233,7 @@ fn make_merge_task_coverage() {
     }
 }
 
-/// [`MergeBuilder::merge`] and [`MergeBuilder::merge_by`] as graph
+/// `AlgorithmBuilder::merge` and `AlgorithmBuilder::merge_by` as graph
 /// nodes: the wrapper the issue's "Scope" section names, over the same
 /// algorithm the sweeps above already check end to end.
 #[test]

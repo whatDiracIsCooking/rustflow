@@ -6,12 +6,13 @@
 //!
 //! Upstream builds its parallel loop straight from `taskflow.for_each(beg,
 //! end, c, part)`, over an iterator pair borrowed from the enclosing scope.
-//! This crate's closest match is [`ForEachBuilder::for_each`], the
-//! owned-data `FlowBuilder` wrapper -- run first below, over an `Arc<Mutex<_>>`
-//! rather than a borrowed iterator pair, since nothing stands in here for a
-//! C++ reference captured by a task upstream trusts the graph to serialise
-//! against. [`Runtime::for_each`] itself runs second, from inside a runtime
-//! task body, over a slice that body owns outright with no `Arc` and no lock
+//! This crate's closest match is [`AlgorithmBuilder::for_each`], the
+//! owned-data `FlowBuilder` wrapper -- run first below, over an
+//! `Arc<Mutex<_>>` rather than a borrowed iterator pair, since nothing
+//! stands in here for a C++ reference captured by a task upstream trusts
+//! the graph to serialise against. [`Runtime::for_each`] itself runs
+//! second, from inside a runtime task body, over a slice that body owns
+//! outright with no `Arc` and no lock
 //! at all -- the shape with no upstream equivalent, since upstream's
 //! `tf::Runtime` has no loop algorithms of its own.
 //!
@@ -19,6 +20,8 @@
 //! milestone's examples print *and* **assert**: every line upstream shows is
 //! also checked with `assert!` or `assert_eq!`, so a non-zero exit from the
 //! binary is itself the test. See the README's "Examples" section.
+//!
+//! [`AlgorithmBuilder::for_each`]: rustflow::algorithm::AlgorithmBuilder::for_each
 
 use std::sync::{Arc, Mutex};
 
@@ -35,7 +38,7 @@ const N: usize = 2_000;
 fn main() {
     let count = i32::try_from(N).expect("N fits in i32");
 
-    // --- `ForEachBuilder::for_each`, the owned-data wrapper closest to
+    // --- `AlgorithmBuilder::for_each`, the owned-data wrapper closest to
     // upstream's own `taskflow.for_each(data.begin(), data.end(), c, part)`.
     let data = Arc::new(Mutex::new((0..count).collect::<Vec<i32>>()));
     let mut taskflow = Taskflow::new();

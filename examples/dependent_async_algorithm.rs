@@ -18,9 +18,7 @@
 //! is what the port actually has, and what it costs: three explicit locks
 //! where upstream's iterators alias the same `std::vector` across all three
 //! stages with none at all, trusted only by the dependency edges named
-//! below. Neither [`ForEachBuilder`](rustflow::algorithm::for_each::ForEachBuilder),
-//! [`ElementwiseBuilder`](rustflow::algorithm::transform::ElementwiseBuilder) nor
-//! [`ReduceBuilder`](rustflow::algorithm::reduce::ReduceBuilder) -- the
+//! below. None of the owned-data wrappers on [`AlgorithmBuilder`] -- the
 //! owned-data `FlowBuilder` wrappers every other example in this milestone
 //! uses -- apply here at all: all three build a task by calling
 //! [`FlowBuilder::emplace_runtime`](rustflow::FlowBuilder::emplace_runtime),
@@ -31,6 +29,8 @@
 //! print *and* **assert**: the same check upstream throws on is also
 //! checked with `assert_eq!`, so a non-zero exit from the binary is itself
 //! the test. See the README's "Examples" section.
+//!
+//! [`AlgorithmBuilder`]: rustflow::algorithm::AlgorithmBuilder
 
 use std::sync::{Arc, Mutex};
 

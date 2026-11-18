@@ -4,19 +4,21 @@
 //! port in this milestone turns a command-line choice into a sequence run
 //! once.
 //!
-//! [`SortBuilder::sort`] is the owned-data `FlowBuilder` wrapper, closest to
-//! upstream's own `taskflow.sort(strings.begin(), strings.end())`, over an
-//! `Arc<Mutex<Vec<String>>>` rather than a borrowed iterator pair.
-//! [`Runtime::sort_by`] runs second, from inside a runtime task body, over a
-//! second copy of the same strings sorted in reverse by an explicit `cmp` --
-//! the slice-borrowing form with no `Arc` or lock, since the data never
-//! leaves that body's own frame.
+//! [`AlgorithmBuilder::sort`] is the owned-data `FlowBuilder` wrapper,
+//! closest to upstream's own `taskflow.sort(strings.begin(),
+//! strings.end())`, over an `Arc<Mutex<Vec<String>>>` rather than a
+//! borrowed iterator pair. [`Runtime::sort_by`] runs second, from inside a
+//! runtime task body, over a second copy of the same strings sorted in
+//! reverse by an explicit `cmp` -- the slice-borrowing form with no `Arc`
+//! or lock, since the data never leaves that body's own frame.
 //!
 //! Upstream's program only *prints* its timings. This milestone's examples
 //! print *and* **assert**: `strings.begin(), strings.end()` sorted is
 //! checked against `std::sort`'s own result with `assert_eq!`, so a
 //! non-zero exit from the binary is itself the test. See the README's
 //! "Examples" section.
+//!
+//! [`AlgorithmBuilder::sort`]: rustflow::algorithm::AlgorithmBuilder::sort
 
 use std::sync::{Arc, Mutex};
 
@@ -63,7 +65,7 @@ fn main() {
     runtime_sort_by_matches_std_sort_unstable_by();
 }
 
-/// Upstream's `argv[1][0] == 'p'` branch, via [`SortBuilder::sort`].
+/// Upstream's `argv[1][0] == 'p'` branch, via `AlgorithmBuilder::sort`.
 fn sort_builder_matches_std_sort() {
     let strings = random_strings(0x5EED_0001, N);
     let mut expected = strings.clone();

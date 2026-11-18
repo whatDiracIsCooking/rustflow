@@ -35,7 +35,7 @@
 //!   default-ordered and custom-comparator forms `merge` and lets overload
 //!   resolution pick; Rust has no such resolution, so the comparator form is
 //!   named `merge_by` throughout -- [`Runtime::merge_by`], the free function
-//!   [`make_merge_task_by`] and the [`MergeBuilder::merge_by`] wrapper --
+//!   [`make_merge_task_by`] and the [`AlgorithmBuilder::merge_by`] wrapper --
 //!   the same split [`<[T]>::sort`] and [`<[T]>::sort_by`] use, and every
 //!   `Ord`-only form calls straight through to its `_by` sibling with
 //!   `|x, y| x < y`, upstream's own `std::less<>`.
@@ -50,7 +50,7 @@
 //!   iterator the caller already owns storage behind, and return nothing but
 //!   a `Task` -- fitting C++'s pointer-like iterators, where the caller's
 //!   storage already exists and outlives the call. [`make_merge_task`] and
-//!   [`MergeBuilder::merge`] take owned `Vec<T>` inputs instead, because
+//!   [`AlgorithmBuilder::merge`] take owned `Vec<T>` inputs instead, because
 //!   a graph node's body must be `Send + 'static`, so the inputs cannot stay
 //!   borrowed from the caller's frame the way [`Runtime::merge`]'s can; with
 //!   no caller-owned destination to write into, each publishes its merged
@@ -64,11 +64,13 @@
 //! cutoff, both input orderings, the custom-comparator case and empty
 //! inputs, each checked against a `std`-sorted concatenation, over the
 //! worker matrix.
+//!
+//! [`AlgorithmBuilder::merge`]: crate::algorithm::AlgorithmBuilder::merge
+//! [`AlgorithmBuilder::merge_by`]: crate::algorithm::AlgorithmBuilder::merge_by
+//! [`Task`]: crate::Task
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crate::flow_builder::FlowBuilder;
-use crate::graph::Task;
 use crate::runtime::Runtime;
 
 // Upstream's inner `std::merge` call, over a comparator rather than its own
@@ -258,10 +260,13 @@ fn lock_result<T>(slot: &Mutex<Vec<T>>) -> std::sync::MutexGuard<'_, Vec<T>> {
 /// [`Executor::spawn_runtime`](crate::Executor::spawn_runtime),
 /// [`Executor::silent_async_runtime`](crate::Executor::silent_async_runtime),
 /// [`Executor::dependent_async_runtime`](crate::Executor::dependent_async_runtime)
-/// or [`FlowBuilder::emplace_runtime`], and the `Arc<Mutex<Vec<T>>>` that
-/// body locks once, after its merge is done, to publish the result into. See
-/// [`make_merge_task_by`] for a custom comparator, and
-/// [`MergeBuilder::merge`] for the graph-node wrapper built on this.
+/// or [`FlowBuilder::emplace_runtime`](crate::FlowBuilder::emplace_runtime),
+/// and the `Arc<Mutex<Vec<T>>>` that body locks once, after its merge is
+/// done, to publish the result into. See [`make_merge_task_by`] for a custom
+/// comparator, and [`AlgorithmBuilder::merge`] for the graph-node wrapper
+/// built on this.
+///
+/// [`AlgorithmBuilder::merge`]: crate::algorithm::AlgorithmBuilder::merge
 ///
 /// `FnMut` rather than `FnOnce`, as [`make_module_task`](super::module::make_module_task)
 /// is, since the node this becomes may run more than once.
@@ -336,81 +341,6 @@ where
     (body, result)
 }
 
-/// The `FlowBuilder::merge` and `FlowBuilder::merge_by` wrappers: upstream
-/// has no separate name for these, since its own overloads are
-/// `tf::FlowBuilder` methods directly. Rust has no way to add a provided
-/// method to a trait from outside the module that declares it, so this
-/// crate's [`FlowBuilder`] -- `src/flow_builder.rs` -- stays untouched and
-/// these two live on an extension trait instead, blanket-implemented for
-/// every [`FlowBuilder`] below; `use` this trait to call `.merge(..)` or
-/// `.merge_by(..)` on a [`Taskflow`](crate::Taskflow) or
-/// [`Subflow`](crate::Subflow) the same way.
-pub trait MergeBuilder: FlowBuilder {
-    /// Emplaces a runtime task that merges owned `a` and `b`, by `T`'s own
-    /// [`Ord`]: upstream's `std::less<>` overload of `FlowBuilder::merge`,
-    /// over owned inputs. Returns the task and the slot its body publishes
-    /// the merged `Vec<T>` into once the run reaches it -- the module docs'
-    /// `# Design` section says why a slot, where upstream returns only the
-    /// `Task`. See [`MergeBuilder::merge_by`] for a custom comparator.
-    ///
-    /// `use rustflow::prelude::*;` brings this trait's methods into scope
-    /// along with [`Taskflow`](crate::Taskflow)'s own -- it is in the
-    /// prelude exactly because [`FlowBuilder`] is too, for the reason the
-    /// prelude's own docs give.
-    ///
-    /// ```
-    /// use rustflow::prelude::*;
-    /// use rustflow::Executor;
-    ///
-    /// let mut taskflow = Taskflow::new();
-    /// let (_task, result) = taskflow.merge(vec![1, 4, 6], vec![2, 3, 5]);
-    ///
-    /// Executor::new(2)
-    ///     .run(&taskflow)
-    ///     .wait()
-    ///     .expect("no task panicked");
-    ///
-    /// assert_eq!(*result.lock().expect("uncontended"), [1, 2, 3, 4, 5, 6]);
-    /// ```
-    fn merge<T>(&mut self, a: Vec<T>, b: Vec<T>) -> (Task, Arc<Mutex<Vec<T>>>)
-    where
-        T: Ord + Clone + Send + Sync + 'static,
-    {
-        let (body, result) = make_merge_task(a, b);
-        (self.emplace_runtime(body), result)
-    }
-
-    /// Emplaces a runtime task that merges owned `a` and `b` under `cmp`:
-    /// upstream's general `FlowBuilder::merge` overload, over owned inputs.
-    /// See [`MergeBuilder::merge`] for the `Ord`-only form and what the
-    /// returned slot is for.
-    ///
-    /// ```
-    /// use rustflow::prelude::*;
-    /// use rustflow::Executor;
-    ///
-    /// let mut taskflow = Taskflow::new();
-    /// let (_task, result) = taskflow.merge_by(vec![6, 4, 1], vec![5, 3, 2], |x, y| x > y);
-    ///
-    /// Executor::new(2)
-    ///     .run(&taskflow)
-    ///     .wait()
-    ///     .expect("no task panicked");
-    ///
-    /// assert_eq!(*result.lock().expect("uncontended"), [6, 5, 4, 3, 2, 1]);
-    /// ```
-    fn merge_by<T, C>(&mut self, a: Vec<T>, b: Vec<T>, cmp: C) -> (Task, Arc<Mutex<Vec<T>>>)
-    where
-        T: Clone + Send + Sync + 'static,
-        C: Fn(&T, &T) -> bool + Send + Sync + 'static,
-    {
-        let (body, result) = make_merge_task_by(a, b, cmp);
-        (self.emplace_runtime(body), result)
-    }
-}
-
-impl<B: FlowBuilder + ?Sized> MergeBuilder for B {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,7 +404,7 @@ mod tests {
             .expect("no task panicked");
     }
 
-    /// [`MergeBuilder::merge_by`] from a [`Subflow`] body: the extension
+    /// `AlgorithmBuilder::merge_by` from a [`Subflow`] body: the extension
     /// trait reaches every [`FlowBuilder`] implementor, not only
     /// [`Taskflow`].
     #[test]

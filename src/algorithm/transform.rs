@@ -7,9 +7,12 @@
 //! upstream's own test-suite names (`ParallelTransform` vs
 //! `ParallelTransform2`) rather than sharing one.
 //!
-//! [`ElementwiseBuilder`] is the owned-data wrapper over every method this
-//! module, [`fill`](super::fill) and [`generate`](super::generate) add --
-//! see this module's `# Design` section for why one trait covers all three.
+//! The owned-data wrappers over every method this module,
+//! [`fill`](super::fill) and [`generate`](super::generate) add are on
+//! [`AlgorithmBuilder`], the one extension trait the whole algorithm family
+//! shares.
+//!
+//! [`AlgorithmBuilder`]: crate::algorithm::AlgorithmBuilder
 //!
 //! # Design
 //!
@@ -33,28 +36,11 @@
 //! the zip. The extra `Vec` is `n` pointer-sized tuples, paid once per call,
 //! not per element.
 //!
-//! **One combined extension trait for `transform`/`fill`/`generate`.**
-//! [`ForEachBuilder`](super::for_each::ForEachBuilder) set the pattern of one
-//! blanket-implemented trait per module; this issue ports three modules at
-//! once, and three more such traits would be three more names a caller has
-//! to have in scope for what is, from the call site, one family of
-//! elementwise operations over an owned `Vec` -- already a tracked concern
-//! as the crate's algorithms grow. [`ElementwiseBuilder`] is the one trait
-//! instead, living here rather than in `fill.rs` or `generate.rs` only
-//! because this module sorts first; its methods reach
-//! [`crate::Runtime::fill`], [`crate::Runtime::fill_n`] and the `generate`
-//! pair the same way they reach the two methods declared in this file, as
-//! plain inherent methods on [`Runtime`].
-//!
 //! **`fill_n`/`generate_n`'s `count` panics past the slice, rather than
 //! being upstream's unchecked iterator advance.** See
 //! [`fill`](super::fill)'s own `# Design` section.
 
-use std::sync::{Arc, Mutex};
-
 use crate::algorithm::SlicePartitioner;
-use crate::flow_builder::FlowBuilder;
-use crate::graph::Task;
 use crate::runtime::Runtime;
 
 impl<'rt> Runtime<'rt> {
@@ -210,271 +196,10 @@ impl<'rt> Runtime<'rt> {
     }
 }
 
-/// The owned-data wrapper over [`Runtime::transform`]/[`Runtime::transform2`]
-/// and over [`Runtime::fill`]/[`Runtime::fill_n`]/the `generate` pair: see
-/// this module's `# Design` section for why one trait covers all three
-/// modules. In [`crate::prelude`] alongside [`FlowBuilder`] itself, for the
-/// reason that module's own docs give.
-pub trait ElementwiseBuilder: FlowBuilder {
-    /// Creates a runtime task that locks `out`, borrows `input`, and runs
-    /// [`Runtime::transform`] over them: upstream's one-input
-    /// `FlowBuilder::transform`, over owned, `Arc`-shared data rather than an
-    /// iterator pair a caller must otherwise keep alive.
-    ///
-    /// `f` and `part` are cloned on every run of the task, matching upstream
-    /// copying `c` and `part` into the closure by value.
-    ///
-    /// ```
-    /// use std::sync::{Arc, Mutex};
-    ///
-    /// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
-    /// use rustflow::prelude::*;
-    /// use rustflow::Executor;
-    ///
-    /// let mut taskflow = Taskflow::new();
-    /// let input = Arc::new(vec![1, 2, 3, 4]);
-    /// let out = Arc::new(Mutex::new(vec![0; 4]));
-    /// taskflow.transform(
-    ///     Arc::clone(&input),
-    ///     Arc::clone(&out),
-    ///     |x: &i32| x * 10,
-    ///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
-    /// );
-    ///
-    /// Executor::new(4).run(&taskflow).wait().expect("no task panicked");
-    /// assert_eq!(*out.lock().expect("uncontended"), vec![10, 20, 30, 40]);
-    /// ```
-    fn transform<A, B, F, P>(
-        &mut self,
-        input: Arc<Vec<A>>,
-        out: Arc<Mutex<Vec<B>>>,
-        f: F,
-        part: P,
-    ) -> Task
-    where
-        A: Sync + Send + 'static,
-        B: Send + 'static,
-        F: Fn(&A) -> B + Sync + Clone + Send + 'static,
-        P: SlicePartitioner + Clone + Send + 'static,
-    {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = out
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runtime.transform(&input, &mut guard, f.clone(), part.clone());
-        })
-    }
-
-    /// The two-input half of the owned-data wrapper: upstream's two-input
-    /// `FlowBuilder::transform` overload, named `transform2` for the reason
-    /// [`Runtime::transform2`]'s own doc gives.
-    ///
-    /// ```
-    /// use std::sync::{Arc, Mutex};
-    ///
-    /// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
-    /// use rustflow::prelude::*;
-    /// use rustflow::Executor;
-    ///
-    /// let mut taskflow = Taskflow::new();
-    /// let a = Arc::new(vec![1, 2, 3]);
-    /// let b = Arc::new(vec![100, 200, 300]);
-    /// let out = Arc::new(Mutex::new(vec![0; 3]));
-    /// taskflow.transform2(
-    ///     Arc::clone(&a),
-    ///     Arc::clone(&b),
-    ///     Arc::clone(&out),
-    ///     |x: &i32, y: &i32| x + y,
-    ///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
-    /// );
-    ///
-    /// Executor::new(4).run(&taskflow).wait().expect("no task panicked");
-    /// assert_eq!(*out.lock().expect("uncontended"), vec![101, 202, 303]);
-    /// ```
-    fn transform2<A, B, C, F, P>(
-        &mut self,
-        a: Arc<Vec<A>>,
-        b: Arc<Vec<B>>,
-        out: Arc<Mutex<Vec<C>>>,
-        f: F,
-        part: P,
-    ) -> Task
-    where
-        A: Sync + Send + 'static,
-        B: Sync + Send + 'static,
-        C: Send + 'static,
-        F: Fn(&A, &B) -> C + Sync + Clone + Send + 'static,
-        P: SlicePartitioner + Clone + Send + 'static,
-    {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = out
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runtime.transform2(&a, &b, &mut guard, f.clone(), part.clone());
-        })
-    }
-
-    /// Creates a runtime task that locks `out` and runs
-    /// [`Runtime::fill`](super::fill) over it: upstream's
-    /// `FlowBuilder::fill`.
-    ///
-    /// ```
-    /// use std::sync::{Arc, Mutex};
-    ///
-    /// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
-    /// use rustflow::prelude::*;
-    /// use rustflow::Executor;
-    ///
-    /// let mut taskflow = Taskflow::new();
-    /// let out = Arc::new(Mutex::new(vec![0; 5]));
-    /// taskflow.fill(
-    ///     Arc::clone(&out),
-    ///     7,
-    ///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
-    /// );
-    ///
-    /// Executor::new(3).run(&taskflow).wait().expect("no task panicked");
-    /// assert_eq!(*out.lock().expect("uncontended"), vec![7; 5]);
-    /// ```
-    fn fill<T, P>(&mut self, out: Arc<Mutex<Vec<T>>>, value: T, part: P) -> Task
-    where
-        T: Clone + Send + Sync + 'static,
-        P: SlicePartitioner + Clone + Send + 'static,
-    {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = out
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runtime.fill(&mut guard, value.clone(), part.clone());
-        })
-    }
-
-    /// Creates a runtime task that locks `out` and runs
-    /// [`Runtime::fill_n`](super::fill) over its first `count` elements:
-    /// upstream's `FlowBuilder::fill_n`.
-    ///
-    /// ```
-    /// use std::sync::{Arc, Mutex};
-    ///
-    /// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
-    /// use rustflow::prelude::*;
-    /// use rustflow::Executor;
-    ///
-    /// let mut taskflow = Taskflow::new();
-    /// let out = Arc::new(Mutex::new(vec![0; 5]));
-    /// taskflow.fill_n(
-    ///     Arc::clone(&out),
-    ///     3,
-    ///     7,
-    ///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
-    /// );
-    ///
-    /// Executor::new(3).run(&taskflow).wait().expect("no task panicked");
-    /// assert_eq!(*out.lock().expect("uncontended"), vec![7, 7, 7, 0, 0]);
-    /// ```
-    fn fill_n<T, P>(&mut self, out: Arc<Mutex<Vec<T>>>, count: usize, value: T, part: P) -> Task
-    where
-        T: Clone + Send + Sync + 'static,
-        P: SlicePartitioner + Clone + Send + 'static,
-    {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = out
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runtime.fill_n(&mut guard, count, value.clone(), part.clone());
-        })
-    }
-
-    /// Creates a runtime task that locks `out` and runs
-    /// [`Runtime::generate`](super::generate) over it: upstream's
-    /// `FlowBuilder::generate`.
-    ///
-    /// ```
-    /// use std::sync::{Arc, Mutex};
-    /// use std::sync::atomic::{AtomicI32, Ordering};
-    ///
-    /// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
-    /// use rustflow::prelude::*;
-    /// use rustflow::Executor;
-    ///
-    /// let mut taskflow = Taskflow::new();
-    /// let out = Arc::new(Mutex::new(vec![0; 4]));
-    /// let next = Arc::new(AtomicI32::new(1));
-    /// taskflow.generate(
-    ///     Arc::clone(&out),
-    ///     move || next.fetch_add(1, Ordering::Relaxed),
-    ///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
-    /// );
-    ///
-    /// Executor::new(3).run(&taskflow).wait().expect("no task panicked");
-    /// let guard = out.lock().expect("uncontended");
-    /// let mut sorted = guard.clone();
-    /// sorted.sort_unstable();
-    /// assert_eq!(sorted, vec![1, 2, 3, 4]);
-    /// ```
-    fn generate<T, G, P>(&mut self, out: Arc<Mutex<Vec<T>>>, generator: G, part: P) -> Task
-    where
-        T: Send + 'static,
-        G: FnMut() -> T + Send + Clone + 'static,
-        P: SlicePartitioner + Clone + Send + 'static,
-    {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = out
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runtime.generate(&mut guard, generator.clone(), part.clone());
-        })
-    }
-
-    /// Creates a runtime task that locks `out` and runs
-    /// [`Runtime::generate_n`](super::generate) over its first `count`
-    /// elements: upstream's `FlowBuilder::generate_n`.
-    ///
-    /// ```
-    /// use std::sync::{Arc, Mutex};
-    ///
-    /// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
-    /// use rustflow::prelude::*;
-    /// use rustflow::Executor;
-    ///
-    /// let mut taskflow = Taskflow::new();
-    /// let out = Arc::new(Mutex::new(vec![0; 5]));
-    /// taskflow.generate_n(
-    ///     Arc::clone(&out),
-    ///     3,
-    ///     || 9,
-    ///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
-    /// );
-    ///
-    /// Executor::new(3).run(&taskflow).wait().expect("no task panicked");
-    /// assert_eq!(*out.lock().expect("uncontended"), vec![9, 9, 9, 0, 0]);
-    /// ```
-    fn generate_n<T, G, P>(
-        &mut self,
-        out: Arc<Mutex<Vec<T>>>,
-        count: usize,
-        generator: G,
-        part: P,
-    ) -> Task
-    where
-        T: Send + 'static,
-        G: FnMut() -> T + Send + Clone + 'static,
-        P: SlicePartitioner + Clone + Send + 'static,
-    {
-        self.emplace_runtime(move |runtime: &mut Runtime<'_>| {
-            let mut guard = out
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runtime.generate_n(&mut guard, count, generator.clone(), part.clone());
-        })
-    }
-}
-
-impl<B: FlowBuilder + ?Sized> ElementwiseBuilder for B {}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::algorithm::partitioner::{
@@ -750,7 +475,7 @@ mod tests {
     }
 
     /// The owned-data wrapper, reached through `rustflow::prelude::*` alone
-    /// -- no direct `ElementwiseBuilder` import -- proving
+    /// -- no direct `AlgorithmBuilder` import -- proving
     /// `taskflow.fill(...)` resolves the way the module docs claim.
     #[test]
     fn flow_builder_wrappers_resolve_through_the_prelude_alone() {
