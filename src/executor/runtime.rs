@@ -635,14 +635,31 @@ fn schedule_bypassing(job: &Job, thread: &mut WorkerThread, task: Task) {
 
     // Before the push, as every other count of a queued job is: the job may
     // run and finish before this call returns, and a parent that had not
-    // been told about it could reach zero with the job still in flight.
+    // been told about it could reach zero with the job still in flight. True
+    // regardless of whether the push below happens now or is deferred to a
+    // claim holder's own release -- the count is owed the instant this call
+    // commits to scheduling the target at all.
     job.parent().count_queued(job.topology(), 1);
 
-    // Upstream's `_executor._schedule(_worker, node)`: this worker's own
-    // queue. `Job::successor` is the job of a task of the same graph, same
-    // run and same parent -- which is what a sibling is, whatever the edges
-    // say.
-    thread.schedule(job.successor(task));
+    // Issue #245: `is_entered` above is the *only* guard that answers "is
+    // this node's nested run outstanding", and it says nothing about a
+    // target whose own callable is locked right now but which never sets
+    // `PREEMPTED` at all -- every non-preempting handle kind -- or has not
+    // set it yet -- a `Handle::Subflow` still building the subgraph that
+    // would make it preempt. `wake` is what answers that question instead:
+    // `true` means nothing holds the target's claim, so queueing now is
+    // exactly what this call always did; `false` means a dispatch is already
+    // running the target's callable, which has itself claimed the node and
+    // will queue this same job the instant it releases -- see
+    // `DispatchClaim`'s own docs for the ordering that makes a `false` here
+    // never a lost wake.
+    if target.dispatch_claim().wake() {
+        // Upstream's `_executor._schedule(_worker, node)`: this worker's own
+        // queue. `Job::successor` is the job of a task of the same graph,
+        // same run and same parent -- which is what a sibling is, whatever
+        // the edges say.
+        thread.schedule(job.successor(task));
+    }
 }
 
 /// The scheduler, as a nonpreemptive runtime task's body sees it: upstream's
@@ -757,11 +774,20 @@ impl fmt::Debug for NonpreemptiveRuntime<'_> {
 ///
 /// A panic out of the body is recorded exactly as a static task's is,
 /// through [`Job::record_panic`].
+///
+/// Issue #245's clearest case: `work.invoke` both takes and drops the one
+/// lock this node's own dispatch claim stands in for, in one statement, so
+/// the claim here is taken immediately before that call and released
+/// immediately after it returns -- nothing between the two touches the
+/// callable at all.
 pub(crate) fn invoke_nonpreemptive(
     worker: &mut WorkerThread,
     job: &Job,
     work: &NonpreemptiveRuntimeWork,
 ) -> Release {
+    let node = job.node();
+    node.dispatch_claim().claim();
+
     // The same construction `run_body` gives a full `Runtime`, over the
     // restricted handle instead: the mutable borrow of the worker's
     // scheduling loop still has to end where the body does, which is a
@@ -776,6 +802,16 @@ pub(crate) fn invoke_nonpreemptive(
     // closure captured.
     if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| work.invoke(&mut line))) {
         job.record_panic(payload);
+    }
+
+    // The guard `work.invoke` took has already dropped by the time that call
+    // returned, so the release below is sound the moment it runs: whatever
+    // `Runtime::schedule`'s bypass asked for while this call held the claim
+    // is honoured now, by queueing this same job again -- a clone, since
+    // `job` is only borrowed here and the rest of this dispatch still needs
+    // it.
+    if node.dispatch_claim().release() {
+        worker.schedule(job.clone());
     }
 
     Release::Strong

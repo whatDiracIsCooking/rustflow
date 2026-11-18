@@ -34,7 +34,7 @@
 use core::fmt;
 use core::num::TryFromIntError;
 use std::any::Any;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
 use crate::executor::runtime::NonpreemptiveRuntime;
@@ -131,8 +131,17 @@ impl<R> Work<R> {
 ///
 /// # Panics
 ///
-/// Panics if the work is already running on another thread, which means the
-/// scheduler's one-worker-per-node invariant was violated.
+/// Panics if the work is already running on another thread. Before issue
+/// #245 this could be tripped from outside the scheduler: a
+/// [`Runtime::schedule`](crate::Runtime::schedule) bypass had no way to see
+/// that a non-preempting target -- or a preempting one still building what
+/// would make it preempt -- was genuinely running, and could queue a second
+/// job onto a callable the first had not finished with. Every dispatch arm
+/// that can be such a target now takes this node's own [`DispatchClaim`]
+/// before it gets here, and `schedule`'s bypass defers onto a held claim
+/// instead of queueing, so a trip here is the scheduler's own invariant
+/// failing -- a dispatch arm that forgot to claim, not a caller of
+/// `schedule`.
 fn lock_callable<F: ?Sized>(callable: &Mutex<Box<F>>) -> MutexGuard<'_, Box<F>> {
     match callable.try_lock() {
         Ok(callable) => callable,
@@ -142,7 +151,11 @@ fn lock_callable<F: ?Sized>(callable: &Mutex<Box<F>>) -> MutexGuard<'_, Box<F>> 
         // about the panic itself is the executor's call.
         Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         Err(TryLockError::WouldBlock) => {
-            panic!("work is already running: one worker per node was violated")
+            panic!(
+                "a node's own callable was locked twice at once: the \
+                 scheduler's own dispatch claim should have made this \
+                 unreachable"
+            )
         }
     }
 }
@@ -849,6 +862,125 @@ pub(crate) struct Semaphores {
     pub(crate) to_release: Vec<Arc<Semaphore>>,
 }
 
+/// Whether a node's own callable is locked by a dispatch in progress, and
+/// whether a [`Runtime::schedule`](crate::Runtime::schedule) bypass asked --
+/// while it was -- to run the node again: the claim issue #245 gives every
+/// node to close a hole `Node::nstate`'s `PREEMPTED` bit cannot, that bit
+/// being set only by the four handle kinds `preempts_itself` answers `true`
+/// for. A node of any other kind -- [`Handle::Static`], either conditioner,
+/// [`Handle::NonpreemptiveRuntime`] -- is never "entered" by that reckoning
+/// even while its body is genuinely running, and [`Handle::Subflow`] is not
+/// either for as long as its body is still *building* the subgraph that
+/// would make it preempt. `schedule`'s own guard, `is_entered`, answers both
+/// cases `false`; this claim is what answers the question `is_entered` is
+/// not asking -- not "is this node's nested run outstanding" but "is this
+/// node's own callable locked right now" -- and `DESIGN.md`'s "Decisions
+/// taken in M8" has the caller-side attempt (#244) that could not close this
+/// from outside the scheduler.
+///
+/// One byte per node: an `AtomicU8` beside [`NodeBase`]'s own three words,
+/// which [`Semaphores`] and [`Node`]'s own data slot already account for
+/// themselves in their own doc comments.
+///
+/// # Ordering
+///
+/// [`DispatchClaim::release`]'s successful store and the successful load
+/// half of [`DispatchClaim::claim`] or [`DispatchClaim::wake`] are the pair.
+/// A caller may call `release` only once its own callable's guard has
+/// already dropped -- every caller here does, since a `MutexGuard` drops at
+/// the end of the statement that locked it, strictly before the next
+/// statement runs, so there is nothing left to publish by the time `release`
+/// is reached. `release`'s `AcqRel` store therefore makes that drop, and
+/// everything the callable wrote before it, visible to whichever `claim` or
+/// `wake` is the first to read the bit clear with `Acquire`; that pairing is
+/// what makes the clear bit *reliable* to the thread that locks the same
+/// callable next, rather than a read a compiler or a core is otherwise free
+/// to reorder ahead of the unlock it is reporting on.
+pub(crate) struct DispatchClaim(AtomicU8);
+
+impl DispatchClaim {
+    /// Set while a dispatch holds this node's callable locked.
+    const CLAIMED: u8 = 0b01;
+    /// Set alongside `CLAIMED`: a [`Runtime::schedule`](crate::Runtime::schedule)
+    /// bypass asked to run this node again while the current dispatch held
+    /// it, for that dispatch's own [`DispatchClaim::release`] to read.
+    const PENDING: u8 = 0b10;
+
+    /// A fresh claim: nothing locked, nothing pending.
+    fn new() -> Self {
+        Self(AtomicU8::new(0))
+    }
+
+    /// Takes the claim, before the dispatch arm that calls this locks this
+    /// node's callable. Idempotent: a dispatch that was already claimed by
+    /// [`DispatchClaim::wake`]'s own first branch finds the bit already set
+    /// and changes nothing, which is how that branch and this call come to
+    /// share one claim rather than racing for two.
+    pub(crate) fn claim(&self) {
+        self.0.fetch_or(Self::CLAIMED, Ordering::AcqRel);
+    }
+
+    /// Releases the claim, once the caller's own callable's guard has
+    /// dropped (the type's own `# Ordering` section), and reports whether a
+    /// `schedule` bypass asked to run this node again while it was held --
+    /// which the caller must then do itself, by queueing the node afresh:
+    /// nothing else is watching for that flag.
+    ///
+    /// Leaves the claim held with pending cleared if it reports `true`: the
+    /// caller's own requeue is what the next dispatch's
+    /// [`DispatchClaim::claim`] will find already set, the same way
+    /// [`DispatchClaim::wake`]'s first branch leaves it. Leaves the claim
+    /// fully idle if it reports `false`.
+    pub(crate) fn release(&self) -> bool {
+        let previous = self.0.update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            if state & Self::PENDING == 0 {
+                0
+            } else {
+                Self::CLAIMED
+            }
+        });
+        previous & Self::PENDING != 0
+    }
+
+    /// What [`Runtime::schedule`](crate::Runtime::schedule)'s bypass calls on
+    /// its target instead of queueing it outright: claims the node for a
+    /// fresh dispatch if nothing holds it, or marks one pending -- rather
+    /// than racing a second worker onto a callable the current dispatch has
+    /// not finished with -- if something does.
+    ///
+    /// Reports which: `true` means the caller must queue the node now,
+    /// exactly as `schedule` always did before this claim existed; `false`
+    /// means the current claim holder's own [`DispatchClaim::release`] will
+    /// queue it once it is done.
+    ///
+    /// Several concurrent calls are safe: only the one whose update is first
+    /// to see the bit clear claims it and is told to queue, and every call
+    /// after that, for as long as the claim is held, finds `PENDING` already
+    /// where it left it and is told to defer -- which is what keeps two
+    /// bypasses from ever queueing two jobs for the same dispatch.
+    pub(crate) fn wake(&self) -> bool {
+        let previous = self.0.update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            if state & Self::CLAIMED == 0 {
+                Self::CLAIMED
+            } else {
+                state | Self::PENDING
+            }
+        });
+        previous & Self::CLAIMED == 0
+    }
+}
+
+impl fmt::Debug for DispatchClaim {
+    /// The claim word, read with the same `Relaxed` load `AtomicU32`'s own
+    /// [`Debug`](fmt::Debug) would use: a diagnostic, not a synchronisation
+    /// point.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("DispatchClaim")
+            .field(&self.0.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
 /// A single task of a [`Graph`]: its name, its work, its edges and the state
 /// words a run mutates.
 ///
@@ -876,6 +1008,11 @@ pub struct Node {
     /// the type change buys. A node that never sets one pays for the
     /// `Option` alone, there being no second allocation behind a `None`.
     data: Option<Box<dyn Any + Send + Sync>>,
+    /// Whether this node's own callable is locked by a dispatch in progress,
+    /// and whether a [`Runtime::schedule`](crate::Runtime::schedule) bypass
+    /// asked to run it again while it was: see [`DispatchClaim`]'s own docs
+    /// for the hole this closes and the ordering argument behind it.
+    dispatch_claim: DispatchClaim,
 }
 
 impl Node {
@@ -890,6 +1027,7 @@ impl Node {
             base: NodeBase::new(),
             semaphores: None,
             data: None,
+            dispatch_claim: DispatchClaim::new(),
         }
     }
 
@@ -1064,6 +1202,13 @@ impl Node {
         self.data.take()
     }
 
+    /// The dispatch claim [`Runtime::schedule`](crate::Runtime::schedule)'s
+    /// bypass and this node's own dispatch arm share: see [`DispatchClaim`]'s
+    /// docs for what it is for.
+    pub(crate) fn dispatch_claim(&self) -> &DispatchClaim {
+        &self.dispatch_claim
+    }
+
     /// Acquires every semaphore this node asked for, in order, and answers
     /// whether the node may run: upstream's `Node::_acquire_all`.
     ///
@@ -1195,6 +1340,7 @@ impl fmt::Debug for Node {
             .field("base", &self.base)
             .field("semaphores", &self.semaphores)
             .field("data", &self.data.is_some())
+            .field("dispatch_claim", &self.dispatch_claim)
             .finish()
     }
 }
@@ -2120,7 +2266,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "one worker per node")]
+    #[should_panic(expected = "locked twice at once")]
     fn invoking_work_twice_at_once_panics() {
         let work = Work::new(|| {});
         // Re-entering from this thread is the cheap stand-in for two workers
