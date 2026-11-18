@@ -13,8 +13,11 @@ ARG RUST_VERSION=1.100-slim-bookworm
 FROM rust:${RUST_VERSION}
 
 # The official rust images install with `--profile minimal`, so clippy and
-# rustfmt are NOT in the base -- they have to be added explicitly.
-RUN rustup component add clippy rustfmt
+# rustfmt are NOT in the base -- they have to be added explicitly. llvm-tools
+# is the llvm-profdata/llvm-cov pair that cargo-llvm-cov (below) drives; it
+# must come from the SAME toolchain that compiles the instrumented tests, which
+# is why it is a rustup component here and not an apt package.
+RUN rustup component add clippy rustfmt llvm-tools
 
 # --- What the Rust build needs ----------------------------------------------
 # git: the devcontainer runs git against the bind-mounted checkout.
@@ -48,6 +51,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG CARGO_DENY_VERSION=0.21.0
 RUN cargo install cargo-deny --locked --version ${CARGO_DENY_VERSION} \
  && cargo deny --version \
+ && rm -rf /usr/local/cargo/registry/*
+
+# Coverage and mutation tooling, installed the same way for the same reasons.
+# Neither is part of the gate: `devtools/coverage.sh` drives cargo-llvm-cov
+# (which needs the llvm-tools component added above) and `cargo mutants` is
+# run by hand when a test suite's bite is in question. They live in the image
+# so that measuring either is a script and not a one-off install -- a number
+# from a tool version nobody recorded is not comparable to the next one.
+#
+# CI does not run them and the stock rust image it uses has neither, so the
+# only check that this block builds is a host-side rebuild of the image
+# (`devtools/devcontainer.sh rebuild`) after a change here.
+ARG CARGO_LLVM_COV_VERSION=0.9.1
+ARG CARGO_MUTANTS_VERSION=27.1.0
+RUN cargo install cargo-llvm-cov --locked --version ${CARGO_LLVM_COV_VERSION} \
+ && cargo install cargo-mutants --locked --version ${CARGO_MUTANTS_VERSION} \
+ && cargo llvm-cov --version \
+ && cargo mutants --version \
  && rm -rf /usr/local/cargo/registry/*
 
 # --- What the in-container agent needs --------------------------------------

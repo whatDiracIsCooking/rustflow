@@ -163,6 +163,21 @@ devtools/devcontainer.sh claude         # Claude Code, TTY attached
 devtools/devcontainer.sh shell -c 'gh pr checks 12'
 ```
 
+The image also carries the two measurement tools the gate does not run:
+`cargo-llvm-cov` for coverage and `cargo-mutants` for mutation testing, pinned
+by `ARG CARGO_LLVM_COV_VERSION` and `ARG CARGO_MUTANTS_VERSION` beside
+`CARGO_DENY_VERSION`, with the `llvm-tools` rustup component the first one
+drives. `devtools/coverage.sh` runs the suite under `cargo llvm-cov` and prints
+the per-file table and total over `src/` alone (`--html` adds a report under
+`/target/llvm-cov/html/`); `cargo mutants` is run by hand against the module
+whose tests are in question. Both are tools, not dependencies — `Cargo.toml`,
+`Cargo.lock` and `deny.toml` know nothing of them. Any change to the
+`Dockerfile`, these pins included, takes effect only after a **host-side**
+rebuild of the image, `devtools/devcontainer.sh rebuild`: nothing in the gate
+or in CI builds the image, so that rebuild is the check that a `Dockerfile`
+edit works, and a container that predates a pin simply lacks the tool (the
+coverage script says so and names this command).
+
 ### Credentials
 
 **Claude Code needs no setup.** The `dev` service bind-mounts your `~/.claude`
