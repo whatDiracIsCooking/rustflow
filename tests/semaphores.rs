@@ -82,8 +82,14 @@ use rustflow::{Executor, RunHandle, Semaphore};
 mod common;
 #[path = "common/counters.rs"]
 mod counters;
+#[path = "common/panics.rs"]
+mod panics;
+#[path = "common/spin.rs"]
+mod spin;
 
 use counters::{count, counter};
+use panics::assert_panicked_with;
+use spin::spin_until;
 
 // ----------------------------------------------------------------------------
 // What a counter cannot say
@@ -665,4 +671,153 @@ fn a_semaphores_debug_reports_its_counter_and_its_waiters() {
         format!("{semaphore:?}"),
         "Semaphore { value: 5, max_value: 5, waiters: 0 }"
     );
+}
+
+// ----------------------------------------------------------------------------
+// The panic-path cells: a task that fails while holding a count
+// ----------------------------------------------------------------------------
+//
+// Not upstream's. `test_exceptions.cpp`'s own `Semaphore` case -- ported in
+// `tests/exceptions.rs` -- fails a task *between* an acquire and the separate
+// task that was going to release, which is the arithmetic of a count nobody
+// gives back. These two are the other half of that: the task that fails is
+// the one holding the count, so the release is its own, and what they pin is
+// that the scheduler performs it anyway.
+
+/// Runs a one-task taskflow on `executor` and asserts it ran: the third
+/// claim of each case in this section, that a failed run left the executor
+/// usable.
+fn assert_executor_is_reusable(executor: &Executor) {
+    let ran = counter();
+    let counted = Arc::clone(&ran);
+    let mut taskflow = Taskflow::new();
+    taskflow.emplace(move || {
+        counted.fetch_add(1, Ordering::Relaxed);
+    });
+    executor
+        .run(&taskflow)
+        .wait()
+        .expect("the executor is reusable after a failed run");
+    assert_eq!(count(&ran), 1);
+}
+
+/// A task that panics while holding a count gives it back: the release hook
+/// is after the dispatch rather than inside it, so the payload the body left
+/// on the node does not skip it.
+///
+/// The count coming back is what tells this apart from upstream's own
+/// failing-semaphore case, where the release belongs to a *later* task that
+/// the failure cancels and the count stays taken until
+/// [`Semaphore::reset`](rustflow::Semaphore::reset).
+#[test]
+fn a_panicking_task_gives_back_the_count_it_was_holding() {
+    let executor = Executor::new(2);
+    let semaphore = Arc::new(Semaphore::new(1));
+
+    let mut taskflow = Taskflow::new();
+    let task = taskflow.emplace(|| panic!("x"));
+    taskflow.task(task).acquire(&semaphore).release(&semaphore);
+
+    let error = executor
+        .run(&taskflow)
+        .wait()
+        .expect_err("the task panicked, so the run failed");
+
+    assert_panicked_with(error, "x");
+    assert_eq!(
+        semaphore.value(),
+        1,
+        "the count the failing task held came back"
+    );
+    assert_executor_is_reusable(&executor);
+}
+
+/// And a task of *another* run that wants the same count runs once it comes
+/// back, rather than waiting for ever on a count a failure took with it.
+///
+/// Two runs because a waiter of the failing run's own graph would be woken
+/// into a cancelled run and skipped: `src/executor/mod.rs` has what a
+/// cancelled run promises, and a second taskflow is the shape in which the
+/// woken task still has a body to run. The gauge is what says the waiter did
+/// not simply overlap the holder -- a semaphore of 1 and a high-water mark of
+/// 1 -- and `reached` is what orders the two runs: the holder keeps the count
+/// until the waiter's own graph has arrived at the task that wants it.
+///
+/// Whether that task then *parks* on the count or merely arrives after the
+/// panic has given it back is a window this case cannot close from outside
+/// the executor -- a parked job is nothing a caller can observe -- and
+/// nothing asserted here rests on which of the two happened: the waiter's
+/// body cannot run until the count is back either way, which is the claim.
+#[test]
+fn a_waiter_of_another_run_gets_the_count_a_panic_gave_back() {
+    let executor = Executor::new(2);
+    let semaphore = Arc::new(Semaphore::new(1));
+    let gauge = Gauge::new();
+    let ran = counter();
+    let holds = counter();
+    let reached = counter();
+
+    let mut waiter_flow = Taskflow::new();
+    let before = waiter_flow.emplace({
+        let reached = Arc::clone(&reached);
+        move || reached.store(1, Ordering::SeqCst)
+    });
+    let waiting = waiter_flow.emplace({
+        let gauge = Arc::clone(&gauge);
+        let ran = Arc::clone(&ran);
+        move || {
+            gauge.enter();
+            ran.fetch_add(1, Ordering::Relaxed);
+            gauge.leave();
+        }
+    });
+    waiter_flow.task(before).precede([waiting]);
+    waiter_flow
+        .task(waiting)
+        .acquire(&semaphore)
+        .release(&semaphore);
+
+    let mut holder_flow = Taskflow::new();
+    let holder = holder_flow.emplace({
+        let gauge = Arc::clone(&gauge);
+        let holds = Arc::clone(&holds);
+        let reached = Arc::clone(&reached);
+        move || {
+            gauge.enter();
+            holds.store(1, Ordering::SeqCst);
+            spin_until(
+                "the other run to reach the task that wants the count",
+                || reached.load(Ordering::SeqCst) == 1,
+            );
+            // Before the panic, so that the mark below reads the overlap of
+            // the two bodies and not this one's own unwind.
+            gauge.leave();
+            panic!("x");
+        }
+    });
+    holder_flow
+        .task(holder)
+        .acquire(&semaphore)
+        .release(&semaphore);
+
+    let failing = executor.run(&holder_flow);
+    spin_until("the holder to take the count", || {
+        holds.load(Ordering::SeqCst) == 1
+    });
+    let waiter = executor.run(&waiter_flow);
+
+    let error = failing.wait().expect_err("the holder panicked");
+    assert_panicked_with(error, "x");
+    waiter
+        .wait()
+        .expect("the waiting run itself had nothing panic in it");
+
+    assert_eq!(count(&ran), 1, "the waiting task ran");
+    assert_eq!(
+        gauge.high_water(),
+        1,
+        "a semaphore of 1 must never have two bodies in flight"
+    );
+    assert_eq!(semaphore.value(), 1, "both runs gave their count back");
+    assert_executor_is_reusable(&executor);
 }

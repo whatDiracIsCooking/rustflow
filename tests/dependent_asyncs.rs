@@ -70,16 +70,22 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use rustflow::algorithm::module::make_module_task;
 use rustflow::observer::{Observer, TaskView, WorkerView};
 use rustflow::prelude::*;
 use rustflow::{AsyncTask, Executor};
 
-// Only the matrix macro. What the cases here record is a per-task *value*
-// rather than a count -- the `Results` array below -- and the three counters
-// that are counts are read with the array in the same assertion, so
-// `common/counters.rs` would carry a third of them.
+// The matrix macro, and the payload check the panic-path case at the end of
+// the file makes. Not `common/counters.rs`: what the cases here record is a
+// per-task *value* rather than a count -- the `Results` array below -- and
+// the three counters that are counts are read with the array in the same
+// assertion, so that topic would carry a third of them.
 #[macro_use]
 mod common;
+#[path = "common/panics.rs"]
+mod panics;
+
+use panics::assert_panicked_with;
 
 /// Where the tasks of one case leave their results: upstream's
 /// `std::vector<int>`, shared with every body that writes it.
@@ -1459,4 +1465,90 @@ fn names_reach_an_observer() {
             "silent runtime".to_string(),
         ])
     );
+}
+
+// ----------------------------------------------------------------------------
+// The panic-path cell: a module task submitted as a dependent-async task
+// ----------------------------------------------------------------------------
+//
+// Not upstream's: `test_dependent_asyncs.cpp` has no failing body anywhere,
+// and the handle a failure comes back through is this port's own shape --
+// `AsyncHandle::wait` hands back a `Result` where upstream's `get()`
+// rethrows.
+
+/// A panic inside the taskflow a [`make_module_task`] body runs reaches the
+/// handle of the dependent-async task that submitted it, rather than the
+/// node's own panic slot or the thread that failed.
+///
+/// The whole chain between the two is what this pins: the failing task's
+/// payload is recorded against its own graph, that graph is the nested one a
+/// runtime task scheduled, and the entered runtime node is the implicit
+/// anchor the walk stops at -- which is the node this task's handle is a
+/// handle on. The dependency is there for the other half of the submission:
+/// the body runs only once `first` is done, and a failure of it still
+/// releases what was waiting on the node.
+#[test]
+fn a_panic_in_a_module_task_submitted_as_a_dependent_async_reaches_its_handle() {
+    let executor = Executor::new(4);
+    let before = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+
+    let mut target = Taskflow::new();
+    let head = target.emplace({
+        let before = Arc::clone(&before);
+        move || {
+            before.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let failing = target.emplace(|| panic!("x"));
+    let tail = target.emplace({
+        let after = Arc::clone(&after);
+        move || {
+            after.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    target.linearize([head, failing, tail]);
+    let target = Arc::new(target);
+
+    let ran_first = Arc::new(AtomicUsize::new(0));
+    let first = executor.silent_dependent_async(
+        {
+            let ran_first = Arc::clone(&ran_first);
+            move || {
+                ran_first.fetch_add(1, Ordering::Relaxed);
+            }
+        },
+        [],
+    );
+    let (_module, done) = executor.dependent_async_runtime(make_module_task(target), [&first]);
+
+    let error = done
+        .wait()
+        .expect_err("a task of the composed taskflow panicked");
+    assert_panicked_with(error, "x");
+
+    assert_eq!(ran_first.load(Ordering::Relaxed), 1, "the dependency ran");
+    assert_eq!(
+        before.load(Ordering::Relaxed),
+        1,
+        "the task before the failing one ran"
+    );
+    assert_eq!(
+        after.load(Ordering::Relaxed),
+        0,
+        "the task after it was cancelled with the rest of the composition"
+    );
+
+    // The third claim: the executor is usable after the failed submission.
+    let ran = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&ran);
+    let mut taskflow = Taskflow::new();
+    taskflow.emplace(move || {
+        counted.fetch_add(1, Ordering::Relaxed);
+    });
+    executor
+        .run(&taskflow)
+        .wait()
+        .expect("the executor is reusable after a failed submission");
+    assert_eq!(ran.load(Ordering::Relaxed), 1);
 }

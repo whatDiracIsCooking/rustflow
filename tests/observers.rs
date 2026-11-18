@@ -12,6 +12,7 @@
 //! run outside any graph.
 
 use std::collections::HashMap;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -23,6 +24,10 @@ use rustflow::prelude::*;
 
 #[macro_use]
 mod common;
+#[path = "common/panics.rs"]
+mod panics;
+
+use panics::assert_panicked_with;
 
 /// Counts [`Observer::set_up`], [`Observer::on_entry`] and
 /// [`Observer::on_exit`], and nothing about the views each call is handed:
@@ -668,4 +673,143 @@ fn worker_row_counts(report: &str) -> Vec<u64> {
             fields.next()?.parse().ok()
         })
         .collect()
+}
+
+// ----------------------------------------------------------------------------
+// The panic-path cells: a hook that fails
+// ----------------------------------------------------------------------------
+
+/// An observer whose hooks panic with `"x"`, one hook per instance.
+///
+/// One type over a [`Hook`] rather than three types, because what each case
+/// below varies is only which call unwinds.
+#[derive(Debug)]
+struct Panicking(Hook);
+
+/// Which of [`Panicking`]'s three hooks is the one that panics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Hook {
+    SetUp,
+    OnEntry,
+    OnExit,
+}
+
+impl Panicking {
+    /// Panics with `"x"` if `hook` is this instance's own. A bare `panic!`
+    /// of a literal rather than an `assert!`, so that the payload is the
+    /// `&str` `assert_panicked_with` reads back.
+    fn fail_if(&self, hook: Hook) {
+        if self.0 == hook {
+            panic!("x");
+        }
+    }
+}
+
+impl Observer for Panicking {
+    fn set_up(&self, _num_workers: usize) {
+        self.fail_if(Hook::SetUp);
+    }
+
+    fn on_entry(&self, _worker: WorkerView<'_>, _task: TaskView<'_>) {
+        self.fail_if(Hook::OnEntry);
+    }
+
+    fn on_exit(&self, _worker: WorkerView<'_>, _task: TaskView<'_>) {
+        self.fail_if(Hook::OnExit);
+    }
+}
+
+/// Runs a one-task taskflow on `executor` and asserts it ran, which is this
+/// section's third claim: the executor is still usable.
+fn still_runs(executor: &Executor) {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&ran);
+    let mut taskflow = Taskflow::new();
+    taskflow.emplace(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+    });
+    executor
+        .run(&taskflow)
+        .wait()
+        .expect("the executor is reusable after a hook failed");
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
+}
+
+/// A panicking `set_up` is reported to whoever registered the observer, and
+/// the observer is not registered: `make_observer` calls `set_up` on the
+/// calling thread, before it inserts anything, so the payload comes back out
+/// of that call rather than out of a run.
+///
+/// The one hook of the three whose failure is not a scheduling question at
+/// all, and the reason this case asserts a payload where the rest of the
+/// suite's panic cases assert a [`rustflow::RunError`]: no run exists yet.
+#[test]
+fn a_panicking_set_up_hook_is_reported_to_the_registering_caller() {
+    let executor = Executor::new(2);
+
+    let payload = panic::catch_unwind(AssertUnwindSafe(|| {
+        executor.make_observer(Panicking(Hook::SetUp))
+    }))
+    .expect_err("`set_up` panicked, so `make_observer` never returned");
+
+    assert_eq!(
+        payload.downcast_ref::<&str>(),
+        Some(&"x"),
+        "the payload keeps its identity"
+    );
+    assert_eq!(
+        executor.num_observers(),
+        0,
+        "an observer whose `set_up` failed is not registered"
+    );
+    still_runs(&executor);
+}
+
+/// A panicking `on_entry` fails the run it was called from and leaves the
+/// executor usable.
+///
+/// `#[ignore]` for #304, which this case was written against: the hook is
+/// called outside any `catch_unwind`, so today the panic unwinds out of the
+/// worker's scheduling loop, the job in flight is dropped without being
+/// finished and the `wait` below never returns. Un-ignoring this is that
+/// issue's acceptance, and it is written to the first of the two answers
+/// that issue puts -- the worker surviving the hook -- so the other answer,
+/// forbidding a hook to panic at all, retires this case rather than fixing
+/// it.
+#[test]
+#[ignore = "hangs until #304 decides what a panicking hook does"]
+fn a_panicking_on_entry_hook_fails_the_run_and_leaves_the_executor_usable() {
+    let executor = Executor::new(2);
+    let _observer = executor.make_observer(Panicking(Hook::OnEntry));
+
+    let mut taskflow = Taskflow::new();
+    taskflow.emplace(|| {});
+    let error = executor
+        .run(&taskflow)
+        .wait()
+        .expect_err("`on_entry` panicked, so the run failed");
+
+    assert_panicked_with(error, "x");
+    still_runs(&executor);
+}
+
+/// The same for `on_exit`, which is the hook after the dispatch rather than
+/// the one before it: also `#[ignore]` for #304, and also a hang today --
+/// the unwind skips the node's own tear-down, so neither the semaphores it
+/// holds nor its successors are released.
+#[test]
+#[ignore = "hangs until #304 decides what a panicking hook does"]
+fn a_panicking_on_exit_hook_fails_the_run_and_leaves_the_executor_usable() {
+    let executor = Executor::new(2);
+    let _observer = executor.make_observer(Panicking(Hook::OnExit));
+
+    let mut taskflow = Taskflow::new();
+    taskflow.emplace(|| {});
+    let error = executor
+        .run(&taskflow)
+        .wait()
+        .expect_err("`on_exit` panicked, so the run failed");
+
+    assert_panicked_with(error, "x");
+    still_runs(&executor);
 }
