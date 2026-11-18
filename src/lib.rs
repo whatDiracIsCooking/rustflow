@@ -161,6 +161,7 @@ pub use crate::taskflow::Taskflow;
 /// assert!(taskflow.graph().node(task).handle().is_static());
 /// ```
 pub mod prelude {
+    pub use crate::algorithm::find::FindBuilder;
     pub use crate::algorithm::for_each::ForEachBuilder;
     pub use crate::algorithm::for_each_index::ForEachIndexBuilder;
     pub use crate::algorithm::merge::MergeBuilder;
