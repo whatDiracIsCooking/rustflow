@@ -2010,3 +2010,86 @@ next to that body but is not nothing, and it is the allocator traffic the
 stated 4-per-token count predicts rather than a number pulled from nowhere.
 The 24-worker rows would need a quieter box to read past their own noise, and
 are left as measured rather than as a resolved claim.
+
+## black_scholes
+
+European option pricing by the Black-Scholes formula, and **the one shape in
+this file whose graph is a loop rather than a fan-out**. Upstream's
+`bs_taskflow` builds three nodes -- a `placeholder`, a
+`for_each_index(0, numOptions, 1, ..., StaticPartitioner())` over the
+`BlkSchlsEqEuroNoDiv` kernel, and a condition task returning `0` to select
+the loop again and `-1` to select nothing -- so one run of the taskflow
+prices every option `NUM_RUNS` times through the *same* three nodes, and what
+is measured on top of the arithmetic is the condition task re-dispatching the
+`for_each_index` module that many times. Upstream couples the two counts:
+`generate_options` sets `NUM_RUNS = numOptions`, so `N` options cost `N * N`
+kernel evaluations and `N` laps, and `benches/black_scholes.rs` keeps the
+coupling.
+
+**What the loop costs is one condition task and one module dispatch a lap,
+and what rayon has to do instead is a barrier.** The baseline is a `for` over
+`NUM_RUNS` around `par_iter_mut` -- the loop once the graph is gone, and
+exactly what upstream's own `tbb.cpp` writes with `tbb::parallel_for`. Both
+sides run the same arithmetic the same number of times; a lap boundary ends a
+rayon parallel iterator, which is one implicit barrier, where on our side it
+is a condition task running, its `0` selecting the loop edge, the
+`for_each_index` runtime task being scheduled again, its chunks being spawned
+and joined, and only then the next lap. So this table is not a measure of the
+kernel at all -- it is the price of a *re-dispatchable* loop against a
+disposable one, which is what buys the graph the ability to decide at run time
+whether to take another lap.
+
+Sizes are two points off upstream's own sweep (`main.cpp` walks
+`N = 1000..=10000` in steps of 1000), and with this shape the `N * N` coupling
+is what makes two points enough: the per-lap cost grows as `N` while the work
+it is amortised over grows as `N * N`, so `1000` is the point where the loop's
+own overhead still shows -- 1000 laps of 1000 options is 42 options a worker a
+lap at 24 workers -- and `4000` the point where the per-option arithmetic
+dominates it. Upstream's last point, `N = 10000`, is `10^8` kernel evaluations
+in a single criterion sample and is left off for that reason alone.
+
+**The options are generated, not read from a file.** Upstream's `common.hpp`
+calls its generator "Read input option data from file" and then draws every
+field from `::rand()`, which is libc's and unseeded, so upstream's data is
+not reproducible off its own machine. This port draws from the crate's own
+`Xorshift32` with a fixed seed, in upstream's ranges shifted off zero: the
+spot and strike prices are uniform on the integers `1..=200`, the volatility
+and the time to expiry uniform on the hundredths `0.01..=1.00`, the risk-free
+rate is upstream's fixed `0.1`, and an option is a put or a call with even
+odds. The shift is what makes a price comparison possible at all -- zero is in
+range for all four of upstream's draws, and each zero puts the kernel
+somewhere it has no answer (`log(0)`, or a division by
+`volatility * sqrt(time)`), which upstream never notices because its own
+`ERR_CHK` compares against a `DGrefval` that is itself a random integer.
+
+Two asymmetries to read the table against, both stated next to the code as
+well. Ours includes building the graph, as every table in this file does --
+though here it is three nodes built once against `N` laps of work, so it is
+the smallest construction share in the file rather than the largest. And the
+array the taskflow writes its prices into is a slice of `AtomicU32` holding
+`f32::to_bits`, because a `for_each_index` body is an `Fn(usize)` and cannot
+be handed the disjoint `&mut f32` that `par_iter_mut` hands the baseline: one
+relaxed 32-bit store an option, against a kernel of two `exp`s, a `ln` and a
+`sqrt`.
+
+The correctness check is in the untimed part of the benchmark, before either
+id is registered: both variants price the options once, and every price is
+compared against a sequential evaluation of the same kernel on the same
+options -- upstream's `-s,--seq` comparison, which upstream leaves commented
+out in `main`. The tolerance is `1e-4` absolute, upstream's own `ERR_CHK`
+threshold: both sides evaluate the same `f32` expression on the same inputs,
+so the only difference either is entitled to is a last-bit one between two
+inlined copies of the kernel, and an `f32` ULP at the largest price these
+options can reach is about `1.5e-5`. A price no lap wrote keeps the `NaN` the
+array is filled with and fails whatever the tolerance, and the condition
+task's own lap count is asserted too, so a loop that quietly took one lap
+instead of `N` fails rather than benchmarks.
+
+**Figures for this section come from #352**, which measures every shape this
+milestone adds in one pass on a quiet box. This issue lands the shape, the ids
+(`rustflow/{1,24}w` and `rayon/{1,24}w` at sizes 1000 and 4000) and the
+assertions; three agents were building on this box while it was written, so
+any number taken here would record the load and not the shape. What is
+verified here is that the benchmark runs and that its answer is right:
+`cargo bench --all-features --bench black_scholes -- --test` drives all eight
+ids and the untimed check behind them.

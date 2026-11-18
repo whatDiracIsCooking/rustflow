@@ -116,3 +116,7 @@ harness = false
 [[bench]]
 name = "data_pipeline"
 harness = false
+
+[[bench]]
+name = "black_scholes"
+harness = false
