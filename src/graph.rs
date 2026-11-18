@@ -1099,6 +1099,23 @@ impl Graph {
         Self::default()
     }
 
+    /// Creates an empty graph whose arena holds `capacity` nodes before it
+    /// reallocates.
+    ///
+    /// Crate-private, because the only caller that can name its final size is
+    /// a free async node, whose arena is one node for the life of the node:
+    /// a graph a [`FlowBuilder`](crate::FlowBuilder) is filling cannot, and
+    /// [`Graph::new`] leaves the `Vec` to pick its own first capacity.
+    /// `DESIGN.md`'s entry on the `Arc`-owned free node says what sizing that
+    /// one case saves.
+    #[must_use]
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            nodes: Vec::with_capacity(capacity),
+            num_live: 0,
+        }
+    }
+
     /// Appends an unnamed node and returns its handle: the arena primitive
     /// the `emplace` family of [`FlowBuilder`](crate::FlowBuilder) is built
     /// on.
@@ -1273,6 +1290,15 @@ impl Graph {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// How many slots the arena holds before it reallocates, which is not
+    /// how many nodes are in it. Test-only: the one thing a caller of
+    /// [`Graph::with_capacity`] can assert about the sizing it asked for.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn capacity(&self) -> usize {
+        self.nodes.capacity()
     }
 
     /// Drops every node and every tombstone, invalidating every [`Task`]

@@ -273,8 +273,11 @@ that happen to look good:
   it also found #60's *stated* reason for declining the change wrong, since
   what pays is not the shapes that steal from worker queues but the shapes
   with one source task and nothing to steal, which pay per run.
-  A free async task submitted the same way costs ~440 ns, 87% of it the node
+  A free async task submitted the same way costs ~415 ns, 87% of it the node
   it allocates (#125), and that too is the design rather than a tuning gap.
+  The one part of it that *was* a tuning gap is gone: the node's one-node
+  arena no longer carries a `Vec`'s spare capacity, which was 528 of the 848
+  bytes a task and 6% of the path (#144).
 - **The continuation optimisation** (issue #62). Upstream's `_update_cache` /
   `TF_INVOKE_CONTINUATION` keeps one ready successor out of the queue and
   resumes it on the worker that just finished its predecessor, so a chain runs

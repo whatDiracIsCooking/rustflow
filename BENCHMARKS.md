@@ -19,7 +19,9 @@ count* across all six shapes, which changed no shipped code and is the reason
 the count is still `bit_width(num_workers)`. The last section is a fifth run,
 #125's, which changed no shipped code either: it takes the per-task cost of
 the `async_task` shape's external submission apart with counters and
-ablations, and records what it is.
+ablations, and records what it is. The sixth and last is #144's, which makes
+the one change that run named and could not reach: a free async node's arena
+sized to the one node it will ever hold.
 
 ```sh
 devtools/devcontainer.sh bench                        # the whole suite
@@ -1405,7 +1407,9 @@ emphatically not timings:
   allocation per async task, beyond its body", and the three are the
   `Arc<AsyncNode>` (88 B), the arena's `Vec<Option<Node>>` (**704 B**: one
   176-byte node in a `Vec` that grew to capacity 4) and the boxed body
-  (56 B).
+  (56 B). The middle figure is 176 B on today's `main` -- #144's section below
+  -- and that section also splits this bullet's 56-byte "boxed body" into the
+  two things a per-size histogram shows it to be.
 
 ### The ablations: what each candidate costs
 
@@ -1485,6 +1489,17 @@ looked like it contradicted and what this A/B settles. The change lives in
 `src/graph.rs` and `src/executor/async_node.rs`, is out of #125's scope, and
 is left for an issue of its own rather than smuggled in here.
 
+That issue is #144 and the last section of this file is its measurement. The
+direction holds and the size does not: re-measured against the same id with
+more rounds, the change is **−6%**, and on the `rustflow-group` id -- the same
+construction submitted from a worker, which this run never A/B'd -- it is
+−34%. So "the bytes it saves were never touched" is too strong a reading of
+G against H: shrinking this block from 704 bytes to 176 buys about 40% of what
+G measured a whole extra 64-byte block to cost in the same regime, and rather
+more than one whole block in the regime where a worker submits. A block's size
+is worth less than its existence, which is what this paragraph has right; how
+much less is what the section below measures instead of inferring.
+
 ### A method note: a stand-in consumer is not a worker
 
 The first version of this harness replaced the executor with one producer
@@ -1545,3 +1560,160 @@ change to #86 and a milestone rather than a patch -- the same place the end of
 the "#60 finding" section arrived at for the flat graph, and for the same kind
 of reason. **That is the recorded cost of the architecture, with the ablations
 above as the evidence.**
+
+## The #144 change: a free node's arena is sized to its one node, and that is 6% of the submission path
+
+#125's section above ends with one change it named and could not make: a free
+async node owns a `Graph` of exactly one node, and `Graph::new` left that
+arena to the `Vec`'s own first capacity -- four slots of 176 bytes, three of
+which nothing will ever fill. This is that change, which is a crate-private
+`Graph::with_capacity` and one call site. It is the first of these six runs to
+move a number the shipped code reads.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id |
+| Date | 2026-11-18 |
+| **Load average** | **1.7 to 3.4, and not this run's own** |
+
+**The box was not quiet, and the load is not the interesting part of it**:
+another agent's test binary held one core at 100% for the whole run, and a
+sibling agent's `cargo` builds came and went between ids. That is a steady
+competitor for one of 24 threads rather than a varying one for all of them,
+which is why the one-worker ids below are pinned.
+
+### Method
+
+Two prebuilt criterion binaries -- one from `main`, one from this branch --
+run as **blocks of four processes, `A B B A`, with the order of the block
+swapped on alternate blocks**, each process its own criterion invocation with
+its own `CRITERION_HOME`, two to three blocks an id. Round 1 is the first half
+of every block and round 2 the second, so each round holds both orders and
+each cell is a median of two or three point estimates with the spread within
+that one side reported beside it. #60's rule, which this file has recorded
+three times as not optional: a fixed order on this shape has read the sign of
+a change wrong.
+
+The one-worker ids are run under `taskset -c 4,5` -- two physical cores of one
+CCD, the producer and the one worker -- which is what makes the shape
+reproducible with a core of the box occupied: unpinned, the same id's four
+processes read 29 to 50 ms where pinned they read 29 to 31. The headline id is
+reported **both** ways, and the two agree; the 24-worker id cannot be isolated
+that way and is reported with the caveat it earns. The counters below are a
+third build, with a counting global allocator in an example that is not part
+of this branch -- an instrumented build is not a build to time, and
+instrumentation does not ship.
+
+### The counters: three blocks still, 320 bytes instead of 848
+
+One instrumented run per side per worker count, 65536 external `silent_async`s
+after a warm-up run of the same shape, counted by block size:
+
+| block | shipped | this branch |
+|---|---|---|
+| the body's box (a closure capturing one `Arc`) | 8 B x 1.0000 | 8 B x 1.0000 |
+| `Arc<AsyncNode>` | 88 B x 1.0000 | 88 B x 1.0000 |
+| the arena's `Vec<Option<Node>>` | **704 B** x 1.0000 | **176 B** x 1.0000 |
+| the spill buffers growing | 3032 B x 0.0159 | 3032 B x 0.0159 |
+| **per task** | **3.0159 blocks, 848.12 B** | **3.0159 blocks, 320.12 B** |
+
+Identical at 1 worker and at 24, and the shipped column reproduces #125's
+848 bytes and 3.016 blocks exactly -- which is also what corrects that run's
+breakdown of them. Its 56-byte "boxed body" is two things: the body's box is
+**8 bytes** here (the benchmark's closure captures one `Arc`, so the box is
+one pointer), and the other 48 bytes a task are its share of the 1040
+reallocations the shared spill buffers make over the run. Neither is the body
+being large; #125 had the residual and not the histogram.
+
+**Three blocks, not two.** The arena cannot share the `Arc<AsyncNode>`'s
+block, and `DESIGN.md`'s entry on the `Arc`-owned free node now says why
+rather than leaving the next reader to re-derive it: a `Graph` holds its nodes
+in a `Vec`, so collapsing the two would take either a graph that can hold one
+node inline or an async path that does not resolve a job through a `&Graph` at
+all. What is reachable is the *size* of the second block, which is this
+change.
+
+### The headline id, both ways
+
+`async_task/rustflow/1w/65536`, medians of each round, per task in brackets:
+
+| protocol | round | shipped | this branch | delta | spread within one side |
+|---|---|---|---|---|---|
+| unpinned, 3 blocks | 1 | 29.059 ms (443 ns) | **27.280 ms (416 ns)** | **−6.1%** | 5.4% / 4.8% |
+| unpinned, 3 blocks | 2 | 29.477 ms (450 ns) | **27.423 ms (418 ns)** | **−7.0%** | 2.6% / 1.0% |
+| `taskset -c 4,5`, 3 blocks | 1 | 29.344 ms | **27.956 ms** | −4.7% | 0.5% / 1.5% |
+| `taskset -c 4,5`, 3 blocks | 2 | 31.028 ms | **27.718 ms** | −10.7% | 8.7% / 1.2% |
+| `taskset -c 4,5`, 2 blocks | 1 | 29.588 ms | **27.474 ms** | −7.2% | 0.2% / 1.5% |
+| `taskset -c 4,5`, 2 blocks | 2 | 30.855 ms | **27.295 ms** | −11.5% | 10.5% / 0.1% |
+
+**#125's −3.3 to −3.6% is confirmed in direction and corrected in size: this
+id is −6 to −7% on the protocol with the tightest sides**, and the pinned
+rounds read −4.7 to −11.5% because the *shipped* side throws occasional 31 to
+32 ms processes where this branch's ten processes never leave the 27.3 to
+28.0 ms band. That asymmetry is the result underneath the percentages: across
+every protocol above, the highest changed reading (28.0 ms) is below the
+lowest shipped one (29.0 ms), which no single pair of rounds would establish.
+
+### The other async ids, and where it is worth most
+
+| id | protocol | round 1 | round 2 | spread within one side |
+|---|---|---|---|---|
+| `async_task/rustflow/1w/4096` | pinned | −12.0% | −8.9% | 0.0% to 2.1% |
+| `async_task/rustflow-group/1w/65536` | pinned, 3 blocks | **−34.3%** | **−34.6%** | 0.1% to 10.3% |
+| `async_task/rustflow-group/1w/65536` | pinned, 2 blocks | **−33.8%** | **−33.7%** | 0.0% to 0.4% |
+| `async_task/rustflow/24w/65536` | unpinned | −1.1% | −8.5% | 1.3% to 3.3% |
+
+The `rustflow-group` id is where this change is worth most, and it is worth
+*five times* what the external id gains: 18.0 ms to 11.9 ms, **274 ns a task
+to 182**, with both sides inside 0.4% of themselves on the second run. That id
+submits the same construction from a worker, so one thread allocates the node
+and -- usually -- the same thread frees it, which is #125's variant F regime;
+a block that fits a smaller size class is worth more there than in the regime
+where a producer allocates and a worker frees, because there is a free list to
+come back to. It supersedes the `async_task` table's "submitting from a worker
+saves 30%" bullet, which is now 56% at 65536 and one worker.
+
+At **24 workers the id is not resolved**: −1.1% is inside the sides' own 1.3
+to 3.3%, −8.5% is well outside it, and 24 workers on a box with a core already
+taken is exactly the measurement this run cannot make. The direction is never
+positive; the size is not a result.
+
+### All six shapes, which is the regression check
+
+`Graph`'s arena is on every shape's path, so every shape was A/B'd and not
+just the one the change is for. One worker, pinned, the larger of each shape's
+two sizes:
+
+| shape | id | round 1 | round 2 | spread within one side |
+|---|---|---|---|---|
+| `linear_chain` | `rustflow/1w/16384` | +0.4% | +0.4% | 0.3% to 1.7% |
+| `binary_tree` | `rustflow/1w/65536` | +1.7% / +1.1% | +0.6% / +0.2% | 0.3% to 2.4% |
+| `graph_traversal` | `rustflow/1w/56759` | −0.0% | −0.1% | 0.1% to 0.4% |
+| `embarrassing_parallelism` | `rustflow/1w/65536` | −0.1% | −0.2% | 0.0% to 0.5% |
+| `async_task` | `rustflow/1w/65536` | −6.1% | −7.0% | 1.0% to 5.4% |
+| `fibonacci` | `rustflow-group/1w/15` | −4.4% | −4.5% | 0.1% to 1.3% |
+| `fibonacci` | `rustflow-runtime/1w/15` | −1.1% | −2.9% | 0.0% to 2.1% |
+
+- **The four graph shapes do not move**, which is what the code says they
+  cannot: a graph a `FlowBuilder` fills still goes through `Graph::new`, whose
+  `Vec` is untouched, and `with_capacity` is crate-private with one caller.
+  `graph_traversal` and `embarrassing_parallelism` read within a fifth of a
+  percent either way. The two that read positive are `linear_chain` at +0.4%
+  twice and `binary_tree`, which was therefore run a second time: four point
+  estimates between +0.2% and +1.7%, against the 0.3 to 2.4% its own sides
+  disagree by. Both are at the edge of what this box resolves and neither has
+  a mechanism -- nothing on either path goes near the arena's sizing -- so
+  what is left for them is code layout.
+- **`fibonacci` gains too, and that is not incidental**: both of its `rustflow`
+  ids are recursive `spawn`s, so every node of the recursion is a free node
+  and pays for its own arena. The `rustflow-group` id's −4.4 / −4.5% against
+  sides inside 1.3% of themselves is a result; the `rustflow-runtime` id's −1.1
+  / −2.9% straddles its own spread and is not.
+
+So the trade to report is that there is none to report: the two shapes that
+allocate a free node per task gain 1 to 34%, and the four that build a graph
+read between −0.2% and +1.7% -- inside, or within a few tenths of a percent
+of, the spread of their own sides, on paths the change does not touch.
