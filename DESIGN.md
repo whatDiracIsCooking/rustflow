@@ -872,3 +872,28 @@ entry above does.
   upstream, it is not wired into upstream's own test `CMakeLists` -- so
   there is no upstream test this port is on the hook for, and nothing here
   builds toward one.
+
+## Decisions taken in M9
+
+- **`TFProfManager` is not ported** (issue #193). `tfprof.hpp` at the pinned
+  v4.1.0 tag builds a process-global singleton around `TfProfObserver`,
+  constructed with `_fpath{get_env(TF_ENABLE_PROFILER)}`; its destructor
+  opens that path and, if it opens, writes a complete `.tfp` file there, or
+  prints a text summary to stderr otherwise. A library has no business
+  installing a process-global singleton whose destructor writes a file to
+  a path an environment variable names -- that is an application's choice
+  to make, not something this crate should do on a caller's behalf without
+  being asked. The port exposes `TfProfObserver::dump` and
+  `TfProfObserver::summary` directly and leaves the sink to the caller, as
+  every other `Observer` in this crate does.
+
+  Preserved as documentation rather than code: a caller who wants a real,
+  multi-executor `.tfp` file -- several `TfProfObserver`s, one file -- can
+  still build exactly the one upstream's `TFProfManager::dump` writes
+  around this port's own `dump` output. Its 12-byte file header, all
+  integers little-endian: `"TFPX"` (4 bytes, the magic), `version` (`u16`,
+  `1` at the pin), `flags` (`u16`, `0` at the pin), `num_exec` (`u32`, how
+  many executor blocks follow). After that header, each `TfProfObserver`'s
+  own self-contained block -- exactly what `TfProfObserver::dump` writes,
+  with no shared state between them -- one after another, in whatever order
+  the caller chooses.

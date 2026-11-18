@@ -11,11 +11,13 @@
 //! [`rustflow::Executor::silent_async`]ed body is the fifth kind, `async`,
 //! run outside any graph.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rustflow::Executor;
 use rustflow::observer::chrome::ChromeObserver;
+use rustflow::observer::tfprof::TfProfObserver;
 use rustflow::observer::{Observer, TaskView, WorkerView};
 use rustflow::prelude::*;
 
@@ -58,6 +60,11 @@ impl Observer for Counting {
 /// what makes "nodes dispatched" and "tasks run" the same count here. See
 /// `src/executor/worker.rs`'s `observer_prologue`/`observer_epilogue` docs
 /// for the node kinds that do not have that property in general.
+///
+/// Every dispatched task is given its own name, distinct from every other
+/// one -- `tfprof_observer_dumps_a_valid_block` below resolves each
+/// recorded segment's name back out of the dump's string table and checks
+/// it against this set.
 fn mixed_graph(taskflow: &mut Taskflow) -> usize {
     let a = taskflow.emplace(|| {});
     let selected = taskflow.emplace(|| {});
@@ -65,6 +72,13 @@ fn mixed_graph(taskflow: &mut Taskflow) -> usize {
     let cond = taskflow.emplace_condition(|| 0);
     let subflow = taskflow.emplace_subflow(|_subflow: &mut Subflow<'_>| {});
     let runtime = taskflow.emplace_runtime(|_runtime: &mut Runtime<'_>| {});
+
+    taskflow.task(a).name("a");
+    taskflow.task(selected).name("selected");
+    taskflow.task(not_selected).name("not_selected");
+    taskflow.task(cond).name("cond");
+    taskflow.task(subflow).name("subflow");
+    taskflow.task(runtime).name("runtime");
 
     taskflow
         .task(cond)
@@ -76,6 +90,10 @@ fn mixed_graph(taskflow: &mut Taskflow) -> usize {
     let _ = (subflow, runtime);
     5
 }
+
+/// The names [`mixed_graph`] gives its five dispatched tasks, in no
+/// particular order.
+const MIXED_GRAPH_DISPATCHED_NAMES: [&str; 5] = ["a", "selected", "cond", "subflow", "runtime"];
 
 /// A fresh executor registers no observer, which is the state the zero-cost
 /// path -- `ObserverList::is_empty`'s one relaxed load -- is for.
@@ -314,4 +332,261 @@ fn chrome_observer_dumps_a_valid_trace() {
             "tid {tid} names no worker of this {num_workers}-worker executor"
         );
     }
+}
+
+/// A hand-rolled little-endian reader over [`TfProfObserver::dump`]'s binary
+/// block -- #193's acceptance asks for exactly this, rather than a
+/// `serde_json` dev-dependency, since the format isn't JSON to begin with.
+struct TfpReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> TfpReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn u32(&mut self) -> u32 {
+        let value = u32::from_le_bytes(self.bytes[self.pos..self.pos + 4].try_into().unwrap());
+        self.pos += 4;
+        value
+    }
+
+    fn u64(&mut self) -> u64 {
+        let value = u64::from_le_bytes(self.bytes[self.pos..self.pos + 8].try_into().unwrap());
+        self.pos += 8;
+        value
+    }
+
+    fn u8(&mut self) -> u8 {
+        let value = self.bytes[self.pos];
+        self.pos += 1;
+        value
+    }
+
+    fn varint(&mut self) -> u64 {
+        let mut value = 0u64;
+        let mut shift = 0u32;
+        loop {
+            let byte = self.u8();
+            value |= u64::from(byte & 0x7F) << shift;
+            if byte & 0x80 == 0 {
+                return value;
+            }
+            shift += 7;
+        }
+    }
+
+    fn bytes(&mut self, len: usize) -> &'a [u8] {
+        let slice = &self.bytes[self.pos..self.pos + len];
+        self.pos += len;
+        slice
+    }
+}
+
+/// One decoded segment out of [`TfProfObserver::dump`]'s binary block: the
+/// fields a reader needs to check the acceptance's claims, resolved out of
+/// the varints, the fixed-width fields and the string table.
+struct DecodedSegment {
+    worker: u32,
+    level: u32,
+    name: String,
+}
+
+/// Parses `bytes` -- a full [`TfProfObserver::dump`] block -- into its
+/// decoded segments, after checking the structural invariants the format's
+/// own layout promises: the header's `str_table_len` is exactly the number
+/// of bytes the string table occupies, every `(worker, level)` block's
+/// `num_segs` accounts for exactly that many segments, and nothing is left
+/// over at the end of the buffer.
+fn parse_tfp_block(bytes: &[u8]) -> (u64, Vec<DecodedSegment>) {
+    let mut reader = TfpReader::new(bytes);
+    let uid = reader.u64();
+    let _origin_us = reader.u64();
+    let str_table_len = reader.u32();
+    let num_wl = reader.u32();
+
+    let string_table = reader
+        .bytes(usize::try_from(str_table_len).unwrap())
+        .to_vec();
+
+    let mut segments = Vec::new();
+    for _ in 0..num_wl {
+        let worker = reader.u32();
+        let level = reader.u32();
+        let num_segs = reader.u32();
+
+        let mut previous_beg_us = 0u64;
+        for _ in 0..num_segs {
+            let delta_beg = reader.varint();
+            let _duration = reader.varint();
+            let name_off = reader.u32();
+            let packed = reader.u8();
+
+            let beg_us = previous_beg_us + delta_beg;
+            previous_beg_us = beg_us;
+
+            let name_len = usize::from(packed & 0x1F);
+            let name = if name_len == 0 {
+                String::new()
+            } else {
+                let start = usize::try_from(name_off).unwrap();
+                String::from_utf8(string_table[start..start + name_len].to_vec())
+                    .expect("mixed_graph's task names are plain ASCII")
+            };
+
+            segments.push(DecodedSegment {
+                worker,
+                level,
+                name,
+            });
+        }
+    }
+
+    assert_eq!(
+        reader.pos,
+        bytes.len(),
+        "a dump must have nothing left over after its last segment"
+    );
+
+    (uid, segments)
+}
+
+/// [`TfProfObserver`] records one segment per dispatch and dumps them as
+/// upstream's binary block: `num_tasks` matches the dispatch count, the
+/// dump's `(worker, level)` blocks hold exactly that many segments between
+/// them, every segment's worker names one of this executor's workers, and
+/// resolving each segment's name out of the string table reproduces exactly
+/// the set of names [`mixed_graph`] gave its dispatched tasks -- #193's
+/// acceptance, read literally.
+#[test]
+fn tfprof_observer_dumps_a_valid_block() {
+    let num_workers = 3;
+    let executor = Executor::new(num_workers);
+    let observer = executor.make_observer(TfProfObserver::new());
+
+    let mut taskflow = Taskflow::new();
+    let dispatched = mixed_graph(&mut taskflow);
+    executor
+        .run(&taskflow)
+        .wait()
+        .expect("no task of the graph panicked");
+
+    assert_eq!(observer.num_tasks(), dispatched);
+
+    let mut dump = Vec::new();
+    observer
+        .dump(&mut dump)
+        .expect("writing to a Vec never fails");
+
+    let (_uid, segments) = parse_tfp_block(&dump);
+    assert_eq!(
+        segments.len(),
+        dispatched,
+        "the dump must hold exactly one segment per dispatched task"
+    );
+
+    for segment in &segments {
+        let worker = usize::try_from(segment.worker).unwrap();
+        assert!(
+            worker < num_workers,
+            "worker {worker} names no worker of this {num_workers}-worker executor"
+        );
+    }
+
+    let mut resolved_names: Vec<&str> = segments.iter().map(|s| s.name.as_str()).collect();
+    resolved_names.sort_unstable();
+    let mut expected_names = MIXED_GRAPH_DISPATCHED_NAMES;
+    expected_names.sort_unstable();
+    assert_eq!(
+        resolved_names, expected_names,
+        "every resolved name must be exactly the set mixed_graph gave its dispatched tasks"
+    );
+
+    // Every segment here is a top-level dispatch with nothing of its own
+    // worker preempting above it, so every one lands at level 0.
+    assert!(
+        segments.iter().all(|segment| segment.level == 0),
+        "no task in mixed_graph preempts its own node"
+    );
+}
+
+/// [`TfProfObserver::summary`] reports the right task count per type for a
+/// graph with a known mix of static, condition and subflow tasks, and its
+/// per-worker counts sum to the total -- #193's acceptance, read literally.
+#[test]
+fn tfprof_observer_summary_reports_counts_by_type_and_worker() {
+    let num_workers = 3;
+    let executor = Executor::new(num_workers);
+    let observer = executor.make_observer(TfProfObserver::new());
+
+    let mut taskflow = Taskflow::new();
+    let dispatched = mixed_graph(&mut taskflow);
+    executor
+        .run(&taskflow)
+        .wait()
+        .expect("no task of the graph panicked");
+
+    let report = observer.summary_to_string();
+
+    // mixed_graph dispatches two static tasks (`a`, `selected`), one
+    // condition, one subflow and one runtime task.
+    let mut expected_type_counts = HashMap::new();
+    expected_type_counts.insert("static", 2u64);
+    expected_type_counts.insert("condition", 1u64);
+    expected_type_counts.insert("subflow", 1u64);
+    expected_type_counts.insert("runtime", 1u64);
+
+    for (type_name, expected_count) in &expected_type_counts {
+        let count = type_row_count(&report, type_name)
+            .unwrap_or_else(|| panic!("summary has no row for task type {type_name:?}:\n{report}"));
+        assert_eq!(
+            count, *expected_count,
+            "task type {type_name:?} has the wrong count in:\n{report}"
+        );
+    }
+
+    let total_by_type: u64 = expected_type_counts.values().sum();
+    assert_eq!(total_by_type, u64::try_from(dispatched).unwrap());
+
+    let worker_counts = worker_row_counts(&report);
+    assert!(
+        !worker_counts.is_empty(),
+        "summary has no worker rows:\n{report}"
+    );
+    let total_by_worker: u64 = worker_counts.iter().sum();
+    assert_eq!(
+        total_by_worker,
+        u64::try_from(dispatched).unwrap(),
+        "per-worker counts must sum to the total dispatched:\n{report}"
+    );
+}
+
+/// Finds the `[Aggregate Task Statistics]` row for `type_name` -- its first
+/// whitespace-separated field -- and returns its `Count` column, the
+/// second field.
+fn type_row_count(report: &str, type_name: &str) -> Option<u64> {
+    report.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next()? != type_name {
+            return None;
+        }
+        fields.next()?.parse().ok()
+    })
+}
+
+/// Returns every `[Worker Utilization]` row's `Tasks` column, the second
+/// whitespace-separated field of a row whose first field parses as a plain
+/// worker id -- which the header, the rules and the `Total` row's "Total"
+/// label all fail to do, leaving only the data rows.
+fn worker_row_counts(report: &str) -> Vec<u64> {
+    report
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let _id: usize = fields.next()?.parse().ok()?;
+            fields.next()?.parse().ok()
+        })
+        .collect()
 }

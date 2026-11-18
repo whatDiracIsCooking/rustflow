@@ -72,6 +72,7 @@
 //! compile error here too, not a silent [`TaskType::Async`].
 
 pub mod chrome;
+pub mod tfprof;
 
 use std::fmt;
 use std::hash::{DefaultHasher, Hash, Hasher};
