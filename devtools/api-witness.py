@@ -65,6 +65,16 @@
 # of the two places this count differs from the name-based one -- a function
 # named only by a *comment* in `tests/` was "named" there and is flagged here.
 #
+# Three limits are in the parsing rather than in the typing. A chunk is cut at
+# every `fn` line, an indented one included, so a helper `fn` nested inside a
+# test orphans each binding made above it. A `let`'s annotation is still read
+# up to its first `;`, where an annotated parameter is read bracket-aware, so
+# `let s: Arc<[Slot; 4]> = ..` loses its annotation and resolves through the
+# right-hand side while `s: Arc<[Slot; 4]>` in a parameter list keeps it. And
+# the brackets those scans count include `<`, so a `<` meant as a comparison
+# rather than as a generic would unbalance one -- no signature or annotation
+# in `src/` or the corpus writes one today.
+#
 # HOW IT FAILS SAFE. A call site it cannot attribute is credited to nothing.
 # A name declared on more than one item is witnessed per declaration, so
 # `hash_value` on three types needs three attributed call sites and is
@@ -323,14 +333,32 @@ def return_type(lines, index):
     return ret or None
 
 
+def signature_end(text):
+    """Where a `fn` signature ends, or None where it has not ended yet.
+
+    The `{` or `;` looked for is the one outside every bracket, because an
+    array type in a parameter list carries a `;` of its own: `[IndexRange<T>;
+    N]` read as the end of the signature, which both truncated the parameter
+    list and hid the return type below it.
+    """
+    depth = 0
+    for i, ch in enumerate(text):
+        if depth == 0 and ch in "{;":
+            return i
+        depth += bracket_delta(text, i)
+    return None
+
+
 def signature(lines, index):
     """The `fn` at `lines[index]` up to its body, `where` clause included."""
     text = lines[index]
     k = index + 1
-    while "{" not in text and ";" not in text and k < len(lines):
+    end = signature_end(text)
+    while end is None and k < len(lines):
         text += " " + lines[k].strip()
+        end = signature_end(text)
         k += 1
-    return re.split(r"\{|;", text)[0]
+    return text if end is None else text[:end]
 
 
 def generic_parameters(sig):
@@ -380,6 +408,27 @@ def split_top_level(text, separator=","):
             piece += ch
     out.append(piece)
     return [piece.strip() for piece in out if piece.strip()]
+
+
+def annotated_type(text, start):
+    """The type annotation beginning at `text[start]`, read bracket-aware.
+
+    It ends at the first `,`, `)`, `|`, `=`, `;`, `{` or `}` outside every
+    bracket -- a type expression holds none of those, braces included -- or at
+    the bracket that closes the one the annotation sits in. The depth is what
+    admits a generic carrying more than one argument, or any argument with a
+    separator inside it: cutting `IndexRanges<i32, 2>` at its comma, or
+    `OnceWork<dyn FnOnce() + Send>` at its parenthesis, gave the same
+    identifier two type strings between this rule and the `let` rule above
+    it, and an identifier at two types is dropped rather than guessed at.
+    """
+    depth = 0
+    for i in range(start, len(text)):
+        delta = bracket_delta(text, i)
+        if depth == 0 and (text[i] in ",)|=;{}" or delta < 0):
+            return text[start:i]
+        depth += delta
+    return text[start:]
 
 
 class Types:
@@ -658,11 +707,13 @@ class Types:
                             record(one.split()[-1], part)
             elif re.fullmatch(r"(?:mut\s+)?[a-z_][a-z0-9_]*", pattern):
                 record(pattern.split()[-1], element)
-        # Annotated parameters, of a function or of a closure.
+        # Annotated parameters, of a function or of a closure. The type is
+        # read from the end of the match rather than captured by it, so that
+        # its own brackets bound it.
         for m in re.finditer(
-            r"([a-z_][a-z0-9_]*)\s*:\s*((?:&(?:\s*mut)?\s*)?[A-Z][^,)|=;]*)", chunk
+            r"([a-z_][a-z0-9_]*)\s*:\s*(?=(?:&(?:\s*mut)?\s*)?[A-Z])", chunk
         ):
-            record(m.group(1), m.group(2))
+            record(m.group(1), annotated_type(chunk, m.end()))
         # Identifiers an enum pattern binds, typed by the variant's own fields:
         # `if let Handle::Static(work) = node.handle()`.
         for m in re.finditer(
