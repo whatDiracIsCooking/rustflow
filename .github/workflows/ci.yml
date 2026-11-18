@@ -74,6 +74,34 @@ jobs:
       # saves. Add actions/cache on ~/.cargo/registry and ./target once there
       # is a dependency tree worth restoring.
 
+  # `ci` above already compiles every example under `--all-targets`, so
+  # clippy and the doc-tests cover *that* they build; this job covers that
+  # they still run cleanly end to end, which is what `devtools/run-examples.sh`
+  # does -- cargo auto-discovers `examples/*.rs`, and so does that script's
+  # glob, so a new example from #194-#200 needs no edit here.
+  examples:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.100-slim-bookworm
+    steps:
+      # Same first apt list as `ci`, for the same reason: before checkout, so
+      # that actions/checkout has git to use rather than falling back to a
+      # tarball with no .git directory.
+      - name: Install container prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates pkg-config libssl-dev
+          rm -rf /var/lib/apt/lists/*
+
+      - uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
+
+      - name: Run examples
+        run: bash devtools/run-examples.sh
+
   # The one gate command that is not a step of `ci` above: `cargo deny check`
   # against deny.toml -- licenses, RustSec advisories, duplicate versions,
   # crate sources.
