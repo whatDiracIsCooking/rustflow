@@ -406,7 +406,6 @@ impl<C: ClosureWrapper> DynamicLoop for GuidedPartitioner<C> {
             self.chunk_size
         };
         let p1 = 2 * w * (chunk_size + 1);
-        let p2 = 0.5_f32 / w as f32;
         let mut curr_b = next.load(Ordering::Relaxed);
 
         while curr_b < n {
@@ -423,7 +422,10 @@ impl<C: ClosureWrapper> DynamicLoop for GuidedPartitioner<C> {
                     }
                 }
             } else {
-                let mut q = floor_to_usize(p2 * r as f32);
+                // Upstream's `p2 * r` is `(0.5 / w) * r`, i.e. `r / (2 * w)`:
+                // integer division gives the same floor exactly, with no
+                // float round-trip to be off by one for a large `r`.
+                let mut q = r / (2 * w);
                 if q < chunk_size {
                     q = chunk_size;
                 }
@@ -657,8 +659,23 @@ impl<C: ClosureWrapper> RandomPartitioner<C> {
     #[must_use]
     pub fn chunk_size_range(&self, n: usize, w: usize) -> (usize, usize) {
         let nw = n as f32 * w as f32;
-        let mut b1 = floor_to_usize(self.alpha * nw);
-        let mut b2 = floor_to_usize(self.beta * nw);
+
+        // Unlike every other float-to-int conversion this module needed,
+        // this one has no integer-arithmetic equivalent to fall back on:
+        // `alpha` and `beta` are arbitrary, user-supplied tunables (upstream
+        // takes the same `float` parameters), not a ratio of two integers
+        // already in hand. `std` has no `TryFrom<f32> for usize` either, so
+        // the cast below is the one conversion left. It is sound regardless
+        // of what `alpha`/`beta` are: Rust's `as` from a float to an
+        // integer is a *total*, saturating operation since 1.45 (`NaN` and
+        // a negative product floor to `0`, anything past `usize::MAX`
+        // saturates to it), unlike C++'s `static_cast`, which is undefined
+        // outside the target type's range -- the lint is flagging a cast
+        // that cannot be proven safe from its syntax alone, not one that is
+        // unsound here.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (mut b1, mut b2) = ((self.alpha * nw) as usize, (self.beta * nw) as usize);
+
         if b1 > b2 {
             std::mem::swap(&mut b1, &mut b2);
         }
@@ -715,22 +732,6 @@ impl<C: ClosureWrapper> DynamicLoop for RandomPartitioner<C> {
 /// `DefaultPartitioner`. A guided schedule gives decent, stable performance
 /// across most workloads without a caller choosing a chunk size.
 pub type DefaultPartitioner = GuidedPartitioner<DefaultClosureWrapper>;
-
-/// Floors a `f32` into a `usize`, matching upstream's
-/// `static_cast<size_t>(x)` at each of this module's call sites.
-///
-/// `std` has no `TryFrom<f32> for usize`, and the cast below is the
-/// conversion upstream performs too -- except Rust's `as` from a float to an
-/// integer is a *total*, saturating operation since 1.45 (`NaN` and a
-/// negative input floor to `0`, anything past `usize::MAX` saturates to it),
-/// unlike C++'s `static_cast`, which is undefined outside the target type's
-/// range. That already is the floor every caller here wants, so the lint is
-/// silenced once, at this single conversion, instead of reasoned about at
-/// each call site.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn floor_to_usize(x: f32) -> usize {
-    x as usize
-}
 
 /// Draws a value uniformly from the inclusive range `[lo, hi]`, matching
 /// upstream's `std::uniform_int_distribution<size_t>(lo, hi)` closely enough
