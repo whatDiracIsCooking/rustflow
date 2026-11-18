@@ -156,3 +156,7 @@ harness = false
 [[bench]]
 name = "nqueens"
 harness = false
+
+[[bench]]
+name = "graph_pipeline"
+harness = false

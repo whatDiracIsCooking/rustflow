@@ -1947,6 +1947,12 @@ shape carrying the same `f64` through a user-owned buffer
 (`tests/pipelines_compose.rs`'s own `Buffer`, narrowed to this shape) instead
 of the typed slot.
 
+**Where those ids live now.** That file also hosts upstream's own
+`data_pipeline` shape, which is a different measurement with a section of its
+own below. The two are separate criterion groups, and the ids this section
+quotes are the `data_pipeline_slot` group's -- `typed/<lines>l_<workers>w` and
+`buffer/<lines>l_<workers>w` -- unchanged in name and in what they measure.
+
 **The allocation count is stated by inspection, not by a counting allocator.**
 Implementing `GlobalAlloc` to count heap operations is `unsafe`, which is out
 of scope for this issue; `src/pipeline/data_pipeline.rs`'s own
@@ -2574,3 +2580,128 @@ section above gives, and #352 takes them**: the machine-and-load table, the
 size × workers × {`rustflow-group`, `rayon`, upstream C++ = not published}
 table and the paragraph reading them, measured on a quiet box in one pass with
 every other section this milestone adds.
+
+## graph_pipeline
+
+A `Pipeline` of `P = 4` pipes over `L = 8` lines run across a
+`LevelGraph` rather than a token stream of its own, which is upstream's
+`graph_pipeline`: a serial `Input` pipe walks the graph's nodes level by level
+and writes the node it is on into the running line's slot of an `L`-wide
+buffer, two `Filter` pipes re-do that node's work, and a serial `FilterFinal`
+adds up the node's predecessors' values from the level above and writes its
+final value back. The pipeline is `composed_of` into a `Taskflow` and run
+once, and -- "ours includes building the graph" from this file's own header --
+building the `Pipeline` and composing it are inside the measured region while
+generating the graph is not, exactly as upstream has them.
+
+**Every pipe is serial, which is upstream's shape and not an omission.**
+`taskflow.cpp` builds all sixteen of its pipe-count variants out of
+`tf::PipeType::SERIAL` alone and `tbb.cpp` matches it with
+`tbb::filter::serial_in_order` throughout, so there is no parallel middle pipe
+anywhere in this benchmark upstream. The concurrency a serial chain still has
+is across *stages* -- one line's token in `FilterFinal` while the next line's
+is still in `Input` -- and that is also what makes a serial `FilterFinal`
+correct here: tokens reach it in token order, the walk is level-major, so every
+node of level `l - 1` has its final value before any node of level `l` asks for
+it.
+
+Sizes are two points off upstream's own `LevelGraph(i, i)` sweep,
+`i = 1, 16, 31, ..., 451`: `i = 16`, where building the pipeline still shows
+against 256 tokens, and `i = 121`, where 14641 tokens' per-node cost dominates
+it. The table reports upstream's own `graph_size()`, `|V| + |E|`, which is 857
+and 51055 for those two. Workers are the usual `1` and `available_parallelism`
+from `benches/common`, and the per-node work is that module's shared `dummy`
+rather than upstream's 16x16 integer matrix multiply -- which allocates three
+`std::vector<std::vector<int>>` per call, so most of what it measures is an
+allocator. **`benches/graph_pipeline.rs` carries its own `LevelGraph`
+generator rather than sharing `benches/graph_traversal.rs`'s:** upstream ships
+`levelgraph.hpp` twice, once per benchmark directory, and this copy is the one
+with `uid()` and `get_value`/`set_value` on a node, plus the in-edges
+`FilterFinal` reads and the traversal's copy drops. Node generation is
+identical in both, and this file's copy keeps the traversal's two documented
+departures from it (a seeded `Xorshift64`, no `_chosen`/`BFS`).
+
+**The baseline is the `mpsc` thread chain, not rayon**, for the reason the
+`pipeline` section above gives at length: rayon has no pipeline primitive. Four
+`std::thread`s chained by `std::sync::mpsc`, one per pipe role, in the role
+`tbb::parallel_pipeline` plays upstream's own `tbb.cpp`. Both sides walk the
+same graph in the same order, call `dummy` once per node per stage and write
+the same values into the same per-node cells, so they differ in their
+scheduling and in nothing else; and as in the `pipeline` section the baseline
+has no `lines`/`workers` axis, so `mpsc` is measured once per graph size and
+read against every row of that size. Both sides' answer is checked against
+upstream's own sequential model -- `gold.cpp`'s `measure_time_gold` --
+*outside* every measured region, before either id is registered, so a schedule
+that sums the wrong predecessors fails the benchmark instead of winning it.
+
+The ids are `graph_pipeline/mpsc/<|V|+|E|>` and
+`graph_pipeline/rustflow/8l_<workers>w/<|V|+|E|>`.
+
+**No figures here yet, and that is deliberate.** Three sibling agents were
+building and testing on this box while this shape was written, so any number
+measured now would be the load rather than the shape. #352 measures every
+section this milestone adds in one quiet-box pass at full width; the
+machine-and-load table and the `|V| + |E|` × workers × {rustflow, mpsc,
+upstream C++ = not published} table land with it, in the format the `sort` and
+`pipeline` sections above use. What is established here is that both ids run to
+completion at both worker counts and that both agree with upstream's `gold`
+answer.
+
+## data_pipeline
+
+Upstream's own `data_pipeline`, which is **not** the measurement the #186/#188
+section above reports: that one is this port's per-line slot against a
+user-owned buffer, invented here, and this one is
+`benchmarks/data_pipeline/taskflow.cpp`'s
+`parallel_pipeline_taskflow_4_pipes` translated. Both live in
+`benches/data_pipeline.rs`, in two criterion groups -- `data_pipeline` for the
+translated shape, `data_pipeline_slot` for the #188 measurement, whose ids are
+unchanged -- and the file's module docs say in their first lines which of the
+two the "Translated from" line covers. **The decision this records:** hosting
+both in one file keeps the ids the #186/#188 section quotes exactly where it
+quotes them; renaming the #188 file to `data_pipeline_slot.rs` would have
+broken them for no gain, since the two shapes share the token counts, the
+sample settings and the `benches/common` body anyway.
+
+The translated shape is a `DataPipeline` of `P = 4` typed pipes over `L = 8`
+lines -- upstream's `-l` default -- composed into a `Taskflow` and run once.
+Its point is that each pipe's output type differs from its input type:
+`Pipeflow& -> int`, then upstream's `int2float`, `float2int` and `int2void`, so
+every value crossing a pipe boundary needs somewhere typed to live, which on
+this port is #186's per-line slot and upstream is a `std::variant`. Every pipe
+is serial, upstream's `-p` default (`"ssssssss"`). Sizes are two points off
+upstream's `L = 1 << i`, `i` in `1..=23`, and they are the same 1024 and 16384
+the `pipeline` and #186/#188 tables use, so the three pipeline shapes are read
+against one another at the same token counts.
+
+Two departures from upstream, both in `benches/data_pipeline.rs`'s own module
+docs as well. The per-pipe work is `benches/common`'s shared `dummy`, folded
+into the value, rather than upstream's 100-iteration `work_int`/`work_float`
+loops -- the same substitution every other shape in this file makes. And
+`float2int` reinterprets the `f64`'s bits instead of casting it: upstream's
+body ends in a C `(int)` cast, which in Rust is the saturating `as` cast this
+crate's `cast_possible_truncation` lint exists to catch and which no benchmark
+may `#[allow]` away, and what the measurement needs from that pipe is that its
+output type differs from its input type and that its value still depends on
+every pipe before it, not the particular arithmetic C performs.
+
+**The baseline is an `mpsc` thread chain**, as in the two sections above and
+for the same reason, with one difference: its three channels are typed as the
+pipes are -- `i64`, `f64`, `i64` -- so the baseline pays for upstream's typed
+chain too, in the role `tbb::parallel_pipeline` plays upstream's own `tbb.cpp`.
+It has no `lines`/`workers` axis, so it is measured once per size. Both sides'
+answer is a wrapping checksum of every token's final value, checked against a
+sequential fold of the same chain *outside* every measured region, before
+either id is registered.
+
+The ids are `data_pipeline/mpsc/<size>` and
+`data_pipeline/rustflow/8l_<workers>w/<size>`.
+
+**No figures here yet, for the same reason the `graph_pipeline` section above
+gives:** the box was loaded by sibling agents while this shape was written, and
+#352 takes the figures for every section this milestone adds in one quiet-box
+pass. The machine-and-load table and the size × workers × {rustflow, mpsc,
+upstream C++ = not published} table land with it. What is established here is
+that both ids run to completion at both worker counts, that each agrees with
+the sequential fold, and that every id the #186/#188 section quotes still
+exists under the name it quotes (`cargo bench -- --list`).
