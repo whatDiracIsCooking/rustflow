@@ -24,13 +24,19 @@
 //! `beg`/`end`/`step` ranges -- the case is cheap per run, the loop is what
 //! upstream actually asserts over, and trimming it would be trimming the
 //! claim rather than the runtime.
+//!
+//! [`range_based_for_each_index_nd`] at the bottom is this file's own case
+//! for `for_each_by_index_nd` (#192): no upstream case to translate, since
+//! `IndexRanges<T, N>` for `N > 1` is this port's own addition to
+//! `for_each_by_index`, but swept over the same partitioner family and
+//! worker-count matrix as [`range_based_for_each_index`] above it.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use rustflow::Executor;
 use rustflow::algorithm::for_each_index::{ForEachIndexBuilder, IndexDispatch};
-use rustflow::algorithm::index_range::{IndexRange, distance};
+use rustflow::algorithm::index_range::{IndexRange, IndexRanges, distance};
 use rustflow::algorithm::partitioner::{
     DefaultClosureWrapper, DefaultPartitioner, DynamicPartitioner, GuidedPartitioner,
     RandomPartitioner, StaticPartitioner,
@@ -483,5 +489,115 @@ fn closure_wrapper_for_each_index_dynamic_runs_at_most_once_per_worker() {
             wrapper_calls.load(Ordering::Relaxed) <= workers,
             "{workers} worker(s)"
         );
+    }
+}
+
+// ----------------------------------------------------------------------------
+// for_each_by_index_nd (#192)
+// ----------------------------------------------------------------------------
+
+/// Every `(i, j)` of a 2-D range is visited exactly once, for every
+/// partitioner and every worker count: this file's own case for
+/// `for_each_by_index_nd`, over the same sweep shape as
+/// [`range_based_for_each_index`].
+fn range_based_for_each_index_nd<P>(make: impl Fn(usize) -> P, workers: usize)
+where
+    P: IndexDispatch + Clone + Send + 'static,
+{
+    let executor = Executor::new(workers);
+    let rows = 9_usize;
+    let cols = 13_usize;
+
+    for c in 0..3_usize {
+        let seen: Arc<Vec<AtomicUsize>> =
+            Arc::new((0..rows * cols).map(|_| AtomicUsize::new(0)).collect());
+        let marked = Arc::clone(&seen);
+
+        let range = IndexRanges::from_ranges([
+            IndexRange::new(0_i32, i32::try_from(rows).expect("rows fits in i32"), 1),
+            IndexRange::new(0_i32, i32::try_from(cols).expect("cols fits in i32"), 1),
+        ]);
+
+        let mut taskflow = Taskflow::new();
+        taskflow.for_each_by_index_nd(
+            range,
+            move |chunk: IndexRanges<i32, 2>| {
+                let (i_beg, i_end, i_step) = chunk.dim(0);
+                let (j_beg, j_end, j_step) = chunk.dim(1);
+                let mut i = i_beg;
+                while if i_step > 0 { i < i_end } else { i > i_end } {
+                    let mut j = j_beg;
+                    while if j_step > 0 { j < j_end } else { j > j_end } {
+                        let row = usize::try_from(i).expect("row is non-negative in this test");
+                        let col = usize::try_from(j).expect("col is non-negative in this test");
+                        marked[row * cols + col].fetch_add(1, Ordering::Relaxed);
+                        j += j_step;
+                    }
+                    i += i_step;
+                }
+            },
+            make(c),
+        );
+        executor.run(&taskflow).wait().expect("no task panicked");
+
+        for (idx, value) in seen.iter().enumerate() {
+            assert_eq!(
+                value.load(Ordering::Relaxed),
+                1,
+                "cell {idx}, c={c}, {workers} worker(s)"
+            );
+        }
+    }
+}
+
+fn range_based_for_each_index_nd_static(workers: usize) {
+    range_based_for_each_index_nd(StaticPartitioner::<DefaultClosureWrapper>::new, workers);
+}
+
+fn range_based_for_each_index_nd_guided(workers: usize) {
+    range_based_for_each_index_nd(GuidedPartitioner::<DefaultClosureWrapper>::new, workers);
+}
+
+fn range_based_for_each_index_nd_dynamic(workers: usize) {
+    range_based_for_each_index_nd(DynamicPartitioner::<DefaultClosureWrapper>::new, workers);
+}
+
+fn range_based_for_each_index_nd_random(workers: usize) {
+    range_based_for_each_index_nd(RandomPartitioner::<DefaultClosureWrapper>::new, workers);
+}
+
+worker_matrix! {
+    range_based_for_each_index_nd_static {
+        range_based_for_each_index_nd_static_1_worker(1),
+        range_based_for_each_index_nd_static_2_workers(2),
+        range_based_for_each_index_nd_static_3_workers(3),
+        range_based_for_each_index_nd_static_4_workers(4),
+    }
+}
+
+worker_matrix! {
+    range_based_for_each_index_nd_guided {
+        range_based_for_each_index_nd_guided_1_worker(1),
+        range_based_for_each_index_nd_guided_2_workers(2),
+        range_based_for_each_index_nd_guided_3_workers(3),
+        range_based_for_each_index_nd_guided_4_workers(4),
+    }
+}
+
+worker_matrix! {
+    range_based_for_each_index_nd_dynamic {
+        range_based_for_each_index_nd_dynamic_1_worker(1),
+        range_based_for_each_index_nd_dynamic_2_workers(2),
+        range_based_for_each_index_nd_dynamic_3_workers(3),
+        range_based_for_each_index_nd_dynamic_4_workers(4),
+    }
+}
+
+worker_matrix! {
+    range_based_for_each_index_nd_random {
+        range_based_for_each_index_nd_random_1_worker(1),
+        range_based_for_each_index_nd_random_2_workers(2),
+        range_based_for_each_index_nd_random_3_workers(3),
+        range_based_for_each_index_nd_random_4_workers(4),
     }
 }

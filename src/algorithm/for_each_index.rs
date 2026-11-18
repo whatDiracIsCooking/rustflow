@@ -17,6 +17,14 @@
 //! runtime task's body that wants `f` to borrow from its own frame instead
 //! of owning everything it touches.
 //!
+//! `for_each_by_index_nd` (free function
+//! [`make_for_each_by_index_nd_task`]) is `for_each_by_index`'s own
+//! counterpart for an
+//! [`IndexRanges<T, N>`](crate::algorithm::index_range::IndexRanges) of more
+//! than one dimension, walking its Cartesian product one dimension-0 row at
+//! a time and handing `f` each row's own N-dimensional sub-range, available
+//! the same three ways.
+//!
 //! # Design
 //!
 //! **No deferred `beg`/`end`/`step`/`range`.** Upstream's `B`, `E`, `S` and
@@ -86,12 +94,41 @@
 //! `tf::PartitionerBase::operator()`'s only real-world implementations are
 //! the same shape -- so this documents the assumption rather than defending
 //! against a caller this module has no test for.
+//!
+//! **The N-dimensional overload is its own name, not the same
+//! `for_each_by_index` dispatching on rank.** Upstream's
+//! `for_each_by_index<R>` is one template over `R: IndexRangesLike`,
+//! `if constexpr`-branching inside on `R::rank == 1` between the 1-D
+//! unraveling fast path and an N-D box partition. Rust's const generics let
+//! [`index_range::IndexRanges<T, N>`](crate::algorithm::index_range::IndexRanges)
+//! serve the same range of `N`, but a function generic over `N` has no
+//! equivalent branch: it type-checks one body for every `N`, so it cannot
+//! call [`IndexRange`]'s own 1-D-only methods the way upstream's discarded
+//! branch can. [`make_for_each_by_index_nd_task`] is therefore a second,
+//! explicitly-named entry point rather than a second case of
+//! [`make_for_each_by_index_task`] -- [`Runtime::for_each_by_index_nd`] and
+//! [`ForEachIndexBuilder::for_each_by_index_nd`] alongside it, the same three
+//! ways the 1-D form is already available.
+//!
+//! **Partitioning an N-D range only ever splits dimension 0.** A worker's
+//! chunk of an `IndexRanges<T, N>` has to stay a single rectangular sub-box
+//! for [`IndexRanges::discrete_domain`](crate::algorithm::index_range::IndexRanges::discrete_domain)
+//! to hand it to `f` in one call, and only a whole number of dimension 0's
+//! own "rows" (one row being every other dimension's own extent) is
+//! guaranteed to form one. So [`make_for_each_by_index_nd_task`] dispatches
+//! over `range.dim_size(0)` rather than `range.size()`, and multiplies each
+//! worker's chunk bounds by the row size before calling `discrete_domain` --
+//! `index_range`'s own `# Design` section says why a finer, any-dimension
+//! split like upstream's `ceil`/`floor`/`upper_slice`/`lower_slice` is out of
+//! this issue's scope.
 
 use std::boxed::Box;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use crate::algorithm::index_range::{IndexInt, IndexRange, distance, is_index_range_invalid};
+use crate::algorithm::index_range::{
+    IndexInt, IndexRange, IndexRanges, distance, is_index_range_invalid,
+};
 use crate::algorithm::partitioner::{
     ClosureWrapper, DynamicLoop, DynamicPartitioner, GuidedPartitioner, Partitioner,
     RandomPartitioner, StaticLoop, StaticPartitioner,
@@ -456,6 +493,93 @@ where
     }
 }
 
+/// Builds the runtime body of the N-dimensional `for_each_by_index`: upstream's
+/// `make_for_each_by_index_task` for `R::rank > 1`. Walks `range`'s Cartesian
+/// product one dimension-0 "row" at a time, calling `f` with each row's own
+/// sub-range (its [`IndexRanges::discrete_domain`]), split across `rt`'s
+/// workers by `part`.
+///
+/// An empty `range` (any dimension's own range invalid or zero-size) makes
+/// the body a no-op. See the module's `# Design` section for why this is a
+/// separate entry point from [`make_for_each_by_index_task`] rather than a
+/// second case of it, and for why partitioning only ever splits dimension 0.
+///
+/// ```
+/// use std::sync::atomic::{AtomicUsize, Ordering};
+/// use std::sync::Arc;
+///
+/// use rustflow::algorithm::for_each_index::make_for_each_by_index_nd_task;
+/// use rustflow::algorithm::index_range::{IndexRange, IndexRanges};
+/// use rustflow::algorithm::partitioner::DefaultPartitioner;
+/// use rustflow::prelude::*;
+/// use rustflow::Executor;
+///
+/// let total = Arc::new(AtomicUsize::new(0));
+/// let counted = Arc::clone(&total);
+///
+/// let range = IndexRanges::from_ranges([IndexRange::new(0_i32, 4, 1), IndexRange::new(0, 5, 1)]);
+/// let mut taskflow = Taskflow::new();
+/// taskflow.emplace_runtime(make_for_each_by_index_nd_task(
+///     range,
+///     move |chunk: IndexRanges<i32, 2>| {
+///         counted.fetch_add(chunk.size(), Ordering::Relaxed);
+///     },
+///     DefaultPartitioner::default(),
+/// ));
+///
+/// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
+/// assert_eq!(total.load(Ordering::Relaxed), 20);
+/// ```
+pub fn make_for_each_by_index_nd_task<T, C, P, const N: usize>(
+    range: IndexRanges<T, N>,
+    f: C,
+    part: P,
+) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static
+where
+    T: IndexInt + Send + 'static,
+    C: Fn(IndexRanges<T, N>) + Clone + Send + 'static,
+    P: IndexDispatch + Clone + Send + 'static,
+{
+    move |rt: &mut Runtime<'_>| {
+        let n = range.size();
+        if n == 0 {
+            return;
+        }
+        let n_outer = range.dim_size(0);
+        let mut w = rt.num_workers();
+        if w <= 1 || n <= part.chunk_size() {
+            let f = f.clone();
+            part.call(|| f(range));
+            return;
+        }
+        if n_outer < w {
+            w = n_outer;
+        }
+        // `n` is nonzero, so every dimension's own count is nonzero (`size`
+        // is their plain product), including `n_outer` itself -- safe to
+        // divide by.
+        let inner_volume = n / n_outer;
+        let f = f.clone();
+        part.dispatch(
+            n_outer,
+            w,
+            || {
+                let f = f.clone();
+                move |part_b: usize, part_e: usize| {
+                    f(range.discrete_domain(part_b * inner_volume, part_e * inner_volume));
+                }
+            },
+            &mut |run_inline, task| {
+                if run_inline {
+                    task();
+                } else {
+                    rt.silent_async(task);
+                }
+            },
+        );
+    }
+}
+
 impl<'rt> Runtime<'rt> {
     /// Walks `[beg, end)` in steps of `step` on this runtime task's own
     /// node, calling `f` once per index: this module's own addition, built
@@ -617,6 +741,83 @@ impl<'rt> Runtime<'rt> {
             );
         });
     }
+
+    /// Walks `range`'s Cartesian product one dimension-0 row at a time on
+    /// this runtime task's own node, calling `f` with each row's own
+    /// sub-range: this module's own addition, built on [`Runtime::scope`]
+    /// for [`Runtime::for_each_index`]'s reason. See the module's `# Design`
+    /// section for why this is a distinct method from
+    /// [`Runtime::for_each_by_index`] rather than a second case of it.
+    ///
+    /// ```
+    /// use rustflow::algorithm::index_range::{IndexRange, IndexRanges};
+    /// use rustflow::algorithm::partitioner::DefaultPartitioner;
+    /// use rustflow::prelude::*;
+    /// use rustflow::Executor;
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// taskflow.emplace_runtime(|runtime: &mut Runtime<'_>| {
+    ///     let mut seen = 0_usize;
+    ///     let range =
+    ///         IndexRanges::from_ranges([IndexRange::new(0_i32, 4, 1), IndexRange::new(0, 3, 1)]);
+    ///     runtime.for_each_by_index_nd(
+    ///         range,
+    ///         |chunk: IndexRanges<i32, 2>| {
+    ///             let _ = chunk.size();
+    ///         },
+    ///         DefaultPartitioner::default(),
+    ///     );
+    ///     seen += 1;
+    ///     assert_eq!(seen, 1);
+    /// });
+    ///
+    /// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
+    /// ```
+    pub fn for_each_by_index_nd<T, C, P, const N: usize>(
+        &mut self,
+        range: IndexRanges<T, N>,
+        f: C,
+        part: P,
+    ) where
+        T: IndexInt + Send + 'static,
+        C: Fn(IndexRanges<T, N>) + Clone + Send,
+        P: IndexDispatch + Clone + Send + 'static,
+    {
+        let n = range.size();
+        if n == 0 {
+            return;
+        }
+        let n_outer = range.dim_size(0);
+        let mut w = self.num_workers();
+        if w <= 1 || n <= part.chunk_size() {
+            let f = f.clone();
+            part.call(|| f(range));
+            return;
+        }
+        if n_outer < w {
+            w = n_outer;
+        }
+        let inner_volume = n / n_outer;
+        self.scope(move |s| {
+            part.dispatch(
+                n_outer,
+                w,
+                || {
+                    let f = f.clone();
+                    move |part_b: usize, part_e: usize| {
+                        f(range.discrete_domain(part_b * inner_volume, part_e * inner_volume));
+                    }
+                },
+                &mut |run_inline, task| {
+                    if run_inline {
+                        task();
+                    } else {
+                        s.spawn(task);
+                    }
+                },
+            );
+        });
+    }
 }
 
 /// [`FlowBuilder`] wrappers for [`for_each_index`](make_for_each_index_task)
@@ -673,6 +874,26 @@ pub trait ForEachIndexBuilder: FlowBuilder {
         P: IndexDispatch + Clone + Send + 'static,
     {
         self.emplace_runtime(make_for_each_by_index_task(range, f, part))
+    }
+
+    /// Creates a runtime task that walks `range`'s Cartesian product one
+    /// dimension-0 row at a time, calling `f` with each row's own sub-range:
+    /// upstream's `FlowBuilder::for_each_by_index` for `R::rank > 1`, over
+    /// [`make_for_each_by_index_nd_task`]. See the module's `# Design`
+    /// section for why this is a distinct method rather than a second case
+    /// of [`Self::for_each_by_index`].
+    fn for_each_by_index_nd<T, C, P, const N: usize>(
+        &mut self,
+        range: IndexRanges<T, N>,
+        f: C,
+        part: P,
+    ) -> Task
+    where
+        T: IndexInt + Send + 'static,
+        C: Fn(IndexRanges<T, N>) + Clone + Send + 'static,
+        P: IndexDispatch + Clone + Send + 'static,
+    {
+        self.emplace_runtime(make_for_each_by_index_nd_task(range, f, part))
     }
 }
 
@@ -790,6 +1011,54 @@ mod tests {
                 .expect("no task panicked");
 
             assert_eq!(total.load(Ordering::Relaxed), 97, "{workers} worker(s)");
+        }
+    }
+
+    #[test]
+    fn for_each_by_index_nd_visits_every_cell_exactly_once() {
+        use crate::algorithm::index_range::IndexRanges;
+
+        for workers in 1..=4 {
+            let rows = 7_usize;
+            let cols = 11_usize;
+            let seen: Arc<Vec<AtomicUsize>> =
+                Arc::new((0..rows * cols).map(|_| AtomicUsize::new(0)).collect());
+            let marked = Arc::clone(&seen);
+
+            let range = IndexRanges::from_ranges([
+                IndexRange::new(0_i32, 7, 1),
+                IndexRange::new(0_i32, 11, 1),
+            ]);
+
+            let mut taskflow = Taskflow::new();
+            taskflow.for_each_by_index_nd(
+                range,
+                move |chunk: IndexRanges<i32, 2>| {
+                    let (i0, i1, _) = chunk.dim(0);
+                    let (j0, j1, _) = chunk.dim(1);
+                    for i in i0..i1 {
+                        for j in j0..j1 {
+                            let row = usize::try_from(i).expect("non-negative in this test");
+                            let col = usize::try_from(j).expect("non-negative in this test");
+                            marked[row * cols + col].fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                },
+                DefaultPartitioner::default(),
+            );
+
+            Executor::new(workers)
+                .run(&taskflow)
+                .wait()
+                .expect("no task panicked");
+
+            for (idx, count) in seen.iter().enumerate() {
+                assert_eq!(
+                    count.load(Ordering::Relaxed),
+                    1,
+                    "cell {idx}, {workers} worker(s)"
+                );
+            }
         }
     }
 

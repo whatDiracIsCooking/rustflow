@@ -7,9 +7,11 @@
 //! [`is_index_range_invalid`] and [`distance`], are the rule it is built on
 //! and the element count the rule implies.
 //!
-//! Multi-dimensional index ranges — the Cartesian product of several of
-//! these, upstream's `IndexRanges<T, N>` for `N > 1` — are a different type
-//! this module does not define; this one stays one-dimensional.
+//! [`IndexRanges<T, N>`] is the Cartesian product of `N` of these — upstream's
+//! own general template, of which `IndexRange<T>` is the `N == 1` case
+//! (`using IndexRange = IndexRanges<T, 1>`). This port keeps the two as
+//! independent types rather than aliasing one to the other; see the
+//! `# Design` section below for why.
 //!
 //! # Design
 //!
@@ -45,6 +47,43 @@
 //!   this port keeps the getters and the all-three-at-once `reset`, and
 //!   leaves a per-field setter unported until something other than a test
 //!   needs one.
+//! - **`IndexRanges<T, N>` stays its own struct, not `IndexRange<T>` aliased
+//!   to `N == 1`, and a const generic rather than a trait.** Upstream's
+//!   one-dimensional-only members (`begin`, `end`, `step_size`, `reset`) are
+//!   gated by a `requires (N == 1)` clause C++ checks per instantiation, so a
+//!   single class body serves both shapes. Rust has no equivalent gate
+//!   inside one generic-over-`N` impl block: a function generic over `N`
+//!   type-checks every branch for every `N`, so it cannot call a method only
+//!   `IndexRanges<T, 1>` has, the way `if constexpr` lets upstream's own
+//!   `for_each_by_index` do. Aliasing the two here would still need two
+//!   call-site-visible shapes wherever that distinction matters, for no
+//!   simplification, so [`IndexRange<T>`] stays exactly the type it already
+//!   was and [`IndexRanges<T, N>`] is its own const-generic sibling. A trait
+//!   standing in for the `N == 1` / `N > 1` distinction was the other option
+//!   this module could have taken; it would only pay off if a caller needed
+//!   one call site generic over an `N` it does not already know at that
+//!   site, which none here does, so the const generic is the whole answer.
+//! - **`discrete_domain` on `IndexRanges<T, N>` only ever narrows dimension
+//!   0.** A `[part_beg, part_end)` slice of the fully flattened, row-major
+//!   space is a valid axis-aligned box only when it is a whole number of
+//!   "rows" of the inner dimensions — cutting across a row boundary produces
+//!   a staircase, not a rectangle, which is exactly why upstream's own
+//!   N-dimensional story (`ceil`/`floor`/`upper_slice`/`lower_slice`) grows a
+//!   box dimension by dimension under a "trailing zeros" rule instead of
+//!   unraveling an arbitrary chunk. Those four methods partition any
+//!   dimension and are out of this issue's scope; this port's
+//!   `discrete_domain` instead keeps the 1-D method's own contract — the
+//!   caller picks a valid `part_beg`/`part_end` — extended to say they must
+//!   also be multiples of the product of every dimension after the first,
+//!   so narrowing dimension 0 alone is always exact.
+//! - **`size()` is the plain product, not upstream's zero-stops-accumulation
+//!   rule.** Upstream's `size()` treats a zero-size dimension as stopping a
+//!   nested loop's own dimension and everything inside it, while leaving
+//!   outer dimensions unaffected — a rule `ceil`/`floor`/`upper_slice`/
+//!   `lower_slice` need in order to know which dimensions are still
+//!   "active". Without those methods this port has no caller for that
+//!   distinction, so `size()` here is the straightforward product of every
+//!   dimension's own count, zero if any one of them is.
 
 use core::fmt;
 use core::ops::{Add, Mul};
@@ -268,9 +307,165 @@ impl<T: IndexInt> IndexRange<T> {
     }
 }
 
+/// The Cartesian product of `N` [`IndexRange<T>`]s, upstream's general
+/// `IndexRanges<T, N>` template (of which `IndexRange<T>` is upstream's own
+/// `N == 1` case, aliased there but not here — see the module's `# Design`
+/// section for why).
+///
+/// Row-major: dimension `0` is outermost and varies slowest, dimension
+/// `N - 1` innermost and fastest, matching the natural nesting of `for`
+/// loops written outer-to-inner in that order. Dimensions are independent:
+/// any combination of positive, negative or mixed step sizes across them is
+/// fine, as long as each dimension's own `(begin, end, step)` is individually
+/// valid (see [`is_index_range_invalid`]).
+///
+/// ```
+/// use rustflow::algorithm::index_range::{IndexRange, IndexRanges};
+///
+/// // 3D: mixed step sizes, upstream's own `r3.size() == 120` example.
+/// let r3 = IndexRanges::from_ranges([
+///     IndexRange::new(0, 4, 1),   // dim 0: 4 elements
+///     IndexRange::new(0, 10, 2),  // dim 1: 5 elements (0,2,4,6,8)
+///     IndexRange::new(0, 6, 1),   // dim 2: 6 elements
+/// ]);
+/// assert_eq!(r3.size(), 120);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexRanges<T: IndexInt, const N: usize> {
+    dims: [(T, T, T); N],
+}
+
+impl<T: IndexInt, const N: usize> IndexRanges<T, N> {
+    /// This instantiation's dimensionality: upstream's `rank`.
+    pub const RANK: usize = N;
+
+    /// Builds an `N`-dimensional range from `N` one-dimensional ones, one per
+    /// dimension in order from outermost (dimension 0) to innermost
+    /// (dimension `N - 1`): upstream's constructor from `N` `IndexRange<T>`s.
+    ///
+    /// ```
+    /// use rustflow::algorithm::index_range::{IndexRange, IndexRanges};
+    ///
+    /// let r = IndexRanges::from_ranges([IndexRange::new(0, 4, 1), IndexRange::new(0, 6, 1)]);
+    /// assert_eq!(r.size(), 24);
+    /// ```
+    pub fn from_ranges(ranges: [IndexRange<T>; N]) -> Self {
+        Self {
+            dims: ranges.map(|r| (r.begin(), r.end(), r.step_size())),
+        }
+    }
+
+    /// The `(begin, end, step_size)` tuple for dimension `d`: upstream's
+    /// `dim(d) const`.
+    ///
+    /// # Panics
+    ///
+    /// If `d >= N`.
+    pub fn dim(&self, d: usize) -> (T, T, T) {
+        self.dims[d]
+    }
+
+    /// A mutable reference to the `(begin, end, step_size)` tuple for
+    /// dimension `d`: upstream's `dim(d)`, used to rebind a stateful range's
+    /// bounds at run time the way [`IndexRange::reset`] does for `N == 1`.
+    ///
+    /// # Panics
+    ///
+    /// If `d >= N`.
+    pub fn dim_mut(&mut self, d: usize) -> &mut (T, T, T) {
+        &mut self.dims[d]
+    }
+
+    /// The number of elements along dimension `d`, independent of every
+    /// other dimension: upstream's `size(d)`.
+    ///
+    /// # Panics
+    ///
+    /// If `d >= N`.
+    pub fn dim_size(&self, d: usize) -> usize {
+        let (beg, end, step) = self.dims[d];
+        distance(beg, end, step)
+    }
+
+    /// The total number of elements in the Cartesian product: the plain
+    /// product of every dimension's own [`Self::dim_size`], zero if any one
+    /// of them is. See the module's `# Design` section for how this differs
+    /// from upstream's `size()`.
+    ///
+    /// ```
+    /// use rustflow::algorithm::index_range::{IndexRange, IndexRanges};
+    ///
+    /// let r = IndexRanges::from_ranges([IndexRange::new(0, 4, 1), IndexRange::new(0, 0, 1)]);
+    /// assert_eq!(r.size(), 0);
+    /// ```
+    pub fn size(&self) -> usize {
+        (0..N).map(|d| self.dim_size(d)).product()
+    }
+
+    /// Maps a contiguous slice `[part_beg, part_end)` of this range's
+    /// zero-based flattened element positions back to the sub-range that
+    /// covers exactly those elements, narrowing dimension 0 and copying
+    /// every other dimension through unchanged.
+    ///
+    /// The caller must ensure `part_end <= self.size()` (as [`IndexRange`]'s
+    /// own `discrete_domain` already requires) and that `part_beg` and
+    /// `part_end` are each a multiple of the product of every dimension's
+    /// own [`Self::dim_size`] after dimension 0 — see the module's `# Design`
+    /// section for why only a slice aligned that way is a valid rectangular
+    /// sub-range.
+    ///
+    /// ```
+    /// use rustflow::algorithm::index_range::{IndexRange, IndexRanges};
+    ///
+    /// let r = IndexRanges::from_ranges([IndexRange::new(0, 4, 1), IndexRange::new(0, 3, 1)]);
+    /// // dim 1 has 3 elements per row of dim 0, so position 3 is row 1.
+    /// let sub = r.discrete_domain(3, 6);
+    /// assert_eq!(sub.dim(0), (1, 2, 1));
+    /// assert_eq!(sub.dim(1), (0, 3, 1));
+    /// ```
+    pub fn discrete_domain(&self, part_beg: usize, part_end: usize) -> Self {
+        let inner_volume = self.inner_volume();
+        let outer_beg = part_beg.checked_div(inner_volume).unwrap_or(0);
+        let outer_end = part_end.checked_div(inner_volume).unwrap_or(0);
+        let (beg0, _end0, step0) = self.dims[0];
+        let mut dims = self.dims;
+        dims[0] = (
+            beg0 + step0 * T::from_position(outer_beg),
+            beg0 + step0 * T::from_position(outer_end),
+            step0,
+        );
+        Self { dims }
+    }
+
+    /// The product of every dimension's own [`Self::dim_size`] after
+    /// dimension 0 -- the number of flattened positions one step along
+    /// dimension 0 covers, and the granularity [`Self::discrete_domain`]
+    /// requires its arguments to respect.
+    fn inner_volume(&self) -> usize {
+        (1..N).map(|d| self.dim_size(d)).product()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_ranges_nd_from_ranges_and_dim_round_trip() {
+        let r = IndexRanges::from_ranges([IndexRange::new(0, 4, 1), IndexRange::new(10, 0, -2)]);
+        assert_eq!(IndexRanges::<i32, 2>::RANK, 2);
+        assert_eq!(r.dim(0), (0, 4, 1));
+        assert_eq!(r.dim(1), (10, 0, -2));
+        assert_eq!(r.size(), 4 * 5);
+    }
+
+    #[test]
+    fn index_ranges_nd_dim_mut_rebinds_in_place() {
+        let mut r = IndexRanges::from_ranges([IndexRange::new(0, 4, 1), IndexRange::new(0, 5, 1)]);
+        *r.dim_mut(1) = (0, 10, 2);
+        assert_eq!(r.dim(1), (0, 10, 2));
+        assert_eq!(r.size(), 4 * 5);
+    }
 
     #[test]
     fn index_int_from_position_round_trips_through_to_usize_checked() {
