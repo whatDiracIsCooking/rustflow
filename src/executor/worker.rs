@@ -21,6 +21,30 @@
 //! inside the `WorkerThread` frame already running that worker's loop, which
 //! the code it calls cannot name, so it gets a second view: `LocalQueue`.
 //!
+//! **No thread handle, and no thread id either.** Upstream's
+//! `Worker::thread()` lends out a mutable `std::thread&`, for the one purpose
+//! its own class docs and `worker.hpp`'s `WorkerInterface` example name:
+//! `native_handle()` into `pthread_setaffinity_np`. [`Worker`] answers
+//! neither half of that. The native handle std will part with lives on the
+//! [`JoinHandle`](std::thread::JoinHandle) the executor owns, not on a
+//! `&Worker` a hook can reach, and it is a raw pthread any thread could then
+//! act on. The one thing std does offer for a thread, a
+//! [`ThreadId`](std::thread::ThreadId), cannot set affinity, and it would
+//! also be no news to its reader: every path handing out a `&Worker` or a
+//! [`WorkerView`] -- [`WorkerInterface`]'s two hooks, `Executor::this_worker`,
+//! `Runtime::worker`, `Subflow::worker`, and an observer's view, a non-worker
+//! thread being refused a corun rather than running a body -- hands out the
+//! worker *of the calling thread*, so a `Worker::thread_id()` would return
+//! `std::thread::current().id()` by construction. The informative direction
+//! is the other one, and the port already has it: `Executor::this_worker` and
+//! `this_worker_id` answer "which worker is this thread" out of the
+//! executor's thread-id map, which is also upstream's own `this_worker_id`.
+//! A caller who wants affinity sets it from inside
+//! [`WorkerInterface::scheduler_prologue`], which runs on the worker's own
+//! thread and so needs nothing lent to it. `DESIGN.md`'s "Decisions taken in
+//! M10" has the decision, and `tests/workers.rs` pins the premise it rests
+//! on.
+//!
 //! **Conditional scheduling.** A conditioner -- [`Handle::Condition`] or
 //! [`Handle::MultiCondition`] -- is the one node kind that picks its own
 //! successors, and that single fact is what the strong/weak dependency split

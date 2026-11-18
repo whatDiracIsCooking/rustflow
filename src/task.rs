@@ -340,6 +340,19 @@ impl<'a> TaskRef<'a> {
     /// through [`FlowBuilder::task_ref`](crate::FlowBuilder::task_ref) against
     /// the wrong arena.
     ///
+    /// The walk holds the node's subgraph lock for its whole length, and that
+    /// lock is a plain [`Mutex`]: calling this method again *for the same
+    /// subflow task* from inside its own visitor -- to resolve a successor
+    /// index a nested [`TaskRef::for_each_successor`] handed back into a name,
+    /// say -- re-enters that lock on the same thread and hangs, rather than
+    /// panicking or failing to compile. Resolve in two passes instead: one
+    /// walk builds a `HashMap<Task, String>` of the subflow's own task names,
+    /// and a second walk, after the first has returned its lock, reads each
+    /// task's successors and resolves them against that map. Two *different*
+    /// subflow tasks are two different locks and nest safely, but the two-pass
+    /// shape is the one to reach for either way, since it is also what
+    /// [`TaskRef::for_each_successor`] asks of a caller that wants to edit.
+    ///
     /// # Examples
     ///
     /// ```

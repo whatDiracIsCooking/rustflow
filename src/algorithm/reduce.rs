@@ -51,7 +51,11 @@
 //! `Fn(&_, &_) -> _`, not upstream's by-value `O`: a reference-taking
 //! signature never needs to move a value out of a `&mut R` (no `Default`,
 //! no placeholder swap) either to seed a local or, at the very end, to fold
-//! a worker's pooled result back into the caller's `init`.
+//! a worker's pooled result back into the caller's `init`. For `T = String`
+//! that same bound is what makes a `bop`/`gop`/`uop` here a closure literal
+//! rather than a named `fn`: [`crate::algorithm::scan`]'s own `# Design`
+//! section has the `clippy::ptr_arg` reason, which applies unchanged to
+//! every operator below.
 //!
 //! **Every worker merges into a shared pool, not directly into `init`.**
 //! Upstream's own per-worker merge locks a mutex and folds straight into

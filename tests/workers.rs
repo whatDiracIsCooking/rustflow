@@ -16,13 +16,21 @@
 //!   cannot be handed it as an argument.
 //! - the last case is from the issue rather than from upstream: an executor
 //!   that is created and dropped in a loop must not leak a thread.
+//!
+//! A third case of this file's own is
+//! [`a_worker_a_caller_reads_is_the_thread_it_runs_on`], added by #260 as the
+//! premise behind the decision that [`Worker`] lends out neither a thread
+//! handle nor a thread id: every `&Worker` a caller can reach is the one
+//! belonging to the thread it is reading from.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+use std::thread::{self, ThreadId};
 use std::time::Duration;
 
-use rustflow::{Executor, Worker, WorkerInterface};
+use rustflow::{Executor, FlowBuilder, Runtime, Taskflow, Worker, WorkerInterface};
 
 // Only the matrix macro: the counters here are `SeqCst` fields of a worker
 // interface rather than the `Relaxed` shares `common/counters.rs` hands to a
@@ -443,6 +451,81 @@ fn creating_and_dropping_executors_joins_every_worker() {
         assert!(
             after <= before + SIBLING_SLACK,
             "thread count went from {before} to {after}"
+        );
+    }
+}
+
+/// What each worker's prologue recorded about itself: the thread the prologue
+/// ran on, keyed by [`Worker::id`].
+#[derive(Debug, Default)]
+struct ThreadsByWorker {
+    threads: Mutex<HashMap<usize, ThreadId>>,
+}
+
+impl ThreadsByWorker {
+    fn threads(&self) -> MutexGuard<'_, HashMap<usize, ThreadId>> {
+        self.threads.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl WorkerInterface for ThreadsByWorker {
+    fn scheduler_prologue(&self, worker: &Worker) {
+        let already = self.threads().insert(worker.id(), thread::current().id());
+        assert!(
+            already.is_none(),
+            "worker {} entered the scheduling loop twice",
+            worker.id()
+        );
+    }
+
+    fn scheduler_epilogue(&self, _worker: &Worker, _panicked: Option<Box<dyn Any + Send>>) {}
+}
+
+/// The premise behind `Worker` lending out neither a thread handle nor a
+/// thread id (#260, and `DESIGN.md`'s M10 entry): the `&Worker` a caller
+/// reads is always the one belonging to the thread it reads from, so the
+/// `ThreadId` such an accessor would hand back is the one
+/// `std::thread::current().id()` already gives.
+///
+/// The prologue hook records `(worker id, thread)` for every worker as it
+/// enters the loop -- which is before it can run any task -- and each body
+/// records the same pair, taking its worker through `Runtime::worker` rather
+/// than through the executor's own thread-id map, so the two sides are
+/// independent reads. A body that ran on a thread its own worker's prologue
+/// never claimed would mean one of the two is answering about another worker.
+#[test]
+fn a_worker_a_caller_reads_is_the_thread_it_runs_on() {
+    const WORKERS: usize = 4;
+    const TASKS: usize = 64;
+
+    let recorded = Arc::new(ThreadsByWorker::default());
+    let interface: Arc<dyn WorkerInterface> = Arc::clone(&recorded) as _;
+    let executor = Executor::with_worker_interface(WORKERS, interface);
+
+    let seen: Arc<Mutex<Vec<(usize, ThreadId)>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut taskflow = Taskflow::new();
+    for _ in 0..TASKS {
+        let seen = Arc::clone(&seen);
+        taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
+            let pair = (runtime.worker().id(), thread::current().id());
+            seen.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(pair);
+        });
+    }
+
+    executor.run(&taskflow).wait().expect("no task panicked");
+
+    let prologues = recorded.threads();
+    let seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(seen.len(), TASKS, "a task body did not report in");
+
+    for &(id, on_thread) in seen.iter() {
+        assert!(id < WORKERS, "a body reported worker {id} of {WORKERS}");
+        assert_eq!(
+            prologues.get(&id),
+            Some(&on_thread),
+            "worker {id}'s body ran on a thread its own prologue never claimed"
         );
     }
 }

@@ -205,6 +205,13 @@ set of test names before and after" means the same set of item paths with
   duplicate versions), and calling it out in the summary.
 - Match the surrounding code's comment density and voice. Comments here
   explain *why* a choice was made; they do not narrate the code.
+- In an `examples/` or `tests/` file, a type the code never names goes in
+  plain backticks, not in an intra-doc link. `cargo doc` does not build those
+  targets, so the link is never rendered anywhere, while the `use` it needs to
+  resolve is `unused_imports` under `clippy --all-targets -D warnings` --
+  which an example that infers the type from a call (`executor.task_group()?`)
+  cannot avoid by using it. Inside `src/` the link is the right spelling and
+  the import is a real one.
 
 ## Stay in your lane
 
