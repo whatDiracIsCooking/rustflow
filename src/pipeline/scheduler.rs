@@ -379,6 +379,61 @@ impl Pipeline {
     /// ("first pipe must be serial"). [`Pipeline::num_lines`] is not
     /// re-checked, already having been checked nonzero by whichever call
     /// established it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    ///
+    /// use rustflow::pipeline::pipe::{Pipe, PipeType, Pipeflow};
+    /// use rustflow::pipeline::scheduler::Pipeline;
+    /// use rustflow::prelude::*;
+    /// use rustflow::Executor;
+    ///
+    /// // Compose, run, reset the chain, then compose *again*: upstream's
+    /// // `scalable_pipeline.cpp` runs its one already-composed task a
+    /// // second time instead, which is the line a faithful translation has
+    /// // to be rewritten at.
+    ///
+    /// // One serial pipe that stops after three tokens, counting each one
+    /// // it lets through into `counter`.
+    /// fn counting_pipe(counter: &Arc<AtomicUsize>) -> Pipe {
+    ///     let counted = Arc::clone(counter);
+    ///     Pipe::new(PipeType::Serial, move |pf: &mut Pipeflow| {
+    ///         if pf.token() == 3 {
+    ///             pf.stop();
+    ///             return;
+    ///         }
+    ///         counted.fetch_add(1, Ordering::Relaxed);
+    ///     })
+    /// }
+    ///
+    /// let first = Arc::new(AtomicUsize::new(0));
+    /// let second = Arc::new(AtomicUsize::new(0));
+    /// let executor = Executor::new(2);
+    ///
+    /// let mut pipeline = Pipeline::new(2, vec![counting_pipe(&first)]);
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// let module = taskflow.composed_of(&pipeline);
+    /// taskflow.task(module).name("module_of_pipeline");
+    /// executor.run(&taskflow).wait().expect("no task panicked");
+    /// assert_eq!(first.load(Ordering::Relaxed), 3);
+    ///
+    /// // The reset builds a fresh graph, so `taskflow` above still runs the
+    /// // old chain: a second composition is what reaches the new one.
+    /// pipeline.reset_pipes(vec![counting_pipe(&second)]);
+    ///
+    /// let mut again = Taskflow::new();
+    /// let module = again.composed_of(&pipeline);
+    /// again.task(module).name("module_of_reset_pipeline");
+    /// executor.run(&again).wait().expect("no task panicked");
+    ///
+    /// assert_eq!(second.load(Ordering::Relaxed), 3);
+    /// assert_eq!(first.load(Ordering::Relaxed), 3);
+    /// assert_eq!(pipeline.num_tokens(), 3);
+    /// ```
     pub fn reset_pipes(&mut self, pipes: Vec<Pipe>) {
         let (taskflow, state) = Self::build(self.state.num_lines, pipes);
         self.taskflow = taskflow;

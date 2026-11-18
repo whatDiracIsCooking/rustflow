@@ -9,6 +9,11 @@
 //! `Ifelse` (16), `PipelineinPipeline` (18), `SNIG` (12) and
 //! `Subflow.{1,3,5,7}R` (24).
 //!
+//! Two cases at the end run `Reset` and `LinesReset` through a
+//! [`DataPipeline`] instead, for [`DataPipeline::reset_pipes`] and
+//! [`DataPipeline::reset_lines`]; their own section comment says what
+//! upstream does and does not have to translate there.
+//!
 //! `ScalablePipeline.move` is not ported: there is nothing for a move test
 //! to prove once a [`Pipeline`] is an ordinary owned value, as `DESIGN.md`
 //! says.
@@ -63,6 +68,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rustflow::Executor;
+use rustflow::pipeline::data_pipeline::{
+    DataPipeline, DataPipelineBuilder, serial_pipe, serial_pipe_with_flow,
+};
 use rustflow::pipeline::pipe::{Pipe, PipeType, Pipeflow};
 use rustflow::pipeline::scheduler::Pipeline;
 use rustflow::prelude::*;
@@ -280,6 +288,123 @@ fn lines_reset() {
     serialized(|| {
         for num_pipes in 1..=10 {
             scalable_pipeline_lines_reset(10, num_pipes);
+        }
+    });
+}
+
+// ----------------------------------------------------------------------------
+// The `DataPipeline` shape of Reset / LinesReset
+//
+// Upstream has no scalable `tf::DataPipeline` and no reset case for one --
+// its `DataPipeline` exposes `reset()` alone -- so these two cases are
+// `ScalablePipeline.Reset` and `ScalablePipeline.LinesReset` run through
+// this port's own [`DataPipeline::reset_pipes`] and
+// [`DataPipeline::reset_lines`], one case per method. The chain is a fixed
+// three pipes rather than upstream's sweep over `num_pipes`: a typed chain's
+// length is its type, so there is no loop that builds one of a runtime
+// length.
+// ----------------------------------------------------------------------------
+
+/// The length of [`counting_chain`], which upstream's own `num_pipes`
+/// parameter stands for.
+const DATA_PIPES: usize = 3;
+
+/// The typed form of [`counting_pipe`]'s chain: the running total upstream
+/// keeps in `data[pf.line()]` is the value the slots carry from one pipe to
+/// the next, and every pipe past the first checks it is exactly
+/// `token * DATA_PIPES + pipe` before passing it on. Pipe `0`'s own copy of
+/// that check is vacuous once the total is a value rather than a cell -- it
+/// stores `DATA_PIPES * token` and would compare it against itself -- so
+/// only the two that add to it carry one.
+fn counting_chain(
+    builder: DataPipelineBuilder<()>,
+    reached_last: Arc<AtomicUsize>,
+) -> DataPipelineBuilder<()> {
+    builder
+        .pipe(serial_pipe_with_flow::<(), usize>(|(), pf| {
+            if pf.token() == STOP_AT {
+                pf.stop();
+                return 0;
+            }
+            DATA_PIPES * pf.token()
+        }))
+        .pipe(serial_pipe_with_flow::<usize, usize>(|total, pf| {
+            let total = total + 1;
+            assert_eq!(total, pf.token() * DATA_PIPES + pf.pipe());
+            total
+        }))
+        .pipe(serial_pipe_with_flow::<usize, ()>(move |total, pf| {
+            let total = total + 1;
+            assert_eq!(total, pf.token() * DATA_PIPES + pf.pipe());
+            reached_last.fetch_add(1, Ordering::Relaxed);
+        }))
+}
+
+/// [`dummy_pipe`]'s typed counterpart: the throwaway one-pipe shape a
+/// `DataPipeline` starts from, for the reason this module's own doc gives
+/// for the untyped one.
+fn dummy_data_pipeline(num_lines: usize) -> DataPipeline {
+    DataPipeline::builder(num_lines)
+        .pipe(serial_pipe::<(), ()>(|()| {}))
+        .build()
+}
+
+/// `ScalablePipeline.Reset` through a [`DataPipeline`]: for every line count
+/// up to ten, [`DataPipeline::reset_pipes`] a throwaway pipeline onto the
+/// typed counting chain, compose and run it, and check all [`STOP_AT`]
+/// tokens reached the last pipe while the line count stayed the one the
+/// pipeline was built with.
+#[test]
+fn data_pipeline_reset_pipes() {
+    serialized(|| {
+        for num_lines in 1..=10 {
+            let executor = Executor::new(2);
+            let reached_last = Arc::new(AtomicUsize::new(0));
+
+            let mut pipeline = dummy_data_pipeline(num_lines);
+            pipeline.reset_pipes(|builder| counting_chain(builder, Arc::clone(&reached_last)));
+
+            let mut taskflow = Taskflow::new();
+            let module = taskflow.composed_of(&pipeline);
+            taskflow.task(module).name("module_of_data_pipeline");
+
+            executor.run(&taskflow).wait().expect("no task panicked");
+
+            assert_eq!(pipeline.num_lines(), num_lines);
+            assert_eq!(pipeline.num_pipes(), DATA_PIPES);
+            assert_eq!(pipeline.num_tokens(), STOP_AT);
+            assert_eq!(reached_last.load(Ordering::Relaxed), STOP_AT);
+        }
+    });
+}
+
+/// `ScalablePipeline.LinesReset` through a [`DataPipeline`]: one pipeline
+/// object, [`DataPipeline::reset_lines`]ed to each line count in turn and
+/// composed into a fresh outer taskflow after each reset. `reached_last` is
+/// upstream's own `N`, never reset between iterations, so after the `l`'th
+/// run it has counted `l * STOP_AT` tokens -- upstream's
+/// `REQUIRE(N == 1111 * l)`.
+#[test]
+fn data_pipeline_lines_reset() {
+    serialized(|| {
+        let executor = Executor::new(2);
+        let reached_last = Arc::new(AtomicUsize::new(0));
+        let mut pipeline = dummy_data_pipeline(1);
+
+        for l in 1..=10 {
+            pipeline.reset_lines(l, |builder| {
+                counting_chain(builder, Arc::clone(&reached_last))
+            });
+
+            let mut taskflow = Taskflow::new();
+            let module = taskflow.composed_of(&pipeline);
+            taskflow.task(module).name("module_of_data_pipeline");
+
+            executor.run(&taskflow).wait().expect("no task panicked");
+
+            assert_eq!(pipeline.num_lines(), l);
+            assert_eq!(pipeline.num_tokens(), STOP_AT);
+            assert_eq!(reached_last.load(Ordering::Relaxed), STOP_AT * l);
         }
     });
 }

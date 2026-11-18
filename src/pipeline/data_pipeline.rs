@@ -14,6 +14,17 @@
 //! `DESIGN.md`'s "Decisions taken in M8" section has why this chain is built
 //! from two callable shapes rather than upstream's three, and what the slot
 //! that carries a token's value from one pipe to the next costs.
+//!
+//! **The two scalable reset forms take a closure over a builder this type
+//! starts, not an already-built chain.** There is no upstream shape to
+//! follow -- `tf::DataPipeline` exposes only `reset()` -- and the obvious
+//! alternative, a chain value a caller builds and hands over, gives up what
+//! [`DataPipelineBuilder`] exists for: its per-line slots are sized by
+//! whichever line count built it, so a chain built over a different count
+//! would turn [`DataPipelineBuilder::pipe`]'s compile-time type check into a
+//! runtime index out of bounds. Handing the closure a builder over the line
+//! count the reset is about keeps the check and leaves the count the
+//! method's own to decide.
 
 use std::any::Any;
 use std::fmt;
@@ -443,6 +454,147 @@ impl DataPipeline {
         self.pipeline.reset();
     }
 
+    /// Rebuilds this pipeline over a new typed chain, keeping its number of
+    /// lines: [`Pipeline::reset_pipes`] behind the compile-time type check
+    /// [`DataPipelineBuilder::pipe`] performs. `chain` is handed a fresh
+    /// builder over this pipeline's own [`DataPipeline::num_lines`] lines and
+    /// returns it with the new chain appended. Every line starts again at
+    /// pipe `0`, each line's slot is empty again and the token counter
+    /// returns to `0`, as a freshly built pipeline would report.
+    ///
+    /// Upstream's `tf::DataPipeline` has no counterpart -- it exposes only
+    /// `reset()` -- so the shape is this port's own; this module's `# Design`
+    /// section says why it takes a closure rather than an already-built
+    /// chain.
+    ///
+    /// Composing this pipeline into a graph
+    /// (`taskflow.composed_of(&pipeline)`) before calling this method leaves
+    /// that composition pointing at the pre-reset graph, for the reason
+    /// [`Pipeline::reset_pipes`] and `src/pipeline/scheduler.rs`'s own
+    /// `# Design` section give; compose again afterwards to run the new
+    /// chain.
+    ///
+    /// # Panics
+    ///
+    /// Panics with [`Pipeline::reset_pipes`]'s own messages: no pipes ("must
+    /// have at least one pipe"), or a first pipe that is not
+    /// [`PipeType::Serial`] ("first pipe must be serial"). Panics too if
+    /// `chain` returns a builder of its own making rather than the one it
+    /// was handed, whose per-line slots would be sized for a different line
+    /// count.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    ///
+    /// use rustflow::pipeline::data_pipeline::{DataPipeline, serial_pipe, serial_pipe_with_flow};
+    /// use rustflow::prelude::*;
+    /// use rustflow::Executor;
+    ///
+    /// let sum = Arc::new(AtomicUsize::new(0));
+    /// let mut pipeline = DataPipeline::builder(2)
+    ///     .pipe(serial_pipe::<(), ()>(|()| {}))
+    ///     .build();
+    ///
+    /// // A void -> i32 -> void chain replaces the throwaway one above.
+    /// let counted = Arc::clone(&sum);
+    /// pipeline.reset_pipes(|builder| {
+    ///     builder
+    ///         .pipe(serial_pipe_with_flow::<(), i32>(|(), pf| {
+    ///             if pf.token() == 4 {
+    ///                 pf.stop();
+    ///                 return 0;
+    ///             }
+    ///             i32::try_from(pf.token()).expect("a token count fits in an i32")
+    ///         }))
+    ///         .pipe(serial_pipe::<i32, ()>(move |value| {
+    ///             counted.fetch_add(usize::try_from(value).expect("nonnegative"), Ordering::Relaxed);
+    ///         }))
+    /// });
+    /// assert_eq!(pipeline.num_lines(), 2);
+    /// assert_eq!(pipeline.num_pipes(), 2);
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// let module = taskflow.composed_of(&pipeline);
+    /// taskflow.task(module).name("module_of_data_pipeline");
+    ///
+    /// let executor = Executor::new(2);
+    /// executor.run(&taskflow).wait().expect("no task panicked");
+    ///
+    /// assert_eq!(pipeline.num_tokens(), 4);
+    /// assert_eq!(sum.load(Ordering::Relaxed), 0 + 1 + 2 + 3);
+    /// ```
+    pub fn reset_pipes<Last>(
+        &mut self,
+        chain: impl FnOnce(DataPipelineBuilder<()>) -> DataPipelineBuilder<Last>,
+    ) {
+        let num_lines = self.num_lines();
+        let built = chain(Self::builder(num_lines));
+        assert_eq!(
+            built.num_lines, num_lines,
+            "a reset chain must be built on the builder this method hands it"
+        );
+        // The rebuild is the step that can panic, so the new slots replace
+        // this pipeline's own only once it has gone through: a caller that
+        // catches the panic is then left with the chain and the slots it
+        // already had, still each other's.
+        self.pipeline.reset_pipes(built.pipes);
+        self.slots = built.slots;
+    }
+
+    /// Rebuilds this pipeline over a new number of lines and a new typed
+    /// chain: [`Pipeline::reset_lines`] behind the same compile-time type
+    /// check, with `chain` handed a fresh builder over `num_lines` lines
+    /// rather than this pipeline's current count.
+    ///
+    /// [`DataPipeline::reset_pipes`]'s docs cover the rest: what has no
+    /// upstream counterpart, and what an already-composed graph keeps
+    /// running.
+    ///
+    /// # Panics
+    ///
+    /// Panics with [`Pipeline::reset_lines`]'s own messages: `num_lines` of
+    /// `0` ("must have at least one line"), no pipes ("must have at least
+    /// one pipe"), or a first pipe that is not [`PipeType::Serial`] ("first
+    /// pipe must be serial"). Panics too on a `chain` that returns a builder
+    /// of its own making, as [`DataPipeline::reset_pipes`] does.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rustflow::pipeline::data_pipeline::{DataPipeline, serial_pipe};
+    ///
+    /// let mut pipeline = DataPipeline::builder(2)
+    ///     .pipe(serial_pipe::<(), ()>(|()| {}))
+    ///     .build();
+    ///
+    /// pipeline.reset_lines(5, |builder| {
+    ///     builder
+    ///         .pipe(serial_pipe::<(), u8>(|()| 7))
+    ///         .pipe(serial_pipe::<u8, String>(|value| value.to_string()))
+    /// });
+    /// assert_eq!(pipeline.num_lines(), 5);
+    /// assert_eq!(pipeline.num_pipes(), 2);
+    /// assert_eq!(pipeline.num_tokens(), 0);
+    /// ```
+    pub fn reset_lines<Last>(
+        &mut self,
+        num_lines: usize,
+        chain: impl FnOnce(DataPipelineBuilder<()>) -> DataPipelineBuilder<Last>,
+    ) {
+        let built = chain(Self::builder(num_lines));
+        assert_eq!(
+            built.num_lines, num_lines,
+            "a reset chain must be built on the builder this method hands it"
+        );
+        // [`DataPipeline::reset_pipes`]'s own comment: the slots follow the
+        // rebuild rather than lead it.
+        self.pipeline.reset_lines(num_lines, built.pipes);
+        self.slots = built.slots;
+    }
+
     /// Returns a share of the taskflow this pipeline composes into a module
     /// task: upstream's `graph()`, widened to the [`Taskflow`] that owns it,
     /// which is what [`Composable`] needs.
@@ -534,6 +686,48 @@ mod tests {
         assert_eq!(pipeline.num_lines(), 3);
         assert_eq!(pipeline.num_pipes(), 2);
         assert_eq!(pipeline.num_tokens(), 0);
+    }
+
+    /// A chain built on a builder of the caller's own making is rejected:
+    /// its per-line slots are sized for its own line count, not this
+    /// pipeline's, so accepting one would reach past the end of them at run
+    /// time.
+    #[test]
+    #[should_panic(expected = "must be built on the builder this method hands it")]
+    fn a_reset_chain_from_a_foreign_builder_panics() {
+        let mut pipeline = DataPipeline::builder(2)
+            .pipe(serial_pipe::<(), ()>(|()| {}))
+            .build();
+        pipeline
+            .reset_pipes(|_builder| DataPipeline::builder(7).pipe(serial_pipe::<(), ()>(|()| {})));
+    }
+
+    /// Both reset forms leave the pipeline reporting the shape they were
+    /// just given, the token counter back at `0`, and -- for
+    /// [`DataPipeline::reset_lines`] -- one slot per new line.
+    #[test]
+    fn the_reset_forms_read_back_the_shape_they_were_given() {
+        let mut pipeline = DataPipeline::builder(2)
+            .pipe(serial_pipe::<(), ()>(|()| {}))
+            .build();
+
+        pipeline.reset_pipes(|builder| {
+            builder
+                .pipe(serial_pipe::<(), i32>(|()| 1))
+                .pipe(serial_pipe::<i32, i32>(|value| value))
+        });
+        assert_eq!(pipeline.num_lines(), 2);
+        assert_eq!(pipeline.num_pipes(), 2);
+        assert_eq!(pipeline.num_tokens(), 0);
+        assert_eq!(pipeline.slots.len(), 2);
+
+        pipeline.reset_lines(4, |builder| {
+            builder.pipe(serial_pipe::<(), String>(|()| String::new()))
+        });
+        assert_eq!(pipeline.num_lines(), 4);
+        assert_eq!(pipeline.num_pipes(), 1);
+        assert_eq!(pipeline.num_tokens(), 0);
+        assert_eq!(pipeline.slots.len(), 4);
     }
 
     /// A three-pipe chain, run then reset then rerun: every value a pipe

@@ -424,9 +424,10 @@ it by composing a second time into a second `Taskflow` after the reset, with
 a comment at the spot.
 
 - **Status: keep, because** the rebuild-rather-than-mutate design is a
-  recorded decision (issue #185). Proposed change: a doc example on
-  `Pipeline::reset_pipes` itself, next to its existing test, showing the
-  compose-again pattern — the PR that found this suggests exactly that.
+  recorded decision (issue #185); the documentation of it is **tracked by
+  #259**. Proposed change: a doc example on `Pipeline::reset_pipes` itself,
+  next to its existing test, showing the compose-again pattern — the PR that
+  found this suggests exactly that.
 - **Reported in:** PR #252 (#199).
 
 ### `DataPipeline` has no `reset_pipes`/`reset_lines`
@@ -437,8 +438,9 @@ private `Pipeline` and exposes only `reset()`. There is no way to replace a
 equivalent of `scalable_pipeline` meant building a second `DataPipeline` from
 scratch rather than resetting one object twice.
 
-- **Status: open.** Proposed change: thread `reset_pipes`/`reset_lines`
-  through to the inner `Pipeline` the same way `reset()` already delegates.
+- **Status: tracked by #259.** Proposed change: thread
+  `reset_pipes`/`reset_lines` through to the inner `Pipeline` the same way
+  `reset()` already delegates.
 - **Reported in:** PR #252 (#199).
 
 ### Upstream's own data-pipeline example has a live type bug the port's typed builder rejects
