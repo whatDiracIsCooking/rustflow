@@ -1,5 +1,6 @@
 //! Translated from `unittests/test_generate.cpp` (Taskflow v4.1.0):
-//! `ParallelGenerate.*`, `ParallelGenerateN.*`, `ParallelGenerateStateful.4`,
+//! `ParallelGenerate.*`, `ParallelGenerateN.*`, `ParallelGenerateAsync.*`,
+//! `ParallelGenerateNAsync.*`, `ParallelGenerateStateful.4`,
 //! `ParallelGenerateStatefulMixed.4` and `ParallelGenerateNStateful.1`.
 //!
 //! Every case here uses a stateless generator, matching upstream's own
@@ -10,21 +11,23 @@
 //! module's own `generate_calls_a_single_shared_generator_once_per_element`
 //! unit test is where a stateful generator is exercised.
 //!
-//! Two adaptations, both forced by the port rather than chosen, mirroring
-//! `tests/fill.rs`'s own:
+//! Two adaptations, mirroring `tests/fill.rs`'s own:
 //!
-//! - **No `ParallelGenerateAsync`/`ParallelGenerateNAsync`.** No
-//!   `make_generate_task` free function survives the port -- see
-//!   `tests/fill.rs`'s own docs for why, and `src/algorithm/generate.rs`'s.
+//! - **`ParallelGenerateAsync`/`ParallelGenerateNAsync` submit the factory
+//!   through the dependent-async forms**, not upstream's `executor.async`:
+//!   see `tests/fill.rs`'s own docs for what that submission adds.
 //! - **One sweep per worker count, not upstream's fixed four**, over `i64`
 //!   alone rather than `int` and `long double` both: the element type does
 //!   not interact with the partitioning logic this port is checking.
+
+use std::sync::{Arc, Mutex};
 
 use rustflow::algorithm::SlicePartitioner;
 use rustflow::algorithm::partitioner::{
     DefaultClosureWrapper, DefaultPartitioner, DynamicPartitioner, GuidedPartitioner,
     RandomPartitioner, StaticPartitioner,
 };
+use rustflow::algorithm::{make_generate_n_task, make_generate_task};
 use rustflow::prelude::*;
 
 #[macro_use]
@@ -33,8 +36,8 @@ mod common;
 mod slice_graphs;
 
 use slice_graphs::{
-    assert_all, assert_filled_to, bounded_by_a_setup_task, from_a_setup_task, over_lengths,
-    over_owned_data, wrapper_runs_once_per_worker,
+    LENGTHS, assert_all, assert_filled_to, bounded_by_a_setup_task, from_a_setup_task,
+    over_lengths, over_owned_data, wrapper_runs_once_per_worker,
 };
 
 // ----------------------------------------------------------------------------
@@ -277,4 +280,57 @@ fn closure_wrapper_runs_once_per_worker() {
         runtime.generate(data, || 1, part);
         assert!(data.iter().all(|&v| v == 1));
     });
+}
+
+// ----------------------------------------------------------------------------
+// ParallelGenerateAsync / ParallelGenerateNAsync
+// ----------------------------------------------------------------------------
+
+/// Upstream's `generate_async<T>(W, N, val)`: [`make_generate_task`] handed
+/// straight to a submission with no handle of its own and waited for through
+/// [`Executor::wait_for_all`], which is how upstream waits for the future it
+/// discards too.
+#[test]
+fn make_generate_task_runs_from_a_silent_dependent_async_body() {
+    let executor = Executor::new(3);
+
+    for n in LENGTHS {
+        let data = Arc::new(Mutex::new(vec![0i64; n]));
+        let _task = executor.silent_dependent_async_runtime(
+            make_generate_task(
+                Arc::clone(&data),
+                || 12,
+                GuidedPartitioner::<DefaultClosureWrapper>::default(),
+            ),
+            [],
+        );
+        executor.wait_for_all();
+
+        assert_all(&data, 12);
+    }
+}
+
+/// Upstream's `generate_n_async<T>(W, N, C, val)`, over the handled flavour:
+/// [`make_generate_n_task`] waited for through the submission's own handle
+/// rather than the whole executor, the same pairing `tests/fill.rs` uses.
+#[test]
+fn make_generate_n_task_runs_from_a_dependent_async_body() {
+    let executor = Executor::new(3);
+
+    for n in LENGTHS {
+        let count = n / 2;
+        let data = Arc::new(Mutex::new(vec![0i64; n]));
+        let (_task, done) = executor.dependent_async_runtime(
+            make_generate_n_task(
+                Arc::clone(&data),
+                count,
+                || 12,
+                GuidedPartitioner::<DefaultClosureWrapper>::default(),
+            ),
+            [],
+        );
+        done.wait().expect("no task panicked");
+
+        assert_filled_to(&data, count, 12, 0);
+    }
 }

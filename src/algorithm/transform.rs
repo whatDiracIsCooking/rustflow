@@ -1,16 +1,20 @@
 //! Translated from `taskflow/algorithm/transform.hpp` (Taskflow v4.1.0).
 //!
 //! [`Runtime::transform`] is the one-input half of upstream's overloaded
-//! `make_transform_task`/`FlowBuilder::transform`; [`Runtime::transform2`] is
-//! the two-input half, upstream's `requires (!PartitionerLike<...>)` overload
-//! on the same two names. Rust has no overload resolution, so the two keep
-//! upstream's own test-suite names (`ParallelTransform` vs
-//! `ParallelTransform2`) rather than sharing one.
+//! `make_transform_task`/`FlowBuilder::transform`, over a borrowed slice;
+//! [`Runtime::transform2`] is the two-input half, upstream's
+//! `requires (!PartitionerLike<...>)` overload on the same two names. Rust
+//! has no overload resolution, so the two keep upstream's own test-suite
+//! names (`ParallelTransform` vs `ParallelTransform2`) rather than sharing
+//! one, and [`make_transform_task`]/[`make_transform2_task`] are those same
+//! two overloads over owned data.
 //!
 //! The owned-data wrappers over every method this module,
 //! [`fill`](super::fill) and [`generate`](super::generate) add are on
 //! [`AlgorithmBuilder`], the one extension trait the whole algorithm family
-//! shares.
+//! shares, each one line over the matching factory -- `DESIGN.md`'s
+//! "Decisions taken in M10" entry on the three layers says why the port
+//! needs all three where upstream needs two.
 //!
 //! [`AlgorithmBuilder`]: crate::algorithm::AlgorithmBuilder
 //!
@@ -39,6 +43,8 @@
 //! **`fill_n`/`generate_n`'s `count` panics past the slice, rather than
 //! being upstream's unchecked iterator advance.** See
 //! [`fill`](super::fill)'s own `# Design` section.
+
+use std::sync::{Arc, Mutex};
 
 use crate::algorithm::SlicePartitioner;
 use crate::runtime::Runtime;
@@ -193,6 +199,108 @@ impl<'rt> Runtime<'rt> {
         self.scope(|s| {
             part.drive(s, triples.as_mut_slice(), n, w_total, &apply);
         });
+    }
+}
+
+/// Builds the runtime body of a [`Runtime::transform`] task over owned
+/// `input` and `out`: upstream's one-input `make_transform_task`. `out` is
+/// locked once per run of the body, not once per element, and `input` is
+/// read without locking, since nothing here ever writes to it.
+///
+/// `f` and `part` are cloned on every run of the body -- relevant only for a
+/// task a cycle revisits -- matching upstream copying `c` and `part` into its
+/// own closure by value.
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+///
+/// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
+/// use rustflow::algorithm::transform::make_transform_task;
+/// use rustflow::prelude::*;
+/// use rustflow::Executor;
+///
+/// let input = Arc::new(vec![1, 2, 3, 4]);
+/// let out = Arc::new(Mutex::new(vec![0; 4]));
+///
+/// let mut taskflow = Taskflow::new();
+/// taskflow.emplace_runtime(make_transform_task(
+///     Arc::clone(&input),
+///     Arc::clone(&out),
+///     |x: &i32| x * 10,
+///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
+/// ));
+///
+/// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
+/// assert_eq!(*out.lock().expect("uncontended"), vec![10, 20, 30, 40]);
+/// ```
+pub fn make_transform_task<A, B, F, P>(
+    input: Arc<Vec<A>>,
+    out: Arc<Mutex<Vec<B>>>,
+    f: F,
+    part: P,
+) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static
+where
+    A: Sync + Send + 'static,
+    B: Send + 'static,
+    F: Fn(&A) -> B + Sync + Clone + Send + 'static,
+    P: SlicePartitioner + Clone + Send + 'static,
+{
+    move |rt: &mut Runtime<'_>| {
+        let mut guard = out
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        rt.transform(&input, &mut guard, f.clone(), part.clone());
+    }
+}
+
+/// Builds the runtime body of a [`Runtime::transform2`] task over owned `a`,
+/// `b` and `out`: upstream's two-input `make_transform_task` overload, named
+/// `make_transform2_task` for the reason [`Runtime::transform2`]'s own doc
+/// gives.
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+///
+/// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
+/// use rustflow::algorithm::transform::make_transform2_task;
+/// use rustflow::prelude::*;
+/// use rustflow::Executor;
+///
+/// let a = Arc::new(vec![1, 2, 3]);
+/// let b = Arc::new(vec![100, 200, 300]);
+/// let out = Arc::new(Mutex::new(vec![0; 3]));
+///
+/// let mut taskflow = Taskflow::new();
+/// taskflow.emplace_runtime(make_transform2_task(
+///     Arc::clone(&a),
+///     Arc::clone(&b),
+///     Arc::clone(&out),
+///     |x: &i32, y: &i32| x + y,
+///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
+/// ));
+///
+/// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
+/// assert_eq!(*out.lock().expect("uncontended"), vec![101, 202, 303]);
+/// ```
+pub fn make_transform2_task<A, B, C, F, P>(
+    a: Arc<Vec<A>>,
+    b: Arc<Vec<B>>,
+    out: Arc<Mutex<Vec<C>>>,
+    f: F,
+    part: P,
+) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static
+where
+    A: Sync + Send + 'static,
+    B: Sync + Send + 'static,
+    C: Send + 'static,
+    F: Fn(&A, &B) -> C + Sync + Clone + Send + 'static,
+    P: SlicePartitioner + Clone + Send + 'static,
+{
+    move |rt: &mut Runtime<'_>| {
+        let mut guard = out
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        rt.transform2(&a, &b, &mut guard, f.clone(), part.clone());
     }
 }
 

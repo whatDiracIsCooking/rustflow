@@ -1,10 +1,14 @@
 //! Translated from `taskflow/algorithm/fill.hpp` (Taskflow v4.1.0).
 //!
-//! [`Runtime::fill`] is upstream's `make_fill_task`/`FlowBuilder::fill`;
-//! [`Runtime::fill_n`] is the `_n` sibling, upstream's `make_fill_n_task`/
-//! `FlowBuilder::fill_n`. The owned-data wrappers over both are
-//! [`AlgorithmBuilder::fill`] and [`AlgorithmBuilder::fill_n`], on the one
-//! extension trait the whole algorithm family shares.
+//! [`Runtime::fill`] is upstream's `make_fill_task`/`FlowBuilder::fill` over
+//! a borrowed slice; [`Runtime::fill_n`] is the `_n` sibling, upstream's
+//! `make_fill_n_task`/`FlowBuilder::fill_n`. [`make_fill_task`] and
+//! [`make_fill_n_task`] are those same two over owned data, and the
+//! wrappers one line over each -- [`AlgorithmBuilder::fill`] and
+//! [`AlgorithmBuilder::fill_n`], on the one extension trait the whole
+//! algorithm family shares. `DESIGN.md`'s "Decisions taken in M10" entry on
+//! the three layers says why the port needs all three where upstream needs
+//! two.
 //!
 //! [`AlgorithmBuilder::fill`]: crate::algorithm::AlgorithmBuilder::fill
 //! [`AlgorithmBuilder::fill_n`]: crate::algorithm::AlgorithmBuilder::fill_n
@@ -34,6 +38,8 @@
 //! `0 <= chunk_size()` already holds for every chunk size, because the
 //! explicit branch is what upstream's own structure reads as and a reader
 //! comparing the two should see the same shape.
+
+use std::sync::{Arc, Mutex};
 
 use crate::algorithm::SlicePartitioner;
 use crate::runtime::Runtime;
@@ -127,6 +133,96 @@ impl<'rt> Runtime<'rt> {
         P: SlicePartitioner,
     {
         self.fill(&mut out[..count], value, part);
+    }
+}
+
+/// Builds the runtime body of a [`Runtime::fill`] task over owned `out`:
+/// upstream's `make_fill_task`. `out` is locked once per run of the body,
+/// not once per element, and the whole slice is filled through that one
+/// guard.
+///
+/// `value` and `part` are cloned on every run of the body -- relevant only
+/// for a task a cycle revisits -- matching upstream copying `value` and
+/// `part` into its own closure by value.
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+///
+/// use rustflow::algorithm::fill::make_fill_task;
+/// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
+/// use rustflow::prelude::*;
+/// use rustflow::Executor;
+///
+/// let out = Arc::new(Mutex::new(vec![0; 5]));
+///
+/// let mut taskflow = Taskflow::new();
+/// taskflow.emplace_runtime(make_fill_task(
+///     Arc::clone(&out),
+///     7,
+///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
+/// ));
+///
+/// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
+/// assert_eq!(*out.lock().expect("uncontended"), vec![7; 5]);
+/// ```
+pub fn make_fill_task<T, P>(
+    out: Arc<Mutex<Vec<T>>>,
+    value: T,
+    part: P,
+) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static
+where
+    T: Clone + Send + Sync + 'static,
+    P: SlicePartitioner + Clone + Send + 'static,
+{
+    move |rt: &mut Runtime<'_>| {
+        let mut guard = out
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        rt.fill(&mut guard, value.clone(), part.clone());
+    }
+}
+
+/// Builds the runtime body of a [`Runtime::fill_n`] task over owned `out`:
+/// upstream's `make_fill_n_task`. A `count` past the end of `out` panics
+/// when the body runs, for the reason this module's `# Design` section
+/// gives.
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+///
+/// use rustflow::algorithm::fill::make_fill_n_task;
+/// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, GuidedPartitioner};
+/// use rustflow::prelude::*;
+/// use rustflow::Executor;
+///
+/// let out = Arc::new(Mutex::new(vec![0; 5]));
+///
+/// let mut taskflow = Taskflow::new();
+/// taskflow.emplace_runtime(make_fill_n_task(
+///     Arc::clone(&out),
+///     3,
+///     7,
+///     GuidedPartitioner::<DefaultClosureWrapper>::default(),
+/// ));
+///
+/// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
+/// assert_eq!(*out.lock().expect("uncontended"), vec![7, 7, 7, 0, 0]);
+/// ```
+pub fn make_fill_n_task<T, P>(
+    out: Arc<Mutex<Vec<T>>>,
+    count: usize,
+    value: T,
+    part: P,
+) -> impl for<'a> FnMut(&mut Runtime<'a>) + Send + 'static
+where
+    T: Clone + Send + Sync + 'static,
+    P: SlicePartitioner + Clone + Send + 'static,
+{
+    move |rt: &mut Runtime<'_>| {
+        let mut guard = out
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        rt.fill_n(&mut guard, count, value.clone(), part.clone());
     }
 }
 
