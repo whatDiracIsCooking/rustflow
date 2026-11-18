@@ -9,7 +9,7 @@
 //! `#[non_exhaustive]` anyway.** [`Handle::NonpreemptiveRuntime`] is
 //! upstream's `NonpreemptiveRuntime`, the second of its two runtime shapes,
 //! which arrived separately from [`Handle::Runtime`] rather than at the same
-//! time -- `DESIGN.md`'s "Decisions taken in M8" has why a pipeline line
+//! time -- `DESIGN.md`'s "Pipelines" section has why a pipeline line
 //! forced a question the single [`Handle::Runtime`] protocol could not
 //! answer. A twelfth variant, should upstream ever grow one, therefore
 //! breaks no caller outside the crate.

@@ -12,8 +12,8 @@
 //! [`invoke_nonpreemptive`] is `_invoke_nonpreemptive_runtime_task`, and
 //! `NonpreemptiveRuntime` itself -- the restricted handle, not part of this
 //! crate's public surface -- is this module's own, with no shell in
-//! `src/runtime.rs` to split it from. `DESIGN.md`'s "Decisions taken in M8"
-//! has why it took a second milestone to arrive rather than the first.
+//! `src/runtime.rs` to split it from. `DESIGN.md`'s "Pipelines" section has
+//! why it took a second milestone to arrive rather than the first.
 //!
 //! # Design
 //!
@@ -419,7 +419,7 @@ impl Runtime<'_> {
     /// spawned at all, `enter` setting the bit before the body runs whether
     /// the body ever spawns one or not; [`Handle::NonpreemptiveRuntime`] is
     /// the one callee that is always safe, whatever its body is doing.
-    /// `DESIGN.md`'s "Decisions taken in M8" has why.
+    /// `DESIGN.md`'s entry on `Runtime::schedule`'s hole has why.
     ///
     /// Either reaches the caller as the failure of this runtime task, since
     /// it happens inside the body.

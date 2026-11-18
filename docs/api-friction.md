@@ -10,9 +10,12 @@ because they bound what the problem actually is.
 
 Each entry states what upstream writes, what the port makes the user write,
 the Rust reason for the difference when there is one, and either a proposed
-change or "keep, because …". **Status** says where the entry already stands:
-*open* (nothing has decided it yet), *keep* (a divergence or a cost this port
-accepts, with the reason), or *tracked by #NNN* (an issue already owns it).
+change or "keep, because …". **Status** says where the entry stands. The
+consolidation this log was the input to has closed, so no entry reads *open*
+any more: each is *keep* (a divergence or a cost this port accepts, with the
+reason) or *tracked by #NNN* (the issue that owned it, closed unless the entry
+says otherwise), and the ones a decision settled name the `DESIGN.md` entry
+that settled them.
 
 A note on sourcing: the themes digest prepared ahead of this document
 mis-cited three items to the wrong PR, and double-cited a fourth to a PR
@@ -62,9 +65,10 @@ which would add `Executor`, `RunError` and the task handle types too.
   is a utility a program reaches for rather than a first-page name, so it
   stays a crate-root name and is imported by name. The eight `*Builder`
   traits stay in the prelude under the same rule, as the traits whose methods
-  a first-page program calls; whether they stay *eight* is #216's. The rule
-  itself is in `rustflow::prelude`'s own doc comment and in `DESIGN.md`'s
-  "Decisions taken in M10".
+  a first-page program calls; whether they stay *eight* was #216's, and the
+  answer is one `AlgorithmBuilder` carrying all 28 methods, so the eight
+  prelude lines are one. The rule itself is in `rustflow::prelude`'s own doc
+  comment and in `DESIGN.md`'s entry on the prelude and the crate root.
 - **Reported in:** PR #225 (#190), PR #232 (#195), PR #233 (#196, counter-evidence), PR #235 (#194).
 
 ## FlowBuilder and task-building ergonomics
@@ -88,8 +92,8 @@ verbose than upstream line for line.
   closure's *return* type is not available at all — two blanket impls keyed
   on `FnMut()` and `FnMut() -> i32` are E0119 under coherence — so a macro
   would have to be told each element's kind syntactically, which is what the
-  per-kind methods already are, and `DESIGN.md`'s M10 entry has what the four
-  call sites would actually have saved (less than the count suggests: most of
+  per-kind methods already are, and `DESIGN.md`'s "Four API-shape questions"
+  entry has what the four call sites would actually have saved (less than the count suggests: most of
   those closures need a block each to clone an `Arc` in).
 - **Reported in:** PR #232 (#195).
 
@@ -114,8 +118,8 @@ module-composing example reads flatter than upstream everywhere it composes
   still one rule rather than two: a chainable `composed_of` would have to hand
   back a `&mut` borrow of the builder, and then the handle would hold the
   taskflow borrowed until it died — exactly the argument the "Naming a task is
-  two statements" entry in `DESIGN.md` already makes for `emplace`. The M10
-  entry there records it.
+  two statements" entry in `DESIGN.md` already makes for `emplace`. The "Four
+  API-shape questions" entry there records it.
 - **Reported in:** PR #235 (#194), PR #252 (#199, confirming — "same as
   #190's examples already reported for other module tasks").
 
@@ -224,8 +228,7 @@ change.
 
 - **Status: keep, because** this is the Rust ownership model forcing a
   different program shape, not a smaller substitute for upstream's. Recorded
-  as a decision in `DESIGN.md`'s "Decisions taken in M9" entry on
-  `Task::data` (#191).
+  as a decision in `DESIGN.md`'s entry on `Task::data` (#191).
 - **Reported in:** PR #235 (#194).
 
 ### `fibonacci` is `TaskGroup` upstream, not a subflow
@@ -255,9 +258,14 @@ PR #233 and PR #241; the corpus text for PR #241 does not mention
 `Runtime::executor()` anywhere, so only the PR #233 citation is substantiated
 here.
 
-- **Status: keep, because — deliberate, tracked by #202.** `Runtime` holds
-  `Arc<Shared>` and no `&Executor`, for the reason `DESIGN.md`'s entry on it
-  gives; a body that needs the executor captures an `Arc<Executor>` instead.
+- **Status: keep, and #202 closed without adding one.** `Runtime` holds
+  `Arc<Shared>` and no `&Executor`, for the reason `DESIGN.md`'s entry on a
+  runtime or subflow handle not handing back the executor gives; a body that
+  needs the executor captures an `Arc<Executor>` instead. That entry left the
+  question to the issue the algorithm seams were filed as, since 25 of
+  upstream's 26 `rt.executor()` uses are `num_workers()` and the twenty-sixth
+  is a `corun_until`: #202 added `Runtime::worker_id` and
+  `Runtime::corun_until` and no accessor, which is the answer that stands.
 - **Reported in:** PR #233 (#196).
 
 ### `Worker` has no `thread()` accessor
@@ -271,12 +279,13 @@ use one.
 - **Status: keep, decided by #260.** No `thread_id()` either, and the
   module-doc explanation is the permanent answer — with the half it was
   missing now written down, since it explained where the thread handle lives
-  rather than why no read-only substitute is coming. `DESIGN.md`'s M10 entry
-  has the argument: a `ThreadId` cannot set affinity, which is what upstream's
-  `Worker::thread()` is for, and every path that hands out a `&Worker` or a
-  `WorkerView` hands out the worker of the *calling* thread, so the accessor
-  would return `std::thread::current().id()` by construction.
-  `tests/workers.rs` pins that premise.
+  rather than why no read-only substitute is coming. `DESIGN.md`'s "Four
+  API-shape questions" entry has the argument: a `ThreadId` cannot set
+  affinity, which is what upstream's `Worker::thread()` is for, and every path
+  that hands out a `&Worker` or a `WorkerView` hands out the worker of the
+  *calling* thread, so the accessor would return
+  `std::thread::current().id()` by construction. `tests/workers.rs` pins that
+  premise.
 - **Reported in:** PR #233 (#196).
 
 ### A free async node cannot be named
@@ -293,8 +302,8 @@ ignore.
   `executor.spawn_named("answer", || 6 * 7)` is upstream's
   `executor.async("answer", ...)` and an observer reads the name back as
   `TaskView::name` in `on_entry`. A `_named` suffix rather than an
-  `Executor::named(..)` submission builder, and `DESIGN.md`'s M10 entry has
-  why; an unnamed submission is unchanged, naming its node the empty string
+  `Executor::named(..)` submission builder, and `DESIGN.md`'s entry on the
+  `_named` twins has why; an unnamed submission is unchanged, naming its node the empty string
   upstream's `DefaultTaskParams` leaves it with.
 - **Reported in:** PR #236 (#197).
 
@@ -362,8 +371,9 @@ holding a reference to the array — easy once the error is seen, but the
 message ("`names` does not live long enough") does not point at the
 array-literal-vs-`'static` distinction directly.
 
-- **Status:** informational. This is an ordinary Rust ownership rule, not a
-  port API gap; no change proposed.
+- **Status: keep, because** this is an ordinary Rust ownership rule rather
+  than a port API gap, and it is a finding that nothing is wrong with the
+  surface; no change proposed.
 - **Reported in:** PR #236 (#197).
 
 ## Observers
@@ -440,8 +450,10 @@ run both forms side by side on the same algorithm.
   `src/`, `scan` runs 2 to 14, and `tests/scan.rs` is wrapper-only. What gets
   completed is the middle layer, the `'static` callable a `FlowBuilder`
   wrapper, an async task *and* a dependent-async task can all accept: 17 new
-  factories, one per wrapper, filed as #292, #293, #294 and #295, with #296
-  rewriting `dependent_async_algorithm.rs` on them. That closes this entry's
+  factories, one per wrapper, landed as #292, #293, #294 and #295, with #296
+  rewriting `dependent_async_algorithm.rs` on them -- its three stages now
+  call `make_for_each_task`, `make_transform_task` and `make_reduce_task`
+  where they hand-locked an `Arc<Mutex<_>>` before. That closes this entry's
   third bullet, and corrects the reason the example gives for the gap -- a
   `Runtime::scope` underneath an algorithm does not stop a factory from
   handing back a cold callable, and `make_inclusive_scan_task` is the proof
@@ -467,8 +479,8 @@ run both forms side by side on the same algorithm.
   read-only parameters of the eleven factories that have one, in argument
   position so every existing call site and all 28 wrapper signatures are
   untouched. What it costs is a discipline rather than a copy, and
-  `DESIGN.md`'s M10 entry states it: guards in parameter order, none held
-  past the body's return, and two stages over one lock need an edge between
+  `DESIGN.md`'s entry on a factory's read parameter states it: guards in
+  parameter order, none held past the body's return, and two stages over one lock need an edge between
   them even when both only read, `Mutex` having no shared mode.
 - **Reported in:** PR #241 (#198).
 
@@ -512,11 +524,10 @@ which already composes after resetting) is the first place this shows up as
 it by composing a second time into a second `Taskflow` after the reset, with
 a comment at the spot.
 
-- **Status: keep, because** the rebuild-rather-than-mutate design is a
-  recorded decision (issue #185); the documentation of it is **tracked by
-  #259**. Proposed change: a doc example on `Pipeline::reset_pipes` itself,
-  next to its existing test, showing the compose-again pattern — the PR that
-  found this suggests exactly that.
+- **Status: keep, and documented as of #259.** The rebuild-rather-than-mutate
+  design is a recorded decision (issue #185), and the documentation the entry
+  asked for is in: `Pipeline::reset_pipes` carries a doc example beside its
+  existing test showing the compose-again pattern.
 - **Reported in:** PR #252 (#199).
 
 ### `DataPipeline` has no `reset_pipes`/`reset_lines`
@@ -527,9 +538,10 @@ private `Pipeline` and exposes only `reset()`. There is no way to replace a
 equivalent of `scalable_pipeline` meant building a second `DataPipeline` from
 scratch rather than resetting one object twice.
 
-- **Status: tracked by #259.** Proposed change: thread
-  `reset_pipes`/`reset_lines` through to the inner `Pipeline` the same way
-  `reset()` already delegates.
+- **Status: tracked by #259, and done there.** `DataPipeline::reset_pipes`
+  and `DataPipeline::reset_lines` thread through to the inner `Pipeline` the
+  way `reset()` already delegates, each checking the new chain's types through
+  `DataPipelineBuilder::pipe` as the builder does.
 - **Reported in:** PR #252 (#199).
 
 ### Upstream's own data-pipeline example has a live type bug the port's typed builder rejects

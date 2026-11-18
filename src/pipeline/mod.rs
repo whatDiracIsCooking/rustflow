@@ -14,8 +14,8 @@
 //! The names a pipeline program writes are re-exported here, flat, so that a
 //! call site spells [`Pipeline`] and [`DataPipeline`] rather than the module
 //! each lives in: this module is the family's front door, which is where the
-//! crate flattens a family instead of at the crate root. `DESIGN.md`'s
-//! "Decisions taken in M10" entry has the rule and why the root is not the
+//! crate flattens a family instead of at the crate root. `DESIGN.md`'s entry
+//! on the prelude and the crate root has the rule and why the root is not the
 //! place for it.
 
 pub mod data_pipeline;

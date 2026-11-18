@@ -12,9 +12,9 @@
 //! The owned-data wrappers over every method this module,
 //! [`fill`](super::fill) and [`generate`](super::generate) add are on
 //! [`AlgorithmBuilder`], the one extension trait the whole algorithm family
-//! shares, each one line over the matching factory -- `DESIGN.md`'s
-//! "Decisions taken in M10" entry on the three layers says why the port
-//! needs all three where upstream needs two.
+//! shares, each one line over the matching factory -- `DESIGN.md`'s "Three
+//! layers, not two forms" entry says why the port needs all three where
+//! upstream needs two.
 //!
 //! [`AlgorithmBuilder`]: crate::algorithm::AlgorithmBuilder
 //!

@@ -6,8 +6,8 @@
 //! [`make_fill_n_task`] are those same two over owned data, and the
 //! wrappers one line over each -- [`AlgorithmBuilder::fill`] and
 //! [`AlgorithmBuilder::fill_n`], on the one extension trait the whole
-//! algorithm family shares. `DESIGN.md`'s "Decisions taken in M10" entry on
-//! the three layers says why the port needs all three where upstream needs
+//! algorithm family shares. `DESIGN.md`'s "Three layers, not two forms" entry
+//! says why the port needs all three where upstream needs
 //! two.
 //!
 //! [`AlgorithmBuilder::fill`]: crate::algorithm::AlgorithmBuilder::fill

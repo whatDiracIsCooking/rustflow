@@ -482,7 +482,7 @@ impl WorkerInterface for ThreadsByWorker {
 }
 
 /// The premise behind `Worker` lending out neither a thread handle nor a
-/// thread id (#260, and `DESIGN.md`'s M10 entry): the `&Worker` a caller
+/// thread id (#260, and `DESIGN.md`'s entry on it): the `&Worker` a caller
 /// reads is always the one belonging to the thread it reads from, so the
 /// `ThreadId` such an accessor would hand back is the one
 /// `std::thread::current().id()` already gives.

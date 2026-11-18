@@ -14,7 +14,7 @@
 # HOST_UID/HOST_GID are required (`:?` below) rather than defaulted: a default
 # of 1000 on a host where you are not uid 1000 writes root-owned files into the
 # bind mount, and that failure surfaces much later as a confusing permission
-# error. See env.example and README.md in this directory.
+# error. See env.example in this directory and ../docs/development.md.
 # Pinned, NOT derived. Compose defaults the project name to the directory
 # holding this file -- "docker" -- which would create volumes called
 # docker_cargo-registry and docker_target and a docker_default network. Those

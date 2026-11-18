@@ -29,10 +29,11 @@
 //! [`Handle::NonpreemptiveRuntime`] -- is never "entered" by that reckoning
 //! even while its body is genuinely running, and [`Handle::Subflow`] is not
 //! either for as long as its body is still *building* the subgraph that
-//! would make it preempt. `DESIGN.md`'s "Decisions taken in M8" has the hole
-//! that left and the caller-side fix that was tried first and could not
-//! close it from outside the scheduler; "Decisions taken in M10" has why the
-//! claim is one pair per job dispatch rather than one pair per handle kind.
+//! would make it preempt. `DESIGN.md`'s entry on `Runtime::schedule`'s hole
+//! has the hole that left and the caller-side fix that was tried first and
+//! could not close it from outside the scheduler; its entry on the dispatch
+//! claim has why that claim is one pair per job dispatch rather than one pair
+//! per handle kind.
 //! The cost is an `AtomicU8` beside [`NodeBase`]'s own three words, which
 //! [`Semaphores`] and [`Node`]'s own data slot already account for
 //! themselves.

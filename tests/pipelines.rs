@@ -10,8 +10,8 @@
 //!
 //! - **Every piece of state a pipe callable closes over is shared through an
 //!   `Arc`, not captured by reference.** A [`Pipe`] callable is
-//!   `Fn(&mut Pipeflow) + Send + Sync + 'static` -- `DESIGN.md`'s "Decisions
-//!   taken in M8" has why -- where upstream's `mutable` lambda captures its
+//!   `Fn(&mut Pipeflow) + Send + Sync + 'static` -- `DESIGN.md`'s "Pipelines"
+//!   section has why -- where upstream's `mutable` lambda captures its
 //!   counters and buffers by reference and mutates them directly. So a
 //!   counter here is an `AtomicUsize`, upstream's `std::mutex`-guarded
 //!   collections are `Mutex`-guarded here too, and [`Buffer`] stands in for

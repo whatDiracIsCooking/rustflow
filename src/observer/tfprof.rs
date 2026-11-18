@@ -38,7 +38,7 @@
 //! `TF_ENABLE_PROFILER` environment variable and, from its destructor,
 //! writing a file to whatever path that names -- is deliberately not
 //! ported; [`DESIGN.md`](https://github.com/whatDiracIsCooking/rustflow/blob/main/DESIGN.md)'s
-//! "Decisions taken in M9" section has why, and the `"TFPX"` multi-executor
+//! entry on `TFProfManager` has why, and the `"TFPX"` multi-executor
 //! file format a caller who wants one can still build around this type's
 //! `dump`.
 //!

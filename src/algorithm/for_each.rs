@@ -9,8 +9,8 @@
 //! closure over `(b, e, c, part)`; [`make_for_each_task`] is upstream's
 //! factory of the same name, over owned data; and
 //! [`AlgorithmBuilder::for_each`] is the one line over that factory --
-//! `DESIGN.md`'s "Decisions taken in M10" entry on the three layers says
-//! why the port needs all three where upstream needs two.
+//! `DESIGN.md`'s "Three layers, not two forms" entry says why the port
+//! needs all three where upstream needs two.
 //!
 //! [`AlgorithmBuilder::for_each`]: crate::algorithm::AlgorithmBuilder::for_each
 //!

@@ -9,8 +9,8 @@
 //!
 //! Upstream's `tf::FlowBuilder` is a base class; translating that into a
 //! trait, and why [`FlowBuilder::composed_of`] takes anything [`Composable`]
-//! rather than a concrete `Arc<Taskflow>`, are under "Rationale moved out" in
-//! `DESIGN.md`.
+//! rather than a concrete `Arc<Taskflow>`, are under "Graph and flow
+//! builder" in `DESIGN.md`.
 //!
 //! **One named method per node kind, where upstream overloads one.**
 //! Upstream's `emplace` picks a node kind from the callable's signature
@@ -254,8 +254,8 @@ pub trait FlowBuilder {
     /// this task's own graph, exactly as a full [`Runtime`] can, but it has
     /// no `silent_async`, no `scope` and no `corun_until` -- there is no
     /// protocol under this node for any of those to resume it with, so the
-    /// type gives a body nothing that would need one. `DESIGN.md`'s
-    /// "Decisions taken in M8" has why this node kind exists at all, and
+    /// type gives a body nothing that would need one. `DESIGN.md`'s entry on
+    /// the eleventh `Handle` variant has why this node kind exists at all, and
     /// [`Handle::NonpreemptiveRuntime`] has the dispatch it runs under.
     ///
     /// ```

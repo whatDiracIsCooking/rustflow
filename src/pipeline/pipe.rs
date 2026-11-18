@@ -7,11 +7,10 @@
 //!
 //! # Design
 //!
-//! `DESIGN.md`'s "Decisions taken in M8" section and the pipe-specific
-//! entries under "Rationale moved out" have why: the `Handle` variant a
-//! pipeline's lines needed after all, the pipe callable's `Fn + Send + Sync`
-//! bound, one `Pipeline` type for upstream's two, and what stayed out of
-//! scope.
+//! `DESIGN.md`'s "Pipelines" section has why, the pipe's own entries among
+//! the family's: the `Handle` variant a pipeline's lines needed after all,
+//! the pipe callable's `Fn + Send + Sync` bound, one `Pipeline` type for
+//! upstream's two, and what stayed out of scope.
 
 use std::fmt;
 
@@ -140,7 +139,7 @@ impl From<PipeType> for usize {
 /// pipeline. The callable bound is `Fn(&mut Pipeflow) + Send + Sync`, both
 /// kinds of pipe paying it alike, and upstream's second callable shape,
 /// `(Pipeflow&, NonpreemptiveRuntime&)`, is not ported; `DESIGN.md`'s
-/// "Rationale moved out" has why for both.
+/// "Pipelines" section has why for both.
 pub struct Pipe {
     kind: PipeType,
     callable: Box<dyn Fn(&mut Pipeflow) + Send + Sync>,

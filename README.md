@@ -3,13 +3,17 @@
 A Rust port of [Taskflow](https://github.com/taskflow/taskflow), a C++
 task-parallel programming system built around task dependency graphs.
 
-**Status: all seven steps of "Order of work" are in, and the port is at
-parity with upstream's user-facing surface at v4.1.0** — every public class,
-free function and example `taskflow/` ships at the pin has a counterpart
-here, or a recorded reason it does not. "Order of work", at the end of this
-file, is where that state is kept rather than duplicated up here: it says
-what each step covers and what it deliberately leaves out, and each step is a
-GitHub milestone, so its issues are what is merged and what is not.
+**Status: all seven steps of "Order of work" are in, the port is at parity
+with upstream's user-facing surface at v4.1.0, and the consolidation
+milestone after that parity pass has closed** — every public class, free
+function and example `taskflow/` ships at the pin has a counterpart here, or
+a recorded reason it does not, and what the second consolidation settled
+about the surface a caller writes is in [`DESIGN.md`](DESIGN.md) under
+"Documentation and tooling", "Algorithms" and "Executor core". "Order of
+work", at the end of this file, is where that state is kept rather than
+duplicated up here: it says what each step covers and what it deliberately
+leaves out, and each step is a GitHub milestone, so its issues are what is
+merged and what is not.
 
 Two things are worth knowing before reading any of it:
 
@@ -18,8 +22,9 @@ Two things are worth knowing before reading any of it:
   saying out loud because a work-stealing scheduler is not where a reader
   expects to find that; "Order of work" says what each of the two buys.
 - **The decisions are written down.** [`DESIGN.md`](DESIGN.md) has one entry
-  per decision, each naming the issue that took it, beside the documentation
-  contract every comment in this crate is held to. The measured ones are in
+  per decision, grouped by the part of the port it decides and each naming the
+  issue that took it, beside the documentation contract every comment in this
+  crate is held to; its index is the ten sections. The measured ones are in
   [`BENCHMARKS.md`](BENCHMARKS.md), which "Performance" indexes.
 
 ## Building and testing
@@ -27,6 +32,15 @@ Two things are worth knowing before reading any of it:
 [`docs/development.md`](docs/development.md) is the contributor page: the
 pinned toolchain, the container both front ends build, the five-command gate
 `devtools/devcontainer.sh check` runs, and what CI runs beside it.
+
+Four measurements of this crate's own documentation and tests sit beside that
+gate without being part of it, all four **reports** that exit 0 whatever they
+find: `devtools/doc-ratio.sh` (the documentation contract's prose ratio),
+`devtools/test-names.sh` (the test-name comparison a documentation pass is
+held to), `devtools/coverage.sh` (line and region coverage of `src/`) and
+`devtools/api-witness.py` (the public declarations no test, example, benchmark
+or doc example witnesses). What does decide a pass is the gate above plus
+`devtools/run-examples.sh`, which CI's `examples` job runs on every PR.
 
 ## Examples
 
@@ -142,8 +156,11 @@ the same split:
 ### Design decisions already taken
 
 They live in [`DESIGN.md`](DESIGN.md), one entry per decision and each still
-naming the issue that took it, beside the documentation contract this crate's
-comments are held to. The measured ones keep their numbers in
+naming the issue that took it, grouped by the part of the port it decides --
+graph and flow builder, executor core, control flow and cancellation, dynamic
+tasking, the async family, observers, algorithms, pipelines, documentation and
+tooling -- beside the documentation contract this crate's comments are held
+to. The measured ones keep their numbers in
 [`BENCHMARKS.md`](BENCHMARKS.md), which "Performance", below, indexes.
 
 ### Performance
@@ -252,12 +269,12 @@ declined:
   above).
 - `NonpreemptiveRuntime` as a user-facing type. The port keeps an internal
   nonpreemptive node kind a pipeline's line task dispatches through instead
-  of a type a caller names directly — [`DESIGN.md`](DESIGN.md)'s M8 entry on
-  the eleventh `Handle` variant has why.
+  of a type a caller names directly — [`DESIGN.md`](DESIGN.md)'s entry on the
+  eleventh `Handle` variant has why.
 - `TFProfManager`. A library has no business installing a process-global
   singleton whose destructor writes a file to a path an environment variable
-  names — [`DESIGN.md`](DESIGN.md)'s M9 entry has the decision and what is
-  kept as documentation instead.
+  names — [`DESIGN.md`](DESIGN.md)'s entry on `TFProfManager` has the
+  decision and what is kept as documentation instead.
 - The serializer and the rest of upstream's `utility/` directory that `std`
   already covers without a port.
 
@@ -271,12 +288,16 @@ left is `executor::topology` as a module tree, an async family of one-line
 delegations onto a single core, every doc comment held to a written
 documentation contract, and the integration suites sharing one `tests/common`
 module. The **parity pass** after step 7 is where "What parity leaves out",
-above, comes from. A **second consolidation** runs after that pass, on what
+above, comes from. A **second consolidation** ran after that pass, on what
 its own friction log ([`docs/api-friction.md`](docs/api-friction.md))
-collected, and this one does reach the surface: it settles what the crate
-root re-exports and what `rustflow::prelude` is for. All three keep their
-decisions in [`DESIGN.md`](DESIGN.md), under "Decisions taken in M6", "…in
-M9" and "…in M10", one entry each.
+collected, and this one did reach the surface: it settled what the crate root
+re-exports and what `rustflow::prelude` is for, collapsed the algorithm
+family's eight extension traits into one and completed the `make_*_task`
+factories behind them, gave every async submission a `_named` twin, and fixed
+two scheduler defects its own panic matrix found. All three keep their
+decisions in [`DESIGN.md`](DESIGN.md), one entry per decision, in the
+subsystem section each belongs to rather than under the milestone that took
+it.
 
 So the step-to-milestone mapping is the seven steps with those three
 interleaved: step 6 is the sixth step and the seventh milestone, step 7 the

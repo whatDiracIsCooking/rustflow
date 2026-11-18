@@ -18,9 +18,10 @@
 //! shape and the `Drop` this type does not have, where a child is queued and
 //! the stack-depth ceiling that follows from it, which anchor a child's
 //! failure reaches depending on which of the eight forms raised it, and the
-//! naming of the eight forms over upstream's four templates -- all under
-//! "Rationale moved out", which also has the one limit this port adds under
-//! cancellation: a cancelled group whose outstanding children are
+//! naming of the eight forms over upstream's four templates -- the first two
+//! under "Dynamic tasking" and the rest under "The async family". Its
+//! "Control flow and cancellation" section has the one limit this port adds
+//! under cancellation: a cancelled group whose outstanding children are
 //! dependent-async tasks should be corun to completion rather than cancelled
 //! mid-chain if any of them still has a successor to release.
 
