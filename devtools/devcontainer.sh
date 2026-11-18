@@ -13,6 +13,7 @@
 #   devtools/devcontainer.sh check         the gate: fmt + clippy + test + deny + doc
 #   devtools/devcontainer.sh test [ARGS]   cargo test
 #   devtools/devcontainer.sh bench [ARGS]  cargo bench (the criterion suite)
+#   devtools/devcontainer.sh bench-test    run each bench once, untimed (as CI does)
 #   devtools/devcontainer.sh rebuild       rebuild the image after a Dockerfile edit
 #   devtools/devcontainer.sh down          stop it (volumes survive)
 #   devtools/devcontainer.sh nuke          stop it AND drop every volume
@@ -124,14 +125,21 @@ case "$cmd" in
     # Not part of `check`, deliberately: a benchmark answers "how fast", which
     # is not a pass/fail, and criterion's own statistics need a quiet machine
     # to mean anything -- see BENCHMARKS.md. What CI holds the suite to is that
-    # it still compiles, which `cargo clippy --all-targets` in the gate above
-    # already does.
+    # it still compiles -- `cargo clippy --all-targets` in the gate above -- and
+    # that it still runs, which is `bench-test` below.
     #
     # ARGS land where `cargo bench`'s own do: a bare word is forwarded to the
     # criterion harness as an id filter (`bench linear_chain`), and anything
     # after `--` is a harness option -- `bench -- --save-baseline mutex` then
     # `bench -- --baseline mutex` being how a before/after pair is collected.
     bench)   in_dev "cargo bench --all-features $*" ;;
+    # The `examples` job's bench step, verbatim, so the host can run what CI
+    # runs. Criterion's `--test` mode executes every id once and times nothing,
+    # so it writes no baseline and a loaded machine does not invalidate it:
+    # what it catches is a bench whose body panics or whose setup no longer
+    # matches the API, which compiling alone does not. Takes no ARGS, since the
+    # point of it is to be the whole suite; filter with `bench` instead.
+    bench-test) in_dev 'cargo bench --all-features -- --test' ;;
     fmt)     in_dev 'cargo fmt --all' ;;
     rebuild) ensure_claude_config_dir \
                  && dc build --no-cache dev \
@@ -144,7 +152,7 @@ case "$cmd" in
     status)  dc ps ;;
     *)
         echo "unknown command: $cmd" >&2
-        sed -n '3,20p' "${BASH_SOURCE[0]}" >&2
+        sed -n '3,21p' "${BASH_SOURCE[0]}" >&2
         exit 2
         ;;
 esac
