@@ -52,8 +52,19 @@ prelude is actually for. The two readings that would answer differently:
 accident, or *the names a caller writes on the first page of a program*,
 which would add `Executor`, `RunError` and the task handle types too.
 
-- **Status: open.** This is the actionable design question for the
-  consolidation milestone, not three small gaps to patch independently.
+- **Status: tracked by #256, and settled there.** The *first page* reading
+  won: the prelude is the names a program spells to build a taskflow, submit
+  it to an executor and read the run's outcome, which added `Executor`,
+  `RunHandle`, `RunError`, `Canceller`, `TaskMut`, `TaskRef`, `TaskType` and
+  `Node` to it and took nothing out. The corpus decided it -- all 44 examples
+  and 33 of the 34 prelude-using test files write `Executor` in an import of
+  their own. `Xorshift32`, the third gap above, is answered the other way: it
+  is a utility a program reaches for rather than a first-page name, so it
+  stays a crate-root name and is imported by name. The eight `*Builder`
+  traits stay in the prelude under the same rule, as the traits whose methods
+  a first-page program calls; whether they stay *eight* is #216's. The rule
+  itself is in `rustflow::prelude`'s own doc comment and in `DESIGN.md`'s
+  "Decisions taken in M10".
 - **Reported in:** PR #225 (#190), PR #232 (#195), PR #233 (#196, counter-evidence), PR #235 (#194).
 
 ## FlowBuilder and task-building ergonomics
@@ -406,7 +417,16 @@ is known it makes sense, but a `pub use` re-export of `Pipeline` and
 closer to upstream's flat `tf::` namespace, and closer to how these examples
 otherwise just open `rustflow::prelude::*`.
 
-- **Status: open.** No issue currently tracks the re-export.
+- **Status: tracked by #256, and done there.** `src/pipeline/mod.rs` is the
+  family's front door and now re-exports the flat names a pipeline program
+  writes -- `Pipeline`, `DataPipeline`, `DataPipelineBuilder`, `DataPipe`,
+  the four `*_pipe*` constructors, `Pipe`, `PipeType` and `Pipeflow` -- so a
+  call site spells `rustflow::pipeline::Pipeline` and the module each type
+  happens to live in is an implementation detail again. The root was the
+  other candidate and was rejected: #256's root rule flattens a family at its
+  own front door rather than at the crate root, since
+  `rustflow::pipeline::Pipeline` reads as well as `rustflow::Pipeline` and
+  says more.
 - **Reported in:** PR #252 (#199).
 
 ### Composing before `reset_pipes`/`reset_lines` is a sharp edge a faithful translation runs straight into
