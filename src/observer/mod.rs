@@ -71,6 +71,8 @@
 //! over [`Handle`] for the same reason that one is: a new variant is a
 //! compile error here too, not a silent [`TaskType::Async`].
 
+pub mod chrome;
+
 use std::fmt;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
