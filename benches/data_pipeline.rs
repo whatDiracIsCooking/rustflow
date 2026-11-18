@@ -164,7 +164,11 @@ struct Buffer {
 impl Buffer {
     fn new(num_lines: usize) -> Self {
         Self {
-            rows: Arc::new((0..num_lines).map(|_| Mutex::new([0.0; NUM_PIPES])).collect()),
+            rows: Arc::new(
+                (0..num_lines)
+                    .map(|_| Mutex::new([0.0; NUM_PIPES]))
+                    .collect(),
+            ),
         }
     }
 

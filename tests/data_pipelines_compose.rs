@@ -904,7 +904,11 @@ fn ifelse_data_pipelines(num_lines: usize, num_workers: usize) {
             };
 
             let pipe1 = parallel_pipe::<i32, i32>(|value| {
-                if value > 4897 { value - 1834 } else { value + 3 }
+                if value > 4897 {
+                    value - 1834
+                } else {
+                    value + 3
+                }
             });
 
             let pipe2 = {
