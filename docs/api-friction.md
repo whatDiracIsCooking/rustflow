@@ -83,10 +83,14 @@ verbose than upstream line for line.
 - **Why:** Rust has no variadics, and the per-kind `emplace_*` methods make a
   mixed-arity `emplace_n` family (one trait per possible arity-and-kind
   combination) an awkward thing to write for a single convenience method.
-- **Status: open.** The PR's own read ("probably the right design") is a
-  reasonable default, but it is a call this document defers rather than
-  makes; nothing currently tracks whether a macro-based mixed-tuple `emplace!`
-  is worth the complexity against the four call sites it would have saved.
+- **Status: keep, decided by #260.** The PR's own read ("probably the right
+  design") is the answer: no mixed-kind `emplace!`. Dispatching on a
+  closure's *return* type is not available at all — two blanket impls keyed
+  on `FnMut()` and `FnMut() -> i32` are E0119 under coherence — so a macro
+  would have to be told each element's kind syntactically, which is what the
+  per-kind methods already are, and `DESIGN.md`'s M10 entry has what the four
+  call sites would actually have saved (less than the count suggests: most of
+  those closures need a block each to clone an `Arc` in).
 - **Reported in:** PR #232 (#195).
 
 ### `composed_of` returns a bare `Task`, not a chainable handle
@@ -106,8 +110,12 @@ module-composing example reads flatter than upstream everywhere it composes
   `composed_of` is not a special case of that rule; it is the same rule,
   independently rediscovered by two examples that happened to compose *and*
   name in the same breath.
-- **Status: open.** Two independent reports of the same shape is a stronger
-  signal than either alone; nothing currently tracks it as its own issue.
+- **Status: keep, decided by #260.** Two independent reports of one shape is
+  still one rule rather than two: a chainable `composed_of` would have to hand
+  back a `&mut` borrow of the builder, and then the handle would hold the
+  taskflow borrowed until it died — exactly the argument the "Naming a task is
+  two statements" entry in `DESIGN.md` already makes for `emplace`. The M10
+  entry there records it.
 - **Reported in:** PR #235 (#194), PR #252 (#199, confirming — "same as
   #190's examples already reported for other module tasks").
 
@@ -145,13 +153,15 @@ always `.clone()` (PR #241: `for_loop.rs`'s `total_body`/`grid_body`,
 - **Why:** a condition task's body can run many times per run, so the
   scheduler invokes it `FnMut`, not `FnOnce` — this is the right bound for a
   body that may be revisited by a cycle, not a tuning gap.
-- **Status: keep, because** the bound is correct. `ForEachBuilder`'s own doc
-  comment already says so for the one wrapper that owns `f`/`part`; the gap
-  is that the note does not extend to `emplace_runtime` or to the subflow
-  closures in general, where a caller hits the same wall with no forward
-  pointer to the explanation. Proposed change: extend that one module's note
-  to a short mention on `FlowBuilder::emplace_runtime` and
-  `FlowBuilder::emplace_subflow` themselves.
+- **Status: keep, and the doc note is in as of #260.** The bound is correct.
+  `AlgorithmBuilder::for_each`'s own doc comment already said so for the one
+  wrapper that owns `f`/`part` — it was `ForEachBuilder`'s until #216
+  collapsed the eight extension traits into one — and the gap this entry
+  names, that nothing said it at the bodies themselves, is closed:
+  `src/flow_builder.rs`'s `# Design` section says what the bound asks of a
+  captured value (the `Arc`-wrapped clone, and E0507 on moving an owned
+  capture out of an `FnMut` body), with `FlowBuilder::emplace_subflow` and
+  `FlowBuilder::emplace_runtime` pointing at it in half a line each.
 - **Reported in:** PR #233 (#196), PR #241 (#198).
 
 ### `clippy::ptr_arg` forces a closure literal over a named `fn` for a `String` `bop`/`uop`
@@ -166,10 +176,12 @@ fire on closures, only on `fn` items.
 
 - **Why:** this is a lint-shaped trap rather than an API gap — the crate's
   own bound is correct, and the workaround is ordinary Rust.
-- **Status: keep, because** nothing in the API needs to change. Proposed
-  change: a one-line mention on the scan/reduce modules' own docs, since this
-  is exactly the shape every associative-but-non-commutative `String`
-  example will hit.
+- **Status: keep, and the doc note is in as of #260.** Nothing in the API
+  needs to change. `src/algorithm/scan.rs`'s `# Design` section carries the
+  note and `src/algorithm/reduce.rs` points at it, with the one refinement
+  checking the lint showed: `ptr_arg` fires on the `fn` item once its *body*
+  shows the parameter would do as `&str`, which a concatenation's body — clone
+  the left operand, push the right onto it — does.
 - **Reported in:** PR #241 (#198).
 
 ## Task introspection and subflows
@@ -190,11 +202,13 @@ against it.
   (`DESIGN.md`'s entry on it), so a nested call from inside the body that
   already holds the lock is a self-deadlock, not a borrow error the type
   system catches.
-- **Status: open.** The module docs on `for_each_successor` already name the
-  general "collect, then resolve" pattern, but not this specific
-  lock-reentrancy trap, which fails differently (hang, not panic) from what a
-  reader expects. Proposed change: a doc note on `for_each_subflow_task`
-  itself naming the trap by name.
+- **Status: keep, and the doc note is in as of #260.**
+  `TaskRef::for_each_subflow_task`'s own docs now name the trap: the walk
+  holds the subgraph's `Mutex` for its whole length, so calling the method
+  again *for the same subflow task* from inside its own visitor re-enters a
+  non-reentrant lock on the same thread and hangs rather than panicking, and
+  the two-pass shape is the answer. Two different subflow tasks are two locks
+  and nest safely, which the note also says.
 - **Reported in:** PR #235 (#194).
 
 ### `attach_data`'s premise does not survive the port unchanged
@@ -254,9 +268,15 @@ module docs explain the `Worker`/`WorkerThread` split and why `Worker` cannot
 lend out a thread handle; this was simply the first example that wanted to
 use one.
 
-- **Status: open.** No issue currently tracks whether a read-only
-  `Worker::thread_id()` (or similar) is worth adding, or whether the existing
-  module-doc explanation is the right permanent answer.
+- **Status: keep, decided by #260.** No `thread_id()` either, and the
+  module-doc explanation is the permanent answer — with the half it was
+  missing now written down, since it explained where the thread handle lives
+  rather than why no read-only substitute is coming. `DESIGN.md`'s M10 entry
+  has the argument: a `ThreadId` cannot set affinity, which is what upstream's
+  `Worker::thread()` is for, and every path that hands out a `&Worker` or a
+  `WorkerView` hands out the worker of the *calling* thread, so the accessor
+  would return `std::thread::current().id()` by construction.
+  `tests/workers.rs` pins that premise.
 - **Reported in:** PR #233 (#196).
 
 ### A free async node cannot be named
@@ -289,9 +309,10 @@ type's own docs say later milestones will add more, but a first-time reader
 hits `E0004` before learning why, since the non-exhaustiveness is not visible
 at the call site that fails.
 
-- **Status: keep, because** the attribute is correct for a type that will
-  grow variants. No change proposed to the type; the friction is purely "a
-  reader meets the consequence before the reason."
+- **Status: keep, recorded in `DESIGN.md` by #260.** The attribute is
+  correct for a type that will grow variants. No change proposed to the type;
+  the friction is purely "a reader meets the consequence before the reason",
+  and the cost is one match arm.
 - **Reported in:** PR #235 (#194).
 
 ### `RunHandle::drop` blocks, where upstream's discarded future does not
@@ -303,9 +324,10 @@ here still compiles, but reads as a bug: dropping the `RunHandle` from
 so the two-call shape no longer buys anything and a reader has to already
 know the drop blocks to see it is not a race.
 
-- **Status: keep, because** the blocking drop is the documented design. No
-  change proposed; the example itself resolved it with
-  `executor.run(&taskflow).wait().expect(...)` plus a comment at the spot.
+- **Status: keep, recorded in `DESIGN.md` by #260.** The blocking drop is
+  the documented design. No change proposed; the example itself resolved it
+  with `executor.run(&taskflow).wait().expect(...)` plus a comment at the
+  spot, which is the port's spelling of upstream's two calls.
 - **Reported in:** PR #236 (#197).
 
 ## Tooling and lint interactions
@@ -321,11 +343,13 @@ names the type directly, since the group's type is inferred from
 `executor.task_group()?`. The fix was to drop the import and write the name
 in plain backticks instead of an intra-doc link.
 
-- **Status: keep, because** clippy is correct — the import genuinely has no
-  runtime use in an example, where it would have one in `src/`. Proposed
-  change: a one-line convention note (in this document or `CLAUDE.md`'s
-  agent-facing rules) that an example's module doc names an unused type in
-  backticks, not an intra-doc link.
+- **Status: keep, and the convention note is in as of #260.** clippy is
+  correct — the import genuinely has no runtime use in an example, where it
+  would have one in `src/`. The note is a bullet in `.claude/agents/rust.md`'s
+  "Conventions" section rather than in this document, since it is a rule for
+  writing the next example rather than a finding about the API: in `examples/`
+  and `tests/`, a type the code never names goes in backticks, `cargo doc`
+  not building those targets in the first place.
 - **Reported in:** PR #236 (#197).
 
 ### `&str` from a local array needs an explicit copy to satisfy a `'static` closure bound

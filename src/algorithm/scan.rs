@@ -83,6 +83,22 @@
 //! by reference on both sides rather than upstream's by-value `BOP(T, T)`,
 //! so a non-commutative, non-`Copy` `bop` -- string concatenation, say --
 //! never has to clone an operand just to be allowed to read it twice.
+//!
+//! **A `String` `bop`/`uop` is written as a closure literal, not a named
+//! `fn`.** For `T = String` the bound above is exactly
+//! `Fn(&String, &String) -> String`, and a `fn` item with that signature is
+//! the one shape `clippy::ptr_arg` asks to be rewritten to `&str` as soon as
+//! its body shows the parameter would do as one -- which a concatenation's
+//! body does, cloning the left operand and pushing the right onto it. Taking
+//! the suggestion does not compile: a `fn(&str, &str) -> String` does not
+//! implement `Fn(&String, &String) -> String`, there being no deref
+//! coercion through a generic `Fn` bound (E0631, "type mismatch in function
+//! arguments"), and the bound cannot widen to `&str` either, since every
+//! other `T` here is an ordinary owned value. `ptr_arg` does not fire on
+//! closures, so a closure literal at the call site is the whole workaround --
+//! what `tests/scan.rs` and `examples/inclusive_scan.rs` write, and what
+//! [`crate::algorithm::reduce`]'s own `bop`/`gop`/`uop` take for the same
+//! reason.
 
 use std::sync::{Arc, Mutex};
 

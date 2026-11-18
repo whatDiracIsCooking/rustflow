@@ -11,6 +11,20 @@
 //! trait, and why [`FlowBuilder::composed_of`] takes anything [`Composable`]
 //! rather than a concrete `Arc<Taskflow>`, are under "Rationale moved out" in
 //! `DESIGN.md`.
+//!
+//! **What `FnMut + Send + 'static` costs a captured value.** A node owns its
+//! body as a `Box<dyn FnMut(..) + Send + 'static>` ([`Work`] and the three
+//! wrappers beside it), so [`FlowBuilder::emplace`] and every `emplace_*`
+//! method below it carry one bound, for the reason `DESIGN.md`'s "Task bodies
+//! are `FnMut() + Send + 'static`" entry gives. A caller pays for it twice
+//! over. A value the program outside the body also wants travels as an
+//! [`Arc`] cloned into each closure, where upstream captures a `&` or a
+//! `&mut` and trusts the dependency edges to make that sound. And a body
+//! cannot move an owned capture out of itself -- `let mut local =
+//! owned;` is E0507, "cannot move out of a captured variable in an `FnMut`
+//! closure", `FnMut` lending the body only `&mut self` -- so it clones
+//! inside instead. Both are the bound being right rather than a tuning gap;
+//! `docs/api-friction.md` collects the examples that met them.
 
 use std::sync::{Arc, Mutex};
 
@@ -165,7 +179,9 @@ pub trait FlowBuilder {
     /// what the children left behind itself with
     /// [`Subflow::join`](crate::Subflow::join). The node owns the graph the
     /// body builds -- see [`Handle::Subflow`] -- fresh on every entry, which
-    /// is what makes a subflow inside a loop behave.
+    /// is what makes a subflow inside a loop behave. What `FnMut + Send +
+    /// 'static` asks of a value this body captures is in this module's
+    /// `# Design` section, which every `emplace_*` method shares.
     ///
     /// ```
     /// use rustflow::prelude::*;
@@ -197,7 +213,9 @@ pub trait FlowBuilder {
     /// Upstream's second runtime shape, over `tf::NonpreemptiveRuntime&`, is
     /// [`FlowBuilder::emplace_nonpreemptive_runtime`] rather than a second
     /// overload of this method, with no SFINAE here to pick between them by
-    /// the callable's own signature.
+    /// the callable's own signature. What `FnMut + Send + 'static` asks of a
+    /// value this body captures is in this module's `# Design` section, which
+    /// every `emplace_*` method shares.
     ///
     /// ```
     /// use rustflow::prelude::*;

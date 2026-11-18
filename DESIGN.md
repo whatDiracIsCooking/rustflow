@@ -1793,3 +1793,101 @@ entry above does.
   other name in the 2549 is identical. The per-module `# Design` sections
   that each argued for their own trait are one paragraph in
   `src/algorithm/mod.rs`, where the trait now is.
+
+- **Four API-shape questions the friction log left open are all "keep", and
+  the reasons are here rather than in code** (issue #260).
+
+  `docs/api-friction.md` closed M9 with four entries whose status was *open*
+  for the same reason: each asks for a decision rather than a fix, and nothing
+  was going to decide itself. All four come out the same way, which is worth
+  stating plainly -- the log is a record of friction, not a backlog of
+  defects, and the most common honest answer to "should the port change
+  shape?" is no.
+
+  **`composed_of` returns a bare `Task`, and naming a module task stays a
+  second statement.** Two different example batches reported this
+  independently (#194's and #199's), which is the only thing that made it a
+  question: two reports of one shape look like a stronger signal than one.
+  They are the same shape, though, and the rule they rediscovered is the
+  "Naming a task is two statements" entry above, not a rule of its own -- a
+  chainable `composed_of` would have to hand back a `&mut` borrow of the
+  builder, and then `let m = taskflow.composed_of(t);` would hold the taskflow
+  borrowed until `m` died, exactly as it would for `emplace`. The module task
+  is not even the sharpest case of the rule, since `composed_of`'s argument is
+  already an `Arc` the caller built in a statement of its own.
+
+  **`emplace_n` keeps emplacing only statics; there is no mixed-kind
+  `emplace!` macro.** Upstream's four conditional examples each destructure
+  one overloaded `emplace` call whose callables mix kinds, and the port writes
+  one `emplace`/`emplace_condition` call per task instead. Closing that by
+  type is not available: dispatching on a closure's *return* type needs
+  `impl<F: FnMut()> ..` beside `impl<F: FnMut() -> i32> ..`, which coherence
+  rejects as overlapping (E0119) even though no closure can satisfy both --
+  the same limitation `src/algorithm/mod.rs`'s own `# Design` section hits
+  between its static and dynamic loop traits. So a macro would have to be told
+  each element's kind syntactically, `emplace!(tf, static || {}, condition ||
+  0)`, which is the kind named per call either way, and it would buy a macro
+  that no rustdoc page lists beside the six methods it stands in for. What it
+  would actually have saved is also smaller than the four call sites suggest:
+  in `examples/if_else.rs` only two of the four tasks are one-liners, the other
+  two needing a block each to clone an `Arc` into the body, and
+  `examples/nested_if_else.rs`, `switch_case.rs` and `while_loop.rs` are the
+  same mixture. Keep.
+
+  **`Worker` gains no `thread_id()`, and `Worker::thread()` has no
+  counterpart at all.** Upstream's accessor lends out a mutable
+  `std::thread&` for one purpose, which its own class docs and
+  `worker.hpp`'s `WorkerInterface` example both name: `native_handle()` into
+  `pthread_setaffinity_np`. The port answers neither half. The native handle
+  std will part with is on the `JoinHandle` the executor owns
+  (`JoinHandleExt::as_pthread_t`), not on a `&Worker` a hook can reach, and it
+  is a raw pthread any thread could act on -- the footgun this port's posture
+  refuses. The one thing std offers for a thread, a `ThreadId`, cannot set
+  affinity, and it would be no news to its reader either: every path that
+  hands out a `&Worker` or a `WorkerView` -- `WorkerInterface`'s two hooks,
+  `Executor::this_worker`, `Runtime::worker`, `Subflow::worker` and an
+  observer's view -- hands out the worker *of the calling thread*, a
+  non-worker thread being refused a corun (`CorunError::NotAWorker`) rather
+  than running a body, so `worker.thread_id()` would return
+  `std::thread::current().id()` by construction. That premise is what
+  `tests/workers.rs`'s `a_worker_a_caller_reads_is_the_thread_it_runs_on`
+  pins, reading the pair from a worker's prologue and from a
+  `Runtime::worker()` in a body and requiring them to agree. The direction
+  that does carry information is the reverse one, and the port already has
+  upstream's own: `Executor::this_worker`/`this_worker_id` answer "which
+  worker is this thread" out of the executor's thread-id map. A caller who
+  wants affinity sets it from inside `scheduler_prologue`, which runs on the
+  worker's own thread and so needs nothing lent to it; what is left for
+  `src/executor/worker.rs`'s module docs to say -- and now does, where before
+  they only said a thread handle lives in `WorkerThread` -- is why no
+  read-only substitute is coming either. This also decides the shape of
+  `examples/worker_interface.rs`'s divergence from upstream's affinity
+  program permanently rather than for now.
+
+  **`RunError` stays `#[non_exhaustive]` with its one variant, and
+  `RunHandle::drop` goes on blocking.** Both were already "keep" in the log
+  with their reasons, and both are recorded here so the log can point at this
+  file instead of restating them. The attribute is right for a type the
+  milestones ahead will add variants to, and the cost -- a trailing wildcard
+  arm in `examples/exception.rs` and `subflow_exception.rs` before a reader
+  has met the reason -- is one match arm. The blocking drop is the documented
+  design (`src/executor/run_handle.rs`'s module docs and its `Drop` impl,
+  under the "A run owns the graph it walks" entry above), which is why
+  upstream's fire-and-forget `run` plus a separate `wait_for_all` has no
+  literal translation worth writing: `executor.run(&taskflow).wait()` is the
+  port's spelling of the same program.
+
+  The doc notes this issue carries alongside the four are at the items
+  themselves, each because a caller meets the consequence before the reason:
+  what `FnMut + Send + 'static` asks of a captured value
+  (`src/flow_builder.rs`'s `# Design` section, pointed at from
+  `emplace_subflow` and `emplace_runtime`), why a `String` `bop` is a closure
+  literal rather than a named `fn` (`src/algorithm/scan.rs`'s `# Design`
+  section, pointed at from `src/algorithm/reduce.rs`), and that re-entering
+  `TaskRef::for_each_subflow_task` from inside its own visitor hangs on a
+  non-reentrant `Mutex` rather than panicking (`src/task.rs`). The lint
+  interaction the log's "Tooling" section reported is a convention rather than
+  a crate doc, so it went to `.claude/agents/rust.md`: in `examples/` and
+  `tests/`, a type the code never names goes in backticks, since `cargo doc`
+  does not build those targets and the `use` an intra-doc link would need is
+  `unused_imports` under `clippy --all-targets`.
