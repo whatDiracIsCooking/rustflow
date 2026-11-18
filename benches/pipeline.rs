@@ -27,13 +27,14 @@
 //!
 //! - **The same per-token work, [`NUM_PIPES`] times over.** Every stage of
 //!   the mpsc chain and every [`Pipe`] of the [`Pipeline`] below calls
-//!   [`dummy`] once per token -- the same 32-iteration floating-point body
-//!   `embarrassing_parallelism.rs` and `graph_traversal.rs` use, rather than
-//!   upstream's own `work()`, a 10 microsecond `sleep_for`. A sleep would
-//!   make every size in [`SIZES`] take minutes once lines and workers
-//!   multiply it, without measuring anything this crate's scheduler does;
-//!   the fixed FP body costs the same amount of CPU and lets the chain
-//!   actually contend for it.
+//!   [`body::dummy`] once per token -- the shared 32-iteration
+//!   floating-point body `common/body.rs` holds, which
+//!   `embarrassing_parallelism.rs` and `graph_traversal.rs` also measure,
+//!   rather than upstream's own `work()`, a 10 microsecond `sleep_for`. A
+//!   sleep would make every size in [`SIZES`] take minutes once lines and
+//!   workers multiply it, without measuring anything this crate's
+//!   scheduler does; the fixed FP body costs the same amount of CPU and
+//!   lets the chain actually contend for it.
 //! - **The same number of hops.** A token crosses [`NUM_PIPES`] pipes in the
 //!   [`Pipeline`] and [`NUM_PIPES`] channel sends in the mpsc chain, so
 //!   neither side is given a shorter path to the answer.
@@ -62,12 +63,10 @@
 
 use std::collections::VecDeque;
 use std::hint::black_box;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::thread::available_parallelism;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -75,6 +74,10 @@ use rustflow::Executor;
 use rustflow::pipeline::pipe::{Pipe, PipeType, Pipeflow};
 use rustflow::pipeline::scheduler::Pipeline;
 use rustflow::prelude::*;
+
+#[path = "common/body.rs"]
+mod body;
+mod common;
 
 /// The number of pipes in the chain every variant measures: serial first,
 /// then alternating serial/parallel, so a chain of four is `S, P, S, P`.
@@ -100,37 +103,9 @@ const WARM_UP: Duration = Duration::from_secs(1);
 /// Measurement time per measurement. See [`SAMPLES`].
 const MEASUREMENT: Duration = Duration::from_secs(3);
 
-/// The worker counts every shape is measured at: one, and the machine's own.
-///
-/// Only the `rustflow` ids vary by this: the mpsc baseline's thread count is
-/// [`NUM_PIPES`], fixed, which is the asymmetry the module docs above name.
-fn worker_counts() -> Vec<usize> {
-    let parallel = available_parallelism().map_or(1, NonZeroUsize::get);
-    if parallel > 1 {
-        vec![1, parallel]
-    } else {
-        vec![1]
-    }
-}
-
-/// Upstream's `dummy`, reused unchanged from `embarrassing_parallelism.rs`:
-/// a small, non-foldable amount of FP work per token, run once per pipe or
-/// per mpsc stage so that both sides pay the same per-token cost.
-fn dummy(i: u64) -> f64 {
-    let mut x = (i.wrapping_mul(1_315_423_911) ^ (i >> 3)) as f64 + 1.0;
-    let mut sink = 0.0_f64;
-
-    for _ in 0..32 {
-        x = x.sin() * 1.000_000_1 + x.cos();
-        sink = black_box(sink + x);
-    }
-
-    sink
-}
-
 /// Builds the [`NUM_PIPES`]-pipe chain this benchmark measures and the
 /// counter its last pipe advances: `S, P, S, P`, matching the mpsc chain's
-/// own stage count and per-token cost.
+/// own stage count and per-token [`body::dummy`] cost.
 fn build_pipeline(num_lines: usize, num_tokens: usize) -> (Pipeline, Arc<AtomicUsize>) {
     let processed = Arc::new(AtomicUsize::new(0));
     let mut pipes = Vec::with_capacity(NUM_PIPES);
@@ -144,7 +119,7 @@ fn build_pipeline(num_lines: usize, num_tokens: usize) -> (Pipeline, Arc<AtomicU
             return;
         }
         let token = u64::try_from(pf.token()).expect("a token index fits in a u64");
-        black_box(dummy(token));
+        black_box(body::dummy(token));
     }));
 
     for stage in 1..NUM_PIPES {
@@ -157,7 +132,7 @@ fn build_pipeline(num_lines: usize, num_tokens: usize) -> (Pipeline, Arc<AtomicU
         let processed = Arc::clone(&processed);
         pipes.push(Pipe::new(kind, move |pf: &mut Pipeflow| {
             let token = u64::try_from(pf.token()).expect("a token index fits in a u64");
-            black_box(dummy(token));
+            black_box(body::dummy(token));
             if is_last {
                 processed.fetch_add(1, Ordering::Relaxed);
             }
@@ -191,10 +166,10 @@ fn run_pipeline(num_lines: usize, num_tokens: usize, executor: &Executor) {
 
 /// Chains [`NUM_PIPES`] freshly spawned threads with
 /// [`NUM_PIPES`]` - 1` fresh [`std::sync::mpsc`] channels, the first thread
-/// generating `num_tokens` tokens and the rest receiving, doing [`dummy`]'s
-/// work and forwarding -- the baseline's whole shape, in the role TBB's
-/// `parallel_pipeline` plays upstream. Returns each stage's own count of
-/// tokens it handled, in stage order.
+/// generating `num_tokens` tokens and the rest receiving, doing
+/// [`body::dummy`]'s work and forwarding -- the baseline's whole shape, in
+/// the role TBB's `parallel_pipeline` plays upstream. Returns each stage's
+/// own count of tokens it handled, in stage order.
 fn run_mpsc(num_tokens: usize) -> Vec<usize> {
     let channels: Vec<(mpsc::Sender<usize>, mpsc::Receiver<usize>)> =
         (0..NUM_PIPES - 1).map(|_| mpsc::channel()).collect();
@@ -219,7 +194,7 @@ fn run_mpsc(num_tokens: usize) -> Vec<usize> {
 
                 let mut handle = |token: usize| {
                     let as_u64 = u64::try_from(token).expect("a token index fits in a u64");
-                    black_box(dummy(as_u64));
+                    black_box(body::dummy(as_u64));
                     count += 1;
                     if let Some(tx) = &output {
                         tx.send(token).expect("the next stage is still receiving");
@@ -280,8 +255,8 @@ fn bench_pipeline(c: &mut Criterion) {
         });
     }
 
-    for workers in worker_counts() {
-        let executor = Executor::new(workers);
+    for workers in common::worker_counts() {
+        let executor = common::executor(workers);
 
         for lines in LINES {
             for size in SIZES {

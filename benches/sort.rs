@@ -19,14 +19,16 @@
 //! untimed setup, consumed by the timed sort.
 
 use std::hint::black_box;
-use std::num::NonZeroUsize;
-use std::thread::available_parallelism;
 use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use rayon::slice::ParallelSliceMut;
 use rustflow::Executor;
 use rustflow::prelude::*;
+
+#[path = "common/baseline.rs"]
+mod baseline;
+mod common;
 
 /// Element counts, two points off upstream's sweep (`N = 10..=1e8`, ×10 each
 /// step): one inside [`src/algorithm/sort.rs`][cutoff]'s own cutoff for
@@ -43,16 +45,6 @@ const SAMPLES: usize = 20;
 const WARM_UP: Duration = Duration::from_secs(1);
 /// Measurement time per measurement. See [`SAMPLES`].
 const MEASUREMENT: Duration = Duration::from_secs(3);
-
-/// The worker counts every shape is measured at: one, and the machine's own.
-fn worker_counts() -> Vec<usize> {
-    let parallel = available_parallelism().map_or(1, NonZeroUsize::get);
-    if parallel > 1 {
-        vec![1, parallel]
-    } else {
-        vec![1]
-    }
-}
 
 /// `n` random `f64`s: upstream's `d = ::rand()` loop, over a linear
 /// congruential generator rather than `rand`, so a run is reproducible.
@@ -96,13 +88,9 @@ fn bench_sort(c: &mut Criterion) {
         .warm_up_time(WARM_UP)
         .measurement_time(MEASUREMENT);
 
-    for workers in worker_counts() {
-        let executor = Executor::new(workers);
-        // rayon's answer to TBB's `global_control(max_allowed_parallelism)`.
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(workers)
-            .build()
-            .expect("a rayon pool of the requested size");
+    for workers in common::worker_counts() {
+        let executor = common::executor(workers);
+        let pool = baseline::rayon_pool(workers);
 
         for size in SIZES {
             group.bench_function(

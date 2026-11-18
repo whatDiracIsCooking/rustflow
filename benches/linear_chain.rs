@@ -19,15 +19,15 @@
 //! outside, as upstream's function-static one is.
 
 use std::hint::black_box;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread::available_parallelism;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rustflow::Executor;
 use rustflow::prelude::*;
+
+mod common;
 
 /// Chain lengths, two points off upstream's sweep.
 ///
@@ -49,20 +49,6 @@ const SAMPLES: usize = 20;
 const WARM_UP: Duration = Duration::from_secs(1);
 /// Measurement time per measurement. See [`SAMPLES`].
 const MEASUREMENT: Duration = Duration::from_secs(3);
-
-/// The worker counts every shape is measured at: one, and the machine's own.
-///
-/// Upstream defaults to `-t 1` and takes the thread count as an option; issue
-/// #18 asks for one worker and `available_parallelism`, which are the two ends
-/// of that option. They collapse to one measurement on a single-core box.
-fn worker_counts() -> Vec<usize> {
-    let parallel = available_parallelism().map_or(1, NonZeroUsize::get);
-    if parallel > 1 {
-        vec![1, parallel]
-    } else {
-        vec![1]
-    }
-}
 
 /// Builds a chain of `length` counting tasks and runs it once.
 ///
@@ -106,8 +92,8 @@ fn bench_linear_chain(c: &mut Criterion) {
         .warm_up_time(WARM_UP)
         .measurement_time(MEASUREMENT);
 
-    for workers in worker_counts() {
-        let executor = Executor::new(workers);
+    for workers in common::worker_counts() {
+        let executor = common::executor(workers);
         for length in LENGTHS {
             group.bench_function(
                 BenchmarkId::new(format!("rustflow/{workers}w"), length),
