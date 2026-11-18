@@ -2,6 +2,39 @@
 //!
 //! Upstream's `class NodeBase` and `class Node`, together with the
 //! `Node::Semaphores` and `ExplicitAnchorGuard` that belong to them.
+//!
+//! # Design
+//!
+//! **The state words are atomic where upstream's are plain** -- `_nstate` is
+//! a bare `int` there -- so that a run can hold a `&Graph` across worker
+//! threads instead of handing out `&mut` to nodes it does not exclusively
+//! own. Upstream's one remaining [`NodeBase`] member is not here at all:
+//! `_parent` travels with the job.
+//!
+//! **The payload slot is a field of the node rather than of the nested
+//! run**, which is `DESIGN.md`'s entry on where a failure inside a nested
+//! graph is delivered; the one anchor without a [`NodeBase`] is the run
+//! itself, whose payload slot is the completion slot a `wait` already reads.
+//! The `Mutex` the slot sits behind is uncontended by construction: at most
+//! one writer arrives, [`NodeBase::claim_panic`] having arbitrated on the
+//! estate word before the lock is taken, and the only readers are the frame
+//! or the second entry that waited for the nested graph, which run when no
+//! job of it is left.
+//!
+//! **The dispatch claim is one byte per node and is independent of
+//! `PREEMPTED`.** [`DispatchClaim`] answers "is this node's own callable
+//! locked right now", which [`Node::PREEMPTED`] cannot: that bit is set only
+//! by the four handle kinds `preempts_itself` answers `true` for, so a node
+//! of any other kind -- [`Handle::Static`], either conditioner,
+//! [`Handle::NonpreemptiveRuntime`] -- is never "entered" by that reckoning
+//! even while its body is genuinely running, and [`Handle::Subflow`] is not
+//! either for as long as its body is still *building* the subgraph that
+//! would make it preempt. `DESIGN.md`'s "Decisions taken in M8" has the hole
+//! that left, the caller-side fix that was tried first and could not close
+//! it from outside the scheduler, and which dispatch arms take the claim.
+//! The cost is an `AtomicU8` beside [`NodeBase`]'s own three words, which
+//! [`Semaphores`] and [`Node`]'s own data slot already account for
+//! themselves.
 
 use core::fmt;
 use std::any::Any;
@@ -21,22 +54,6 @@ use crate::semaphore::{Semaphore, SemaphoreError};
 /// whatever they were scheduled under, and the last of them to reach zero
 /// ends that nested run. Upstream says the same by inheritance, reaching
 /// either through a `NodeBase*`.
-///
-/// The words are atomic even where upstream's are plain -- `_nstate` is a
-/// bare `int` there -- so that a run can hold a `&Graph` across worker
-/// threads instead of handing out `&mut` to nodes it does not exclusively
-/// own. Upstream's one remaining member is not here: `_parent` travels with
-/// the job.
-///
-/// The payload slot is a field of the node rather than of the nested run,
-/// which is `DESIGN.md`'s entry on where a failure inside a nested graph is
-/// delivered; the one anchor without a `NodeBase` is the run itself, whose
-/// payload slot is the completion slot a `wait` already reads. The `Mutex`
-/// the slot sits behind is uncontended by construction: at most one writer
-/// arrives, [`NodeBase::claim_panic`] having arbitrated on the estate word
-/// before the lock is taken, and the only readers are the frame or the second
-/// entry that waited for the nested graph, which run when no job of it is
-/// left.
 #[derive(Default)]
 pub(crate) struct NodeBase {
     /// Upstream's `_nstate`: the strong-dependency count in the low 28 bits
@@ -236,23 +253,9 @@ pub(crate) struct Semaphores {
 
 /// Whether a node's own callable is locked by a dispatch in progress, and
 /// whether a [`Runtime::schedule`](crate::Runtime::schedule) bypass asked --
-/// while it was -- to run the node again: the dispatch claim every node
-/// carries to close a hole `Node::nstate`'s `PREEMPTED` bit cannot, that bit
-/// being set only by the four handle kinds `preempts_itself` answers `true`
-/// for. A node of any other kind -- [`Handle::Static`], either conditioner,
-/// [`Handle::NonpreemptiveRuntime`] -- is never "entered" by that reckoning
-/// even while its body is genuinely running, and [`Handle::Subflow`] is not
-/// either for as long as its body is still *building* the subgraph that
-/// would make it preempt. `schedule`'s own guard, `is_entered`, answers both
-/// cases `false`; this claim is what answers the question `is_entered` is
-/// not asking -- not "is this node's nested run outstanding" but "is this
-/// node's own callable locked right now" -- and `DESIGN.md`'s "Decisions
-/// taken in M8" has the caller-side fix that was tried first and could not
-/// close this from outside the scheduler.
-///
-/// One byte per node: an `AtomicU8` beside [`NodeBase`]'s own three words,
-/// which [`Semaphores`] and [`Node`]'s own data slot already account for
-/// themselves in their own doc comments.
+/// while it was -- to run the node again: the claim every node carries so
+/// that two dispatches cannot hold one callable, which the module's
+/// `# Design` section places against `schedule`'s own `is_entered` guard.
 ///
 /// # Ordering
 ///

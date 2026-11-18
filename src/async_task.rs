@@ -15,6 +15,27 @@
 //! What the packing bought upstream and what giving it up costs is
 //! `DESIGN.md`'s entry on the handle being that `Arc`; the consequence a
 //! caller sees is [`AsyncTask::use_count`].
+//!
+//! **What `use_count` counts.** Handles plus the executor's own shares: a
+//! task that is queued or running is named by a [`Job`](crate::executor) the
+//! scheduler holds, which is a share like any other, so two clones of a
+//! handle on a task still in the queue read three. Upstream's count includes
+//! the same thing, which its own docs say from the other side. The number is
+//! a liveness fact rather than a count of a caller's own variables.
+//!
+//! **Why the identity traits are hand-written.** Upstream declares no
+//! `operator==`, and this port needs one because a handle that hashes has to
+//! agree with how it compares: both read the node's address, through
+//! `AsyncTask::identity`, which is also what makes two empty handles equal
+//! without a case of their own. [`Clone`] is spelled out so that it can name
+//! upstream's `_incref`, and [`Debug`](fmt::Debug) so that the derived impl
+//! does not print the node and through it whatever the body captured.
+//!
+//! **Where a failed async task's payload goes**, and why a *graph* task has
+//! no accessor for one, is `DESIGN.md`'s: its entry on a failure out of a
+//! free node names [`AsyncTask::take_panic`] as upstream's `exception_ptr()`
+//! on such a node, and its entry on the one-payload race says why the port
+//! declines upstream's `tf::Task::exception_ptr`.
 
 use core::fmt;
 use core::hash::{Hash, Hasher};
@@ -48,13 +69,10 @@ impl AsyncTask {
 
     /// The free-standing node this handle shares, `None` for an empty handle:
     /// upstream's `task._node`, reached from `_process_dependent_async`
-    /// through its `friend class Executor`.
-    ///
-    /// The one caller is `executor::dependent_async`, pushing the job of a
-    /// new task onto the successor list of every dependency named, and `None`
-    /// is upstream's `task.empty()` branch -- the dependency it counts off
-    /// instead of waiting for. A share rather than a borrow, that caller
-    /// building a [`Job`](crate::executor) that keeps the node alive.
+    /// through its `friend class Executor`. `None` is upstream's
+    /// `task.empty()` branch -- the named dependency a submission counts off
+    /// instead of waiting for. A share rather than a borrow, so that the
+    /// [`Job`](crate::executor) built from it keeps the node alive.
     pub(crate) fn node(&self) -> Option<&Arc<AsyncNode>> {
         self.0.as_ref()
     }
@@ -77,14 +95,9 @@ impl AsyncTask {
     }
 
     /// How many shares of this task are outstanding: upstream's
-    /// `use_count()`, which is `0` for an empty handle.
-    ///
-    /// **Handles plus the executor's own shares**: a task that is queued or
-    /// running is named by a [`Job`](crate::executor) the scheduler holds,
-    /// which is a share like any other, so two clones of a handle on a task
-    /// still in the queue read three. Upstream's count includes the same
-    /// thing, which its own docs say from the other side. The number is a
-    /// liveness fact rather than a count of your own variables.
+    /// `use_count()`, which is `0` for an empty handle and counts the
+    /// executor's own shares beside a caller's -- the module's `# Design`
+    /// section has what that means for the number read back.
     #[must_use]
     pub fn use_count(&self) -> usize {
         self.0.as_ref().map_or(0, Arc::strong_count)
@@ -104,11 +117,10 @@ impl AsyncTask {
 
     /// The hash of this handle's task identity: upstream's `hash_value()`,
     /// which is `std::hash<Node*>{}(_node)` and so hashes the null pointer
-    /// for an empty handle. A `u64` where upstream's is a `size_t`, that
-    /// being what Rust's [`Hasher`] produces, and it is this port's [`Hash`]
-    /// impl run through the default hasher -- so it agrees with what a
-    /// [`HashMap`](std::collections::HashMap) of handles computes, which is
-    /// the only promise a hash of an address can keep.
+    /// for an empty handle. A `u64` where upstream's is a `size_t`, and this
+    /// port's [`Hash`] impl run through the default hasher -- so it agrees
+    /// with what a [`HashMap`](std::collections::HashMap) of handles
+    /// computes, which is the only promise a hash of an address can keep.
     #[must_use]
     pub fn hash_value(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
@@ -122,13 +134,9 @@ impl AsyncTask {
     /// The one accessor that reads the *node* rather than its state word, for
     /// upstream's own case: a **silent** async task has no future and no
     /// frame waiting on it, so a panic out of its body is parked on the node,
-    /// and this hands it back to whoever still holds a handle.
-    ///
-    /// It is not the `Task::exception_ptr` the README declines to port: a
-    /// *graph* node's slot is an anchor's, where only the first of several
-    /// failures claims it, so handing one back would report an arbitrary one
-    /// of them. A free node's slot holds the one failure of the one task it
-    /// is.
+    /// and this hands it back to whoever still holds a handle. A free node's
+    /// slot holds the one failure of the one task it is, which is why there
+    /// is no such accessor on a graph task.
     ///
     /// Takes rather than peeks, as [`RunHandle::wait`](crate::RunHandle)
     /// does, the payload being a `Box<dyn Any + Send>` only one caller can
@@ -148,18 +156,14 @@ impl AsyncTask {
 }
 
 impl Clone for AsyncTask {
-    /// Upstream's copy constructor, whose `_incref` this is; hand-written
-    /// only so that the comment can say so, `Option<Arc<_>>` cloning the
-    /// same way.
+    /// Upstream's copy constructor, whose `_incref` this is.
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
 impl PartialEq for AsyncTask {
-    /// By node identity, upstream's `_node == rhs._node`. Upstream declares
-    /// no `operator==`; this one exists because a handle that hashes has to
-    /// agree with how it compares.
+    /// By node identity, upstream's `_node == rhs._node`.
     fn eq(&self, other: &Self) -> bool {
         core::ptr::eq(self.identity(), other.identity())
     }
@@ -176,8 +180,7 @@ impl Hash for AsyncTask {
 }
 
 impl fmt::Debug for AsyncTask {
-    /// Hand-written because the derived one would print the node, and
-    /// through it whatever the body captured.
+    /// Hand-written so that the node's captures are never printed.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = f.debug_struct("AsyncTask");
         match &self.0 {
