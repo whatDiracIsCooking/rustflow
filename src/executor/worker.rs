@@ -66,6 +66,7 @@ use crate::executor::rng::Xorshift32;
 use crate::executor::topology::Job;
 use crate::executor::{r#async, dependent_async, module, runtime, subflow};
 use crate::graph::{Handle, Node};
+use crate::observer::{TaskView, WorkerView};
 
 /// What a strong release that lands on a node some bypass has already entered
 /// reports, instead of resuming that node: the successor arm of
@@ -603,18 +604,41 @@ impl WorkerThread {
 
     /// The point at which this worker is about to run `job`'s work: upstream's
     /// `Executor::_observer_prologue`, which notifies every registered observer of
-    /// the entry. Empty until there are observers to notify, and named so that the
-    /// step that adds them adds a call. Upstream calls its own from inside each
-    /// `_invoke_*_task`, so its window is the body alone; the one call site here is
-    /// around the whole dispatch, which puts the scheduling of a nested graph inside
-    /// the window of the kind that preempts for it.
-    fn observer_prologue(&self, _job: &Job) {}
+    /// the entry. Upstream calls its own from inside each `_invoke_*_task`, so its
+    /// window is the body alone; the one call site here is around the whole
+    /// dispatch, which puts the scheduling of a nested graph inside the window of
+    /// the kind that preempts for it.
+    ///
+    /// The empty-list check is the one thing this does with no observers
+    /// registered: see the [`observer`](crate::observer) module docs' "Design"
+    /// section for why that is lock-free and allocates nothing.
+    fn observer_prologue(&self, job: &Job) {
+        if self.shared.observers.is_empty() {
+            return;
+        }
+        let (node, graph, _topology) = job.parts();
+        let worker = WorkerView::new(self.worker());
+        let task = TaskView::new(node, graph);
+        for observer in self.shared.observers.snapshot() {
+            observer.on_entry(worker, task);
+        }
+    }
 
     /// The point right after that: upstream's `Executor::_observer_epilogue`, which
     /// notifies every registered observer of the exit. Reached on the entry that
     /// *finishes* the node and on every entry that preempts it, the dispatch arm
     /// having returned either way.
-    fn observer_epilogue(&self, _job: &Job) {}
+    fn observer_epilogue(&self, job: &Job) {
+        if self.shared.observers.is_empty() {
+            return;
+        }
+        let (node, graph, _topology) = job.parts();
+        let worker = WorkerView::new(self.worker());
+        let task = TaskView::new(node, graph);
+        for observer in self.shared.observers.snapshot() {
+            observer.on_exit(worker, task);
+        }
+    }
 
     /// Keeps `job` for this worker to run next, queueing whatever was being kept
     /// before it: upstream's `_update_cache`, line for line. Called once per

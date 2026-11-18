@@ -1718,3 +1718,42 @@ So the trade to report is that there is none to report: the two shapes that
 allocate a free node per task gain 1 to 34%, and the four that build a graph
 read between −0.2% and +1.7% -- inside, or within a few tenths of a percent
 of, the spread of their own sides, on paths the change does not touch.
+
+## The #167 note: observer seams cost one relaxed load with none registered
+
+#167 gave the executor's two scheduling seams, `observer_prologue` and
+`observer_epilogue`, bodies: an `ObserverList::is_empty` check -- one relaxed
+load of an `AtomicUsize`, no lock and no allocation -- around every dispatch,
+taken on every seam whether or not anything is registered. This is not the
+case for the heavier A/B protocol the sections above use: the claim is
+structural (the branch a reader can see in `src/executor/worker.rs`, and the
+one-row measurement below with no observer ever registered), not a result
+repeated runs would sharpen.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id |
+| Date | 2026-11-18 |
+
+One criterion run per side, `linear_chain/rustflow/24w/16384`, no observer
+registered either side:
+
+| | load average | time |
+|---|---|---|
+| before (`main`) | 3.16 | 1.9200 ms – 1.9480 ms |
+| after (this branch) | 10.84 | 2.0959 ms – 2.1208 ms |
+
+Criterion itself reports the difference as "+7.9% to +9.3%, regressed" --
+but the load average more than tripled between the two runs, three sibling
+agents' `cargo` builds having started on this box in between, which is
+exactly the kind of swing "The machine, and what it was doing" above says to
+read as noise rather than as a result: the `before` row of that section's own
+`linear_chain/rustflow/1w` id moved by a similar amount between two runs an
+hour apart at a load average of 1.4 versus 7.9. A single relaxed atomic load
+added to a dispatch that was already reading several others does not have a
+mechanism to cost 9% of a 2 ms run, and this file's standing rule is not to
+chase a number by re-running until the load looks better -- so both numbers
+are reported as measured, with the caveat that earns them.
