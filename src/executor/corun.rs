@@ -1,175 +1,36 @@
 //! Translated from `taskflow/core/executor.hpp` (Taskflow v4.1.0): `corun`,
 //! `corun_until`, `_corun_until` and `_corun_graph`.
 //!
-//! # Why `run(..).wait()` from inside a task deadlocks
+//! # Design
 //!
-//! A task body runs on a worker thread, and an executor's workers are a fixed
-//! pool: the only threads that will ever take a job out of its queues. So when
-//! a task calls [`Executor::run`] and then waits -- with
-//! [`RunHandle::wait`](crate::RunHandle::wait), or by letting the handle drop,
-//! which blocks the same way -- it parks one of those threads in the inner
-//! run's completion slot. The work it is waiting for is sitting in the pool's
-//! queues; the thread that could have taken it is asleep.
+//! `DESIGN.md` has why a worker that waits for a nested graph does not park,
+//! which is the whole of what this module is for, and what a caller feels for
+//! it. The rest is the two things a corun does that a run does not.
 //!
-//! Nothing in the executor undoes that. A parked thread is woken by the
-//! topology it waited on finishing, and the topology finishes when some
-//! *other* worker runs its last job, so the pool has to have a worker to
-//! spare. One nested wait on a four-worker executor leaves three. Four at once
-//! leave none, and then no inner graph can start: every thread that could run
-//! one is waiting for one. At a single worker it takes just one nested wait --
-//! the inner run's sources are queued, the only worker is asleep, and the run
-//! that would wake it needs that worker. That is a deadlock, not a slow patch,
-//! and it is what upstream's documentation means by
-//! `//executor.run(tf).wait(); <- blocking the worker without doing anything
-//! will introduce deadlock`.
+//! The inner graph is scheduled under an **anchor** rather than under the
+//! topology, upstream's local `NodeBase anchor`: its jobs count that anchor
+//! down and the corunning frame waits for it to reach zero, while the topology
+//! is still the run -- what `join` waits on, what a run policy reports to --
+//! with nothing driving *its* counter, so this frame is its own tear-down. The
+//! anchor is also where a failing task of the inner graph reports, upstream's
+//! `ESTATE::EXPLICITLY_ANCHORED`, so the payload comes out of the corun call
+//! on the worker that made it rather than out of a `wait` somewhere else;
+//! `DESIGN.md` has why there are two shapes of that, and both leave the rest
+//! of the inner graph cancelled. The run's own slot is read as a backstop, for
+//! the one failure with no node to walk up from: a run policy's callback.
 //!
-//! [`Executor::corun`] is the answer, and the whole of it is: do not park.
-//! The calling worker stays in the work-stealing loop, running the inner
-//! graph's jobs and anybody else's, until the inner run's last job has
-//! finished. The pool never loses a thread to waiting, so no amount of nesting
-//! can drain it. `WorkerThread::corun_until`, in `executor::worker`, is that
-//! loop, and its comment says what separates it from the worker's own.
-//!
-//! Three consequences worth stating, because they are what a caller feels:
-//!
-//! - The wait is not ordered. A corunning worker runs whatever it can steal,
-//!   which includes work from runs the caller knows nothing about, so `corun`
-//!   returns no sooner than the inner run finishes and no later than the next
-//!   job it picked up is done.
-//! - `corun` is for a worker of *this* executor and nothing else. From any
-//!   other thread it is [`CorunError::NotAWorker`]; see below.
-//! - Nesting a run on a *different* executor and blocking on it is still
-//!   fine, and still costs a thread. Two pools cannot starve each other the
-//!   way one pool starves itself.
-//!
-//! # The inner run's anchor and topology
-//!
-//! Every queued job holds a share of the run it belongs to, of the storage of
-//! the taskflow it walks and of the parent its graph was scheduled under,
-//! which is what `executor::topology` rests on: none of the three can be
-//! freed while a job can name it. A corun adds nothing to that argument and
-//! takes nothing away. What it does add is a second reason the inner run
-//! cannot be left behind: both the anchor and the topology are owned by
-//! `InnerRun`, a value this module creates on the corun frame and never hands
-//! out, so a caller cannot hold either and therefore cannot leak them -- and
-//! the `Drop` that ends the run is the only way the frame can be left, an
-//! unwind through it included.
-//!
-//! The anchor is what the inner graph is scheduled *under*, and it is
-//! upstream's local `NodeBase anchor` in `corun`: the jobs of the graph count
-//! it down rather than counting down the topology, and the corunning frame
-//! waits for it to reach zero. The topology is still there and still the run
-//! -- it is what `join` waits on and what a run policy reports to -- but
-//! nothing drives *its* counter to zero, so this frame is its own tear-down.
-//! Scheduling under an anchor rather than under the topology is what the
-//! parent machinery of #47 is for.
-//!
-//! That makes a corun the closure-shaped version of the promise
-//! [`Executor::run`] makes with a lifetime: the borrow of `taskflow` ends when
-//! this function returns, and it cannot return until the run is over.
-//!
-//! # Why the frame waits twice
-//!
-//! "The run is over" turns out to be two questions, and the anchor answers
-//! only the first. A node that **preempts** -- a module task, a subflow task,
-//! a runtime task -- is dequeued as a job and that job is then *copied*: onto
-//! the frame still inside the dispatch arm, into the parent its nested graph
-//! is scheduled under, and once more as the job the last child of that graph
-//! re-queues to resume it. Only the third copy is ever finished, so only its
-//! share of the taskflow's storage is given up before the decrement that
-//! drives the anchor's counter to zero. The other two are dropped a few
-//! instructions later by frames that have moved on. So the anchor reaching
-//! zero says *every job of the graph has finished*; it does not say every
-//! copy of one has been dropped, and the caller's next line may be an edit of
-//! the taskflow -- which panics in
-//! [`Taskflow::graph_mut`](crate::Taskflow::graph_mut) while any share of its
-//! storage is outstanding.
-//!
-//! Issue #109 met that for a thread waiting in a run's completion slot and
-//! answered it with the hold `executor::topology` calls `Storage`: every job
-//! of the run's graph owns a share, and whoever drops the *last* one releases
-//! the storage and then the waiter, so the two are one event in one order. A
-//! corun frame cannot be released that way, because it is not waiting to be
-//! released -- it is spinning in the work-stealing loop, and there is no
-//! parked thread for a straggling copy to wake. #112 is that gap.
-//!
-//! What a frame can do instead is the one thing no holder of a share can: ask
-//! whether it holds the last one. So a corun **takes its run's hold out of
-//! the topology**, schedules the graph through it exactly as a `run`'s
-//! tear-down schedules its own, and then waits a second time -- in the same
-//! loop, on `Arc::get_mut` -- until that hold is unique. The flow share the
-//! caller is about to edit through is *inside* the hold, so uniqueness is the
-//! whole of the guarantee: no second share to be ordered against, and the
-//! frame drops the hold itself as its last act. `corun_payload` is those few
-//! lines.
-//!
-//! Three properties make the second wait sound rather than hopeful:
-//!
-//! - **It terminates.** Every holder of a share other than this frame is a
-//!   job of the graph, a copy of one, or an owner derived from one -- and a
-//!   job that has not finished still counts against the anchor, so the first
-//!   wait has already ruled out anything parked, queued or running. What is
-//!   left is copies on their way out of frames that owe nothing and wait for
-//!   nobody, which is why no job this wait is waiting for can be waiting for
-//!   it.
-//! - **It is not a busy wait that costs the pool a thread.** It is
-//!   `corun_until`, so the worker runs other people's jobs while it asks, as
-//!   it does for the first wait and for the same reason.
-//! - **It covers the nested graphs too.** A job of a module's target graph
-//!   holds a share of *that* taskflow rather than of this one, and it keeps
-//!   the hold alive through its parent chain -- the copy of the preempted
-//!   node's job -- which it gives up after its own. So a unique hold means
-//!   every graph under the corun is finished with, one level or five.
-//!
-//! The other callers of `corun_graph` need none of this, which is worth
-//! saying because it is why the fix is here rather than there.
-//! `Subflow::join` and `Runtime::corun` wait on a *node*, inside a run that
-//! somebody else is waiting on, and every job under such a node holds the
-//! hold of that enclosing run -- through its owner chain for a job of the
-//! run's own graph, through its parent chain for a job nested deeper -- so
-//! #109's ordering already covers the edit those frames lead back to. The
-//! anchor case is the one where the graph belongs to a taskflow nobody else
-//! is holding still, and the frame that returns is the one that may edit it.
-//!
-//! # Why a failure comes back here rather than from `wait`
-//!
-//! A task of the inner graph that panics does not report to the inner run.
-//! It reports to the **anchor**, because the anchor is what this frame is
-//! waiting on and this frame is therefore what can do something about it --
-//! that is the whole of what upstream's `ESTATE::EXPLICITLY_ANCHORED` is for,
-//! and `corun_graph` below -- crate-private, so it is named rather than
-//! linked -- is where the bit is set. So the payload comes out of the corun
-//! call, on the worker that made it, and not out of a `wait` somewhere else:
-//! there is no handle to wait on, and the task body that called `corun` is
-//! the only code that knows what the inner graph was for.
-//!
-//! The inner run's own payload slot is still read, as a backstop, because one
-//! kind of failure has no node to walk up from and lands there instead: this
-//! run's policy callbacks, which a corun gives nothing to do, and anything a
-//! future node kind records against a topology directly.
-//!
-//! Which leaves the question of what to *do* with it, and both answers are
-//! wanted often enough that this module offers each by name:
-//!
-//! - [`Executor::corun`] re-raises it, with
-//!   [`resume_unwind`](std::panic::resume_unwind). That is upstream's
-//!   `_rethrow_exception` exactly, and it is the shape that composes: a
-//!   caller who wrapped the call in nothing has the failure propagate out of
-//!   its own task body, where the executor catches it as that task's failure
-//!   and the *outer* run reports it. The payload keeps its identity all the
-//!   way, so a handler two levels up still downcasts it to what the inner
-//!   task panicked with.
-//! - [`Executor::try_corun`] hands it back as a [`CorunError::Run`]. That is
-//!   the shape for a caller who means to inspect or ignore the failure, and
-//!   it is what upstream's callers write a `try`/`catch` around.
-//!
-//! Both leave the rest of the inner graph cancelled, on the terms the
-//! [`executor`](crate::executor) module docs set out for any failure:
-//! claiming the anchor's payload slot sets the same `EXCEPTION` bit that
-//! stops jobs being started, so the siblings of the failing task that had not
-//! begun do not run. The outer run is untouched by either shape -- the walk
-//! stopped at the anchor -- unless the body lets the panic through, which is
-//! precisely how `corun` propagates.
+//! And the frame waits *twice*, which `DESIGN.md` also has: the anchor
+//! reaching zero says every job has finished, not that every copy of a
+//! preempted node's job has been dropped, and the caller's next line may be an
+//! edit of the taskflow. So the frame takes its run's hold on the storage out
+//! of the topology, schedules the graph through it, and waits in the same loop
+//! for `Arc::get_mut` to call that hold unique -- the one question no mere
+//! holder of a share can answer. It terminates, every other holder being a
+//! finished job or a copy on its way out of a frame that owes nothing; costs
+//! the pool no thread; and covers the nested graphs, a job of a module's
+//! target graph keeping the hold alive through its parent chain. The other
+//! callers of `corun_graph` need none of it, waiting on a *node* inside a run
+//! somebody else is waiting on.
 
 use std::any::Any;
 use std::fmt;
@@ -185,39 +46,23 @@ use crate::taskflow::{Flow, Taskflow};
 /// Runs `flow`'s graph under `parent` and waits for it on the calling worker,
 /// handing back what the first task of it to fail panicked with.
 ///
-/// Upstream's `Executor::_corun_graph`, and the one primitive every blocking
-/// wait on a nested graph is built from: [`Executor::corun`] here,
-/// `Subflow::join` (#50) and `Runtime::corun` (#51). Four steps, in
-/// upstream's order, and the order is the whole of it:
+/// Upstream's `Executor::_corun_graph`, the one primitive every blocking wait
+/// on a nested graph is built from, in four steps whose order is the whole of
+/// it: a graph with nothing to run is nothing to wait for, upstream's
+/// `if(g.empty()) return`; `parent` is anchored **before** the graph is
+/// scheduled, a source being able to fail before this call returns and a
+/// failure arriving while the bit is clear walking past the waiting frame;
+/// the graph goes under `parent`, whose counter its jobs take down while the
+/// calling worker stays in the work-stealing loop; and the guard is dropped
+/// and the payload taken, upstream's `p->_rethrow_exception()` with the
+/// decision left to the caller, which gives the two shapes one implementation.
 ///
-/// 1. a graph with nothing to run is nothing to wait for, so this returns at
-///    once -- upstream's `if(g.empty()) return`;
-/// 2. `parent` is anchored **before** the graph is scheduled, because a
-///    source of it can fail before this call has returned and a failure that
-///    arrives while the bit is clear walks past the frame that is waiting;
-/// 3. the graph goes under `parent`, so its jobs count that parent down
-///    rather than the run, and the calling worker stays in the work-stealing
-///    loop until they have all finished -- which is what keeps a nested wait
-///    from costing the pool a thread;
-/// 4. the guard is dropped and the payload taken, which is upstream's
-///    `p->_rethrow_exception()` with the decision of what to do about it left
-///    to the caller. That is what gives the two shapes [`Executor::corun`]
-///    and [`Executor::try_corun`] one implementation.
-///
-/// The graph arrives as whatever owns it rather than as a `&Graph`, because a
-/// job of this graph has to own the storage its node indices resolve in and a
-/// reference cannot be owned. It is any of the four kinds of graph owner
-/// `Shared::schedule_graph` takes since #74, which is what lets the two
-/// callers it has today share one implementation: [`Executor::corun`] hands
-/// over its run's hold on a taskflow's storage -- the share it then waits to
-/// become unique, which is the module docs' second wait -- and
-/// `Subflow::join` (#50) the lease of the subgraph its own node owns.
-///
-/// `worker` is upstream's `Worker&`: the real one when the caller is a
-/// dispatch arm inside `WorkerThread::invoke`, and a
+/// The graph arrives as whatever owns it rather than as a `&Graph`, a job of
+/// it having to own the storage its node indices resolve in. `worker` is
+/// upstream's `Worker&`: the real one when the caller is a dispatch arm
+/// inside `WorkerThread::invoke`, a
 /// [`corun_view`](WorkerThread::corun_view) of it when the caller is a task
-/// *body*, which cannot name the frame running it. Either way the loop is the
-/// same one.
+/// *body*, which cannot name the frame running it.
 pub(crate) fn corun_graph(
     worker: &mut WorkerThread,
     owner: &GraphOwner,
@@ -247,47 +92,34 @@ pub(crate) fn corun_graph(
 /// Why a [`Executor::corun`] or [`Executor::corun_until`] call did not do what
 /// it was asked.
 ///
-/// `#[non_exhaustive]` for the same reason [`RunError`] is: later milestones
-/// have more ways for a nested run to fail. Cancellation turned out not to be
-/// one of them, which is worth recording because it was the reason this was
-/// written that way. A corun's topology is the one `InnerRun` owns on the
-/// corunning frame: nothing outside this module can name it and no
-/// [`Canceller`](crate::Canceller) is ever handed out for it, so there is no
-/// way to cancel a corun, and cancelling the *outer* run does not reach it
-/// either -- the task that called `corun` was already running, and
-/// cancellation is not preemptive. Upstream agrees by construction: its
-/// `Executor::corun` schedules the graph with a null topology and a fresh
-/// local anchor as the parent, so the `_is_parent_cancelled` check at the top
-/// of its `_invoke` answers no for the nodes of it -- until one of them
-/// fails. A failure under the anchor marks it, which is how the rest of a
-/// corun graph is skipped, and that is a failure rather than a cancellation
-/// however much the scheduler reads the two as one bit. Where the
-/// cancellation question does come back is the corun upstream *does* pass an
-/// enclosing topology for -- a subflow or a module task, which is M4, and
-/// which is also where this enum is likeliest to gain a variant.
+/// `#[non_exhaustive]` for [`RunError`]'s reason: later milestones have more
+/// ways for a nested run to fail. Cancellation is not one, which is worth
+/// recording rather than leaving as an absence -- a corun's topology is the
+/// one `InnerRun` owns on the frame, which nothing outside this module can
+/// name and no [`Canceller`](crate::Canceller) is handed out for, and
+/// cancelling the *outer* run does not reach it either, the task that called
+/// `corun` being already running. Upstream agrees by construction, its `corun`
+/// scheduling the graph with a null topology and a fresh local anchor, so that
+/// `_is_parent_cancelled` answers no for the nodes of it -- until one fails,
+/// which marks the anchor and is how the rest of a corun graph is skipped,
+/// however much the scheduler reads failure and cancellation as one bit.
 #[non_exhaustive]
 pub enum CorunError {
     /// The calling thread is not a worker of this executor.
     ///
     /// Upstream throws here -- *"corun must be called by a worker of the
-    /// executor"* -- and the shape of the failure is the only part this port
-    /// changes. It is an error rather than a panic because it is the one thing
-    /// a caller can act on: the fix is [`Executor::run`], which is what a
-    /// thread outside the pool should have called. It is an error rather than
-    /// silently running the graph the blocking way because a `corun` on a
-    /// non-worker is a mistake about *which thread the code is on*, and
-    /// quietly doing the other thing would hide it.
+    /// executor"* -- and the shape of the failure is all this port changes: an
+    /// error rather than a panic, being the one thing a caller can act on, the
+    /// fix being [`Executor::run`]; and an error rather than the blocking wait
+    /// done quietly, which would hide a mistake about which thread this is.
     NotAWorker,
     /// A task of the corun graph panicked.
     ///
-    /// The same failure [`Executor::run`] reports, carried unchanged so that
-    /// there is one answer in the crate to "a task panicked" and one place
-    /// ([`RunError::Panicked`]) that says what to do with the payload.
-    ///
-    /// Returned by [`Executor::try_corun`] only. The other two calls of this
-    /// module cannot produce it: [`Executor::corun`] re-raises that failure
-    /// instead of reporting it, and [`Executor::corun_until`] waits on a
-    /// predicate rather than on a graph of its own.
+    /// The same failure [`Executor::run`] reports, so that one place
+    /// ([`RunError::Panicked`]) says what to do with the payload. Returned by
+    /// [`Executor::try_corun`] only: [`Executor::corun`] re-raises that
+    /// failure instead, and [`Executor::corun_until`] waits on a predicate
+    /// rather than on a graph of its own.
     Run(RunError),
 }
 
@@ -323,23 +155,14 @@ impl std::error::Error for CorunError {
 /// The run and the anchor of one [`Executor::corun`], held for as long as the
 /// corun frame runs.
 ///
-/// The anchor is upstream's local `NodeBase anchor` in `corun` and plays the
-/// same part: the thing the inner graph's nodes count down to, and the thing
-/// a failure inside that graph is delivered to, belonging to the corunning
-/// frame for the duration.
-///
-/// Shared, as [`Executor::run`]'s own topology is, because every queued job of
-/// the run holds a share of it -- so a job of a corun cannot outlive its run
-/// any more than a job of a `run` can. [`Drop`] is then not what keeps the
-/// topology alive but what keeps the *frame* honest, and it is the reason this
-/// is a type rather than a local: an unwind through the frame holding one --
-/// which only a scheduler bug could cause, since a *task*'s panic is caught
-/// and recorded instead -- must not take the caller's borrow of the taskflow
-/// with it while a job of this run is still in a queue.
-///
-/// The unwind [`Executor::corun`] *does* raise is not that frame's: it is
-/// raised by `corun` itself once `corun_payload` has returned and this value
-/// has been dropped, which is why those are two functions.
+/// Both are shared, as [`Executor::run`]'s own topology is, every queued job
+/// of the run holding a share. [`Drop`] is then not what keeps them alive but
+/// what keeps the *frame* honest, and is why this is a type rather than a pair
+/// of locals: an unwind through the frame -- which only a scheduler bug could
+/// cause, a *task*'s panic being caught and recorded -- must not take the
+/// caller's borrow of the taskflow with it while a job is still queued. The
+/// unwind [`Executor::corun`] *does* raise is not that frame's: `corun` raises
+/// it once this value has been dropped, which is why those are two functions.
 struct InnerRun {
     /// The run. Nothing outside this module can name it.
     topology: Arc<Topology>,
@@ -349,14 +172,10 @@ struct InnerRun {
 }
 
 impl InnerRun {
-    /// A run of `flow`'s graph that has not started, with an anchor of its
-    /// own to count down.
-    ///
-    /// A corun runs its graph exactly once, so the run policy is the only one
-    /// that says "do not go round again" from the start, with no callback to
-    /// carry out: `run_n`/`run_until` are for a taskflow a caller runs. The
-    /// anchor has no node to resume, which is what tells the last job of the
-    /// graph that nothing is waiting to be re-queued -- this frame is.
+    /// A run of `flow`'s graph that has not started, with an anchor of its own
+    /// to count down. A corun runs its graph once, so its policy says "do not
+    /// go round again" from the start; the anchor has no node to resume, which
+    /// tells the last job that nothing is waiting to be re-queued.
     fn new(flow: &Arc<Flow>) -> Self {
         Self {
             topology: Arc::new(Topology::new(|| true, || {}, Arc::clone(flow))),
@@ -365,9 +184,8 @@ impl InnerRun {
     }
 
     /// The topology, which is what the run policy reports to and what `join`
-    /// waits on. A failing *task* of the inner graph reports to the anchor
-    /// instead -- the module docs say why -- so this is the backstop rather
-    /// than the usual path.
+    /// waits on -- the backstop rather than the usual path, a failing *task*
+    /// reporting to the anchor instead.
     fn topology(&self) -> &Arc<Topology> {
         &self.topology
     }
@@ -379,19 +197,10 @@ impl InnerRun {
 
     /// This run's hold on the taskflow's storage, taken out for the frame to
     /// own: what the graph is scheduled through, and what the frame waits to
-    /// become unique before it returns.
-    ///
-    /// The run keeps no share of its own afterwards, which is the point --
-    /// uniqueness is the question, and a share left behind a lock in the
-    /// topology would answer it `false` for ever. [`InnerRun::end`] is
-    /// unaffected: it finds no share and finishes the run itself, which is
-    /// what `Topology::release_flow` does for any hold that releases nobody.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called twice, or after [`InnerRun::end`]: a run built by
-    /// [`InnerRun::new`] holds its storage exactly once, and `corun_payload`
-    /// is the one caller.
+    /// become unique. The run keeps no share of its own afterwards, which is
+    /// the point -- a share left behind a lock in the topology would answer
+    /// the uniqueness question `false` for ever. Panics if called twice, or
+    /// after [`InnerRun::end`].
     fn take_hold(&self) -> Arc<Storage> {
         self.topology
             .take_storage()
@@ -399,58 +208,33 @@ impl InnerRun {
     }
 
     /// Ends the run: the last touch of the graph, and then the completion
-    /// slot.
-    ///
-    /// With an anchor as the parent, no job of this run ever drives the
-    /// topology's counter to zero, so nothing reaches
-    /// `Shared::tear_down_topology` and this frame owes what that function
-    /// would have done. Two of its steps do not apply -- a corun's policy
-    /// cannot ask for another round and its topology is never on a taskflow's
-    /// run queue -- which leaves releasing the run's share of the storage and
-    /// releasing whoever waits, in that order, for the reason
-    /// `executor::topology` gives: by the time this frame returns, its
-    /// caller may edit the taskflow again.
-    ///
-    /// One call does both, because a corun's hold releases nobody:
-    /// `Topology::release_flow` drops whatever the slot holds and then, for a
-    /// hold that does not gate completion, finishes the run itself. For a run
-    /// whose graph was scheduled the slot is already empty --
-    /// [`InnerRun::take_hold`] took it, and the frame dropped it once no job
-    /// held a copy -- so `release_flow` finds nothing and finishes. A run
-    /// with no graph to schedule still holds it, and `release_flow` is then
-    /// the tear-down's own pair in one. A second `finish` here used to follow
-    /// and did nothing, by idempotency rather than by design (#141).
-    ///
-    /// Idempotent, so that [`Drop`] can call it after the frame already has.
+    /// slot. With an anchor as the parent no job drives the topology's counter
+    /// to zero, so nothing reaches `Shared::tear_down_topology` and this frame
+    /// owes what it would have done -- minus the two steps that do not apply,
+    /// a corun's policy asking for no second round and its topology never
+    /// being on a taskflow's run queue. One call does both halves, a corun's
+    /// hold releasing nobody: `release_flow` drops whatever the slot holds
+    /// and then finishes the run itself. Idempotent, so that [`Drop`] can
+    /// call it after the frame already has.
     fn end(&self) {
         self.topology.release_flow();
     }
 
-    /// Blocks until the run is over and hands back whatever reached the
-    /// run's own payload slot, if anything.
-    ///
-    /// Called after [`InnerRun::end`], so it does not actually block; what it
-    /// is for is the payload, which it takes so that the caller reports it
-    /// once. A failing task of the inner graph does not come through here --
-    /// it reports to the anchor, which `corun_graph` takes the payload from
-    /// -- so what this can still find is a failure with no node to walk up
-    /// from: this run's policy callbacks, or a node kind that records against
-    /// a topology directly.
+    /// Blocks until the run is over and hands back whatever reached the run's
+    /// own payload slot. Called after [`InnerRun::end`], so it does not
+    /// actually block; what it is for is the payload, taken so that the caller
+    /// reports it once. A failing task reports to the anchor instead, so what
+    /// this finds is a failure with no node to walk up from.
     fn join(&self) -> Option<Box<dyn std::any::Any + Send>> {
         self.topology.join()
     }
 }
 
 impl Drop for InnerRun {
-    /// Ends the run if the frame did not get that far.
-    ///
-    /// On the ordinary path this is a second, idempotent `end` and a `join`
-    /// that finds the payload already taken. What it is here for is an unwind
-    /// through the corun frame -- which a scheduler bug could cause, since a
-    /// *task*'s panic is caught and recorded instead: a corun's topology is
-    /// finished by its own frame, so a frame that unwound past that point
-    /// would leave a run nothing could ever complete, and a `join` waiting on
-    /// it would block for ever.
+    /// Ends the run if the frame did not get that far: on the ordinary path a
+    /// second, idempotent `end` and a `join` that finds the payload taken,
+    /// and here for the unwind a scheduler bug could cause, which would
+    /// otherwise leave a run nothing could ever complete.
     fn drop(&mut self) {
         self.end();
 
@@ -467,44 +251,29 @@ impl Executor {
     ///
     /// Upstream's `corun`. The calling worker schedules `taskflow`'s sources
     /// and then keeps working -- on this graph and on anything else it can
-    /// steal -- until the run's last job has finished. The module docs say why
-    /// this exists and what calling [`Executor::run`] here would do instead.
+    /// steal -- until the run's last job has finished; the module docs say why
+    /// this exists and what [`Executor::run`] here would do instead.
     ///
-    /// `taskflow` is borrowed for the call, which is the whole of the
-    /// "do not mutate a running taskflow" rule for a corun: the borrow ends
-    /// when the run is over, because the run being over is what lets this
-    /// function return. As with [`Executor::run`], two overlapping runs of the
-    /// *same* taskflow are the caller's responsibility -- they would put two
-    /// workers on one node, which [`Work::invoke`](crate::Work::invoke)
-    /// reports as a panic.
-    ///
-    /// "Over" is as strong here as it is for
-    /// [`RunHandle::wait`](crate::RunHandle::wait), and that is a promise
-    /// rather than an accident: a caller that owns the taskflow it coruns may
-    /// edit it on the next line, with nothing in between. No job of the run
-    /// and no copy of one holds a share of its storage by the time this
-    /// returns, so [`Taskflow::clear`](crate::Taskflow::clear) and the
-    /// task-building API cannot find `Arc::get_mut` contested. The module
-    /// docs' "Why the frame waits twice" is what that costs and why the
-    /// anchor alone was not enough (#112).
-    ///
-    /// A taskflow with no source task -- an empty one, or one whose every node
-    /// is in a cycle -- runs nothing and returns `Ok`. Upstream returns early
-    /// on the empty graph too; the cyclic one is this port's reading, the same
-    /// one [`Executor::run`] documents.
+    /// `taskflow` is borrowed for the call, which is the whole of the "do not
+    /// mutate a running taskflow" rule for a corun, the borrow ending when the
+    /// run is over because that is what lets this function return. "Over" is
+    /// as strong here as for [`RunHandle::wait`](crate::RunHandle::wait): a
+    /// caller that owns the taskflow may edit it on the next line, no job of
+    /// the run and no copy of one holding a share of its storage by then. Two
+    /// overlapping runs of the *same* taskflow are the caller's
+    /// responsibility, as for [`Executor::run`], and a taskflow with no source
+    /// task runs nothing and returns `Ok`.
     ///
     /// ```
     /// use std::sync::Arc;
     /// use std::sync::atomic::{AtomicUsize, Ordering};
-    ///
     /// use rustflow::prelude::*;
     /// use rustflow::Executor;
     ///
     /// let executor = Arc::new(Executor::new(1));
     /// let counter = Arc::new(AtomicUsize::new(0));
     ///
-    /// // What the task body runs: one worker is enough, because the worker
-    /// // that coruns it is the one that runs it.
+    /// // One worker is enough: the worker that coruns it runs it.
     /// let inner = Arc::new({
     ///     let mut inner = Taskflow::new();
     ///     let counter = Arc::clone(&counter);
@@ -532,17 +301,13 @@ impl Executor {
     /// # Panics
     ///
     /// Panics with the payload of the first task of `taskflow` to panic,
-    /// which is upstream's rethrow: `corun` propagates a failure of the inner
-    /// graph on the calling worker, where the task body that called it can
-    /// catch it as its own -- or not, in which case the executor catches it
-    /// where it catches any other failing task and the *outer* run reports
-    /// it. The payload keeps its identity, because it is handed to
-    /// [`std::panic::resume_unwind`] rather than re-panicked: a caller that
-    /// catches it downcasts to exactly what the inner task panicked with, and
-    /// the panic hook does not print it a second time.
-    ///
-    /// [`Executor::try_corun`] is the same call with that failure as an
-    /// `Err` instead. The module docs say which to reach for.
+    /// which is upstream's rethrow: the failure propagates on the calling
+    /// worker, where the body that called `corun` can catch it as its own or
+    /// let the *outer* run report it. Handed to
+    /// [`std::panic::resume_unwind`] rather than re-panicked, so a caller
+    /// downcasts to what the inner task panicked with and the panic hook does
+    /// not print it twice. [`Executor::try_corun`] is the same call with that
+    /// failure as an `Err`.
     ///
     /// # Errors
     ///
@@ -565,16 +330,13 @@ impl Executor {
     ///
     /// [`Executor::corun`] with the one difference the name says: a task of
     /// `taskflow` that panics comes back as
-    /// [`CorunError::Run`]`(`[`RunError::Panicked`]`)` carrying the payload,
-    /// in the shape [`RunHandle::wait`](crate::RunHandle::wait) reports a
-    /// failing run in, instead of being raised on this thread. Everything
-    /// else -- the anchor, the loop, the borrow of `taskflow`, what happens
-    /// to the rest of the inner graph -- is that method's, and its docs are
-    /// where the explanation lives.
+    /// [`CorunError::Run`]`(`[`RunError::Panicked`]`)`, in the shape
+    /// [`RunHandle::wait`](crate::RunHandle::wait) reports a failing run in,
+    /// instead of being raised on this thread. Everything else is that
+    /// method's, and its docs are where the explanation lives.
     ///
     /// ```
     /// use std::sync::Arc;
-    ///
     /// use rustflow::prelude::*;
     /// use rustflow::{Executor, RunError};
     ///
@@ -614,15 +376,11 @@ impl Executor {
         }
     }
 
-    /// Both shapes of corun, up to what is done with the payload.
-    ///
-    /// The whole of upstream's `corun` template: an anchor this frame owns --
-    /// upstream's local `NodeBase`, in an [`Arc`] here because every job of
-    /// the graph holds a share of it -- the graph scheduled under it, and the
-    /// calling worker kept in the loop until that anchor's counter reaches
-    /// zero. What this adds is the topology, which upstream passes as
-    /// `nullptr` here and this port cannot: a queued job owns a share of its
-    /// run, and the run is what the policy callbacks report to.
+    /// Both shapes of corun, up to what is done with the payload: the whole of
+    /// upstream's `corun` template -- an anchor this frame owns, the graph
+    /// scheduled under it, the calling worker kept in the loop until that
+    /// counter reaches zero -- plus the topology upstream passes as `nullptr`
+    /// and this port cannot, a queued job owning a share of its run.
     fn corun_payload(
         &self,
         taskflow: &Taskflow,
@@ -632,23 +390,21 @@ impl Executor {
         let run = InnerRun::new(taskflow.flow());
         let mut payload = None;
         if taskflow.flow().has_source_task() {
-            // Counted as the `run` family counts its own, and for the reason
-            // that family's `start` gives: a worker skips the steal loop while
-            // `num_topologies` is zero, so this run has to be visible there
-            // before its sources are.
+            // Counted as the `run` family counts its own: a worker skips the
+            // steal loop while `num_topologies` is zero, so this run has to
+            // be visible there before its sources are.
             self.shared.increment_topology();
 
-            // The corun view is this frame's stand-in for the `Worker&`
-            // upstream hands `_corun_graph`; `WorkerThread::corun_view` says
-            // why the real one cannot be reached from a task body.
+            // This frame's stand-in for the `Worker&` upstream hands
+            // `_corun_graph`; `WorkerThread::corun_view` says why the real
+            // one cannot be reached from a task body.
             let mut worker = WorkerThread::corun_view(Arc::clone(&self.shared), id);
 
-            // The run's own hold on the storage, taken out so that this frame
-            // owns it: the graph goes under it exactly as
+            // The run's own hold on the storage, taken out so that this
+            // frame owns it: the graph goes under it as
             // `Shared::set_up_topology` puts a `run`'s graph under its own,
-            // which is what gives every job of the graph -- and every copy of
-            // one -- a share of this allocation rather than a share of the
-            // taskflow nobody can count.
+            // which gives every job -- and every copy of one -- a share of
+            // this allocation.
             let mut hold = run.take_hold();
             payload = corun_graph(
                 &mut worker,
@@ -657,65 +413,53 @@ impl Executor {
                 run.anchor(),
             );
 
-            // The second wait, and issue #112: the anchor reaching zero says
-            // every job of the graph has finished, not that every copy of one
-            // has been dropped. This asks the other question, on the one
-            // allocation that can answer it and in the loop that keeps the
-            // worker useful while it does.
+            // The second wait: the anchor reaching zero says every job of
+            // the graph has finished, not that every copy of one has been
+            // dropped. This asks the other question, on the one allocation
+            // that can answer it.
             worker.corun_until(|| Arc::get_mut(&mut hold).is_some());
 
             // Which makes this the last share of the taskflow's storage any
-            // run of it holds. The caller may edit the taskflow the instant
-            // this call returns, and the line above is what that rests on.
+            // run of it holds, so the caller may edit the taskflow the
+            // instant this call returns.
             drop(hold);
 
-            // The decrement every run gets, which for a corun is this frame's
-            // rather than a tear-down's -- see `InnerRun::end`, which is the
-            // rest of what the tear-down would have done. After the waits, as
-            // a tear-down accounts for a run before it releases the thread
-            // waiting on it: once this call returns, the run is accounted for.
+            // The decrement every run gets, here this frame's rather than a
+            // tear-down's -- `InnerRun::end` is the rest of it -- and after
+            // the waits, so that a returning call means an accounted run.
             self.shared.decrement_topology();
         }
 
-        // Nothing to schedule means nobody to finish the run either, and the
-        // line below covers both cases: a graph with no source was never
-        // counted, so there is nothing to decrement for it.
+        // Nothing to schedule means nobody to finish the run either, and a
+        // graph with no source was never counted.
         run.end();
 
-        // The anchor is where a failing task of the inner graph reports, so
-        // the payload above is almost always the whole answer. The run's own
-        // slot is still read, as the backstop it is: a failure with no node
-        // to walk up from -- a run policy's callback -- lands there instead,
-        // and so does one recorded against the topology directly by a node
-        // kind the executor does not run yet.
+        // The anchor is where a failing task reports, so the payload above
+        // is almost always the whole answer; the run's own slot is the
+        // backstop, for a failure with no node to walk up from.
         Ok(payload.or_else(|| run.join()))
     }
 
     /// Keeps the calling worker in the work-stealing loop until `predicate`
     /// returns `true`.
     ///
-    /// Upstream's `corun_until`, and the primitive under
-    /// [`Executor::corun`]: it is how a worker waits for anything at all --
-    /// a run on another executor, a thread it spawned, a flag another task
-    /// sets -- without taking its thread out of the pool. Later milestones'
-    /// `Runtime::corun_until` is this method.
+    /// Upstream's `corun_until`, and the primitive under [`Executor::corun`]:
+    /// how a worker waits for anything at all -- a run on another executor, a
+    /// thread it spawned, a flag another task sets -- without taking its
+    /// thread out of the pool.
     ///
     /// `predicate` is called on the calling worker, between jobs, and may run
-    /// many times; it must not block, and it must eventually return `true`.
-    /// This loop has nothing else that ends it: a predicate that never becomes
-    /// true keeps the worker running other people's jobs forever, which is
-    /// upstream's behaviour and is the same bug as a `while` loop that never
-    /// exits.
-    ///
-    /// A panic in a job this loop happens to run is delivered to whatever is
-    /// waiting for *that* job's graph -- its own run, or a frame blocked on a
-    /// nested graph it belongs to -- and reported to whoever waits there, so
-    /// there is nothing for this method to report but the one failure below.
+    /// many times; it must not block, and it must eventually return `true`,
+    /// this loop having nothing else that ends it -- one that never becomes
+    /// true keeps the worker running other people's jobs for ever, which is
+    /// upstream's behaviour and the same bug as a `while` loop that never
+    /// exits. A panic in a job this loop happens to run goes to whatever waits
+    /// for *that* job's graph, so there is nothing here to report but the
+    /// failure below.
     ///
     /// ```
     /// use std::sync::Arc;
     /// use std::sync::atomic::{AtomicBool, Ordering};
-    ///
     /// use rustflow::prelude::*;
     /// use rustflow::Executor;
     ///

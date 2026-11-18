@@ -1,58 +1,29 @@
 //! The free-standing node an async task is: a node that belongs to no
 //! taskflow, no graph the caller built and no run.
 //!
-//! Upstream has no such type, which is why this module names no source. Its
+//! Upstream has no such type, which is why this module names no source: its
 //! async node is an ordinary `Node` out of the object pool with
-//! `_topology == nullptr`, held alive by a reference count packed into the
-//! low 24 bits of `_estate` and handed back to the pool by whichever of the
-//! worker and the last `tf::AsyncTask` releases the last count. A `Node` in
-//! this port is a slot in a [`Graph`]'s arena and nothing else -- it has no
-//! count of its own and no way to exist outside an arena -- so the question
-//! this module answers is where the arena for a node that belongs to nobody
-//! comes from.
+//! `_topology == nullptr`, held alive by a reference count in the low 24 bits
+//! of `_estate`. A `Node` here is a slot in a [`Graph`]'s arena and nothing
+//! else, so what this module answers is where the arena for a node that
+//! belongs to nobody comes from: the task owns one, of one node, and the `Arc`
+//! around it is the task's lifetime.
 //!
-//! The answer is: the async task owns one, with exactly one node in it, and
-//! the task's lifetime is the `Arc` around that. Three things fall out of
-//! that and all three are the reason it was preferred to the alternatives:
+//! # Design
 //!
-//! - **The `Arc` *is* upstream's refcount.** Handles share it
-//!   ([`AsyncTask`](crate::AsyncTask), which is an `Option<Arc<AsyncNode>>`),
-//!   and so does every queued [`Job`] of the node, which is what upstream's
-//!   count also includes while the task is queued or running. So there is no
-//!   second counter to keep in step with it, and no recycle call to get
-//!   right: the node goes when the last share goes, whether that is a
-//!   handle's or the worker's.
-//! - **The node resolves like any other.** A [`Job`] names its node by
-//!   [`Task`] index into a graph its [`GraphOwner`](super::topology) resolves,
-//!   so a one-node graph makes a free node a job the scheduler already knows
-//!   how to run: `Job::parts()` hands the worker a `&Node`, a `&Graph` and a
-//!   run, and the dispatch arm that reaches it is a `match` arm on the
-//!   handle like the other nine. Nothing in the hot path learns that this
-//!   node is special.
-//! - **One allocation per async task, beyond the body.** Upstream's cost
-//!   model for the async family is one pooled node per task and no topology,
-//!   and that is what this is: the `Arc<AsyncNode>` holds the arena inline,
-//!   and `Topology::free_standing` -- the run every free node's job claims to
-//!   be part of -- is one sentinel shared by every async task in the process.
-//!   `executor::topology` has that decision in full.
-//!
-//! The node's own state words are the `NodeBase` it has as a node, so
-//! upstream's `_join_counter`, its `_nstate` preemption bit and the payload
-//! slot a silent failure is parked in all come for free and are read by the
-//! same code that reads a graph node's. The two things a free node needs that
-//! a graph node does not are here instead: the `FINISHED` bit upstream keeps
-//! in `_estate`, and -- for a dependent-async node -- the successor list
-//! upstream keeps in `_edges` under the `ESTATE::LOCKED` spin bit.
-//!
-//! Both of those live behind one `Mutex`, and that is deliberate rather than
-//! incidental: upstream's spin bit protects exactly the pair, because the
-//! only two operations on them have to be atomic *with respect to each
-//! other*. Naming a dependency ([`AsyncNode::push_successor`]) must either
-//! find the dependency unfinished and leave a successor behind for it, or
-//! find it finished and leave nothing; finishing
-//! ([`AsyncNode::finish`]) must either see a successor and take it, or set
-//! the bit that sends the next namer down the other branch. A lost race
-//! either way is a task that never runs or one that runs twice.
+//! `DESIGN.md` has that decision -- why the `Arc` is upstream's refcount, why
+//! a free node's job names a sentinel run, and what the shape costs. What is
+//! left to this file is the two pieces of state a free node needs and a graph
+//! node does not: upstream's `ESTATE::FINISHED` bit and, for a dependent-async
+//! node, the successor list it keeps in `_edges` under its `ESTATE::LOCKED`
+//! spin bit. Both live behind one lock because the two operations on them
+//! have to be atomic with respect to *each other*: a lost race between naming
+//! a dependency ([`AsyncNode::push_successor`]) and finishing one
+//! ([`AsyncNode::finish`]) is a task that never runs or one that runs twice,
+//! each of those calls deciding what the other will find. Nothing is
+//! scheduled under that lock, a woken job being free to run before the call
+//! that woke it returns; upstream releases successors under its spin bit,
+//! which it can afford, its scheduling path being lock-free.
 
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,70 +32,43 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use crate::executor::topology::Job;
 use crate::graph::{Graph, Handle, Node, Task};
 
-/// The one-node graph an async or dependent-async task is, plus the two
-/// pieces of state a node outside any run needs.
-///
-/// Crate-private: a caller reaches one only through the public
-/// [`AsyncTask`](crate::AsyncTask) handle, which is what upstream's `friend
-/// class Executor` plus a private `Node*` member amount to.
+/// The one-node graph an async or dependent-async task is, plus the two pieces
+/// of state a node outside any run needs. Crate-private -- upstream's `friend
+/// class Executor` -- so a caller reaches one only through
+/// [`AsyncTask`](crate::AsyncTask).
 pub(crate) struct AsyncNode {
-    /// The arena the node lives in, with exactly one live node in it --
-    /// [`AsyncNode::TASK`].
-    ///
-    /// A whole [`Graph`] for one node is three empty `Vec`s and a counter
-    /// more than the node itself, and what it buys is that every piece of the
-    /// scheduler that resolves a node by index resolves this one too. The
-    /// graph is never edited after the constructor: it has no second node to
-    /// add an edge to, and a dependent-async task's dependencies are *not*
-    /// edges of it -- they are the successor list below, because a dependency
-    /// of a free node is another free node in another arena.
+    /// The arena the node lives in, with one live node in it --
+    /// [`AsyncNode::TASK`] -- never edited after the constructor: a
+    /// dependent-async task's dependencies are the successor list below, not
+    /// edges, a dependency of a free node being free itself.
     graph: Graph,
     /// Upstream's `ESTATE::FINISHED`: whether the one run of this task is
     /// over, which is what [`AsyncTask::is_done`](crate::AsyncTask::is_done)
-    /// reports.
-    ///
-    /// Written under `successors`, read without it -- see the module docs for
-    /// why the write is under a lock at all, and [`AsyncNode::is_finished`]
-    /// for why the read need not be.
+    /// reports. Written under `successors`, read without it, and set in
+    /// `_tear_down_dependent_async` alone upstream, a plain async node having
+    /// no handle to be asked through.
     finished: AtomicBool,
     /// The jobs to release when this task finishes: upstream's `_edges` on a
-    /// `DEPENDENT_ASYNC` node, under its `ESTATE::LOCKED` spin bit.
-    ///
-    /// Always empty for a [`Handle::Async`] node, which nothing can depend
-    /// on. Jobs rather than nodes, because a successor of a free node may be
-    /// a free node of its own -- so what is kept is the value the scheduler
-    /// would queue, which already owns everything it names.
-    ///
-    /// A `Mutex` where upstream spins on a bit of the estate word: the
-    /// critical section is a push or a `mem::take` and never user code, so
-    /// what the two differ in is which of them parks a thread that loses the
-    /// race, and parking is the better answer when the holder can be
+    /// `DEPENDENT_ASYNC` node, under its `ESTATE::LOCKED` spin bit, and always
+    /// empty for a [`Handle::Async`] node, which nothing can depend on. Jobs
+    /// rather than nodes, so that what is kept is the value the scheduler
+    /// would queue; a `Mutex` where upstream spins, since the critical section
+    /// is never user code and parking is better when a holder can be
     /// descheduled.
     successors: Mutex<Vec<Job>>,
 }
 
 impl AsyncNode {
-    /// The one node of the arena, which every job of a free node names.
-    ///
-    /// A constant because the arena has exactly one node and
-    /// [`Graph::add_node`] hands out indices from zero: the first node of a
-    /// fresh graph is index 0, and this arena never gets a second.
+    /// The one node of the arena, which every job of a free node names: a
+    /// constant, [`Graph::add_node`] handing out indices from zero.
     pub(crate) const TASK: Task = Task::new(0);
 
-    /// The free-standing node of an async task whose body is `handle`.
-    ///
-    /// Shared from the start, because every holder of one is a share:
-    /// upstream's `AsyncTask(Node*)` takes the first reference count in its
-    /// constructor for the same reason, and for the same purpose -- so that
-    /// the submitting call can hand a dependency out before the task it
-    /// belongs to has been queued, let alone run.
-    ///
-    /// # Panics
-    ///
-    /// Panics in a debug build if `handle` is not one of the two async
-    /// handles. A free node with, say, a subflow handle would be a node whose
-    /// dispatch arm preempts it with no parent above it to resume it, so the
-    /// assertion is about the scheduler and not about tidiness.
+    /// The free-standing node of an async task whose body is `handle`, shared
+    /// from the start as upstream's `AsyncTask(Node*)` takes the first
+    /// reference count in its constructor: a dependency may be handed out
+    /// before the task is queued. Panics in a debug build if `handle` is
+    /// neither async handle -- a free node with (say) a subflow handle is one
+    /// whose arm preempts it with nothing above it to resume it.
     pub(crate) fn new(name: impl Into<String>, handle: Handle) -> Arc<Self> {
         debug_assert!(
             handle.is_async() || handle.is_dependent_async(),
@@ -142,58 +86,39 @@ impl AsyncNode {
         })
     }
 
-    /// The arena, which is what a job of this node resolves its index
-    /// against: `GraphOwner::Async`'s half of `GraphOwner::graph`.
+    /// The arena, which `GraphOwner::Async` resolves a job's index against.
     pub(crate) fn graph(&self) -> &Graph {
         &self.graph
     }
 
     /// The node itself, for the one caller that has the `AsyncNode` rather
-    /// than a job of it: the handle's payload slot.
-    ///
-    /// # Panics
-    ///
-    /// Cannot: the constructor put the node at [`AsyncNode::TASK`] and
-    /// nothing erases it -- the graph is not reachable mutably from anywhere.
+    /// than a job of it: the handle's payload slot. Cannot panic, the
+    /// constructor having put the node at [`AsyncNode::TASK`].
     pub(crate) fn node(&self) -> &Node {
         self.graph.node(Self::TASK)
     }
 
     /// Whether the one run of this task is over: upstream's
-    /// `_estate.load(acquire) & ESTATE::FINISHED`.
-    ///
-    /// Acquire, as upstream's load is, and read without the lock the write
-    /// takes: a reader that sees `true` has to see everything the body wrote,
-    /// which the release store below pairs with, and a reader that sees
-    /// `false` has learned only that the task had not finished at some point
-    /// during the call -- which is all upstream's load promises either.
+    /// `_estate.load(acquire) & ESTATE::FINISHED`. Acquire, as upstream's is,
+    /// and lock-free -- `true` pairs with [`AsyncNode::finish`]'s release
+    /// store, `false` says only that it had not finished during the call.
     pub(crate) fn is_finished(&self) -> bool {
         self.finished.load(Ordering::Acquire)
     }
 
-    /// Takes the payload of a failure parked on this node, if there was one:
-    /// what [`AsyncTask::take_panic`](crate::AsyncTask::take_panic) hands
-    /// back.
-    ///
-    /// The node's own slot, which is the `NodeBase` one every node has. For a
-    /// free node it holds what upstream's `exception_ptr()` reads: the one
-    /// failure of the one task this node is, parked here because a silent
-    /// task's chain of parents roots at neither a run anybody can wait for
-    /// nor a waiting frame, so there is nothing above it to deliver to --
-    /// `Job::record_panic`'s last case, which a parentless free node is the
-    /// one thing in the crate to reach (#105).
+    /// Takes the payload of a failure parked on this node, out of the
+    /// `NodeBase` slot every node has: upstream's `exception_ptr()`, and what
+    /// [`AsyncTask::take_panic`](crate::AsyncTask::take_panic) hands back. A
+    /// silent task's parent chain roots at no waiter, so this is where its
+    /// failure stays.
     pub(crate) fn take_panic(&self) -> Option<Box<dyn Any + Send>> {
         self.node().base().take_panic()
     }
 
-    /// Leaves `job` to be released when this task finishes, reporting
-    /// `false` if it has finished already and the caller must therefore
-    /// release it itself.
-    ///
-    /// Upstream's `_process_dependent_async`, which takes the spin lock,
-    /// tests `ESTATE::FINISHED` and either pushes onto `_edges` or counts the
-    /// dependency as already met. The two branches have to be one atomic
-    /// step, and the module docs say what a lost race would cost.
+    /// Leaves `job` to be released when this task finishes, reporting `false`
+    /// if it has finished already and the caller must release it itself:
+    /// upstream's `_process_dependent_async`, which takes the lock, tests
+    /// `ESTATE::FINISHED` and either pushes or reports the dependency met.
     pub(crate) fn push_successor(&self, job: Job) -> bool {
         let mut successors = self.lock_successors();
         if self.is_finished() {
@@ -204,35 +129,21 @@ impl AsyncNode {
     }
 
     /// Marks this task finished and hands back the jobs that were waiting for
-    /// it: upstream's `_tear_down_dependent_async`, minus the scheduling.
-    ///
-    /// The successors come *out* rather than being released here, so that
-    /// nothing is scheduled with the lock held -- a job pushed to a worker's
-    /// queue can be stolen and run before this call returns, and whatever it
-    /// does must not be able to wait on this lock. Upstream releases them
-    /// under its spin bit, which it can afford because its scheduling path is
-    /// lock-free.
-    ///
-    /// The flag is written under the lock for the reason the module docs give
-    /// -- it is the other half of what [`AsyncNode::push_successor`] decides
-    /// -- and with release ordering, which is what makes the acquire load in
-    /// [`AsyncNode::is_finished`] a real happens-before for a handle holder
-    /// reading the body's results.
-    // #91's rather than #88's, which is worth saying because the plain async
-    // tear-down landed without calling this: upstream sets `ESTATE::FINISHED`
-    // in `_tear_down_dependent_async` only, since a `Handle::Async` node has
-    // no handle through which anybody could ask whether it is done.
+    /// it, for the caller to release once this lock is gone: upstream's
+    /// `_tear_down_dependent_async`, minus the scheduling. The flag is written
+    /// under the lock, as the other half of what
+    /// [`AsyncNode::push_successor`] decides, and with release ordering, which
+    /// makes [`AsyncNode::is_finished`]'s acquire load a happens-before for a
+    /// handle holder reading what the body wrote.
     pub(crate) fn finish(&self) -> Vec<Job> {
         let mut successors = self.lock_successors();
         self.finished.store(true, Ordering::Release);
         std::mem::take(&mut *successors)
     }
 
-    /// The successor list. Poisoning is taken rather than propagated, as it
-    /// is everywhere else in the executor: nothing under this lock does more
-    /// than push or move a vector, so a poisoned list means a panic
-    /// elsewhere, and refusing to hand it back would strand every task that
-    /// is waiting for this one.
+    /// The successor list. Poisoning is taken rather than propagated, as
+    /// everywhere else in the executor: refusing to hand the list back would
+    /// strand every task waiting for this one.
     fn lock_successors(&self) -> MutexGuard<'_, Vec<Job>> {
         self.successors
             .lock()
@@ -241,9 +152,7 @@ impl AsyncNode {
 }
 
 impl core::fmt::Debug for AsyncNode {
-    /// Hand-written because the derived one would print the successor list,
-    /// which is a list of jobs each owning the graph it names; the node's own
-    /// `Debug` is what identifies this one.
+    /// Hand-written: the derived one would print every job in the list.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("AsyncNode")
             .field("node", self.node())

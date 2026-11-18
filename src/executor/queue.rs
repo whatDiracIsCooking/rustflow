@@ -1,34 +1,25 @@
 //! Work-stealing queues: one LIFO deque per worker, plus a handful of shared
 //! overflow buffers that non-worker threads push into.
 //!
-//! This is deliberately *not* a translation of `taskflow/core/wsq.hpp`
-//! (Taskflow v4.1.0). Upstream hand-writes the Chase-Lev deque twice, once
-//! bounded and once unbounded; `crossbeam-deque` is the same algorithm from the
-//! same paper, better tested than our own port of it would be, so the queues
-//! themselves are a dependency rather than a port.
+//! # Design
 //!
-//! What *is* carried over from upstream is the shape of the layer:
+//! Deliberately *not* a translation of `taskflow/core/wsq.hpp` (Taskflow
+//! v4.1.0). Upstream hand-writes the Chase-Lev deque twice, bounded and
+//! unbounded; `crossbeam-deque` is the same algorithm from the same paper and
+//! better tested than our own port of it would be, so the queues themselves
+//! are a dependency rather than a port. What is carried over is the shape of
+//! the layer: the two-outcome steal protocol, the buffer count and the routing
+//! into them, each named below where it is implemented.
 //!
-//! - the steal protocol callers see -- an item, or "empty", and nothing else;
-//! - `bit_width(num_workers)` shared buffers, upstream's `Executor::_buffers`,
-//!   whose comment records that "empirically, we find that log2(N) performs
-//!   best";
-//! - picking one of them by hashing the item, as `Executor::_spill` does, for
-//!   a single item -- and dealing a *batch* round-robin without hashing
-//!   anything, as `Executor::_bulk_spill_round_robin` does, which is #60's one
-//!   measured win on this path.
-//!
-//! The one behavioural difference worth stating up front: upstream's per-worker
-//! queue is a `BoundedWSQ` (256 items by default) whose `try_push` can fail, so
-//! a *worker* that overflows its own queue spills into the shared buffers. A
-//! crossbeam deque is unbounded, so [`WorkerQueue::push`] cannot fail and that
-//! spill path disappears -- [`Buffers`] exists here only for callers with no
-//! owning end of a queue to reach. Three have none: a thread outside the
-//! executor, a corun loop (`executor::worker`'s `LocalQueue`, which holds the
-//! argument for why it runs without one), and a task body that cannot name
-//! the `WorkerThread` frame below it -- `executor::async`'s "Where a free
-//! async job is queued" is that last one, and the `!Sync` of the owning end
-//! below is what makes all three the same fact rather than three decisions.
+//! One behavioural difference follows from the dependency. Upstream's
+//! per-worker queue is a `BoundedWSQ` whose `try_push` can fail, so a *worker*
+//! that overflows spills into the shared buffers; a crossbeam deque is
+//! unbounded, so [`WorkerQueue::push`] cannot fail and that path disappears.
+//! [`Buffers`] is then for callers with no owning end of a queue to reach, of
+//! which there are three -- a thread outside the executor, a corun loop, and a
+//! task body that cannot name the `WorkerThread` frame below it -- and the
+//! `!Sync` of the owning end below is what makes those one fact rather than
+//! three decisions.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,16 +30,12 @@ use crossbeam_utils::CachePadded;
 /// A worker's own queue of pending items.
 ///
 /// One thread -- the worker that owns it -- pushes and pops at the back, in
-/// last-in-first-out order, so the item pushed most recently (the one most
-/// likely to still be in cache) is the next one run. Any number of other
-/// threads steal from the front through a [`Thief`], in first-in-first-out
-/// order, which is both where the contention is lowest and where the oldest
-/// and therefore coarsest work tends to sit.
-///
-/// The type is `!Sync` by construction: [`push`](Self::push) and
-/// [`pop`](Self::pop) take `&self` but the handle cannot be shared across
-/// threads, which is how "only the owner may push or pop" is enforced here.
-/// Upstream states that rule in a doc comment and trusts the caller.
+/// last-in-first-out order, so the item pushed most recently is the next one
+/// run; any number of other threads steal from the front through a [`Thief`],
+/// in first-in-first-out order, where contention is lowest and the coarsest
+/// work tends to sit. `!Sync` by construction, so that "only the owner may
+/// push or pop" is enforced here rather than, as upstream has it, stated in a
+/// doc comment and left to the caller.
 #[derive(Debug)]
 pub struct WorkerQueue<T> {
     deque: Worker<T>,
@@ -63,37 +50,28 @@ impl<T: Send> WorkerQueue<T> {
         }
     }
 
-    /// Pushes an item onto the back of the queue.
-    ///
-    /// This cannot fail. Upstream's bounded queue returns `false` once it is
-    /// full and the caller spills into the shared [`Buffers`]; the deque behind
-    /// this queue grows instead, so a worker never has to spill.
+    /// Pushes an item onto the back of the queue. Cannot fail, where
+    /// upstream's bounded queue returns `false` when full and spills.
     pub fn push(&self, item: T) {
         self.deque.push(item);
     }
 
-    /// Pops the most recently pushed item, or returns `None` if the queue is
-    /// empty.
-    ///
-    /// `None` also covers the case where the last remaining item was stolen out
-    /// from under this call; the item is not lost, the thief has it.
+    /// Pops the most recently pushed item, or `None` if the queue is empty --
+    /// which covers the last item being stolen out from under this call, in
+    /// which case it is not lost, the thief has it.
     pub fn pop(&self) -> Option<T> {
         self.deque.pop()
     }
 
-    /// Returns `true` if the queue held no items at the moment of the call.
-    ///
-    /// Worth only what upstream's `empty()` is worth: by the time the answer is
-    /// read, a thief may have emptied the queue or the owner may have filled
-    /// it.
+    /// Whether the queue held no items at the moment of the call, worth what
+    /// upstream's `empty()` is: by the time the answer is read, a thief may
+    /// have emptied the queue or the owner filled it.
     pub fn is_empty(&self) -> bool {
         self.deque.is_empty()
     }
 
-    /// Creates a handle other threads can steal from.
-    ///
-    /// Each call returns an independent handle onto the same queue; they are
-    /// also [`Clone`], so the executor can hand one to every worker.
+    /// Creates a handle other threads can steal from: independent per call,
+    /// and [`Clone`], so the executor can hand one to every worker.
     #[must_use]
     pub fn thief(&self) -> Thief<T> {
         Thief {
@@ -115,18 +93,15 @@ pub struct Thief<T> {
 }
 
 impl<T: Send> Thief<T> {
-    /// Steals the oldest item from the queue, or returns `None` if there was
-    /// nothing to take.
-    ///
-    /// `None` means the queue looked empty, not that the attempt lost a race:
-    /// a contended attempt is retried inside this call, so callers see
-    /// upstream's two-outcome protocol -- an item, or empty -- and need no
-    /// third "try again" case.
+    /// Steals the oldest item from the queue, or `None` if there was nothing
+    /// to take -- meaning the queue looked empty, not that a race was lost: a
+    /// contended attempt is retried inside this call, so callers see
+    /// upstream's two-outcome protocol and need no "try again" case.
     pub fn steal(&self) -> Option<T> {
         settle(|| self.stealer.steal())
     }
 
-    /// Returns `true` if the queue held no items at the moment of the call.
+    /// Whether the queue held no items at the moment of the call.
     pub fn is_empty(&self) -> bool {
         self.stealer.is_empty()
     }
@@ -143,47 +118,24 @@ impl<T> Clone for Thief<T> {
 /// The shared overflow buffers: where threads with no queue of their own put
 /// work for the executor to pick up.
 ///
-/// There are `bit_width(num_workers)` of them -- 3 buffers for 4 workers, 6 for
-/// 32 -- which is upstream's `Executor::_buffers`, sized by its own empirical
-/// result that "log2(N) performs best". Fewer buffers than workers is the
-/// point: this is the cold path, and one queue per worker would cost every
-/// thief a sweep over mostly-empty queues.
+/// There are `bit_width(num_workers)` of them -- 3 for 4 workers, 6 for 32 --
+/// which is upstream's `Executor::_buffers`, sized by its own comment that
+/// "empirically, we find that log2(N) performs best". Fewer buffers than
+/// workers is the point: this is the cold path, and one queue per worker would
+/// cost every thief a sweep over mostly-empty queues. A single item is routed
+/// by its hash, so that two threads scheduling two items usually contend on
+/// two different buffers -- upstream hashes the node pointer it is about to
+/// push, and the item's own [`Hash`] stands in here. A batch is dealt
+/// round-robin instead and hashes nothing; see [`push_bulk`](Self::push_bulk).
 ///
-/// A *single* item is routed to a buffer by its hash, so that two threads
-/// scheduling two different items usually contend on two different buffers.
-/// Upstream hashes the node pointer it is about to push; there is no pointer to
-/// hash here, so the item's own [`Hash`] stands in, reduced to a buffer the same
-/// way `Executor::_spill` reduces its pointer.
-///
-/// A *batch* -- [`push_bulk`](Self::push_bulk) -- is dealt round-robin instead,
-/// and hashes nothing. See that method: the hash is what #60 measured as the
-/// one reducible cost on this path.
-///
-/// # Why the count is not larger, which is #102 and is settled
-///
-/// More buffers measurably help the one path this type exists for -- 48 of them
-/// at 24 workers are worth 4 to 6% to a submission that keeps thousands of jobs
-/// in the buffers at once -- and the count is **still**
-/// `bit_width(num_workers)`, because it is not a property of that path alone.
-/// `Shared::num_queues` is workers plus buffers, and that one number is every
-/// worker's victim space
-/// (`WorkerThread::explore_task` draws over it), the spin budget before a
-/// worker gives up and parks (`max_steals`), and the length of the
-/// [`first_nonempty`](Self::first_nonempty) sweep on the sleep path. At 48
-/// buffers a 1024-task chain at 24 workers costs **26% more** and a
-/// `TaskGroup` recursion 18% more, both measured larger than their own noise.
-/// Nor is there a compromise count: at 12 buffers the chain still costs 21%,
-/// and the bulk submission gets back only a third of its win.
-///
-/// The regime that decides the sign is how deep the buffers are when a thief
-/// arrives: 65536 sources dealt round-robin leave every buffer non-empty, so
-/// extra buffers only spread the cache lines, while one source task leaves all
-/// but one empty and every extra buffer is somewhere else to look. The shapes
-/// in `BENCHMARKS.md` want opposite ends of that trade, which is why upstream's
-/// "log2(N) performs best" is kept rather than tuned: see that file's "#102
-/// decision" section for the six shapes' figures, and for what sizing the
-/// buffers *independently* of the victim space would have to look like if the
-/// win is ever wanted. The measurement says it would not be enough on its own.
+/// More buffers measurably help the submission path this type exists for, and
+/// the count is still `bit_width(num_workers)` because it is not a property of
+/// that path alone: `Shared::num_queues` is workers plus buffers, and that one
+/// number is also every worker's victim space, the spin budget before a worker
+/// parks, and the length of the [`first_nonempty`](Self::first_nonempty)
+/// sweep. `BENCHMARKS.md`'s section on the buffer count has what a wider
+/// victim space costs a chain and a task-group recursion, and what sizing the
+/// two apart would have to look like if the win is ever wanted.
 #[derive(Debug)]
 pub struct Buffers<T> {
     // Upstream gives each queue `alignas(TF_CACHELINE_SIZE)`. crossbeam already
@@ -193,11 +145,9 @@ pub struct Buffers<T> {
     buffers: Vec<CachePadded<Injector<T>>>,
     /// Where the next [`push_bulk`](Self::push_bulk) starts dealing, so that
     /// two batches do not both begin at buffer zero. Advanced once per batch,
-    /// never per item.
-    ///
-    /// Padded because it is the one *written* field of this struct: the `Vec`'s
-    /// pointer and length are read by every steal attempt, and a counter on
-    /// their cache line would dirty it for every thief on every batch.
+    /// never per item, and padded because it is the one *written* field here:
+    /// the `Vec`'s pointer and length are read by every steal attempt, and a
+    /// counter on their cache line would dirty it for every thief.
     rotation: CachePadded<AtomicUsize>,
 }
 
@@ -220,43 +170,34 @@ impl<T: Send> Buffers<T> {
         }
     }
 
-    /// Returns the number of buffers.
-    ///
-    /// The executor needs this to address them: upstream numbers its steal
-    /// victims `0..num_workers + num_buffers` and treats the tail of that range
-    /// as buffer indices.
+    /// The number of buffers, which the executor needs in order to address
+    /// them: upstream numbers its steal victims `0..num_workers + num_buffers`
+    /// and treats the tail of that range as buffer indices.
     #[must_use]
     pub fn num_buffers(&self) -> usize {
         self.buffers.len()
     }
 
-    /// Returns the index of the first buffer that was not empty, or `None` if
-    /// they all were.
-    ///
-    /// The buffers are not read atomically with respect to each other, so this
-    /// is a hint -- the same hint upstream checks before a worker commits to
-    /// sleeping. The *index* is the part that matters to the caller: a worker
-    /// that finds work here points its sticky victim at the buffer holding it
-    /// rather than at the first buffer, which is what upstream does when it
-    /// walks the buffers one at a time.
+    /// The index of the first buffer that was not empty, or `None` if they
+    /// all were: a hint, the buffers not being read atomically with respect to
+    /// each other, and the same hint upstream checks before a worker commits
+    /// to sleeping. The index is the part that matters -- a worker that finds
+    /// work here points its sticky victim at the buffer holding it.
     #[must_use]
     pub fn first_nonempty(&self) -> Option<usize> {
         self.buffers.iter().position(|buffer| !buffer.is_empty())
     }
 
-    /// Returns `true` if every buffer was empty at the moment of the call.
-    ///
-    /// As much of a hint as [`first_nonempty`](Self::first_nonempty), which is
-    /// what it asks.
+    /// Whether every buffer was empty at the moment of the call: as much of a
+    /// hint as [`first_nonempty`](Self::first_nonempty), which it asks.
     pub fn is_empty(&self) -> bool {
         self.first_nonempty().is_none()
     }
 
-    /// Returns the index of the buffer [`push`](Self::push) routes `item` to.
-    ///
-    /// Stable for a given item and a given buffer count, which is what makes
-    /// the routing testable; it is not a promise to callers, who should treat
-    /// which buffer an item lands in as an implementation detail.
+    /// The index of the buffer [`push`](Self::push) routes `item` to: stable
+    /// for a given item and buffer count, which is what makes the routing
+    /// testable, and not a promise to callers, for whom which buffer an item
+    /// lands in is an implementation detail.
     #[must_use]
     pub fn buffer_of(&self, item: &T) -> usize
     where
@@ -270,9 +211,8 @@ impl<T: Send> Buffers<T> {
         reduce(hasher.finish(), self.buffers.len())
     }
 
-    /// Pushes an item into one of the buffers.
-    ///
-    /// Callable from any thread, including several at once.
+    /// Pushes an item into one of the buffers, from any thread, including
+    /// several at once.
     pub fn push(&self, item: T)
     where
         T: Hash,
@@ -281,30 +221,21 @@ impl<T: Send> Buffers<T> {
     }
 
     /// Pushes a batch of items into the buffers, dealing them round-robin, and
-    /// returns how many there were.
+    /// reports how many there were.
     ///
-    /// This is the whole of the external submission path: one graph's source
-    /// tasks, queued by a thread that is not a worker. Upstream's counterpart
-    /// is `Executor::_bulk_spill_round_robin`, which deals *chunks* of
-    /// `N / num_buffers` rather than single items and picks its starting buffer
-    /// by a multiplicative hash of the first node pointer. Two differences,
-    /// both measured on #60's 65536-source graph at 24 workers:
-    ///
-    /// - **Nothing is hashed per item.** [`push`](Self::push) costs a
-    ///   `DefaultHasher` run -- 14 ns an item of the ~110 ns a source task took
-    ///   end to end -- and spends it to reach a distribution this already has
-    ///   by construction. Dealing instead of hashing was worth 15% of the run
-    ///   at 65536 sources and 25% at 4096, both at 24 workers; it is the only
-    ///   reducible cost #60 found on this path.
-    /// - **Items, not chunks.** A chunked deal fills one buffer at a time, so a
-    ///   thief whose sticky victim is a buffer the producer has moved past
-    ///   finds it empty and goes looking; dealing one at a time keeps every
-    ///   buffer non-empty for as long as the batch lasts. Chunks of 16 and 64
-    ///   both measured slower than single items here.
-    ///
-    /// The starting buffer rotates per batch rather than being hashed, which
-    /// costs one relaxed `fetch_add` per call instead of one hash, and spreads
-    /// two concurrent batches the same way upstream's hash is meant to.
+    /// The whole of the external submission path: one graph's source tasks,
+    /// queued by a thread that is no worker. Upstream's counterpart is
+    /// `Executor::_bulk_spill_round_robin`, dealing *chunks* of
+    /// `N / num_buffers` and picking its starting buffer by a multiplicative
+    /// hash of the first node pointer. Two differences, both measured and
+    /// recorded in `BENCHMARKS.md`'s section on external submission: nothing
+    /// is hashed per item, the hash being spent to reach a distribution
+    /// dealing already has; and items are dealt rather than chunks, a chunked
+    /// deal filling one buffer at a time and leaving a thief whose sticky
+    /// victim the producer has moved past with nothing to take. The starting
+    /// buffer rotates per batch rather than being hashed, which costs one
+    /// relaxed `fetch_add` and spreads two concurrent batches as upstream's
+    /// hash is meant to.
     pub fn push_bulk(&self, items: impl IntoIterator<Item = T>) -> usize {
         let num_buffers = self.buffers.len();
         // Relaxed: nothing is ordered by this counter, and two batches that
@@ -323,11 +254,9 @@ impl<T: Send> Buffers<T> {
         pushed
     }
 
-    /// Steals an item from the buffer at `index`, or returns `None` if there
-    /// was nothing to take.
-    ///
-    /// Like [`Thief::steal`], a contended attempt is retried internally, so
-    /// `None` means the buffer looked empty.
+    /// Steals an item from the buffer at `index`, or `None` if there was
+    /// nothing to take -- which, as for [`Thief::steal`], means it looked
+    /// empty rather than that a race was lost.
     ///
     /// # Panics
     ///
@@ -341,12 +270,11 @@ impl<T: Send> Buffers<T> {
 /// Runs a steal attempt to a decision: an item, or empty.
 ///
 /// crossbeam reports a lost race as a third outcome, [`Steal::Retry`], which
-/// upstream's queues do not have -- their `steal` reports a lost compare-and-
-/// swap as "empty" and leaves the caller to pick another victim. Treating a
-/// race as emptiness here would be worse than upstream, not equal to it:
-/// an `Injector` also answers `Retry` while a *concurrent* steal is in flight,
-/// and a worker that read that as "empty" could park with work sitting in a
-/// buffer. So the race is settled here instead.
+/// upstream's queues do not have -- their `steal` reports a lost
+/// compare-and-swap as "empty" and leaves the caller to pick another victim.
+/// Reading a race as emptiness here would be worse than upstream rather than
+/// equal to it: an `Injector` answers `Retry` while a *concurrent* steal is in
+/// flight too, so a worker could park with work sitting in a buffer.
 fn settle<T>(mut attempt: impl FnMut() -> Steal<T>) -> Option<T> {
     loop {
         match attempt() {
@@ -365,9 +293,9 @@ const fn bit_width(n: usize) -> u32 {
 /// Reduces a hash to an index below `len`.
 ///
 /// Upstream shifts its node pointer right by 16 before taking the remainder,
-/// because the low bits of an allocation are nearly constant; the shift is kept
-/// so the two implementations can be compared line by line, and it costs
-/// nothing on a hash whose bits are already well mixed.
+/// the low bits of an allocation being nearly constant; the shift is kept so
+/// that the two can be compared line by line, and costs nothing on a hash
+/// whose bits are already well mixed.
 fn reduce(hash: u64, len: usize) -> usize {
     // `len` is a bit width, so it is at most 64 and both conversions are exact.
     // They are spelled out rather than cast with `as` because this crate treats

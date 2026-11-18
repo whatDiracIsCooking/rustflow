@@ -2,88 +2,42 @@
 //! `run_n` and `run_until` overload set, `_set_up_topology`,
 //! `_tear_down_topology`, `_increment_topology` and `wait_for_all`.
 //!
-//! # `RunHandle` where upstream has `tf::Future`
-//!
 //! Upstream's `run` hands back a `tf::Future<void>`: a `std::future` with a
 //! `std::weak_ptr<Topology>` beside it, which owns nothing and is there so
 //! that `cancel()` has something to reach through. The rule upstream documents
-//! and cannot enforce is *do not mutate a taskflow while it is running*. Break
-//! it and the scheduler walks edges the user is editing.
+//! and cannot enforce is *do not mutate a taskflow while it is running*; here
+//! it is the type system's, [`Executor::run`] borrowing the executor and the
+//! taskflow for the lifetime it puts on the handle. Running the taskflow
+//! *again* is allowed, as upstream, and is what the queue on [`Taskflow`] is
+//! for; [`Drop`] blocks until the run is over, so that the ordinary way of
+//! using a handle never leaves a run going on behind the caller's back.
 //!
-//! Here the rule is the type system's. [`Executor::run`] borrows the executor
-//! and the taskflow for the same lifetime and puts that lifetime on the
-//! handle, so a taskflow cannot be edited or dropped -- nor the executor
-//! dropped -- while a handle naming them is alive. Running it *again* is
-//! allowed, as it is upstream, and is what the queue on [`Taskflow`] is for:
-//! two runs of one taskflow take its graph in turn rather than at once.
+//! # Design
 //!
-//! [`Drop`] then blocks until the run is over, so that the ordinary way of
-//! using a handle -- take it, maybe wait on it, let it go -- never leaves a
-//! run going on behind the caller's back.
-//!
-//! # What a leaked handle does, and what it does not
-//!
-//! Blocking in `Drop` is not a guarantee, because `Drop` is not guaranteed to
-//! run: [`std::mem::forget`], a [`ManuallyDrop`](std::mem::ManuallyDrop), a
+//! Blocking in `Drop` is not a guarantee, `Drop` not being guaranteed to run:
+//! [`std::mem::forget`], a [`ManuallyDrop`](std::mem::ManuallyDrop), a
 //! [`Box::leak`] and an [`Rc`](std::rc::Rc) cycle all skip it, and under NLL
-//! the borrow this handle holds ends at the handle's last use -- the `forget`
-//! call. So a caller *can* end the borrow with the run still in flight, in
-//! safe code, and then drop or edit the taskflow the workers are walking.
+//! the borrow ends at the handle's last use -- the `forget` call. What closes
+//! that is ownership rather than `Drop`, and `DESIGN.md` has the decision:
+//! every queued job holds a share of the run *and* of the taskflow's storage,
+//! so a leaked handle leaks rather than dangling. Two consequences are this
+//! module's. **Editing the taskflow panics** rather than racing the scheduler,
+//! [`Taskflow::graph_mut`] finding the run's shares in the way -- a finished
+//! run is never in the way, however recently it finished. And **dropping the
+//! executor is allowed**, which it otherwise is not: the workers stop, the
+//! queued jobs are dropped, and the run never finishes, which nothing waits
+//! for, the thing that would have waited being the leaked handle. There is no
+//! detached run either, and deliberately: a run outliving its handle is what
+//! the design does not *offer*, as distinct from what it cannot survive.
 //!
-//! This is not the hole [`std::thread::scope`] has, because `scope` has no
-//! such hole: it is closure-based, so there is no guard value to forget. The
-//! shape that *did* have it is `std::thread::scoped`, removed before Rust 1.0
-//! for exactly this reason (RFC 1084, "leakpocalypse"). An earlier version of
-//! this module claimed a blocking `Drop` made the borrow airtight; it did not,
-//! and the gap was a use-after-free reachable from safe code (issue #40).
-//!
-//! What closes it is ownership rather than `Drop`: every queued job holds a
-//! share of the run *and* of the taskflow's storage, so the storage cannot be
-//! freed while a job can name it, whatever happens to the handle.
-//! `executor::topology` has that argument in full. A leaked handle therefore
-//! leaks -- the run still finishes, the storage is freed when the last share
-//! of it goes, and the handle's own topology is never freed at all -- and
-//! leaking is safe. The two observable consequences are worth naming:
-//!
-//! - **Editing the taskflow panics** rather than racing the scheduler. The
-//!   taskflow holds the one share that can hand out `&mut`, so
-//!   [`Taskflow::graph_mut`] asks `Arc::get_mut` and finds the run's shares
-//!   in the way. A run that has *finished* is never in the way, however
-//!   recently it did: `executor::topology` has the ordering that buys that,
-//!   which since #109 is the drop of the last share rather than anything the
-//!   tear-down does by hand.
-//! - **Dropping the executor is allowed**, which it otherwise is not, and
-//!   takes the pool down under the run: the workers stop, the jobs still
-//!   queued are dropped, and the run never finishes. Nothing waits for it,
-//!   since the thing that would have waited is the handle that was leaked.
-//!
-//! Two things follow from the design as a whole, and both are deliberate:
-//!
-//! - There is no detached run and no `std::future`-style transfer of the
-//!   result to somewhere else in the program. A run outliving its handle is
-//!   the one thing the design does not *offer*, as distinct from the one thing
-//!   it cannot survive.
-//! - [`Executor::wait_for_all`] is not what makes dropping an executor safe:
-//!   an executor with a run in flight is one some handle borrows, so only the
-//!   leaked-handle case above can reach `Drop` at all. What it is *for* is
-//!   the work that has no borrowing handle, which the crate has had since
-//!   #88: a free async task is counted in the same count as a run, so this is
-//!   the one call that waits for one, and dropping the executor waits for
-//!   that kind of work alone -- on a second count of its own, so that the
-//!   leaked-handle promise above survives. `executor::async` has the split.
-//!
-//! # The `run` family
-//!
-//! Upstream spells twelve overloads of three names: `run`, `run_n` and
-//! `run_until`, each over a borrowed or a moved-in taskflow and each with or
-//! without an on-finish callback. Rust has no overloading, so the twelve are
-//! twelve methods here, named after what they vary: `_n` and `_until` for the
-//! repeat count and the predicate, `_with` for the callback, and `run_owned`
-//! for the half of the set that takes the taskflow by value. Each of them is
+//! Upstream spells twelve overloads of three names, over a borrowed or a
+//! moved-in taskflow and with or without an on-finish callback. Rust has no
+//! overloading, so the twelve are twelve methods named after what they vary --
+//! `_n` and `_until` for the repeat count and the predicate, `_with` for the
+//! callback, `run_owned` for the half that takes the taskflow by value -- each
 //! two lines over [`Executor::run_until_with`] or
-//! [`Executor::run_owned_until_with`], which are the two that do the work --
-//! the same shape as upstream, whose ten short overloads all forward to the
-//! two long ones.
+//! [`Executor::run_owned_until_with`], as upstream's ten short overloads
+//! forward to its two long ones.
 
 use std::any::Any;
 use std::fmt;
@@ -102,38 +56,26 @@ use crate::executor::{Executor, Shared};
 use crate::graph::Node;
 use crate::taskflow::{Flow, Taskflow};
 
-/// Why a run did not finish cleanly -- and, since the async family, also what
-/// an [`AsyncHandle`](crate::AsyncHandle)'s `wait`, a
+/// Why a run did not finish cleanly -- and what an
+/// [`AsyncHandle`](crate::AsyncHandle)'s `wait`, a
 /// [`TaskGroup::try_corun`](crate::TaskGroup) and a `Runtime::try_corun`
-/// report about the work *they* were waiting for. One type for one question,
-/// whoever is asking, which is why [`CorunError::Run`](crate::CorunError)
-/// carries this rather than restating it.
-///
-/// One variant so far, and the enum is `#[non_exhaustive]` because later
-/// milestones have more ways for a run to fail. Cancellation is deliberately
-/// not one of them: a cancelled run completes *normally*, so
-/// [`RunHandle::wait`] reports `Ok(())` for it, exactly as upstream's
+/// report about the work *they* waited for, which is why
+/// [`CorunError::Run`](crate::CorunError) carries this. `#[non_exhaustive]`
+/// because later milestones have more ways for a run to fail; cancellation is
+/// deliberately not one, a cancelled run completing *normally*, as upstream's
 /// `fu.get()` does not throw after a `fu.cancel()`.
 #[non_exhaustive]
 pub enum RunError {
     /// A task panicked, carrying what it panicked with.
     ///
-    /// This is the port's reading of upstream's `std::exception_ptr`: a panic
-    /// escaping a task body is caught where upstream catches an exception,
-    /// stored in the topology, and surfaced here. The payload is whatever the
-    /// task panicked with, so a caller that wants upstream's behaviour --
-    /// the failure continuing to propagate on *this* thread -- can hand it to
-    /// [`std::panic::resume_unwind`].
-    ///
-    /// Only the first panicking task of a run is reported, and the panic
-    /// cancels the rest of that run: it sets the `EXCEPTION` bit of the same
-    /// estate word [`RunHandle::cancel`] sets `CANCELLED` in, so the executor
-    /// stops scheduling that run onwards on exactly the terms
-    /// [`RunHandle::cancel`] describes. Tasks already running finish, tasks
-    /// not yet scheduled do not run at all, and a `run_n` or `run_until` run
-    /// does not go round again. The *next* run of the same taskflow starts
-    /// clean: each run has its own topology, and every node's state is re-armed
-    /// before a run's sources are queued.
+    /// The port's reading of upstream's `std::exception_ptr`: a panic escaping
+    /// a task body is caught where upstream catches an exception, stored in
+    /// the topology, and surfaced here, so a caller who wants the failure to
+    /// propagate on *this* thread hands the payload to
+    /// [`std::panic::resume_unwind`]. Only the first panicking task is
+    /// reported, and the panic cancels the rest of the run on the terms
+    /// [`RunHandle::cancel`] describes, setting the `EXCEPTION` bit of the
+    /// word that method sets `CANCELLED` in; the *next* run starts clean.
     Panicked(Box<dyn Any + Send>),
 }
 
@@ -168,23 +110,16 @@ impl fmt::Debug for RunError {
 
 impl std::error::Error for RunError {}
 
-/// A run of a taskflow in progress, and the right to wait for it.
-///
-/// Returned by [`Executor::run`]. Upstream's `tf::Future<void>`, with the
-/// differences the module docs set out: the handle borrows the executor and
-/// the taskflow for as long as it lives, and dropping it blocks until the run
-/// is over.
+/// A run of a taskflow in progress, and the right to wait for it: upstream's
+/// `tf::Future<void>`, with the differences the module docs set out.
 ///
 /// ```
 /// use rustflow::prelude::*;
 /// use rustflow::Executor;
-///
 /// let executor = Executor::new(4);
-///
 /// let mut taskflow = Taskflow::new();
 /// let (a, b) = taskflow.emplace_n((|| println!("a"), || println!("b")));
 /// taskflow.task(a).precede([b]);
-///
 /// executor.run(&taskflow).wait().expect("no task panicked");
 ///
 /// // The borrow is over, so the taskflow can be edited and run again.
@@ -192,18 +127,13 @@ impl std::error::Error for RunError {}
 /// executor.run(&taskflow).wait().expect("no task panicked");
 /// ```
 pub struct RunHandle<'a> {
-    /// The run, shared with the taskflow's queue of runs and with every job
-    /// of this one still in a worker's queue.
+    /// The run, shared with the taskflow's queue of runs and with this run's
+    /// every queued job.
     topology: Arc<Topology>,
-    /// The taskflow, for a run that was handed one by value.
-    ///
-    /// [`Executor::run_owned`] is upstream's `run(Taskflow&&)`: the run owns
-    /// the taskflow and nothing outside it can name it, so it is dropped here
-    /// -- after the blocking [`Drop`] below has seen the last run finish, since
-    /// a field is dropped after the body of its owner's `drop`. What that drop
-    /// releases is the last share of the taskflow's storage, the run's own
-    /// having been released by its tear-down; the graph and the task bodies go
-    /// with it.
+    /// The taskflow, for a run that was handed one by value:
+    /// [`Executor::run_owned`], upstream's `run(Taskflow&&)`. Dropped after
+    /// the blocking [`Drop`] below has seen the last run finish, a field being
+    /// dropped after the body of its owner's `drop`.
     taskflow: Option<Taskflow>,
     /// The borrows that make "do not mutate a running taskflow" a compile
     /// error. A marker rather than two reference fields because nothing reads
@@ -214,26 +144,19 @@ pub struct RunHandle<'a> {
 /// The right to cancel a run, with no lifetime attached.
 ///
 /// Handed out by [`RunHandle::canceller`], and `Clone + Send + Sync +
-/// 'static`, so it can be captured by a task body, stored in a struct or sent
-/// to another thread.
+/// 'static`, so that it can be captured by a task body, stored in a struct or
+/// sent to another thread.
 ///
 /// Upstream needs no such type: its `tf::Future` *is* the cancel token, and
-/// its test suite cancels a run from a task of another taskflow by capturing
-/// the future by reference. A task body here is `'static` -- see
-/// [`Work`](crate::Work) -- so it cannot capture a [`RunHandle`], which
-/// borrows the executor and the taskflow the run is of. This is the part of
-/// the handle that *can* be captured.
-///
-/// See [`RunHandle::cancel`] for what cancelling does and does not promise,
-/// and the [`executor`](crate::executor) module docs for the whole of it.
+/// its own tests cancel a run from another taskflow's task by capturing the
+/// future by reference. A task body here is `'static`, so it cannot capture a
+/// [`RunHandle`]; this is the part that can be. [`RunHandle::cancel`] has what
+/// cancelling promises.
 #[derive(Clone)]
 pub struct Canceller {
-    /// The run's cancellation state, or what is left of it.
-    ///
-    /// `Weak`, because a token may outlive the run's topology: the topology is
-    /// freed when the [`RunHandle`] that owns it is dropped, and nothing stops
-    /// a token outliving that. Upstream's `std::weak_ptr<Topology>`, and a
-    /// failed upgrade here is its failed `lock()`.
+    /// The run's cancellation state, or what is left of it: upstream's
+    /// `std::weak_ptr<Topology>`, `Weak` because a token may outlive the
+    /// topology, which goes with the [`RunHandle`] owning it.
     state: Weak<Cancellable>,
 }
 
@@ -241,11 +164,8 @@ impl Canceller {
     /// Cancels the run, reporting `false` if it has already finished.
     ///
     /// Upstream's `tf::Future::cancel` through a `weak_ptr` whose referent may
-    /// be gone, which is the one difference from [`RunHandle::cancel`]: this
-    /// reports `false` both for a run that has finished and for one whose
-    /// handle has since been dropped. Everything else -- non-preemptive,
-    /// harmless twice, and the run still completing normally -- is the same,
-    /// and [`RunHandle::cancel`] says it.
+    /// be gone, the one difference from [`RunHandle::cancel`]: `false` covers
+    /// both a finished run and one whose handle has been dropped.
     pub fn cancel(&self) -> bool {
         self.state
             .upgrade()
@@ -254,8 +174,8 @@ impl Canceller {
 }
 
 impl fmt::Debug for Canceller {
-    /// Hand-written because `Weak`'s own prints `(Weak)`, and what is worth
-    /// seeing is whether there is still a run on the other end of it.
+    /// Hand-written: `Weak`'s own prints `(Weak)`, where what is worth seeing
+    /// is whether there is still a run on the other end.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Canceller")
             .field("live", &(self.state.strong_count() > 0))
@@ -267,58 +187,39 @@ impl<'a> RunHandle<'a> {
     /// Cancels this run, reporting `false` if it has already finished.
     ///
     /// Upstream's `tf::Future::cancel`, promise for promise: the executor
-    /// stops scheduling tasks of this run onwards, and tasks already running
-    /// are left to finish, cancellation being non-preemptive. So a cancelled
-    /// run is one that stops *early*, by however much the pool had not got to
-    /// yet, and "none of it had started" and "all of it ran" are both possible
-    /// outcomes of a cancellation that raced the run.
-    ///
-    /// The run then completes normally. [`RunHandle::wait`] returns `Ok(())`,
-    /// as upstream's `fu.get()` does not throw; the on-finish callback still
-    /// runs; and a `run_n` or `run_until` run does not go round again however
-    /// many rounds its predicate had left. A run that was cancelled is
-    /// therefore indistinguishable afterwards from one whose tasks did
-    /// nothing, which is upstream's behaviour and the decision issue #29 took;
-    /// a `was_cancelled` query is a follow-up if anyone needs one.
-    ///
-    /// Cancelling twice is harmless and reports `true` twice: the answer is
-    /// about the run, not about this caller. The `false` is upstream's
-    /// `weak_ptr::lock()` failing, and it means the run was over before the
-    /// call -- nothing was cancelled because there was nothing left to cancel.
+    /// stops scheduling tasks of this run onwards and tasks already running
+    /// are left to finish, cancellation being non-preemptive, so "none of it
+    /// had started" and "all of it ran" are both outcomes of a cancellation
+    /// that raced the run. The run then completes normally --
+    /// [`RunHandle::wait`] returns `Ok(())`, the callback still runs, and a
+    /// `run_n` or `run_until` run does not go round again -- so a cancelled
+    /// run is indistinguishable afterwards from one whose tasks did nothing.
+    /// Cancelling twice is harmless and reports `true` twice; the `false` is
+    /// upstream's `weak_ptr::lock()` failing.
     ///
     /// ```
     /// use rustflow::prelude::*;
     /// use rustflow::Executor;
-    ///
     /// let executor = Executor::new(4);
     /// let mut taskflow = Taskflow::new();
     /// for _ in 0..1000 {
     ///     taskflow.emplace(|| std::thread::sleep(std::time::Duration::from_millis(1)));
     /// }
-    ///
     /// let run = executor.run(&taskflow);
-    ///
-    /// // What `cancel` *reports* is deliberately not asserted here, and is
-    /// // not to be "tightened" into an `assert!` (#67): a run that has
-    /// // already finished answers `false`, which is this method's contract
-    /// // rather than a fault, and whether this one has is a race with the
-    /// // pool. `tests/cancellation.rs` is where the behaviour is pinned.
+    /// // What `cancel` *reports* is deliberately not asserted: a finished
+    /// // run answers `false`, and whether this one has is a race with the
+    /// // pool. `tests/cancellation.rs` pins the behaviour.
     /// run.cancel();
-    ///
-    /// // A cancelled run completes normally; what it does not do is finish
-    /// // the work it had not started.
+    /// // A cancelled run completes normally, minus the work it had not begun.
     /// run.wait().expect("no task panicked");
     /// ```
     pub fn cancel(&self) -> bool {
         self.topology.cancel()
     }
 
-    /// A token that cancels this run from anywhere, including from a task
-    /// body.
-    ///
-    /// The lifetime-free half of [`RunHandle::cancel`]; see [`Canceller`] for
-    /// why it exists. Any number may be handed out, and each of them cancels
-    /// the one run this handle is for.
+    /// A token that cancels this run from anywhere, a task body included: the
+    /// lifetime-free half of [`RunHandle::cancel`], of which any number may be
+    /// handed out, each cancelling the one run this handle is for.
     #[must_use]
     pub fn canceller(&self) -> Canceller {
         Canceller {
@@ -329,35 +230,23 @@ impl<'a> RunHandle<'a> {
     /// Blocks until the run finishes, and reports whether a task panicked.
     ///
     /// Upstream's `tf::Future::get`, which rethrows the stored exception on
-    /// the calling thread; a `Result` says the same thing without unwinding
-    /// somebody else's stack for them. See [`RunError::Panicked`] for how to
-    /// get upstream's behaviour back.
-    ///
-    /// When this returns, the run is not merely finished but fully accounted
-    /// for: [`Executor::num_topologies`] no longer counts it, so a
-    /// [`Executor::wait_for_all`] that follows cannot block on it, and no job
-    /// of it holds a share of the taskflow's storage any more, so the
-    /// taskflow can be edited again at once. Dropping the handle without
-    /// waiting gives the same two guarantees, for the same reasons. Upstream's
-    /// `tf::Future` gives neither -- see `Shared::tear_down_topology` for the
-    /// accounting and `executor::topology` for the share.
-    ///
-    /// Waiting from inside a task body works, but it blocks the worker running
-    /// that task, so the run being waited for needs another worker to make
-    /// progress on. `corun`, which lends the blocked worker to the inner run
-    /// instead, is the tool for that and is a later milestone.
+    /// the calling thread where a `Result` says the same without unwinding
+    /// somebody else's stack; [`RunError::Panicked`] has how to get that
+    /// behaviour back. When this returns the run is not merely finished but
+    /// fully accounted for: [`Executor::num_topologies`] no longer counts it
+    /// and no job holds a share of the taskflow's storage, so the taskflow can
+    /// be edited at once. Dropping the handle promises the same two, and
+    /// upstream's `tf::Future` neither. Waiting inside a task body blocks that
+    /// worker, so [`Executor::corun`] lends a worker to the inner run.
     pub fn wait(self) -> Result<(), RunError> {
         outcome(self.topology.join())
     }
 
-    /// The handle for a run that is over before it began: an empty or sourceless
-    /// taskflow, or a predicate that was already true.
-    ///
-    /// Upstream returns a ready `std::future` from a promise it fulfils on the
-    /// spot, for the reason its comment gives -- the caller gets a handle that
-    /// behaves like every other one. `taskflow` is `Some` only for the
-    /// `run_owned` family, which owns what it was handed even when it runs
-    /// nothing with it.
+    /// The handle for a run that is over before it began: a sourceless
+    /// taskflow, or a predicate already true. Upstream returns a ready
+    /// `std::future` from a promise it fulfils on the spot, so that the caller
+    /// gets a handle behaving like every other. `taskflow` is `Some` only for
+    /// the `run_owned` family, which owns what it was handed.
     fn finished(taskflow: Option<Taskflow>) -> Self {
         Self {
             // Finished before it is handed out, and holding no share of any
@@ -381,18 +270,14 @@ fn outcome(panic: Option<Box<dyn Any + Send>>) -> Result<(), RunError> {
 impl Drop for RunHandle<'_> {
     /// Blocks until the run finishes.
     ///
-    /// This is what makes the handle's borrow mean something *in practice*: a
-    /// handle that is dropped rather than leaked cannot leave a run going
-    /// after the borrow it was scheduled under has ended, so the ordinary
-    /// program never has a run and an edit in the air at once. What makes the
-    /// leaked case safe as well is that a job owns what it names -- see the
-    /// module docs, which also say why this `Drop` is not a guarantee. After
-    /// [`RunHandle::wait`] it finds the run already over and returns at once.
+    /// What makes the handle's borrow mean something *in practice*: a handle
+    /// dropped rather than leaked cannot leave a run going after the borrow it
+    /// was scheduled under ended. The module docs say why that is no
+    /// guarantee; after [`RunHandle::wait`] this returns at once.
     fn drop(&mut self) {
-        // A panic payload nobody waited for is dropped here rather than
-        // re-raised: this `Drop` may itself be running during an unwind, and a
-        // panic from there aborts the process. Upstream's `Future` likewise
-        // lets an unobserved exception go.
+        // A payload nobody waited for is dropped rather than re-raised: this
+        // `Drop` may itself run during an unwind, where a second panic aborts.
+        // Upstream's `Future` likewise lets one go.
         drop(self.topology.join());
     }
 }
@@ -400,35 +285,22 @@ impl Drop for RunHandle<'_> {
 /// A run can be awaited instead of waited for, on any runtime and without one:
 /// the completion slot holds the [`Waker`](std::task::Waker) of whoever is
 /// polling, and the worker that finishes the run wakes it where it would
-/// otherwise signal the condvar. Nothing here spawns, blocks or sleeps, so
-/// there is no executor to agree with and no feature flag to turn on.
-///
-/// Three things are worth knowing before awaiting one:
-///
-/// - Polling does not consume the handle, so the handle is still there when the
-///   future is ready -- and dropping it then returns at once, the run being
-///   over. A future polled again after it was ready reports success: the panic
-///   payload, like [`RunHandle::wait`]'s, is handed over once.
-/// - Dropping the handle *before* the run is over blocks the thread that drops
-///   it, which on an async runtime means blocking a runtime thread. A cancelled
-///   task holding a `RunHandle` therefore waits out its run.
-/// - Neither the blocking nor the awaiting path can do anything about a handle
-///   that is leaked rather than dropped, since [`std::mem::forget`] skips the
-///   `Drop` they both lean on. What makes that a leak rather than a
-///   use-after-free is ownership, not either path: see the module docs.
+/// otherwise signal the condvar, so nothing here spawns, blocks or sleeps.
+/// Polling does not consume the handle, so it is still there when the future
+/// is ready and dropping it then returns at once; a future polled again after
+/// it was ready reports success, the payload being handed over once. Dropping
+/// the handle *before* the run is over blocks the dropping thread.
 ///
 /// ```
 /// use std::future::Future;
 /// use std::pin::pin;
 /// use std::sync::Arc;
 /// use std::task::{Context, Poll, Wake, Waker};
-///
 /// use rustflow::Executor;
 /// use rustflow::prelude::*;
 ///
 /// /// The whole runtime this needs: unpark the thread that is waiting.
 /// struct Unpark(std::thread::Thread);
-///
 /// impl Wake for Unpark {
 ///     fn wake(self: Arc<Self>) {
 ///         self.0.unpark();
@@ -439,11 +311,9 @@ impl Drop for RunHandle<'_> {
 /// let mut taskflow = Taskflow::new();
 /// let (a, b) = taskflow.emplace_n((|| {}, || {}));
 /// taskflow.task(a).precede([b]);
-///
 /// let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
 /// let mut context = Context::from_waker(&waker);
 /// let mut run = pin!(executor.run_n(&taskflow, 3));
-///
 /// let result = loop {
 ///     if let Poll::Ready(result) = run.as_mut().poll(&mut context) {
 ///         break result;
@@ -474,29 +344,21 @@ impl Executor {
     ///
     /// Upstream's `run`, which is `run_n(taskflow, 1)` there and here.
     ///
-    /// Several runs of one taskflow may be in the air at once: the second and
-    /// later ones queue up on the taskflow and each is started by the
-    /// tear-down of the one before it, so they share the graph in turn rather
-    /// than at the same time. That is upstream's arrangement, and it is why
-    /// `run` may be called again without waiting for the previous run.
-    ///
-    /// A taskflow with no source task -- an empty one, or one whose every
-    /// node is in a cycle -- schedules nothing and the returned handle is
-    /// already finished. Upstream returns a ready future for the empty case
-    /// and blocks forever on the cyclic one; a static graph with a cycle has
-    /// no execution order, and reporting that as "nothing ran" beats reporting
-    /// it as a hang.
+    /// Several runs of one taskflow may be in the air at once: the later ones
+    /// queue up on the taskflow, each started by the tear-down of the one
+    /// before, which is upstream's arrangement and why `run` may be called
+    /// again without waiting. A taskflow with no source task schedules nothing
+    /// and the handle is already finished, where upstream blocks for ever on
+    /// the cyclic case.
     pub fn run<'a>(&'a self, taskflow: &'a Taskflow) -> RunHandle<'a> {
         self.run_n_with(taskflow, 1, || {})
     }
 
-    /// Runs `taskflow` once and calls `on_finish` when the run is over.
-    ///
-    /// Upstream's `run(Taskflow&, C&&)`. The callback runs on whichever worker
-    /// finished the run, before the handle is released, so a
-    /// [`RunHandle::wait`] that returns has already seen it; a panic out of it
-    /// is reported as the run's failure, since unwinding out of the tear-down
-    /// would leave the waiter blocked for good.
+    /// Runs `taskflow` once and calls `on_finish` when the run is over:
+    /// upstream's `run(Taskflow&, C&&)`. The callback runs on whichever worker
+    /// finished the run, before the handle is released, so a returning
+    /// [`RunHandle::wait`] has already seen it; a panic out of it is the run's
+    /// failure, unwinding out of the tear-down leaving the waiter blocked.
     pub fn run_with<'a, C>(&'a self, taskflow: &'a Taskflow, on_finish: C) -> RunHandle<'a>
     where
         C: FnOnce() + Send + 'static,
@@ -504,10 +366,9 @@ impl Executor {
         self.run_n_with(taskflow, 1, on_finish)
     }
 
-    /// Runs `taskflow` `times` times over, one run after the other.
-    ///
-    /// Upstream's `run_n`. Zero runs it not at all and hands back a finished
-    /// handle, as upstream's already-true predicate does.
+    /// Runs `taskflow` `times` times over, one run after the other: upstream's
+    /// `run_n`, where zero runs it not at all and hands back a finished handle,
+    /// as an already-true predicate does.
     pub fn run_n<'a>(&'a self, taskflow: &'a Taskflow, times: usize) -> RunHandle<'a> {
         self.run_n_with(taskflow, times, || {})
     }
@@ -526,11 +387,9 @@ impl Executor {
         self.run_until_with(taskflow, repeat(times), on_finish)
     }
 
-    /// Runs `taskflow` over and over until `predicate` returns `true`.
-    ///
-    /// Upstream's `run_until`. The predicate is asked once before the first
-    /// run and once after each run finishes, so a predicate that is true from
-    /// the start runs the graph not at all.
+    /// Runs `taskflow` over and over until `predicate` returns `true`:
+    /// upstream's `run_until`. The predicate is asked once before the first
+    /// run and once after each, so one true from the start runs nothing.
     pub fn run_until<'a, P>(&'a self, taskflow: &'a Taskflow, predicate: P) -> RunHandle<'a>
     where
         P: FnMut() -> bool + Send + 'static,
@@ -539,22 +398,19 @@ impl Executor {
     }
 
     /// Runs `taskflow` until `predicate` returns `true`, then calls
-    /// `on_finish`. Upstream's `run_until(Taskflow&, P&&, C&&)`, and the one
-    /// the rest of the borrowing half of the family forwards to.
+    /// `on_finish`: upstream's `run_until(Taskflow&, P&&, C&&)`, which the
+    /// borrowing half of the family forwards to.
     ///
     /// The predicate and the callback are `Send + 'static` where upstream's
-    /// capture by reference, for the reason
-    /// [`Work`](crate::Work) is `'static` too: both outlive this call -- they
-    /// live on the topology, which the taskflow's run queue shares -- so there
-    /// is no lifetime for them to borrow. A caller that wants upstream's
-    /// `[&counter]` shares an [`Arc`] with the closure instead.
+    /// capture by reference, for the reason [`Work`](crate::Work) is `'static`
+    /// too: both outlive this call, living on the topology the taskflow's run
+    /// queue shares. Upstream's `[&counter]` becomes a shared [`Arc`].
     ///
     /// # Panics
     ///
-    /// Panics if `predicate` panics on this thread, which is the one call of
-    /// it that happens before a run exists to report a failure on. Every later
-    /// call is on a worker, and a panic there is reported from
-    /// [`RunHandle::wait`] like a task's.
+    /// Panics if `predicate` panics on this thread, the one call of it that
+    /// happens before a run exists to report a failure on; every later call is
+    /// on a worker, reported from [`RunHandle::wait`] like a task's.
     pub fn run_until_with<'a, P, C>(
         &'a self,
         taskflow: &'a Taskflow,
@@ -590,17 +446,11 @@ impl Executor {
     /// is over.
     ///
     /// Upstream's `run(Taskflow&&)`, which hands the taskflow to an async task
-    /// that holds it for the life of the run. Here the handle holds it, which
-    /// is the same guarantee with no extra machinery: the taskflow is dropped
-    /// when the handle is, and the handle does not finish dropping until the
-    /// last run of the graph has.
-    ///
-    /// This is the one member of the family with no taskflow to borrow, so it
-    /// is also the one a caller can use when there is nothing to borrow *from*
-    /// -- a taskflow built inside a function and run on the way out. The
-    /// handle still borrows the executor: a run in flight needs the pool that
-    /// is running it, and dropping an [`Executor`] stops its workers whether
-    /// or not a run is outstanding.
+    /// that holds it for the life of the run; here the handle holds it, the
+    /// same guarantee with no extra machinery. The one member of the family
+    /// with no taskflow to borrow, and so the one for when there is nothing to
+    /// borrow *from*; the handle still borrows the executor, dropping which
+    /// stops its workers.
     pub fn run_owned(&self, taskflow: Taskflow) -> RunHandle<'_> {
         self.run_owned_n_with(taskflow, 1, || {})
     }
@@ -664,8 +514,8 @@ impl Executor {
         C: FnOnce() + Send + 'static,
     {
         // Nothing is boxed and nothing has to stay put: what a job names is
-        // the taskflow's *storage*, which is already a shared allocation of
-        // its own, so this value is free to move into the handle below.
+        // the taskflow's *storage*, already a shared allocation of its own, so
+        // this value is free to move into the handle below.
         if !taskflow.flow().has_source_task() || predicate() {
             on_finish();
             return RunHandle::finished(Some(taskflow));
@@ -691,9 +541,9 @@ impl Executor {
     ///
     /// The tail of upstream's `run_until`: `_increment_topology()`, then
     /// `_fetch_enqueue`, then `_set_up_topology` if this run is the front of
-    /// the queue. A run queued behind another is counted here all the same, so
-    /// that [`Executor::wait_for_all`] waits for it and the worker loop's fast
-    /// path knows there is something coming.
+    /// the queue. A run queued behind another is counted all the same, so that
+    /// [`Executor::wait_for_all`] waits for it and the worker loop knows there
+    /// is something coming.
     fn start(&self, flow: &Arc<Flow>, topology: &Arc<Topology>) {
         self.shared.increment_topology();
 
@@ -702,32 +552,17 @@ impl Executor {
         }
     }
 
-    /// Blocks until this executor is carrying nothing: no run, and no free
-    /// async task. Upstream's `wait_for_all`.
+    /// Blocks until this executor is carrying nothing -- no run, no free async
+    /// task: upstream's `wait_for_all`.
     ///
     /// Upstream's destructor calls this so that a detached future cannot
-    /// outlive the pool. For a *run* nothing here needs it for that -- a
-    /// [`RunHandle`] borrows the executor and blocks on drop, so a run in
-    /// flight is already a run whose handle is alive and whose borrow keeps
-    /// the executor around. For an async task it is the whole answer, and the
-    /// reason this is not only a diagnostic: an
-    /// [`Executor::silent_async`](crate::Executor::silent_async) hands out no
-    /// handle at all and an [`AsyncHandle`](crate::AsyncHandle) that is
-    /// dropped detaches, so this call and
-    /// [`Executor`]'s own `Drop` are the two things that wait for such a
-    /// task. The two counts behind that are `executor::async`'s to explain,
-    /// including why `Drop` waits on the narrower of them (#88) and why a
-    /// child of a [`Runtime`](crate::Runtime) body or of a
-    /// [`TaskGroup`](crate::TaskGroup) is in neither (#115) -- the parent
-    /// waiting for it accounts for it instead.
-    ///
-    /// Once it returns, every taskflow whose runs it waited for is editable,
-    /// as it is after a `wait`: the decrement that wakes this is performed by
-    /// the last share of each run's hold on its storage, after that share has
-    /// released the storage (#138). Only a leaked [`RunHandle`] can edit after
-    /// this rather than after `wait` in safe code, but the promise is the
-    /// same either way, and the ordering section of `executor::topology` has
-    /// the inventory of waits it is one of.
+    /// outlive the pool. A *run* does not need it for that -- a [`RunHandle`]
+    /// borrows the executor and blocks on drop -- but an async task does, an
+    /// [`Executor::silent_async`](crate::Executor::silent_async) handing out
+    /// no handle and a dropped [`AsyncHandle`](crate::AsyncHandle) detaching.
+    /// Once this returns, every taskflow whose runs it waited for is editable,
+    /// as after a `wait`: the decrement that wakes it is performed by the last
+    /// share of each run's hold on its storage.
     pub fn wait_for_all(&self) {
         let mut idle = self
             .shared
@@ -748,8 +583,8 @@ impl Executor {
 ///
 /// Asked once before the first run and once after each run, so it has to say
 /// "stop" on its `times + 1`-th call. The decrement saturates where upstream's
-/// `size_t` wraps, which makes no difference -- nothing asks again once it has
-/// said stop -- and means the arithmetic cannot be the thing that goes wrong.
+/// `size_t` wraps, which changes nothing, nothing asking again once it has
+/// said stop.
 fn repeat(times: usize) -> impl FnMut() -> bool + Send + 'static {
     let mut remaining = times;
     move || {
@@ -764,30 +599,16 @@ impl Shared {
     /// tasks against `parent` and queues them.
     ///
     /// Upstream's `_schedule_graph(Worker&, Graph&, Topology*, NodeBase*)`,
-    /// which is the one scheduling primitive in the executor: a run's own
-    /// graph goes through it with [`Parent::Run`], and so does every nested
-    /// graph with the node or the anchor it hangs off. Three steps, in
-    /// upstream's order, and the order is the whole of it -- the parent is
-    /// told about the sources *before* any of them is queued, because a source
-    /// can run and finish, and decrement that counter, before this call has
-    /// returned.
-    ///
-    /// Upstream takes a `Graph&`, where this takes whatever owns the graph: a
-    /// job owns what it names, so the jobs this queues each need a handle on
-    /// the graph rather than a reference into it. That is #40's shape, and
-    /// `executor::topology` has the argument -- including why that handle is
-    /// a choice of four kinds (#74) rather than the one `Arc<Flow>` it was
-    /// when a nested graph could only be a composed taskflow's.
-    ///
-    /// The `worker` is upstream's: a thread that is one of this executor's
-    /// workers pushes the sources onto its own queue, and any other thread
-    /// goes through the shared buffers. `run` is the second case; the
-    /// tear-down -- which both re-runs a topology and starts the next one of a
-    /// taskflow's queue -- is the first.
-    ///
-    /// Scheduling a graph does not touch the topology count: a run is counted
-    /// once, when its handle is created, however many times its graph goes
-    /// round and however many graphs nest inside it.
+    /// the one scheduling primitive in the executor: a run's own graph goes
+    /// through it with [`Parent::Run`], every nested graph with the node or
+    /// anchor it hangs off. The order of the three steps is the whole of it --
+    /// the parent is told about the sources *before* any is queued, a source
+    /// being able to run, finish and decrement that counter before this call
+    /// returns. Upstream takes a `Graph&` where this takes whatever owns the
+    /// graph, a job owning what it names. The `worker` is upstream's: one of
+    /// this executor's workers pushes onto its own queue, any other thread
+    /// through the shared buffers. Scheduling does not touch the topology
+    /// count, a run being counted once, when its handle is created.
     pub(crate) fn schedule_graph(
         &self,
         worker: Option<&WorkerThread>,
@@ -811,15 +632,12 @@ impl Shared {
         }
     }
 
-    /// Arms `topology` over `flow`'s graph and queues its source tasks.
-    ///
-    /// Upstream's `_set_up_topology(Worker*, Topology*)`, which is
-    /// [`Shared::schedule_graph`] with the topology as its own parent --
-    /// upstream's `_set_up_graph(g, tpg, tpg)`. Upstream *stores* the source
-    /// count on the topology where `schedule_graph` adds it, which is the same
-    /// write: a topology reaches this with nothing outstanding, whether
-    /// because it has never run or because the run that just ended drove the
-    /// counter to zero.
+    /// Arms `topology` over `flow`'s graph and queues its source tasks:
+    /// upstream's `_set_up_topology(Worker*, Topology*)`,
+    /// [`Shared::schedule_graph`] with the topology as its own parent, which
+    /// is upstream's `_set_up_graph(g, tpg, tpg)`. Upstream *stores* the
+    /// source count where `schedule_graph` adds it, the same write -- a
+    /// topology reaches this with nothing outstanding.
     pub(crate) fn set_up_topology(&self, worker: Option<&WorkerThread>, topology: &Arc<Topology>) {
         let storage = topology
             .storage()
@@ -832,17 +650,13 @@ impl Shared {
     }
 
     /// Ends a run whose last job has just finished, or sends its graph round
-    /// again. Upstream's `_tear_down_topology`.
-    ///
-    /// Called by the worker that drove the topology's join counter to zero,
-    /// and the last thing that worker does with either argument.
-    ///
-    /// The graph is not an argument, where every other method of this family
-    /// takes it: the job that got here has already given its share of the
-    /// taskflow's storage up, which keeps the window a job's share is
-    /// outstanding for as narrow as it can be -- see `Job::finish`. So what
-    /// this reaches the graph through is the run's own share of its hold on
-    /// the storage, taken back out of the topology below.
+    /// again: upstream's `_tear_down_topology`, called by the worker that drove
+    /// the topology's join counter to zero and the last thing that worker does
+    /// with either argument. The graph is
+    /// not an argument, where every other method of this family takes it: the
+    /// job that got here has already given up its share of the taskflow's
+    /// storage, so what this reaches the graph through is the run's own share,
+    /// taken back out of the topology below.
     pub(crate) fn tear_down_topology(
         &self,
         worker: Option<&WorkerThread>,
@@ -853,32 +667,25 @@ impl Shared {
             .expect("a run in flight holds a share of the taskflow it runs");
         let flow = storage.flow();
 
-        // Upstream's case 1: the predicate says run the graph again. Same
-        // topology, so it is neither counted again nor finished -- and
-        // `set_up_graph` re-arms every join counter the run just spent.
-        // The run keeps its hold on the storage, since it is about to need it
-        // again.
+        // Upstream's case 1: the predicate says run the graph again. The same
+        // topology, so neither counted again nor finished, `set_up_graph`
+        // re-arming every join counter the run just spent.
         if topology.run_again() {
             self.set_up_topology(worker, topology);
             return;
         }
 
-        // Upstream's case 2: the final run of this topology -- which is where
-        // a cancelled run arrives, since `run_again` answers no for one. Every
-        // line below therefore runs for a cancelled run too, and that is the
-        // point: cancelling stops the *scheduling*, not the accounting, so the
-        // callback still fires, the next queued run of this taskflow still
-        // starts, and the waiter is still released with `Ok(())`.
-        //
-        // The callback first, as upstream calls `_on_finish()` first, so that a
-        // waiter released below has already seen whatever the callback did.
+        // Upstream's case 2: the final run of this topology, where a
+        // cancelled run arrives too, `run_again` answering no for one --
+        // cancelling stops the *scheduling*, not the accounting. The callback
+        // first, as upstream's `_on_finish()`, so that a waiter released below
+        // has already seen whatever it did.
         topology.carry_out_callback();
 
-        // Then the next run of this taskflow, if one queued up behind this
-        // one, started *before* this run is released rather than after it as
-        // upstream does. The reason is what the next few lines are about: the
-        // thread `finish` releases is free to edit the taskflow the moment it
-        // wakes, so the last touch of the graph has to come first. A
+        // Then the next run of this taskflow, if one queued behind this one,
+        // started *before* this run is released where upstream starts it
+        // after: the thread released below is free to edit the taskflow the
+        // moment it wakes, so the last touch of the graph comes first. A
         // `run_owned` taskflow is named by nothing but its own handle, so its
         // queue can never hold a second run at all.
         if let Some(next) = flow.pop_finished_run(topology) {
@@ -886,28 +693,14 @@ impl Shared {
         }
 
         // The last two acts, in this order: this thread's own share of the
-        // run's hold on the storage, and then the run's. What releases the
-        // waiting thread -- either waiting thread -- is the drop of the *last*
-        // share of that hold, wherever it is: `Drop for Storage` takes the run
-        // out of the executor's count and then wakes the completion slot, so
-        // the two lines below are not merely before the release but are what
-        // performs it, on this thread when nothing else is still holding a
-        // copy of a preempted node's job and on the worker dropping that copy
-        // when something is.
-        //
-        // Nothing is decremented here, and that is #138. Upstream's
-        // `_tear_down_topology` calls `_carry_out_promise()` and only then
-        // `_decrement_topology()`, so a caller whose `tf::Future` has come
-        // back can still see the run counted; this function used to close
-        // that window by decrementing *first* -- and `wait_for_all`, which
-        // sleeps on that very count, could then wake before the share below
-        // was dropped and find the storage held. Decrementing in the `Drop`,
-        // after the storage and before the completion slot, keeps the first
-        // property and gains the second: once either wait returns, the run is
-        // accounted for and its storage is free. Issue #109 is why it is the
-        // share rather than this function that releases the waiter;
-        // `executor::topology`'s ordering section has the argument and the
-        // inventory of waits.
+        // run's hold on the storage, then the run's. What releases a waiting
+        // thread is the drop of the *last* share of that hold, wherever it is
+        // -- `Drop for Storage` takes the run out of the executor's count and
+        // then wakes the completion slot -- so these two lines are not merely
+        // before the release but are what performs it, here when nothing else
+        // holds a copy of a preempted node's job and on the worker dropping
+        // that copy when something does. `executor::topology::ownership`'s
+        // own docs have the lock and wake orderings this is one of.
         drop(storage);
         topology.release_flow();
     }
@@ -916,10 +709,9 @@ impl Shared {
 impl WorkerThread {
     /// Ends a run whose last job this worker has just finished.
     ///
-    /// The worker's end of [`Shared::tear_down_topology`], which lives in this
-    /// module because every line of it is about the run rather than about the
-    /// worker; what the worker brings is the queue the next run's source tasks
-    /// go onto.
+    /// The worker's end of [`Shared::tear_down_topology`], which lives here
+    /// because every line of it is about the run; what the worker brings is
+    /// the queue the next run's source tasks go onto.
     pub(crate) fn tear_down_topology(&self, topology: &Arc<Topology>) {
         self.shared.tear_down_topology(Some(self), topology);
     }
@@ -928,17 +720,12 @@ impl WorkerThread {
     /// scheduled under, ending the run or resuming that parent if it was the
     /// last.
     ///
-    /// Upstream's `_tear_down_nonasync`, both of its branches. It is the tail
-    /// of `WorkerThread::invoke` and the whole of what a job skipped by the
-    /// cancelled early-out at the top of that method still owes: the join
-    /// counters have to reach zero for anything to finish at all, which is why
-    /// upstream's cancelled branch goes to `_tear_down_invoke` rather than
-    /// simply returning.
-    ///
-    /// **The last thing the caller may do with the run**, for the reason
-    /// [`Shared::tear_down_topology`] gives -- and the caller must already
-    /// have given up its share of the taskflow's storage, which is why the
-    /// only way to reach this is through [`Job::finish`].
+    /// Upstream's `_tear_down_nonasync`, both branches: the tail of
+    /// `WorkerThread::invoke`, and the whole of what a job skipped by the
+    /// cancelled early-out still owes, the join counters having to reach zero
+    /// for anything to finish. **The last thing the caller may do with the
+    /// run**, and the caller must already have given up its share of the
+    /// storage, which is why the only way here is [`Job::finish`].
     pub(crate) fn finish_job(&self, finished: Finished) {
         let (parent, topology) = finished.into_parts();
 
@@ -953,24 +740,22 @@ impl WorkerThread {
             // Upstream's `else`: the parent is a node whose graph this job
             // belonged to, or a corun's anchor.
             Parent::Nested(nested) => {
-                // Read before the decrement, as upstream reads it and for a
-                // reason that survives translation: the instant that counter
-                // reaches zero the parent may be resumed on another worker,
-                // and a resumed parent clears its own `PREEMPTED` bit. A read
-                // after the decrement could therefore miss the bit that is
-                // asking for the resumption. (Upstream's own comment is about
-                // the node being *deleted* by then, which an arena and a share
-                // rule out.)
+                // Read before the decrement, as upstream reads it: the
+                // instant that counter reaches zero the parent may be resumed
+                // on another worker, and a resumed parent clears its own
+                // `PREEMPTED` bit, so a later read could miss the bit asking
+                // for the resumption. (Upstream's comment is about the node
+                // being *deleted* by then, which an arena and a share rule
+                // out.)
                 let base = nested.base();
                 let preempted = base.nstate().load(Ordering::Relaxed) & Node::PREEMPTED != 0;
 
                 if base.join_counter().fetch_sub(1, Ordering::AcqRel) == 1 && preempted {
-                    // Upstream's `_update_cache(worker, cache, parent)`, which
-                    // is not ported: the parent goes back on a queue like any
-                    // other job rather than being run immediately on this
-                    // worker. A corun's anchor is never preempted and has no
-                    // job to resume -- the frame waiting on it is watching the
-                    // counter this decrement just drove to zero.
+                    // Upstream's `_update_cache(worker, cache, parent)` is
+                    // not ported: the parent goes back on a queue like any
+                    // other job. A corun's anchor is never preempted and has
+                    // no job to resume -- the frame waiting on it watches the
+                    // counter this decrement drove to zero.
                     if let Some(job) = nested.resume() {
                         self.schedule(job.clone());
                     }
