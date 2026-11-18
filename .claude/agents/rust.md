@@ -181,6 +181,9 @@ pass renames doctests, because a doctest's generated name embeds the line its
 example starts on (`src/task.rs - task::TaskMut (line 349)`), so **"the same
 set of test names before and after" means the same set of item paths with
 ` (line N)` stripped** -- and a PR that claims one says which it compared.
+`devtools/test-names.sh snapshot <file>` takes that comparison and
+`devtools/test-names.sh diff <before> <after>` reports it, stripping the
+` (line N)` suffix for you and exiting non-zero on any name added or removed.
 
 ## Conventions
 
