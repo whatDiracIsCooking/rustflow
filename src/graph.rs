@@ -1,33 +1,35 @@
 //! Translated from `taskflow/core/graph.hpp` (Taskflow v4.1.0).
 //!
-//! The one structural departure from upstream is how a node is addressed. In
-//! C++ a `tf::Task` wraps a raw `Node*` into a graph the caller keeps mutating,
-//! which does not survive translation to Rust's aliasing rules; here [`Graph`]
-//! owns its nodes by value in a `Vec` and a [`Task`] is an index into it.
-//! Upstream's object pool (`TF_ENABLE_TASK_POOL`) is therefore not ported.
-//! Upstream's `NodeBase`/`Node` split is, as of #47: the base holds the
-//! state words a run writes, so that everything which can be the *parent* of
-//! a graph is one kind of thing to the scheduler -- a node whose nested graph
-//! is running, or the anchor a `corun` waits on. One of upstream's fields is
-//! deliberately not in it: `_parent` travels with the *job* that names a node
-//! rather than being stored on the node -- `executor::topology` has that
-//! argument, and it is what keeps the scheduler free of raw pointers.
-//! `_exception_ptr` *is* in it, as of #48, because an anchor is where a
-//! failure inside a nested graph is delivered and an anchor is a `NodeBase`
-//! -- crate-private, so it is named rather than linked here, and its own doc
-//! comment says why the slot cannot live anywhere cheaper.
+//! [`Graph`] owns its nodes by value and a [`Task`] is an index into that
+//! arena. Upstream's `NodeBase`/`Node` split is kept: the base holds the
+//! state words a run writes, so that a node whose nested graph is running and
+//! the anchor a `corun` waits on are one kind of thing to the scheduler.
 //!
-//! That choice decides what erasing a node has to do. Upstream's `Graph::_erase`
-//! compacts its `_nodes` vector, which it can afford because a `tf::Task` holds
-//! a `Node*` that compaction does not move. An index handle is not so lucky: any
-//! shuffle would silently re-point live [`Task`]s at other nodes. So
-//! [`Graph::erase`] *tombstones* -- it empties the slot and leaves it empty
-//! forever. Indices stay stable, which is the promise a `Copy` handle makes, at
-//! the cost of a slot that is never reused: a graph that erases N nodes keeps N
-//! empty slots until [`Graph::clear`]. A tombstoned handle then behaves exactly
-//! like one that was never valid -- [`Graph::contains`] is `false`,
-//! [`Graph::get`] is `None`, [`Graph::node`] panics -- and [`Graph::len`] counts
-//! live nodes only, so the three iterators skip the dead.
+//! # Design
+//!
+//! The arena and the index handle are the crate-wide decision `DESIGN.md`
+//! records as "Graph as an arena", which is also why upstream's object pool
+//! (`TF_ENABLE_TASK_POOL`) is not ported. Two members of upstream's
+//! `NodeBase` are placed by decisions of their own, both in `DESIGN.md`:
+//! `_parent` is not stored on a node but travels with the *job* that names
+//! one, which is what keeps the scheduler free of raw pointers, and
+//! `_exception_ptr` is on the node because an anchor is a `NodeBase`.
+//!
+//! [`Graph::erase`] **tombstones** a slot where upstream's `Graph::_erase`
+//! compacts its `_nodes` vector. Upstream can compact because a `tf::Task`
+//! holds a `Node*` that compaction does not move; a shuffle here would
+//! silently re-point live [`Task`]s at other nodes. The price of an index
+//! that stays stable is a slot that is never reused.
+//!
+//! The work handles lock their callable for two different reasons. [`Work`],
+//! [`SubflowWork`] and [`RuntimeWork`] hold a `Mutex` because a closure needs
+//! `&mut` to be called and a worker reaches its node as `&Node`; that lock is
+//! an *assertion* on the scheduler's one-worker-per-node promise, taken with
+//! `try_lock` so that a contended one panics rather than waits, and trading
+//! it for an `UnsafeCell` was left to the benchmarks and not taken.
+//! [`OnceWork`] locks to *arbitrate* instead: a free async node is reachable
+//! through an [`AsyncTask`](crate::AsyncTask) handle a caller holds, so two
+//! callers can race to take the one body and exactly one is given it.
 
 use core::fmt;
 use core::num::TryFromIntError;
@@ -43,10 +45,10 @@ use crate::taskflow::Taskflow;
 
 /// A handle to one node of a [`Graph`], as an index into that graph's arena.
 ///
-/// A `Task` carries no reference to the graph it indexes, so it is `Copy` and
-/// cheap to pass around, but it is only meaningful together with the `Graph`
-/// that produced it -- using one against a different graph addresses an
-/// unrelated node, exactly as a stale `Node*` would upstream.
+/// A `Task` carries no reference to the graph it indexes, so it is `Copy`,
+/// but it is only meaningful together with the `Graph` that produced it:
+/// using one against a different graph addresses an unrelated node, exactly
+/// as a stale `Node*` would upstream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct Task(u32);
 
@@ -91,19 +93,15 @@ impl From<Task> for u32 {
 
 /// The callable behind a task, returning `R`.
 ///
-/// Upstream stores a different `std::function` per node kind and the return
-/// type is the only thing that differs between three of them -- `void()` for a
-/// static task, `int()` for a condition, `SmallVector<int>()` for a
-/// multi-condition -- so one type parameter covers all three. It defaults to
-/// `()`, which keeps `Work` on its own meaning the static case.
+/// Upstream stores a different `std::function` per node kind, and the return
+/// type is all that differs between three of them -- `void()` for a static
+/// task, `int()` for a condition, `SmallVector<int>()` for a multi-condition
+/// -- so one type parameter covers all three, defaulting to `()` so that
+/// `Work` on its own means the static case.
 ///
-/// Upstream calls the function through a `Node*`. A Rust closure needs `&mut`
-/// to be called, so the `Mutex` is what lets a `&Node` shared across workers
-/// invoke the work at all. It is an assertion rather than a synchronisation
-/// primitive: the scheduler promises one worker per node, so [`Work::invoke`]
-/// takes the lock with `try_lock` and panics instead of blocking if that
-/// promise is ever broken. Whether to trade it for an `UnsafeCell` is for the
-/// M2 benchmark to decide.
+/// The `Mutex` is what lets a `&Node` shared across workers invoke the work
+/// at all, where upstream calls the function through a `Node*`; the module
+/// docs say why it is an assertion rather than a synchronisation primitive.
 pub struct Work<R = ()>(Mutex<Box<dyn FnMut() -> R + Send + 'static>>);
 
 impl<R> Work<R> {
@@ -127,11 +125,8 @@ impl<R> Work<R> {
     }
 }
 
-/// Takes the lock the callable of a work handle sits behind.
-///
-/// The three work handles -- [`Work`], [`SubflowWork`] and [`RuntimeWork`] --
-/// differ only in what they call and share this discipline, so it is written
-/// once here rather than three times.
+/// Takes the lock the callable of a work handle sits behind: the one
+/// discipline [`Work`], [`SubflowWork`] and [`RuntimeWork`] share.
 ///
 /// # Panics
 ///
@@ -155,19 +150,16 @@ fn lock_callable<F: ?Sized>(callable: &Mutex<Box<F>>) -> MutexGuard<'_, Box<F>> 
 /// builds into.
 ///
 /// Upstream's `std::function<void(tf::Subflow&)>`. The body builds a graph
-/// while it runs, so it cannot be a [`Work`]: what it returns is nothing and
-/// what it needs is the handle. The `Mutex` is [`Work`]'s, for [`Work`]'s
-/// reason and under the same discipline -- a second worker on one node is a
-/// reported panic, not a race.
-///
-/// The bound is higher-ranked over the subflow's own lifetime because the
-/// handle borrows the node the body is running on, which is a lifetime no
-/// stored closure can name.
+/// while it runs, so what it needs is the handle rather than a return value
+/// and it cannot be a [`Work`]; the `Mutex` is [`Work`]'s, under the same
+/// discipline. The bound is higher-ranked over the subflow's own lifetime
+/// because the handle borrows the node the body is running on, which is a
+/// lifetime no stored closure can name.
 pub struct SubflowWork(Mutex<SubflowBody>);
 
-/// The boxed body of a subflow task. Named rather than written inline because
-/// the lock, the box and the higher-ranked bound together are past what
-/// clippy's `type_complexity` admits in a field.
+/// The boxed body of a subflow task, named rather than written inline because
+/// the lock, the box and the bound together are past what clippy's
+/// `type_complexity` admits in a field.
 type SubflowBody = Box<dyn for<'a> FnMut(&mut Subflow<'a>) + Send + 'static>;
 
 impl SubflowWork {
@@ -201,9 +193,8 @@ impl fmt::Debug for SubflowWork {
 /// node it runs on.
 ///
 /// Upstream's `std::function<void(tf::Runtime&)>`, under [`SubflowWork`]'s
-/// discipline and for the same reasons. Upstream's second runtime shape,
-/// `std::function<void(tf::NonpreemptiveRuntime&)>`, is excluded from this
-/// milestone.
+/// discipline. Upstream's second runtime shape,
+/// `std::function<void(tf::NonpreemptiveRuntime&)>`, is not ported.
 pub struct RuntimeWork(Mutex<RuntimeBody>);
 
 /// The boxed body of a runtime task, named for [`SubflowBody`]'s reason.
@@ -245,33 +236,20 @@ impl<R> fmt::Debug for Work<R> {
 /// A body that runs **once**, in the slot the one worker that runs it takes
 /// it out of.
 ///
-/// The three [`AsyncWork`] shapes are built out of this, and it is what makes
-/// them different in kind from [`Work`] rather than merely different in
-/// signature: upstream's async bodies are a `std::packaged_task` or a
-/// `mutable` lambda that is moved into the node and called once, where a
-/// static task's `std::function` is called afresh on every run of the graph
-/// it belongs to. A `FnOnce` says that, and a `FnOnce` cannot be called
-/// through a shared reference -- so the body has to be *moved out* of the
-/// node to be run, which is what [`OnceWork::take`] is.
-///
-/// The `Mutex` here is a synchronisation primitive and not the assertion
-/// [`Work`]'s is. [`Work::invoke`] panics rather than blocking, because the
-/// scheduler promises one worker per node and a second one is a defect to
-/// report; this lock is what *arbitrates* that promise instead -- two callers
-/// racing to take the body are given an answer rather than a panic, exactly
-/// one of them gets `Some`, and the critical section is an
-/// [`Option::take`] rather than a user's body. A free async node is reachable
-/// through an [`AsyncTask`](crate::AsyncTask) handle a caller holds, so
-/// "exactly one caller arrives" is a weaker thing to rest on there than it is
-/// inside a graph a run owns.
+/// The three [`AsyncWork`] shapes are built out of this. Upstream's async
+/// bodies are a `std::packaged_task` or a `mutable` lambda that is moved into
+/// the node and called once, where a static task's `std::function` is called
+/// afresh on every run of its graph; a `FnOnce` says that, and cannot be
+/// called through a shared reference, so the body is *moved out* of the node
+/// to be run -- which is what [`OnceWork::take`] is. The module docs say why
+/// this lock arbitrates where [`Work`]'s asserts.
 pub struct OnceWork<F: ?Sized>(Mutex<Option<Box<F>>>);
 
 impl<F: ?Sized> OnceWork<F> {
     /// Fills the slot with `body`, which is the one call of it there will be.
-    ///
-    /// Takes the box rather than the callable, because `F` is a `dyn FnOnce`
-    /// of one of three shapes and the coercion belongs at the three call
-    /// sites in [`AsyncWork`] rather than in a bound here.
+    /// Takes the box rather than the callable, `F` being a `dyn FnOnce` of
+    /// one of three shapes whose coercion belongs at the call sites in
+    /// [`AsyncWork`].
     #[must_use]
     pub fn new(body: Box<F>) -> Self {
         Self(Mutex::new(Some(body)))
@@ -280,16 +258,14 @@ impl<F: ?Sized> OnceWork<F> {
     /// Takes the body out, leaving the slot empty: `Some` for the one caller
     /// that got there first, `None` for every caller after it.
     ///
-    /// Upstream has no equivalent because it needs none -- its async node is
-    /// recycled by the worker that ran it, so nothing can reach the body a
-    /// second time. Here the node lives as long as the last handle on it, and
-    /// this is what keeps a body from being run twice.
+    /// Upstream needs no equivalent, its async node being recycled by the
+    /// worker that ran it. Here the node lives as long as the last handle on
+    /// it, and this is what keeps a body from being run twice.
     pub fn take(&self) -> Option<Box<F>> {
         self.lock().take()
     }
 
-    /// Whether the body has been taken, which is as close to "has run" as the
-    /// slot itself can say -- the taker may still be running it.
+    /// Whether the body has been taken, the taker possibly still running it.
     #[must_use]
     pub fn is_spent(&self) -> bool {
         self.lock().is_none()
@@ -297,22 +273,19 @@ impl<F: ?Sized> OnceWork<F> {
 
     /// The slot. Poisoning is taken rather than propagated, as it is
     /// everywhere else in the crate: nothing under this lock does more than
-    /// move a box, so a poisoned slot means a panic *elsewhere* -- in the body
-    /// after it was taken -- and refusing to hand the slot back would turn a
-    /// reported failure into one nobody can account for.
+    /// move a box, so a poisoned slot means a panic in the body after it was
+    /// taken, which is already on its way to being reported.
     fn lock(&self) -> MutexGuard<'_, Option<Box<F>>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 impl<F: ?Sized> fmt::Debug for OnceWork<F> {
-    /// Whether the body is still there is the whole of what is printable about
-    /// it, as it is for a `NodeBase`'s payload slot.
+    /// Whether the body is still there is the whole of what is printable.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // The lock rather than a `try_lock`, where a `NodeBase`'s `Debug`
         // declines to wait: nothing holds this one across anything but an
-        // `Option::take`, so there is no lock here to be stuck behind and no
-        // reason to print a guess.
+        // `Option::take`.
         f.debug_tuple("OnceWork")
             .field(&if self.is_spent() { "spent" } else { "pending" })
             .finish()
@@ -330,11 +303,10 @@ impl<F: ?Sized> fmt::Debug for OnceWork<F> {
 /// under two names.
 ///
 /// Not generic over a return value, where upstream's third `async` form is a
-/// `std::packaged_task<R()>`: what delivers the result of a value-returning
-/// body is a wrapper closure the submitting call builds, which captures the
-/// slot it will put the value in and is itself a `Plain` body. That keeps the
-/// node one type whatever the body returns, which is what lets a queue hold
-/// jobs of async tasks that disagree about `R`.
+/// `std::packaged_task<R()>`: a value-returning body is submitted as a
+/// `Plain` wrapper closure that captures the slot it will put the value in,
+/// which is what lets one queue hold jobs of async tasks that disagree about
+/// `R`.
 #[derive(Debug)]
 pub enum AsyncWork {
     /// A plain callable, upstream's `std::function<void()>` alternative: the
@@ -349,15 +321,13 @@ pub enum AsyncWork {
     /// A runtime-shaped body somebody *is* waiting on, upstream's
     /// `std::function<void(tf::Runtime&, bool reentered)>` alternative.
     ///
-    /// Two closures rather than one closure and a flag, and that is this
-    /// port's one departure from the variant above it. Upstream's lambda is
+    /// Two closures rather than one closure and a flag. Upstream's lambda is
     /// called twice: once with `reentered == false`, when it runs the user's
     /// body, and once with `true`, when its only job is to deliver the node's
-    /// payload slot to whoever holds the handle (`_async` in
+    /// payload to whoever holds the handle (`_async` in
     /// `taskflow/core/async.hpp`, which reads `rt._node->_exception_ptr` on
-    /// that second entry). Each half therefore runs exactly once, and two
-    /// `FnOnce`s say so where one `FnMut` and a `bool` would leave a reader --
-    /// and the type system -- to take it on trust.
+    /// that second entry). Each half runs exactly once, and two `FnOnce`s say
+    /// so where one `FnMut` and a `bool` leave it to be taken on trust.
     Reentrant {
         /// The user's body, run on the first entry.
         body: OnceWork<AsyncRuntimeBody>,
@@ -378,8 +348,8 @@ type PlainAsyncBody = dyn FnOnce() + Send + 'static;
 type AsyncRuntimeBody = dyn for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static;
 
 /// The boxed second half of an [`AsyncWork::Reentrant`] body: what hands the
-/// node's payload -- upstream's `_exception_ptr`, `None` for a task that did
-/// not fail -- to whoever is waiting on the task.
+/// node's payload -- `None` for a task that did not fail -- to whoever is
+/// waiting on the task.
 type AsyncCompleteBody = dyn FnOnce(Option<Box<dyn Any + Send>>) + Send + 'static;
 
 impl AsyncWork {
@@ -403,8 +373,8 @@ impl AsyncWork {
 
     /// Wraps a runtime-shaped callable somebody is waiting on, plus what
     /// delivers the node's payload to them: upstream's
-    /// `std::function<void(tf::Runtime&, bool)>` alternative, as the two
-    /// `FnOnce`s the variant's docs argue for.
+    /// `std::function<void(tf::Runtime&, bool)>` alternative, as two
+    /// `FnOnce`s.
     pub fn reentrant<B, C>(body: B, complete: C) -> Self
     where
         B: for<'a> FnOnce(&mut Runtime<'a>) + Send + 'static,
@@ -420,13 +390,10 @@ impl AsyncWork {
 /// What a node does when the executor reaches it.
 ///
 /// Upstream is a `std::variant` of eleven alternatives (subflow, module,
-/// async, ...) and this port has ten of them: the one still missing is
-/// upstream's `NonpreemptiveRuntime`, the second of its two runtime shapes.
-/// The enum stays `#[non_exhaustive]` all the same, because arriving at that
-/// eleventh must not break callers outside the crate -- and because a variant
-/// here is not a variant a caller can usefully construct for itself:
-/// [`Handle::Async`] and [`Handle::DependentAsync`] are handles the
-/// *executor* makes, as their own docs say.
+/// async, ...) and this port has ten of them: the one missing is upstream's
+/// `NonpreemptiveRuntime`, the second of its two runtime shapes. The enum is
+/// `#[non_exhaustive]` so that arriving at that eleventh does not break
+/// callers outside the crate.
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub enum Handle {
@@ -447,20 +414,18 @@ pub enum Handle {
     /// A callable whose return value picks any number of this node's
     /// successors to run next, upstream's `Node::MultiCondition`.
     ///
-    /// `Vec<i32>` stands in for upstream's inline `SmallVector<int>`: the
-    /// allocation per invocation is a known cost, to revisit with a bench
-    /// before hand-rolling a small-vector type for it.
+    /// `Vec<i32>` stands in for upstream's inline `SmallVector<int>`, the
+    /// allocation per invocation being a known cost not yet worth a
+    /// small-vector type of our own.
     MultiCondition(Work<Vec<i32>>),
     /// A callable that builds a graph of its own while it runs, which the
     /// executor then runs before this node's successors: upstream's
     /// `Node::Subflow`.
     ///
     /// `subgraph` is upstream's `Graph subgraph` field, behind a `Mutex`
-    /// because the body mutates it through a node the run only *borrows*: a
-    /// worker reaches the node as `&Node`, so the graph it writes into has to
-    /// carry its own interior mutability. It cannot deadlock a body either,
-    /// since a nested subflow locks its own node's graph and never this one
-    /// again. See [`crate::subflow`] for what holds the guard.
+    /// because the body mutates it through a node the run only *borrows*.
+    /// [`crate::subflow`] has what holds the guard and why no body can
+    /// deadlock on it.
     Subflow {
         /// The body, which is handed the [`Subflow`] it builds into.
         work: SubflowWork,
@@ -472,44 +437,37 @@ pub enum Handle {
     /// A task that stands for another whole taskflow, upstream's
     /// `Node::Module`.
     ///
-    /// Upstream stores a bare `Graph&` and leaves it to the caller to keep the
-    /// target alive for as long as any graph composed of it may run; a safe
-    /// Rust API cannot state that obligation, so the module *shares* ownership
-    /// of its target instead. The run needs no more than that: the `Arc` hands
-    /// out `&Graph` through [`Taskflow::graph`], and running the target writes
-    /// its nodes only through their atomic state words.
+    /// The module *shares* ownership of its target where upstream stores a
+    /// bare `Graph&` -- `DESIGN.md` has why. The run needs no more than the
+    /// share: the `Arc` hands out `&Graph` through [`Taskflow::graph`], and
+    /// running the target writes its nodes only through their atomic state
+    /// words.
     Module(Arc<Taskflow>),
     /// A task that stands for a graph it owns, upstream's
-    /// `Node::AdoptedModule` -- the `adopt(Graph&&)` form of the variant
-    /// above, which moves the graph in rather than sharing it.
+    /// `Node::AdoptedModule`: the `adopt(Graph&&)` form of the variant above,
+    /// which moves the graph in rather than sharing it.
     AdoptedModule(Graph),
     /// A task submitted outside any graph, upstream's `Node::Async`: the body
     /// a `silent_async` or `async` call hands the pool, which has no
     /// dependencies and no successors.
     ///
     /// The node such a task is lives in a one-node graph of its own rather
-    /// than in a taskflow's arena -- `executor::async_node` is where that
-    /// node and its ownership are -- so this variant is the *handle* of an
-    /// async task and not a way to build one. Nothing on
-    /// [`FlowBuilder`](crate::FlowBuilder) produces it.
-    ///
-    /// One can nevertheless be put in a taskflow's graph through
-    /// [`Graph::add_node`], because that function takes any handle. Such a
-    /// node dumps as a plain node and the worker that reaches it refuses the
-    /// run -- `executor::async` -- rather than running a body that has no
-    /// business being counted as part of a taskflow.
+    /// than in a taskflow's arena -- `executor::async_node` owns it -- so
+    /// this variant is the *handle* of an async task and not a way to build
+    /// one: nothing on [`FlowBuilder`](crate::FlowBuilder) produces it. One
+    /// put in a taskflow's graph through [`Graph::add_node`] anyway dumps as
+    /// a plain node, and the worker that reaches it refuses the run.
     Async(AsyncWork),
     /// A task submitted outside any graph that other such tasks can depend
     /// on, upstream's `Node::DependentAsync`.
     ///
-    /// The same body as [`Handle::Async`] over the same free-standing node;
-    /// what the two differ in is who may wait for it and what the node keeps
-    /// besides its body -- a dependent-async node holds the successors
-    /// upstream keeps in `_edges` under its `ESTATE::LOCKED` spin bit, and
-    /// hands out an [`AsyncTask`](crate::AsyncTask) handle so that a later
-    /// submission can name it as a dependency. Everything the paragraphs
-    /// above say about a node of this kind inside a taskflow holds of this
-    /// one too.
+    /// The same body as [`Handle::Async`] over the same free-standing node,
+    /// differing in who may wait for it and in what the node keeps besides
+    /// its body: a dependent-async node holds the successors upstream keeps
+    /// in `_edges` under its `ESTATE::LOCKED` spin bit, and hands out an
+    /// [`AsyncTask`](crate::AsyncTask) handle so that a later submission can
+    /// name it as a dependency. It is no more a taskflow's citizen than
+    /// [`Handle::Async`] is.
     DependentAsync(AsyncWork),
 }
 
@@ -553,10 +511,9 @@ impl Handle {
     /// Returns `true` for either module handle, [`Handle::Module`] and
     /// [`Handle::AdoptedModule`].
     ///
-    /// The two are one task kind as far as anything outside the executor is
-    /// concerned -- upstream's `TaskType` has no separate name for the adopted
-    /// form either -- and they differ only in who owns the target graph, which
-    /// is a question only the arm that runs one asks. Match the handle to tell
+    /// The two are one task kind outside the executor, as upstream's
+    /// `TaskType` has no separate name for the adopted form either: they
+    /// differ only in who owns the target graph. Match the handle to tell
     /// them apart.
     #[must_use]
     pub fn is_module(&self) -> bool {
@@ -571,14 +528,12 @@ impl Handle {
 
     /// Returns `true` for [`Handle::DependentAsync`].
     ///
-    /// Separate from [`Handle::is_async`] where [`is_module`](Handle::is_module)
-    /// folds its two variants together, and the difference is upstream's: the
-    /// two module forms differ only in who owns the target graph, which
-    /// nothing outside the dispatch arm asks, whereas an async and a
-    /// dependent-async task differ in whether anything can depend on them --
-    /// a question a caller holding an [`AsyncTask`](crate::AsyncTask) asks all
-    /// the time. The flat [`TaskType`](crate::TaskType) still folds them, as
-    /// upstream's does.
+    /// Separate from [`Handle::is_async`], where
+    /// [`is_module`](Handle::is_module) folds its two variants together: the
+    /// two async forms differ in whether anything can depend on them, which
+    /// is a question a caller holding an [`AsyncTask`](crate::AsyncTask)
+    /// asks. The flat [`TaskType`](crate::TaskType) folds them all the same,
+    /// as upstream's does.
     #[must_use]
     pub fn is_dependent_async(&self) -> bool {
         matches!(self, Self::DependentAsync(_))
@@ -602,51 +557,25 @@ impl Handle {
 /// A [`Node`] embeds one, and so does the anchor a
 /// [`corun`](crate::Executor::corun) waits on, because the scheduler counts
 /// both down the same way: the jobs of a graph decrement the join counter of
-/// whatever they were scheduled under, and the last of them to reach zero is
-/// what ends that nested run. Upstream says the same thing by inheritance,
-/// and reaches either through a `NodeBase*`.
+/// whatever they were scheduled under, and the last of them to reach zero
+/// ends that nested run. Upstream says the same by inheritance, reaching
+/// either through a `NodeBase*`.
 ///
 /// The words are atomic even where upstream's are plain -- `_nstate` is a
 /// bare `int` there -- so that a run can hold a `&Graph` across worker
 /// threads instead of handing out `&mut` to nodes it does not exclusively
-/// own. Upstream's one remaining member is not here, and the module docs say
-/// why: `_parent` travels with the job.
+/// own. Upstream's one remaining member is not here: `_parent` travels with
+/// the job.
 ///
-/// # Why the payload slot is here and not on the parent
-///
-/// `panic` is upstream's `_exception_ptr`, and the question #48 had to settle
-/// is whose field it is. A chain of parents in this port is a chain of
-/// `Nested` allocations in `executor::topology` -- not of nodes -- so storing
-/// a nested failure *there* looks cheaper: one slot per nested run instead of
-/// one per node. It does not work, and the case that breaks it is the one the
-/// slot exists for.
-///
-/// A parent whose nested graph is running is **preempted**: the last job of
-/// that graph re-queues the parent's own job and then lets the `Nested` go,
-/// so by the time the parent is entered a second time -- possibly on another
-/// worker -- the allocation that was its children's parent has been dropped.
-/// A payload stored on it would be gone exactly when the resumed node needs
-/// to look at it. Upstream reads `rt._node->_exception_ptr` on precisely that
-/// second entry (`_async` in `taskflow/core/async.hpp`), which is the same
-/// statement from the other side: the node outlives its nested run, and the
-/// `Nested` does not.
-///
-/// So the slot is on the node, as upstream has it -- and the anchor a `corun`
-/// waits on gets one for free, because that anchor *is* a `NodeBase`. The one
-/// anchor with no `NodeBase` is the run itself, whose payload slot is the
-/// completion slot a `wait` already reads.
-///
-/// The cost is a `Mutex` per node where upstream has a pointer, and it is
-/// uncontended by construction. Which thread may *write* the slot is settled
-/// by an atomic `fetch_or` of `CAUGHT` on the estate word before the lock is
-/// taken, so at most one writer ever arrives; the only readers are the frame
-/// or the second entry that waited for the nested graph, which run when no
-/// job of it is left, and the clearing a re-run does, which `set_up_graph`
-/// skips unless that same bit says there is something under the lock. What
-/// the lock buys over a raw pointer is that it is safe code, and that it
-/// carries the payload's own happens-before: a taker sees the write because
-/// it took the same lock, not because it read some counter in the right
-/// order.
+/// The payload slot is a field of the node rather than of the nested run,
+/// which is `DESIGN.md`'s entry on where a failure inside a nested graph is
+/// delivered; the one anchor without a `NodeBase` is the run itself, whose
+/// payload slot is the completion slot a `wait` already reads. The `Mutex`
+/// the slot sits behind is uncontended by construction: at most one writer
+/// arrives, [`NodeBase::claim_panic`] having arbitrated on the estate word
+/// before the lock is taken, and the only readers are the frame or the second
+/// entry that waited for the nested graph, which run when no job of it is
+/// left.
 #[derive(Default)]
 pub(crate) struct NodeBase {
     /// Upstream's `_nstate`: the strong-dependency count in the low 28 bits
@@ -663,15 +592,13 @@ pub(crate) struct NodeBase {
     join_counter: AtomicUsize,
     /// Upstream's `_exception_ptr`: what the first task to fail under this
     /// anchor panicked with, until whoever waited for that graph takes it.
-    ///
-    /// Empty on every node that is not an anchor, which is most of them; the
-    /// type doc says why it is nevertheless here rather than on the parent.
+    /// Empty on every node that is not an anchor, which is most of them.
     panic: Mutex<Option<Box<dyn Any + Send>>>,
 }
 
 impl NodeBase {
-    /// A base with every word clear: no dependencies, no state, nothing
-    /// outstanding and no payload.
+    /// A base with every word clear: no dependencies, no payload, nothing
+    /// outstanding.
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -695,11 +622,11 @@ impl NodeBase {
     /// guard is dropped: upstream's `ExplicitAnchorGuard`.
     ///
     /// Taken by whoever is about to wait for a graph scheduled under this
-    /// base -- `corun_graph` in `executor::corun`, which is upstream's
-    /// `_corun_graph` -- and taken *before* the graph is scheduled, because a
-    /// source of that graph can fail before the call that scheduled it has
-    /// returned, and a failure that arrives while the bit is clear walks
-    /// straight past the frame that is waiting for it.
+    /// base -- `corun_graph` in `executor::corun`, upstream's `_corun_graph`
+    /// -- and taken **before** the graph is scheduled: a source of that graph
+    /// can fail before the call that scheduled it has returned, and a failure
+    /// arriving while the bit is clear walks straight past the frame that is
+    /// waiting for it.
     pub(crate) fn anchor_explicitly(&self) -> ExplicitAnchor<'_> {
         self.estate
             .fetch_or(Cancellable::EXPLICITLY_ANCHORED, Ordering::Relaxed);
@@ -717,13 +644,11 @@ impl NodeBase {
     /// itself and will look at its slot when it is resumed.
     ///
     /// `executor::runtime` is what sets it, taking
-    /// `PREEMPTED | IMPLICITLY_ANCHORED` together on a first entry -- so it
-    /// is on a runtime task (#51) and on a free node whose body is handed a
-    /// `Runtime` (#90), the two kinds that go through that entry. A
-    /// `TaskGroup`'s anchor carries it from the moment the group is opened
-    /// instead, for its whole life rather than for one nested run (#93). A
-    /// node that a subflow or a module merely preempted is no anchor, which
-    /// is upstream's arrangement too.
+    /// `PREEMPTED | IMPLICITLY_ANCHORED` together on a first entry, so it is
+    /// on a runtime task and on a free node whose body is handed a `Runtime`.
+    /// A `TaskGroup`'s anchor carries it for its whole life instead, rather
+    /// than for one nested run. A node that a subflow or a module merely
+    /// preempted is no anchor, which is upstream's arrangement too.
     pub(crate) fn is_implicitly_anchored(&self) -> bool {
         self.nstate.load(Ordering::Relaxed) & Node::IMPLICITLY_ANCHORED != 0
     }
@@ -734,9 +659,9 @@ impl NodeBase {
     /// Upstream's `(_estate.fetch_or(EXCEPTION | CAUGHT) & CAUGHT) == 0`: the
     /// atomic is the arbiter, so a later failure under the same anchor is
     /// turned away here rather than at the lock. `EXCEPTION` comes with it
-    /// because an anchor that has a failure to report is an anchor whose
-    /// remaining children are to be skipped, which is the same bit
-    /// cancellation reads.
+    /// because an anchor with a failure to report is an anchor whose
+    /// remaining children are to be skipped, which is the bit cancellation
+    /// reads.
     ///
     /// Masking `CAUGHT` alone rather than the pair is upstream's and is
     /// load-bearing on a node: the panic walk sets `EXCEPTION` on every base
@@ -764,15 +689,12 @@ impl NodeBase {
     }
 
     /// Takes the payload out of the slot and un-claims it: upstream's
-    /// `NodeBase::_rethrow_exception`, minus the rethrow.
-    ///
-    /// Upstream raises the exception again on the spot; here the payload is
-    /// handed back so that the caller decides, which is what gives
+    /// `NodeBase::_rethrow_exception`, minus the rethrow -- the payload is
+    /// handed back so that the caller decides, which gives
     /// [`Executor::corun`](crate::Executor::corun) and its `try_` form one
     /// primitive instead of two. Clearing `EXCEPTION | CAUGHT` is upstream's
-    /// too and only happens when there was something to take: the anchor has
-    /// no failure to report any more, so a graph scheduled under it next is
-    /// not born cancelled.
+    /// too and only happens when there was something to take, so that a graph
+    /// scheduled under this anchor next is not born cancelled.
     pub(crate) fn take_panic(&self) -> Option<Box<dyn Any + Send>> {
         let payload = self.lock_panic().take();
         if payload.is_some() {
@@ -783,16 +705,15 @@ impl NodeBase {
     }
 
     /// Empties the slot, which is what arming a graph does to a node whose
-    /// slot it finds claimed -- `set_up_graph` in `executor::topology`,
-    /// upstream's `_set_up_graph`: a payload nobody came for must not be
-    /// reported by the next run of the same graph.
+    /// slot it finds claimed (`set_up_graph` in `executor::topology`): a
+    /// payload nobody came for must not be reported by the next run.
     pub(crate) fn clear_panic(&self) {
         drop(self.lock_panic().take());
     }
 
     /// The payload slot. Poisoning is taken rather than propagated, as the
     /// executor's locks are: nothing under this lock does more than move a
-    /// box, so a poisoned slot means a panic *elsewhere* and refusing to hand
+    /// box, so a poisoned slot means a panic elsewhere and refusing to hand
     /// it back would turn a reported failure into a stuck wait.
     fn lock_panic(&self) -> MutexGuard<'_, Option<Box<dyn Any + Send>>> {
         self.panic.lock().unwrap_or_else(PoisonError::into_inner)
@@ -801,8 +722,7 @@ impl NodeBase {
 
 impl fmt::Debug for NodeBase {
     /// Hand-written because the payload is a `Box<dyn Any + Send>`, which has
-    /// no [`Debug`](fmt::Debug) -- whether there *is* one is the part worth
-    /// printing, as it is for a run's completion slot.
+    /// no [`Debug`](fmt::Debug); whether there is one is what gets printed.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NodeBase")
             .field("nstate", &self.nstate)
@@ -820,16 +740,9 @@ impl fmt::Debug for NodeBase {
 /// upstream's `ExplicitAnchorGuard`.
 ///
 /// Taken by [`NodeBase::anchor_explicitly`] and released on drop, including
-/// on an unwind through the frame that is waiting -- which is the whole
-/// reason it is a guard rather than two calls, exactly as upstream's is.
-///
-/// Upstream's comment on why the bit sits in `_estate` rather than beside the
-/// other scheduler bits in `_nstate` is about a C++ data race it would
-/// otherwise have: its `_nstate` is a plain `int`, written by the thread
-/// taking the guard and read by another thread tearing a child down. Both
-/// words are atomic here, so the port keeps the bit where upstream put it for
-/// the ordinary reason -- it is the word the panic walk reads -- rather than
-/// for that one.
+/// on an unwind through the frame that is waiting -- which is why it is a
+/// guard rather than two calls, exactly as upstream's is. The bit is in
+/// `estate` because that is the word the panic walk reads.
 pub(crate) struct ExplicitAnchor<'a>(&'a NodeBase);
 
 impl Drop for ExplicitAnchor<'_> {
@@ -843,16 +756,14 @@ impl Drop for ExplicitAnchor<'_> {
 /// What a node acquires before its work runs and releases after it:
 /// upstream's `Node::Semaphores`.
 ///
-/// Upstream stores `Semaphore*` and leaves the caller to keep each one alive
-/// for as long as the graph refers to it, which is a promise a safe API cannot
-/// ask for; these are `Arc<Semaphore>` instead, so a node's claim on a
-/// semaphore is a share of it. The *same* semaphore is what constrains a set
-/// of tasks, so every node of that set holds a clone of one `Arc` -- see
-/// [`TaskMut::acquire`](crate::TaskMut::acquire).
+/// These are `Arc<Semaphore>` where upstream stores `Semaphore*` -- the
+/// decision is `DESIGN.md`'s, on semaphore waiters -- so a node's claim on a
+/// semaphore is a share of it, and every node of one constrained set holds a
+/// clone of one `Arc`: see [`TaskMut::acquire`](crate::TaskMut::acquire).
 ///
 /// Crate-private, like upstream's nested struct: what a caller edits is the
-/// task handle's `acquire`/`release`, and what a caller can ask is how many of
-/// each there are.
+/// task handle's `acquire`/`release`, and what a caller can ask is how many
+/// of each there are.
 #[derive(Debug, Default)]
 pub(crate) struct Semaphores {
     /// Acquired in this order before the node's work, and given back in
@@ -873,17 +784,15 @@ pub struct Node {
     name: String,
     handle: Handle,
     /// Successors occupy `edges[..num_successors]` and predecessors the rest,
-    /// which is upstream's `_edges`/`_num_successors` layout exactly. One
-    /// vector per node instead of two keeps a node's degree to a single
-    /// allocation, and keeps the order of each half observable to tests.
+    /// which is upstream's `_edges`/`_num_successors` layout exactly: one
+    /// allocation per node's degree, with the order of each half observable.
     num_successors: usize,
     edges: Vec<Task>,
     /// The state words a run writes, upstream's `NodeBase` subobject.
     base: NodeBase,
     /// What this node acquires and releases around its work, `None` until a
     /// caller asks for either: upstream's `unique_ptr<Semaphores>`, boxed for
-    /// the same reason -- a graph in which nothing acquires anything pays one
-    /// pointer per node rather than two empty vectors.
+    /// its reason -- a graph that acquires nothing pays one pointer per node.
     semaphores: Option<Box<Semaphores>>,
 }
 
@@ -980,8 +889,8 @@ impl Node {
     /// explicitly waiting for a graph -- see the
     /// [`executor`](crate::executor) module docs for the three kinds and the
     /// order they are tried in. Upstream sets it on a runtime task's node for
-    /// as long as that body's own children are running, which is #51, and on
-    /// a task group's anchor for the whole life of the group, which is #93.
+    /// as long as that body's own children are running, and on a task group's
+    /// anchor for the whole life of the group.
     pub const IMPLICITLY_ANCHORED: u32 = 0x1000_0000;
 
     /// Upstream's `NSTATE::STRONG_DEPENDENCIES_MASK`: which bits of the
@@ -997,20 +906,16 @@ impl Node {
     pub const STRONG_DEPENDENCIES_MASK: u32 = 0x0FFF_FFFF;
 
     /// The state words a run writes on this node, upstream's `NodeBase`
-    /// subobject.
-    ///
-    /// This is what the scheduler holds when it does not care whether the
-    /// thing it is counting down is a node or the anchor of a nested run.
+    /// subobject: what the scheduler holds when it does not care whether the
+    /// thing it counts down is a node or the anchor of a nested run.
     pub(crate) fn base(&self) -> &NodeBase {
         &self.base
     }
 
-    /// Returns the scheduler state word, upstream's `_nstate`.
-    ///
-    /// The four state bits above are the whole of upstream's `NSTATE`
-    /// vocabulary. The word is the strong-dependency count with those bits
-    /// above it, so the count is read through
-    /// [`Node::STRONG_DEPENDENCIES_MASK`] and nothing else.
+    /// Returns the scheduler state word, upstream's `_nstate`: the
+    /// strong-dependency count with the four state bits above it, so the
+    /// count is read through [`Node::STRONG_DEPENDENCIES_MASK`] and nothing
+    /// else.
     #[must_use]
     pub fn nstate(&self) -> &AtomicU32 {
         self.base.nstate()
@@ -1018,12 +923,11 @@ impl Node {
 
     /// Returns the exception state word, upstream's `_estate`.
     ///
-    /// Three kinds of thing live in it, all of them the scheduler's: whether
-    /// the graph under this node has been cancelled or has failed, whether
-    /// this node's one payload slot is taken, and whether something is
-    /// blocked waiting for a graph scheduled under it. The bit values are
-    /// upstream's `ESTATE` and are crate-private, since a caller has no
-    /// business setting them; what a caller can do with the word is read it.
+    /// Three kinds of thing live in it, all the scheduler's: whether the
+    /// graph under this node has been cancelled or has failed, whether this
+    /// node's one payload slot is taken, and whether something is blocked
+    /// waiting for a graph scheduled under it. The bit values are upstream's
+    /// `ESTATE` and crate-private; what a caller can do is read the word.
     #[must_use]
     pub fn estate(&self) -> &AtomicU32 {
         self.base.estate()
@@ -1034,9 +938,9 @@ impl Node {
     ///
     /// It counts two things, as upstream's does: the strong dependencies this
     /// node is still waiting for, and -- while the node is the parent of a
-    /// running graph -- the jobs of that graph which have not finished. The
-    /// two never overlap, because a node whose nested graph is running has
-    /// already had its own dependencies spent.
+    /// running graph -- the jobs of that graph which have not finished. They
+    /// never overlap, a node whose nested graph is running having had its own
+    /// dependencies spent already.
     #[must_use]
     pub fn join_counter(&self) -> &AtomicUsize {
         self.base.join_counter()
@@ -1059,21 +963,17 @@ impl Node {
     /// whether the node may run: upstream's `Node::_acquire_all`.
     ///
     /// `false` means a clone of `job` is parked on the first semaphore that
-    /// could not be had, and the caller must not run the node -- whoever
+    /// could not be had and the caller must not run the node -- whoever
     /// releases that semaphore will schedule the job. The ones already taken
     /// are given back before returning, newest first, which is upstream's
-    /// inner loop: a node that holds half of what it needs would otherwise
-    /// deadlock the rest of its set against a task that is itself parked.
-    /// Anything those releases wake goes into `woken`, for the caller to
-    /// schedule.
+    /// inner loop: a node holding half of what it needs would otherwise
+    /// deadlock the rest of its set. Anything those releases wake goes into
+    /// `woken`, for the caller to schedule.
     ///
-    /// `&self`, because a worker reaches its node through a shared graph. It
+    /// `&self`, because a worker reaches its node through a shared graph: it
     /// is each semaphore's own lock that makes the counter and the waiting
-    /// list sound under that sharing; nothing is written here.
-    //
-    // The caller is `WorkerThread::invoke_one`, which acquires on a first
-    // entry into a node only: #89 is where that arrived and where the
-    // `expect(dead_code)` this carried until then came off.
+    /// list sound under that sharing, and nothing is written here. The one
+    /// caller is `WorkerThread::invoke_one`, on a first entry into a node.
     pub(crate) fn acquire_all(&self, job: &Job, woken: &mut Vec<Job>) -> bool {
         // Upstream asserts `_semaphores != nullptr` (commented out) because
         // only its executor calls this, and only for a node that has them. A
@@ -1112,11 +1012,8 @@ impl Node {
     /// Returns [`SemaphoreError`] from the first semaphore that was already at
     /// its maximum, leaving the ones after it unreleased -- which is where
     /// upstream's throw leaves the loop too. What a task that over-releases
-    /// has done is the executor's decision, not this module's.
-    //
-    // Called from `WorkerThread::invoke_one` on the entry that finishes the
-    // node, which is what #89 added and what the `expect(dead_code)` here
-    // was waiting for.
+    /// has done is the executor's decision, not this module's. The one caller
+    /// is `WorkerThread::invoke_one`, on the entry that finishes the node.
     pub(crate) fn release_all(&self, woken: &mut Vec<Job>) -> Result<(), SemaphoreError> {
         let Some(semaphores) = self.semaphores() else {
             return Ok(());
@@ -1182,10 +1079,9 @@ impl Node {
 
 /// The arena a task dependency graph lives in.
 ///
-/// Nodes are owned by value and addressed by [`Task`]. Unlike upstream's
-/// `tf::Graph` this type is movable *and* copy-free in the same sense -- there
-/// are no owning pointers to fix up -- but it is deliberately not `Clone`,
-/// since the work closures are not.
+/// Nodes are owned by value and addressed by [`Task`]. Moving one fixes up no
+/// owning pointers, where upstream's `tf::Graph` has them, and it is
+/// deliberately not `Clone`, the work closures not being.
 #[derive(Debug, Default)]
 pub struct Graph {
     /// Slots in creation order. A `None` is a tombstone left by
@@ -1203,10 +1099,9 @@ impl Graph {
         Self::default()
     }
 
-    /// Appends an unnamed node and returns its handle.
-    ///
-    /// This is the low-level arena primitive; the fluent `emplace` family that
-    /// upstream exposes through `tf::FlowBuilder` is built on top of it.
+    /// Appends an unnamed node and returns its handle: the arena primitive
+    /// the `emplace` family of [`FlowBuilder`](crate::FlowBuilder) is built
+    /// on.
     ///
     /// # Panics
     ///
@@ -1339,13 +1234,11 @@ impl Graph {
     /// and returns `true` if there was one. Upstream's `Graph::_erase`, plus
     /// the neighbour patch-up that upstream leaves to `FlowBuilder::erase`.
     ///
-    /// A handle that addresses nothing live -- out of range, or erased already
-    /// -- is a no-op returning `false`, matching upstream's "if the task does
-    /// not belong to the graph, nothing will happen".
-    ///
-    /// The slot becomes a tombstone and is never reused, so every other
-    /// [`Task`] keeps addressing the node it always did. See the module docs
-    /// for why that is worth a permanently empty slot.
+    /// A handle that addresses nothing live -- out of range, or erased
+    /// already -- is a no-op returning `false`, matching upstream's "if the
+    /// task does not belong to the graph, nothing will happen". The slot
+    /// becomes a tombstone and is never reused, so every other [`Task`] keeps
+    /// addressing the node it always did; the module docs say why.
     pub fn erase(&mut self, task: Task) -> bool {
         if !self.contains(task) {
             return false;
@@ -1369,10 +1262,8 @@ impl Graph {
     }
 
     /// Returns the number of live nodes in the graph, not counting the
-    /// tombstones [`Graph::erase`] leaves behind.
-    ///
-    /// This is the single definition of "how many tasks": [`crate::Taskflow`]
-    /// defers to it.
+    /// tombstones [`Graph::erase`] leaves behind. This is the one definition
+    /// of "how many tasks", which [`crate::Taskflow`] defers to.
     #[must_use]
     pub fn len(&self) -> usize {
         self.num_live
@@ -1414,11 +1305,9 @@ impl Graph {
     }
 }
 
-/// Converts an arena index back into a handle.
-///
-/// [`Graph::add_named_node`] refuses to grow past `u32::MAX` nodes, so every
-/// index that names a live node fits, and the conversion only fails on the
-/// push that would have overflowed.
+/// Converts an arena index back into a handle. [`Graph::add_named_node`]
+/// refuses to grow past `u32::MAX` nodes, so the conversion can only fail on
+/// the push that would have overflowed.
 fn task_at(index: usize) -> Task {
     Task::try_from(index).expect("a graph cannot hold more than u32::MAX nodes")
 }

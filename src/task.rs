@@ -1,8 +1,6 @@
 //! Translated from `taskflow/core/task.hpp` (Taskflow v4.1.0).
 //!
-//! Upstream's `tf::Task` is a copyable wrapper around a `Node*` that keeps
-//! aliasing a graph the caller goes on mutating, which is exactly the shape
-//! Rust's borrow rules exist to forbid. The handle is therefore split in two
+//! Upstream's one copyable wrapper around a `Node*` is split here into two
 //! short-lived borrows of the builder that owns the graph:
 //!
 //! - [`TaskMut`], from [`FlowBuilder::task`](crate::FlowBuilder::task), is the
@@ -14,31 +12,33 @@
 //!   half. It doubles as the port of upstream's `tf::TaskView`, which differs
 //!   from `tf::Task` only in leaving the editing methods out.
 //!
-//! Both accessors are on the builder trait rather than on
-//! [`Taskflow`](crate::Taskflow), so a subflow body reaches a handle the same
-//! way its enclosing taskflow does (issue #120).
+//! The lasting handle is the [`Task`] index from [`crate::graph`]; neither
+//! borrow is meant to be stored.
 //!
-//! The lasting handle is the [`Task`] index from [`crate::graph`]; these two
-//! borrow types are the fluent sugar over it and are not meant to be stored.
-//! That split is also why upstream's `name()` overload pair cannot survive:
-//! one type cannot have `name` as both getter and setter, so [`TaskMut::name`]
-//! is the setter and the getter is [`TaskRef::name`].
+//! # Design
 //!
-//! # Departures from upstream
+//! A handle that keeps aliasing a graph the caller goes on mutating is the
+//! shape Rust's borrow rules exist to forbid, so the split follows from
+//! `DESIGN.md`'s "Graph as an arena"; that both accessors are on the builder
+//! trait rather than on [`Taskflow`](crate::Taskflow), so that a subflow body
+//! reaches a handle the way its enclosing taskflow does, is the entry there
+//! on naming a task in two statements. The split is also why upstream's
+//! `name()` overload pair cannot survive: one type cannot have `name` as both
+//! getter and setter, so [`TaskMut::name`] is the setter and [`TaskRef::name`]
+//! the getter. The rest of what departs from upstream:
 //!
 //! - `data()`/`data(void*)` are **not** ported. A raw `void*` side channel on a
 //!   node has no Rust shape, and it exists upstream only so that a lambda can
 //!   reach mutable state it does not own; here the closure captures that state.
 //! - `reset()` means something different. Upstream's nulls the aliasing
-//!   pointer -- `_node = nullptr` -- which an index handle has no analogue for,
-//!   so what is ported is the node-level reset upstream performs on reuse:
-//!   drop the work and drop the edges. Upstream's own `Node::reset` does that
-//!   second half with a bare `_edges.clear()`, which is one-sided and leaves
-//!   every neighbour still listing this node; that is safe there only because
-//!   reset is reached from the object pool, where the neighbours are being
-//!   recycled too. [`TaskMut::reset`] therefore goes through
-//!   [`Graph::remove_edge`] in both directions instead, so a reset in the
-//!   middle of a live graph cannot leave a half-edge behind.
+//!   pointer -- `_node = nullptr` -- which an index handle has no analogue
+//!   for, so what is ported is the node-level reset upstream performs on
+//!   reuse: drop the work and drop the edges. Upstream's own `Node::reset`
+//!   does that second half with a one-sided `_edges.clear()`, safe there only
+//!   because reset is reached from the object pool, where the neighbours
+//!   still listing this node are being recycled too. [`TaskMut::reset`] goes
+//!   through [`Graph::remove_edge`] in both directions instead, so a reset in
+//!   a live graph cannot leave a half-edge behind.
 //! - `empty()` follows from that: with no null handle to ask about, the ported
 //!   [`TaskRef::is_empty`] asks whether the node is indistinguishable from a
 //!   freshly created placeholder -- no work, no edges -- which keeps upstream's
@@ -50,10 +50,10 @@
 //!   points at outlives it. Upstream's `(first, last)` overloads become
 //!   [`TaskMut::acquire_each`] and [`TaskMut::release_each`], there being no
 //!   overloading to hang them on.
-//! - `exception_ptr()`, `dump()` and `for_each_subflow_task()`
-//!   wait for the milestones that give them meaning, and so does the
-//!   `composed_of()`/`adopt()` pair that upstream has on `tf::Task` as well as
-//!   on its builder: the builder forms are
+//! - `exception_ptr()`, `dump()` and `for_each_subflow_task()` wait for the
+//!   milestones that give them meaning, and so does the
+//!   `composed_of()`/`adopt()` pair upstream has on `tf::Task` as well as on
+//!   its builder: the builder forms are
 //!   [`FlowBuilder::composed_of`](crate::FlowBuilder::composed_of) and
 //!   [`FlowBuilder::adopt`](crate::FlowBuilder::adopt), and turning an
 //!   existing task into a module has no caller in this port yet.
@@ -75,11 +75,10 @@ use crate::subflow::Subflow;
 
 /// What a task does when the executor reaches it, as a flat enumeration.
 ///
-/// This is upstream's `tf::TaskType`, which was kept complete from the first
-/// milestone rather than grown with [`Handle`]: the variants name the port's
-/// own roadmap, and the DOT output and the profiler want the whole set.
-/// Upstream's `UNDEFINED` is kept for the same reason, though nothing can
-/// produce it while every [`Handle`] variant maps to a type of its own.
+/// Upstream's `tf::TaskType`, kept complete rather than grown with [`Handle`]
+/// because the DOT output and the profiler want the whole set. Upstream's
+/// `UNDEFINED` is kept too, though nothing can produce it while every
+/// [`Handle`] variant maps to a type of its own.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum TaskType {
     /// A task with no work attached, upstream's `PLACEHOLDER`.
@@ -129,10 +128,10 @@ impl fmt::Display for TaskType {
 
 /// The task type a given handle implies.
 ///
-/// Upstream switches over `_handle.index()` and ends in `default: UNDEFINED`.
-/// Here the match is exhaustive on purpose: [`Handle`] gains a variant per
-/// milestone, and a new variant should stop the compiler here rather than be
-/// silently reported as [`TaskType::Undefined`] by a wildcard arm.
+/// Upstream switches over `_handle.index()` and ends in `default: UNDEFINED`;
+/// the match here is exhaustive on purpose, so that a new [`Handle`] variant
+/// stops the compiler rather than being reported as
+/// [`TaskType::Undefined`] by a wildcard arm.
 fn task_type_of(handle: &Handle) -> TaskType {
     match handle {
         Handle::Placeholder => TaskType::Placeholder,
@@ -234,10 +233,8 @@ impl<'a> TaskRef<'a> {
     /// Returns how many predecessors are conditioners, any one of which may
     /// instead branch away from this task.
     ///
-    /// It is upstream's count exactly: over the predecessors, keyed on each
-    /// predecessor's own type rather than on anything stored here, which is why
-    /// adding the two conditioner handles brought it to life without touching
-    /// a line of it.
+    /// Upstream's count exactly: over the predecessors, keyed on each
+    /// predecessor's own type rather than on anything stored here.
     #[must_use]
     pub fn num_weak_dependencies(self) -> usize {
         self.graph
@@ -279,10 +276,10 @@ impl<'a> TaskRef<'a> {
     ///
     /// Upstream hashes the `Node*`, so its value is unique across every live
     /// taskflow. This hashes the arena index, so two tasks of *different*
-    /// graphs can collide -- which costs nothing, because a [`Task`] is only
-    /// meaningful together with the graph that produced it in the first place.
-    /// Within one graph the guarantee is upstream's: equal handles hash equal,
-    /// distinct ones hash distinctly.
+    /// graphs can collide -- which costs nothing, a [`Task`] being meaningful
+    /// only together with the graph that produced it. Within one graph the
+    /// guarantee is upstream's: equal handles hash equal, distinct ones
+    /// distinctly.
     #[must_use]
     pub fn hash_value(self) -> u64 {
         let mut hasher = DefaultHasher::new();
@@ -317,11 +314,10 @@ impl<'a> TaskRef<'a> {
 
     /// How many semaphores this task acquires before its work runs.
     ///
-    /// Upstream has no query for this at all -- its `Node::Semaphores` is
-    /// private to the node and only the executor reads it. The count is what
-    /// makes [`TaskMut::acquire`] observable without handing out the shares
-    /// themselves, which would be a second way to reach a semaphore the graph
-    /// holds.
+    /// Upstream has no query for this at all, its `Node::Semaphores` being
+    /// private to the node. The count makes [`TaskMut::acquire`] observable
+    /// without handing out the shares themselves, which would be a second way
+    /// to reach a semaphore the graph holds.
     #[must_use]
     pub fn num_semaphores_to_acquire(self) -> usize {
         self.graph
@@ -584,11 +580,10 @@ impl<'a> TaskMut<'a> {
     /// Makes this task acquire `semaphore` before its work runs: upstream's
     /// `acquire(Semaphore&)`.
     ///
-    /// The task takes a *share* of the semaphore, where upstream stores a
-    /// pointer and leaves the caller to keep the object alive. That is the
-    /// whole of the departure: the semaphore that constrains a set of tasks is
-    /// one object, so the tasks of that set are given clones of one `Arc` and
-    /// the set is however many of them share it.
+    /// The task takes a *share* of the semaphore where upstream stores a
+    /// pointer, which is the whole of the departure: one semaphore constrains
+    /// a set of tasks, so the tasks of that set are given clones of one `Arc`
+    /// and the set is however many of them share it.
     ///
     /// Acquiring the same semaphore twice records it twice, as upstream's
     /// `push_back` does, and means a task that takes two of its counts.

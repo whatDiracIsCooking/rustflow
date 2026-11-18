@@ -6,26 +6,21 @@
 //! five-task example with a semaphore of 1 is the whole idea -- five
 //! independent tasks that nonetheless run one at a time.
 //!
-//! # Departures from upstream
+//! # Design
 //!
-//! - The waiting list holds `Job`s -- the crate-private unit of work a worker
-//!   queue holds -- where upstream's list holds `Node*`. A parked task has to
-//!   be re-schedulable later by whichever task releases the semaphore, and a
-//!   job is the one value in this port that can be queued *and* owns
-//!   everything it names: the run, the graph and the node stay alive for as
-//!   long as the job sits in the list. Upstream's raw `Node*` makes the same
-//!   list a promise the caller has to keep.
+//! - The waiting list holds `Job`s where upstream's holds `Node*`, so that a
+//!   parked task keeps the run, the graph and the node it names alive for as
+//!   long as it sits in the list: `DESIGN.md` on semaphore waiters.
 //! - `try_acquire_or_wait` takes the job by reference and answers with a
-//!   `bool`, cloning into the waiting list only when it parks. The alternative
-//!   shape -- hand the job back and let the caller park it -- cannot work: the
-//!   counter test and the park have to be one critical section, or a release
-//!   landing between them wakes nothing and the job is left parked on a
-//!   semaphore that is already free. Since the semaphore has to be the one
-//!   that stores it, the caller keeps its own job, which is what it needs
-//!   anyway on the path where the acquire *succeeds* and the task runs.
-//! - Releasing past the maximum is a [`SemaphoreError`] rather than upstream's
-//!   `TF_THROW`. This module does not decide what a task that over-releases
-//!   has done; the executor does.
+//!   `bool`, cloning into the waiting list only when it parks. Handing the
+//!   job back for the caller to park cannot work: the counter test and the
+//!   park have to be one critical section, or a release landing between them
+//!   wakes nothing and leaves the job parked on a free semaphore. The caller
+//!   keeps its own job, which is what it needs on the path where the acquire
+//!   *succeeds* anyway.
+//! - Releasing past the maximum is a [`SemaphoreError`] rather than
+//!   upstream's `TF_THROW`: what a task that over-releases has done is the
+//!   executor's decision, not this module's.
 //! - Every query takes the lock, including [`Semaphore::max_value`], which
 //!   upstream reads unlocked even though `reset` writes it.
 
@@ -45,9 +40,9 @@ use crate::executor::topology::Job;
 /// is parked on the semaphore and re-scheduled by whoever releases.
 ///
 /// The counter and the parked tasks are behind one `Mutex`, as upstream has
-/// one `_mtx`, and every method here takes `&self`: a semaphore is shared by
-/// the tasks it constrains, which means an `Arc<Semaphore>` the graph holds a
-/// clone of per task, so nothing can hand out a `&mut`.
+/// one `_mtx`, and every method takes `&self`: a semaphore is shared by the
+/// tasks it constrains, as an `Arc<Semaphore>` the graph holds a clone of per
+/// task, so nothing can hand out a `&mut`.
 ///
 /// # Examples
 ///
@@ -112,8 +107,8 @@ impl Semaphore {
     ///
     /// Dropping the parked tasks is upstream's behaviour and is only safe
     /// between runs: a parked job *is* the scheduling of a task that has not
-    /// run, so a reset while a run of the constrained graph is in flight
-    /// leaves that task permanently unscheduled and the run unable to finish.
+    /// run, so a reset during a run of the constrained graph leaves that task
+    /// unscheduled for good and the run unable to finish.
     pub fn reset(&self) {
         let mut inner = self.lock();
         inner.value = inner.max_value;
@@ -155,8 +150,8 @@ impl Semaphore {
     /// Gives one back to the counter and moves every parked task into `woken`
     /// for the caller to schedule: upstream's `_release`.
     ///
-    /// `woken` is appended to rather than replaced, because one task can
-    /// release several semaphores and the caller schedules the lot once --
+    /// `woken` is appended to rather than replaced, one task being able to
+    /// release several semaphores for the caller to schedule at once:
     /// upstream's `dst`, including its swap when `dst` is still empty, which
     /// steals the waiting list's allocation instead of copying out of it.
     ///
@@ -188,12 +183,11 @@ impl Semaphore {
 
     /// How many tasks are parked on this semaphore.
     ///
-    /// Not upstream's API, which has no query for its `_waiters` at all, and
-    /// `cfg(test)` because it has no business being one: a count that another
-    /// thread can change the instant it is read answers nothing a caller could
-    /// act on. What it is for is the unit tests of this module and of
-    /// [`crate::graph`], which drive the semaphore from one thread and have no
-    /// other window onto a list whose contents they cannot name.
+    /// Not upstream's API, which has no query for its `_waiters`, and
+    /// `cfg(test)` because a count another thread can change the instant it
+    /// is read answers nothing a caller could act on. The unit tests of this
+    /// module and of [`crate::graph`] drive the semaphore from one thread and
+    /// have no other window onto the list.
     #[cfg(test)]
     pub(crate) fn num_waiters(&self) -> usize {
         self.lock().waiters.len()
@@ -207,12 +201,10 @@ impl Semaphore {
     }
 
     /// Empties the waiting list, dropping the jobs *after* the lock is
-    /// released.
-    ///
-    /// A [`Job`] owns a share of its run and of the graph it indexes, so
-    /// dropping the last one can run the tear-down of a whole taskflow's
-    /// storage. None of that wants to happen under this lock, which a worker
-    /// may be waiting on.
+    /// released: a [`Job`] owns a share of its run and of the graph it
+    /// indexes, so dropping the last one can run the tear-down of a whole
+    /// taskflow's storage, and none of that wants to happen under a lock a
+    /// worker may be waiting on.
     fn drop_waiters(mut inner: MutexGuard<'_, Inner>) {
         let waiters = mem::take(&mut inner.waiters);
         drop(inner);
@@ -229,9 +221,8 @@ impl Default for Semaphore {
 }
 
 impl fmt::Debug for Semaphore {
-    /// Hand-written for two reasons: the state is behind a lock, and a `Job`
-    /// has no `Debug` -- so what is printed of the waiting list is its length,
-    /// which is the part that says anything anyway.
+    /// Hand-written because the state is behind a lock and a `Job` has no
+    /// `Debug`, so the waiting list is printed as its length.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let inner = self.lock();
         f.debug_struct("Semaphore")
@@ -245,16 +236,14 @@ impl fmt::Debug for Semaphore {
 /// A release that would push a semaphore's counter past its maximum.
 ///
 /// Upstream throws this -- `TF_THROW("can't release the semaphore more than
-/// its maximum value: ", _max_value)` -- out of the release itself. Here it is
-/// a value the release hands back, because the two callers answer for it
-/// differently: a task that over-releases is a failure of *that task*, which
-/// is the executor's business, while a rollback inside
-/// [`Node::acquire_all`](crate::Node) cannot be over-releasing in the first
-/// place.
+/// its maximum value: ", _max_value)` -- out of the release itself. Here the
+/// release hands it back, because the two callers answer for it differently:
+/// a task that over-releases is a failure of *that task*, which is the
+/// executor's business, while a rollback inside
+/// [`Node::acquire_all`](crate::Node) cannot be over-releasing at all.
 ///
-/// There is one way to fail, so this is a struct rather than an enum. It
-/// carries the maximum, which is the number upstream prints and the only thing
-/// that makes the message actionable.
+/// One way to fail, so a struct rather than an enum, carrying the maximum --
+/// the number upstream prints and what makes the message actionable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct SemaphoreError {
     max_value: usize,

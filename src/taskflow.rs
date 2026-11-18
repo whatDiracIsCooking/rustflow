@@ -1,30 +1,19 @@
 //! Translated from `taskflow/core/taskflow.hpp` (Taskflow v4.1.0).
 //!
 //! Only the half of `tf::Taskflow` that owns a graph is here, plus upstream's
-//! `_topologies` queue and the `_mutex` that guards it -- `_fetch_enqueue` and
-//! the half of `_tear_down_topology` that rotates the queue. The `emplace`
-//! family, dependency editing and DOT output arrive in their own modules.
+//! `_topologies` queue and the `_mutex` guarding it -- `_fetch_enqueue` and
+//! the half of `_tear_down_topology` that rotates the queue.
 //!
-//! # Why a taskflow is a name and a shared `Flow`
+//! # Design
 //!
-//! Upstream reaches a running graph through raw references: a queued `Node`
-//! holds a `Topology*`, a `Topology` holds a `Taskflow&`, and *"do not destroy
-//! or modify a taskflow while it is running"* is a rule its documentation
-//! states and its types cannot. The one `shared_ptr<Topology>` it does keep
-//! lives in the taskflow's own queue, so even that share is gone once the
-//! taskflow is.
-//!
-//! A port cannot inherit that, because safe Rust has to stay safe when the
-//! caller does something the documentation told it not to. So the storage a
-//! run reaches -- the graph and the queue of runs -- is split out into a
-//! `Flow`, one reference-counted allocation that every queued job owns a
-//! share of. A job cannot outlive what it names, whatever the caller does
-//! with the handle it was given; see `executor::topology` for the whole
-//! argument and issue #40 for what it replaced.
-//!
-//! The name stays outside that allocation because nothing in a run reads it,
-//! and because [`Taskflow::set_name`] is then still an edit a caller can make
-//! at any time.
+//! A taskflow is a name plus a shared `Flow`, so that a queued job cannot
+//! outlive the graph and the run it names, where upstream reaches a running
+//! graph through raw references and leaves *"do not destroy or modify a
+//! taskflow while it is running"* to its documentation: `DESIGN.md`'s "A run
+//! owns the graph it walks" has the argument, `executor::topology` the order
+//! the shares are released in. The name is outside the allocation because
+//! nothing in a run reads it, which keeps [`Taskflow::set_name`] always
+//! available.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -34,60 +23,34 @@ use crate::graph::Graph;
 
 /// A named task dependency graph.
 ///
-/// `Taskflow` owns its [`Graph`] outright. Upstream hands out `tf::Task`
-/// objects that alias into the graph while the caller keeps mutating it; here
-/// the graph stays behind [`Taskflow::graph`]/[`Taskflow::graph_mut`] and tasks
-/// are addressed by [`crate::Task`] index, so nothing aliases.
-///
-/// `Taskflow` also owns the queue of runs of itself, as upstream does: several
-/// runs of one taskflow line up behind each other instead of running at once,
-/// and each is started by the tear-down of the one before it. That is what
-/// makes `executor.run(&taskflow)` twice in a row safe without a wait in
-/// between -- the two runs share one graph, whose per-node counters only one of
-/// them may be using.
-///
-/// Both of those live in one allocation -- the crate-private `Flow` -- that
-/// the taskflow shares with the runs of it, which is what makes a queued
-/// job's reach into a graph an *owning* reach. The module docs say why that
-/// is not upstream's arrangement.
+/// `Taskflow` owns its [`Graph`] outright, behind
+/// [`Taskflow::graph`]/[`Taskflow::graph_mut`], and tasks are addressed by
+/// [`crate::Task`] index rather than by a handle that aliases into it. It
+/// also owns the queue of runs of itself, as upstream does: runs of one
+/// taskflow serialise rather than going at once, which makes
+/// `executor.run(&taskflow)` twice in a row safe with no wait between. Both
+/// live in the crate-private `Flow` the taskflow shares with its runs.
 #[derive(Debug, Default)]
 pub struct Taskflow {
     name: String,
-    /// The graph and the runs of it, shared with those runs.
-    ///
-    /// A `Taskflow` holds the one share that can hand out `&mut`, which is
-    /// what keeps editing a graph ordinary safe code: see
-    /// [`Taskflow::flow_mut`].
+    /// The graph and the runs of it, shared with those runs. A `Taskflow`
+    /// holds the one share that can hand out `&mut`: [`Taskflow::flow_mut`].
     flow: Arc<Flow>,
 }
 
-/// A taskflow's storage: the graph a run walks, and the queue of runs waiting
+/// A taskflow's storage: the graph a run walks and the queue of runs waiting
 /// to walk it.
 ///
-/// Upstream has no equivalent, because it has no need of one -- its nodes and
-/// topologies point at each other and at the taskflow, and the rule that keeps
-/// those pointers valid is a sentence of documentation. This is the shape that
-/// rule takes in Rust: one allocation behind an [`Arc`], shared by the
-/// taskflow, by every run of it and by every job of those runs, so that
-/// nothing a worker is walking can be freed under it.
-///
-/// Everything a run needs is in here and nothing else is. A [`Topology`] holds
-/// a share of it for the length of the run, and so does each queued
-/// [`Job`](crate::executor::topology::Job) of that run; both are released in
-/// an order that leaves the taskflow's own share the only one left the moment the
-/// run's last job is accounted for, which is what keeps
-/// [`Taskflow::graph_mut`] working the instant a `wait` returns.
+/// Everything a run needs is in here and nothing else is: a [`Topology`]
+/// holds a share of it for the length of the run, as does each queued
+/// [`Job`](crate::executor::topology::Job) of that run.
 #[derive(Debug, Default)]
 pub(crate) struct Flow {
-    /// The graph itself.
     graph: Graph,
-    /// The runs of this taskflow that have been handed out and not yet
-    /// finished, oldest first: upstream's `_topologies` and `_mutex`.
-    ///
-    /// The front one is the run in flight; the rest are waiting for it. A run
-    /// is pushed by [`Flow::enqueue_run`] when its handle is created and
-    /// popped by [`Flow::pop_finished_run`] when its last graph run is over,
-    /// which is also where the next one is started.
+    /// The runs handed out and not yet finished, oldest first: upstream's
+    /// `_topologies` and `_mutex`. The front one is in flight and the rest
+    /// wait for it, pushed by [`Flow::enqueue_run`] and popped by
+    /// [`Flow::pop_finished_run`].
     runs: Mutex<VecDeque<Arc<Topology>>>,
 }
 
@@ -98,10 +61,8 @@ impl Taskflow {
         Self::default()
     }
 
-    /// Creates an empty taskflow with the given name.
-    ///
-    /// Upstream spells this as a second constructor overload, which Rust has
-    /// no equivalent of.
+    /// Creates an empty taskflow with the given name: upstream's second
+    /// constructor overload.
     pub fn with_name(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -115,10 +76,9 @@ impl Taskflow {
         &self.name
     }
 
-    /// Renames this taskflow. Upstream overloads `name()` for this.
-    ///
-    /// The name is not part of what a run reads, so this is the one edit that
-    /// is always available -- even, in principle, while a run is in flight.
+    /// Renames this taskflow. Upstream overloads `name()` for this, and the
+    /// name being no part of what a run reads, it is the one edit that is
+    /// always available -- even, in principle, while a run is in flight.
     pub fn set_name(&mut self, name: impl Into<String>) {
         self.name = name.into();
     }
@@ -135,14 +95,12 @@ impl Taskflow {
         self.graph().is_empty()
     }
 
-    /// Drops every task, invalidating every [`crate::Task`] handed out so far.
-    ///
-    /// The name is kept, as upstream keeps it.
+    /// Drops every task, invalidating every [`crate::Task`] handed out so
+    /// far. The name is kept, as upstream keeps it.
     ///
     /// # Panics
     ///
-    /// Panics if a run of this taskflow is still in flight, for the reason
-    /// [`Taskflow::graph_mut`] gives.
+    /// Panics if a run is still in flight, as [`Taskflow::graph_mut`] does.
     pub fn clear(&mut self) {
         self.graph_mut().clear();
     }
@@ -153,19 +111,16 @@ impl Taskflow {
         self.flow.graph()
     }
 
-    /// Returns the underlying graph, mutably.
-    ///
-    /// This is the seam the task-building API is written against.
+    /// Returns the underlying graph, mutably: the seam the task-building API
+    /// is written against.
     ///
     /// # Panics
     ///
     /// Panics if a run of this taskflow is still in flight. A
-    /// [`RunHandle`](crate::RunHandle) borrows the taskflow for as long as it
-    /// lives, so ordinary code cannot reach this method during a run at all --
-    /// the borrow is a compile error. What can reach it is code that *leaks* a
-    /// handle: [`std::mem::forget`] and friends end the borrow while the run
-    /// goes on, and the graph is then still being walked by workers. Editing
-    /// it would race them, so this panics instead. See issue #40.
+    /// [`RunHandle`](crate::RunHandle) borrows the taskflow while it lives,
+    /// so ordinary code cannot reach this during a run at all; what can is
+    /// code that *leaks* a handle, ending the borrow while workers are still
+    /// walking the graph.
     pub fn graph_mut(&mut self) -> &mut Graph {
         self.flow_mut().graph_mut()
     }
@@ -177,29 +132,14 @@ impl Taskflow {
 
     /// The storage, mutably, which is only possible while nothing is running.
     ///
-    /// The `expect` is the whole of "do not modify a running taskflow" for
-    /// code that got past the borrow checker by leaking its handle: a run in
-    /// flight is a run whose topology and whose queued jobs hold shares of
-    /// this allocation, so the uniqueness check is exactly the question "is
-    /// anything still running".
-    ///
-    /// It cannot fire for a run that has *finished*, however recently, and
-    /// the reason is one rule rather than the pair of orderings this comment
-    /// used to name: the thread waiting on a run is released by whoever drops
-    /// the **last** share of that run's hold on this storage -- which is the
-    /// tear-down in the ordinary case and, when a node of the graph preempted,
-    /// may be a worker still dropping a copy of that node's job. So a `wait`
-    /// that has returned is a wait whose run holds no share, whichever thread
-    /// got there last. `executor::topology`'s "order the shares are released
-    /// in" has the argument, and issue #109 is the race the old pair of
-    /// orderings left: two of the three copies a preempting node's job is
-    /// made into are spent by nobody, so no per-job ordering can account for
-    /// them.
-    ///
-    /// Two runs of one taskflow are a different matter and are not this
-    /// panic's business to avoid: a second run queued behind the one that has
-    /// just finished holds a share of its own, and editing the taskflow while
-    /// it is in flight is exactly what this refuses.
+    /// The uniqueness check is the whole of "do not modify a running
+    /// taskflow" for the leaked handle [`Taskflow::graph_mut`] describes: a
+    /// run in flight is a run whose topology and queued jobs hold shares of
+    /// this allocation. It cannot fire for a run that has *finished*, however
+    /// recently, the waiter being released by whoever drops the **last** such
+    /// share (`DESIGN.md` on how a run's waiter is released); a second run
+    /// queued behind it holds its own, and editing while *that* runs is what
+    /// this refuses.
     ///
     /// # Panics
     ///
@@ -211,29 +151,22 @@ impl Taskflow {
 }
 
 impl Flow {
-    /// The graph.
     pub(crate) fn graph(&self) -> &Graph {
         &self.graph
     }
 
-    /// The graph, mutably. Reachable only through `&mut Taskflow`, which is
-    /// what makes it exclusive -- see [`Taskflow::flow_mut`].
+    /// The graph, mutably: exclusive because reachable only through
+    /// `&mut Taskflow` -- see [`Taskflow::flow_mut`].
     fn graph_mut(&mut self) -> &mut Graph {
         &mut self.graph
     }
 
-    /// Whether this graph has a task a run could start at.
-    ///
-    /// Upstream's `f.empty()` check at the top of `run_until` is this, widened
-    /// by one case: an empty graph has no source, and neither has a graph whose
-    /// every node is in a cycle. Both answer "nothing to run", and asking here
-    /// -- before a run is ever queued -- is what keeps the tear-down from
-    /// having to deal with a queued run that would schedule nothing.
-    ///
-    /// It walks the graph, which `set_up_graph` then walks again. That is
-    /// the same trade the port already makes for the sources, and the same
-    /// answer: a walk is cheaper than an allocation, and it buys a scheduling
-    /// path with no empty case in it.
+    /// Whether this graph has a task a run could start at: upstream's
+    /// `f.empty()` check at the top of `run_until`, widened by one case -- a
+    /// graph whose every node is in a cycle has no source either. Asking
+    /// before a run is queued keeps the tear-down from having to deal with a
+    /// queued run that would schedule nothing; the walk is one `set_up_graph`
+    /// then repeats, cheaper than remembering the answer.
     pub(crate) fn has_source_task(&self) -> bool {
         self.graph
             .iter()
@@ -241,11 +174,9 @@ impl Flow {
     }
 
     /// Queues `run` as a run of this taskflow and reports how many runs were
-    /// already queued ahead of it. Upstream's `_fetch_enqueue`.
-    ///
-    /// A zero means this run is the front of the queue and its caller must
-    /// start it; anything else means an earlier run is in flight and will start
-    /// this one from its tear-down.
+    /// already queued ahead of it: upstream's `_fetch_enqueue`. A zero means
+    /// the caller must start this run; anything else means an earlier run
+    /// will start it from its tear-down.
     pub(crate) fn enqueue_run(&self, run: Arc<Topology>) -> usize {
         let mut runs = self.lock_runs();
         let queued_ahead = runs.len();
@@ -253,19 +184,16 @@ impl Flow {
         queued_ahead
     }
 
-    /// Drops the finished run at the front of the queue and hands back the one
-    /// behind it, which stays queued.
+    /// Drops the finished run at the front of the queue and hands back the
+    /// one behind it, which stays queued and is the next to be started: the
+    /// queue half of upstream's `_tear_down_topology`, which moves the front
+    /// out, pops it and reads the new front under the same lock.
     ///
-    /// The queue half of upstream's `_tear_down_topology`, which moves the
-    /// front out, pops it, and reads the new front under the same lock.
-    ///
-    /// A topology that is not the front of this queue is not in it at all, and
-    /// then there is nothing to pop and nobody to hand over to: that is a
-    /// [`corun`](crate::Executor::corun), whose topology is owned by the
-    /// corunning worker's frame and is deliberately not queued -- a corun
-    /// cannot wait for its turn, since the frame it blocks is the one that
-    /// would run the graph ahead of it. So the identity check is a condition
-    /// rather than an assertion.
+    /// A topology that is not the front of this queue is not in it at all, so
+    /// the identity check is a condition rather than an assertion: that is a
+    /// [`corun`](crate::Executor::corun), whose topology the corunning
+    /// worker's frame owns and does not queue -- a corun cannot wait its
+    /// turn, the frame it blocks being the one that would run the graph ahead.
     pub(crate) fn pop_finished_run(&self, finished: &Topology) -> Option<Arc<Topology>> {
         let mut runs = self.lock_runs();
         if !runs
@@ -275,16 +203,14 @@ impl Flow {
             return None;
         }
 
-        // The share this queue held is dropped here, which cannot be the last
-        // one: the thread tearing the run down holds one of its own, and so
-        // does the run's handle until it is dropped.
+        // The share this queue held is dropped here, never the last one: the
+        // thread tearing the run down holds one of its own.
         drop(runs.pop_front());
         runs.front().map(Arc::clone)
     }
 
-    /// The run queue. A poisoned lock is taken rather than propagated, as the
-    /// executor's locks are: the queue is a `VecDeque` of shares and nothing
-    /// under the lock can leave it half-updated.
+    /// The run queue. A poisoned lock is taken rather than propagated, as
+    /// the executor's are: nothing under it can leave the queue half-updated.
     fn lock_runs(&self) -> MutexGuard<'_, VecDeque<Arc<Topology>>> {
         self.runs.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -294,8 +220,7 @@ const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Taskflow>();
     // A job owns an `Arc<Flow>` and hands out a `&Flow` on whichever worker
-    // dequeues it, so the storage has to be shareable across threads for that
-    // to mean anything.
+    // dequeues it.
     assert_send_sync::<Flow>();
 };
 
