@@ -622,7 +622,27 @@ impl<'rt> Runtime<'rt> {
 /// a second `impl FlowBuilder` block the way a second `impl Runtime` block
 /// (above) is possible for an inherent type. Blanket-implemented for every
 /// [`FlowBuilder`], so `taskflow.for_each_index(...)` reads the same at the
-/// call site as every other builder method once this trait is in scope.
+/// call site as every other builder method once this trait is in scope --
+/// [`crate::prelude`] carries it for the same reason it carries
+/// [`FlowBuilder`] itself.
+///
+/// ```
+/// // Only the prelude, exactly as a caller would write it -- no direct
+/// // `use` of `ForEachIndexBuilder` itself.
+/// use rustflow::prelude::*;
+/// use rustflow::Executor;
+///
+/// let mut taskflow = Taskflow::new();
+/// taskflow.for_each_index(
+///     0_i32,
+///     5,
+///     1,
+///     |_| {},
+///     rustflow::algorithm::partitioner::DefaultPartitioner::default(),
+/// );
+///
+/// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
+/// ```
 pub trait ForEachIndexBuilder: FlowBuilder {
     /// Creates a runtime task that walks `[beg, end)` in steps of `step`,
     /// calling `f` once per index: upstream's `FlowBuilder::for_each_index`,
