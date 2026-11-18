@@ -26,26 +26,14 @@
 //!
 //! # Design
 //!
-//! **A per-worker stack of begin timestamps, not one.** Upstream's own
-//! `Timeline::stacks` exists for the same reason the `observer` module's
-//! docs name: a [`Runtime::scope`](crate::Runtime::scope) or a `corun` loop
-//! can dispatch another job from inside a worker thread already running
-//! one, nesting an inner `on_entry`/`on_exit` pair inside the outer one on
-//! the same worker. A stack -- `on_entry` pushes, `on_exit` pops -- pairs
-//! each exit with the entry it belongs to regardless of nesting; a single
-//! saved timestamp per worker would not.
-//!
-//! **A [`Mutex`] per worker, not upstream's bare vectors.** Every
-//! [`Observer`] method takes `&self` and may run
-//! on any worker at once -- the trait's own doc comment says so -- while
-//! upstream's equivalent methods are `private` and called only from the one
-//! worker `id` they are about, under no lock, because nothing else ever
-//! touches `_timeline.segments[w]`. Rust has no way to grant one thread
-//! exclusive access to one slot of a shared `Vec` without something that
-//! enforces it; a `Mutex<WorkerTimeline>` per worker is that something, and
-//! the worker index that already selects *which* mutex keeps the lock
-//! itself uncontended between workers -- the same `w`-indexed independence
-//! upstream relies on without a lock at all.
+//! **The timeline itself is shared with [`TfProfObserver`](crate::observer::tfprof::TfProfObserver).**
+//! Upstream gives each of its two observers a private copy of the per-worker
+//! segment list, the stack of begins that pairs an exit with its entry, and
+//! the locking those need once every [`Observer`] method takes `&self`; this
+//! port has one `observer::timeline` module instead, whose own docs carry the
+//! reasoning. What stays here is what is Chrome's alone: a flat list of
+//! segments per worker, in the order its exits fired, and the JSON writer
+//! below.
 //!
 //! **`dump` takes a [`Write`], not upstream's `ostream`.** [`std::io::Write`]
 //! is the idiomatic equivalent, and threading it as `impl Write` rather than
@@ -60,50 +48,22 @@
 //! sharp edge.
 
 use std::io::{self, Write};
-use std::sync::{Mutex, OnceLock, PoisonError};
-use std::time::Instant;
 
+use crate::observer::timeline::{Segment, Timeline};
 use crate::observer::{Observer, TaskView, WorkerView};
-
-/// One finished task execution: upstream's `ChromeObserver::Segment`.
-struct Segment {
-    /// The task's name, copied out of the [`TaskView`] that named it in
-    /// `on_exit`: nothing a [`TaskView`] borrows outlives that call.
-    name: String,
-    /// When the task started running.
-    begin: Instant,
-    /// When it finished.
-    end: Instant,
-}
-
-/// One worker's own timeline: the segments it has finished, and a stack of
-/// begins for entries not yet matched with an exit.
-///
-/// Upstream's `ChromeObserver::Timeline` holds one `segments` vector and one
-/// `stacks` vector, each indexed by worker; this is that pair's `w`th slot
-/// pulled out into its own type, so each worker's slot can carry its own
-/// [`Mutex`] -- see the module docs' "Design" section.
-#[derive(Default)]
-struct WorkerTimeline {
-    /// Begin timestamps not yet popped by a matching `on_exit`, nested
-    /// innermost-last so that a dispatch nested inside another task's body
-    /// still pairs correctly.
-    stack: Vec<Instant>,
-    /// Finished segments, in the order `on_exit` recorded them.
-    segments: Vec<Segment>,
-}
 
 /// An [`Observer`] that records a [Chrome trace-event] timeline: upstream's
 /// `ChromeObserver`. See the module docs for the trace format and a worked
 /// example.
+///
+/// [Chrome trace-event]: https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU/preview
 #[derive(Default)]
 pub struct ChromeObserver {
-    /// The instant every segment's timestamp is reported relative to:
-    /// upstream's `Timeline::origin`, set once in `set_up`.
-    origin: OnceLock<Instant>,
-    /// One timeline per worker, sized to the executor's worker count in
-    /// `set_up` and never resized after.
-    workers: OnceLock<Vec<Mutex<WorkerTimeline>>>,
+    /// Every worker's segments, each worker's own in the order its exits
+    /// fired: upstream's `ChromeObserver::Timeline`. A segment carries no
+    /// payload beyond its name and span, this trace format having nowhere to
+    /// put one.
+    timeline: Timeline<Vec<Segment<()>>>,
 }
 
 impl ChromeObserver {
@@ -118,18 +78,10 @@ impl ChromeObserver {
     /// before [`Observer::set_up`] has run. Upstream's `num_tasks`.
     #[must_use]
     pub fn num_tasks(&self) -> usize {
-        self.workers.get().map_or(0, |workers| {
-            workers
-                .iter()
-                .map(|worker| {
-                    worker
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .segments
-                        .len()
-                })
-                .sum()
-        })
+        self.timeline
+            .workers()
+            .map(|worker| worker.store.len())
+            .sum()
     }
 
     /// Discards every recorded segment, leaving
@@ -137,14 +89,7 @@ impl ChromeObserver {
     /// [`Observer::set_up`] has run, there being nothing to discard yet.
     /// Upstream's `clear`.
     pub fn clear(&self) {
-        let Some(workers) = self.workers.get() else {
-            return;
-        };
-        for worker in workers {
-            let mut timeline = worker.lock().unwrap_or_else(PoisonError::into_inner);
-            timeline.segments.clear();
-            timeline.stack.clear();
-        }
+        self.timeline.clear(Vec::clear);
     }
 
     /// Writes every recorded segment into `writer` as a [Chrome
@@ -161,10 +106,9 @@ impl ChromeObserver {
     pub fn dump(&self, writer: &mut impl Write) -> io::Result<()> {
         writer.write_all(b"[")?;
         let mut wrote_one = false;
-        if let (Some(&origin), Some(workers)) = (self.origin.get(), self.workers.get()) {
-            for (tid, worker) in workers.iter().enumerate() {
-                let timeline = worker.lock().unwrap_or_else(PoisonError::into_inner);
-                for (index, segment) in timeline.segments.iter().enumerate() {
+        if let Some(origin) = self.timeline.origin() {
+            for (tid, worker) in self.timeline.workers().enumerate() {
+                for (index, segment) in worker.store.iter().enumerate() {
                     if wrote_one {
                         writer.write_all(b",")?;
                     }
@@ -208,42 +152,26 @@ impl ChromeObserver {
 
 impl Observer for ChromeObserver {
     fn set_up(&self, num_workers: usize) {
-        let _ = self.workers.set(
-            (0..num_workers)
-                .map(|_| Mutex::new(WorkerTimeline::default()))
-                .collect(),
-        );
-        let _ = self.origin.set(Instant::now());
+        self.timeline.set_up(num_workers);
     }
 
     fn on_entry(&self, worker: WorkerView<'_>, _task: TaskView<'_>) {
-        let workers = self
-            .workers
-            .get()
-            .expect("Executor::make_observer calls set_up before registering this observer");
-        let mut timeline = workers[worker.id()]
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        timeline.stack.push(Instant::now());
+        self.timeline.on_entry(worker.id());
     }
 
     fn on_exit(&self, worker: WorkerView<'_>, task: TaskView<'_>) {
-        let workers = self
-            .workers
-            .get()
-            .expect("Executor::make_observer calls set_up before registering this observer");
-        let mut timeline = workers[worker.id()]
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let begin = timeline
-            .stack
-            .pop()
-            .expect("on_exit always follows a matching on_entry on the same worker");
-        timeline.segments.push(Segment {
-            name: task.name().to_string(),
-            begin,
-            end: Instant::now(),
-        });
+        // A nested dispatch's level is of no interest here: this trace
+        // format is flat, and the event's own `ts` and `dur` already show a
+        // nested segment sitting inside the one it preempted.
+        self.timeline
+            .on_exit(worker.id(), |segments, _level, begin, end| {
+                segments.push(Segment {
+                    name: task.name().to_string(),
+                    payload: (),
+                    begin,
+                    end,
+                });
+            });
     }
 }
 

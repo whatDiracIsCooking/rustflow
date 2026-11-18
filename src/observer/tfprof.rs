@@ -52,17 +52,18 @@
 //! produce, so each gets a code of its own rather than inheriting that
 //! collapse.
 //!
-//! **A per-worker [`Mutex`], for the reason [`ChromeObserver`](crate::observer::chrome::ChromeObserver)'s own docs
-//! give** -- every [`Observer`] method takes `&self` and any worker may call
-//! one at once. What differs here is the second dimension: a worker's
-//! segments are `Vec<Vec<Segment>>`, indexed by nesting level the way
-//! upstream's own `_timeline.segments[w][l]` is, because a task whose body
-//! preempts (a subflow's `join`, a `Runtime::corun`, a module task waiting
-//! on its target) dispatches a nested graph on the very same worker before
-//! its own `on_exit` fires, nesting an inner `on_entry`/`on_exit` pair
-//! inside the outer one. The level a finished segment belongs at is the
-//! depth of the begin stack *after* popping it, upstream's
-//! `_timeline.segments[w][_stacks[w].size()]` read the same way here.
+//! **The timeline itself is shared with [`ChromeObserver`](crate::observer::chrome::ChromeObserver)**
+//! -- the per-worker segments, the stack of begins that pairs an exit with
+//! its entry and the locking both need live in this crate's
+//! `observer::timeline` module, whose own docs carry the reasoning upstream's
+//! two private copies each repeat. What is this observer's alone is the
+//! second dimension: a worker's segments are `Vec<Vec<Segment<TaskType>>>`,
+//! indexed by nesting level the way upstream's own `_timeline.segments[w][l]`
+//! is, because a task whose body preempts (a subflow's `join`, a
+//! `Runtime::corun`, a module task waiting on its target) dispatches a nested
+//! graph on the very same worker before its own `on_exit` fires. A level is
+//! allocated the first time an exit reports it, upstream's resize of
+//! `_timeline.segments[w]` read the same way here.
 //!
 //! **`summary`'s table omits upstream's concurrency histogram**, the
 //! `worker_histogram`/`task_histogram` arrays `TFProfObserver::summary`
@@ -83,10 +84,11 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::observer::timeline::{Segment, Timeline};
 use crate::observer::{Observer, TaskView, WorkerView};
 use crate::task::TaskType;
 
@@ -123,33 +125,11 @@ const fn type_code(task_type: TaskType) -> u8 {
     }
 }
 
-/// One finished task execution: upstream's `Segment`.
-struct Segment {
-    /// The task's name, copied out of the [`TaskView`] that named it in
-    /// `on_exit`: nothing a [`TaskView`] borrows outlives that call.
-    name: String,
-    /// What kind of task this was.
-    task_type: TaskType,
-    /// When the task started running.
-    begin: Instant,
-    /// When it finished.
-    end: Instant,
-}
-
-/// One worker's own timeline: its segments, nested by level, and a stack of
-/// begins for entries not yet matched with an exit. Upstream's pair of
-/// `Timeline::segments[w]` and the sibling `_stacks[w]`, pulled into one
-/// type per worker so each can carry its own [`Mutex`] -- see the module
-/// docs' "Design" section.
-#[derive(Default)]
-struct WorkerTimeline {
-    /// Begin timestamps not yet popped by a matching `on_exit`, nested
-    /// innermost-last.
-    stack: Vec<Instant>,
-    /// Finished segments, indexed by nesting level: `segments[0]` is every
-    /// task that ran with nothing of this worker's own preempting above it.
-    segments: Vec<Vec<Segment>>,
-}
+/// One worker's finished segments, indexed by nesting level: `[0]` is every
+/// task that ran with nothing of this worker's own preempting above it. The
+/// store half of this observer's `Timeline`, upstream's
+/// `Timeline::segments[w]`.
+type WorkerLevels = Vec<Vec<Segment<TaskType>>>;
 
 /// A deduplicating table of task names, upstream's `_StringTable`: used only
 /// while building [`TfProfObserver::dump`]'s output.
@@ -279,16 +259,16 @@ pub struct TfProfObserver {
     /// [`summary`](TfProfObserver::summary) report a stable id even for an
     /// observer that is never registered.
     uid: u64,
-    /// The instant every segment's timestamp is reported relative to, paired
-    /// with that same instant's wall-clock reading in microseconds since the
-    /// Unix epoch -- [`Instant`] carries no absolute value of its own, where
-    /// upstream's `steady_clock::time_point` can at least report *an*
-    /// implementation-defined one, so the second half is read from
-    /// [`SystemTime`] at the same moment instead. Set once, in `set_up`.
-    origin: OnceLock<(Instant, u64)>,
-    /// One timeline per worker, sized to the executor's worker count in
-    /// `set_up` and never resized after.
-    workers: OnceLock<Vec<Mutex<WorkerTimeline>>>,
+    /// The wall-clock reading, in microseconds since the Unix epoch, of the
+    /// moment `set_up` fixed this observer's origin -- [`Instant`]
+    /// carries no absolute value of its own, where upstream's
+    /// `steady_clock::time_point` can at least report *an*
+    /// implementation-defined one, so this is read from [`SystemTime`]
+    /// alongside it. Set once, in `set_up`, together with the timeline below.
+    origin_us: OnceLock<u64>,
+    /// Every worker's segments, each worker's own indexed by nesting level:
+    /// a segment's payload is the task's [`TaskType`].
+    timeline: Timeline<WorkerLevels>,
 }
 
 /// Hands out the next value of upstream's `unique_id<size_t>()`, one call
@@ -310,8 +290,8 @@ impl TfProfObserver {
     pub fn new() -> Self {
         Self {
             uid: NEXT_UID.fetch_add(1, Ordering::Relaxed),
-            origin: OnceLock::new(),
-            workers: OnceLock::new(),
+            origin_us: OnceLock::new(),
+            timeline: Timeline::default(),
         }
     }
 
@@ -321,20 +301,10 @@ impl TfProfObserver {
     /// `num_tasks`.
     #[must_use]
     pub fn num_tasks(&self) -> usize {
-        self.workers.get().map_or(0, |workers| {
-            workers
-                .iter()
-                .map(|worker| {
-                    worker
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .segments
-                        .iter()
-                        .map(Vec::len)
-                        .sum::<usize>()
-                })
-                .sum()
-        })
+        self.timeline
+            .workers()
+            .map(|worker| worker.store.iter().map(Vec::len).sum::<usize>())
+            .sum()
     }
 
     /// How many workers have recorded at least one task since this observer
@@ -348,18 +318,10 @@ impl TfProfObserver {
     /// [`num_tasks`](Self::num_tasks) at zero.
     #[must_use]
     pub fn num_workers(&self) -> usize {
-        self.workers.get().map_or(0, |workers| {
-            workers
-                .iter()
-                .filter(|worker| {
-                    !worker
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .segments
-                        .is_empty()
-                })
-                .count()
-        })
+        self.timeline
+            .workers()
+            .filter(|worker| !worker.store.is_empty())
+            .count()
     }
 
     /// Discards every recorded segment, leaving
@@ -367,16 +329,11 @@ impl TfProfObserver {
     /// [`Observer::set_up`] has run, there being nothing to discard yet.
     /// Upstream's `clear`.
     pub fn clear(&self) {
-        let Some(workers) = self.workers.get() else {
-            return;
-        };
-        for worker in workers {
-            let mut timeline = worker.lock().unwrap_or_else(PoisonError::into_inner);
-            for level in &mut timeline.segments {
-                level.clear();
-            }
-            timeline.stack.clear();
-        }
+        // Each level's segments go, but the levels themselves stay: the
+        // `num_workers` quirk documented above is upstream's, and dropping
+        // them here would quietly correct it.
+        self.timeline
+            .clear(|levels| levels.iter_mut().for_each(Vec::clear));
     }
 
     /// Writes this observer's recorded timeline into `writer` as a
@@ -390,17 +347,14 @@ impl TfProfObserver {
     ///
     /// Whatever writing to `writer` itself returns.
     pub fn dump(&self, writer: &mut impl Write) -> io::Result<()> {
-        let Some(&(origin, origin_us)) = self.origin.get() else {
+        let (Some(origin), Some(&origin_us)) = (self.timeline.origin(), self.origin_us.get())
+        else {
             write_u64(writer, self.uid)?;
             write_u64(writer, 0)?;
             write_u32(writer, 0)?;
             write_u32(writer, 0)?;
             return Ok(());
         };
-        let workers = self
-            .workers
-            .get()
-            .expect("origin and workers are set together in set_up");
 
         struct Block {
             worker: u32,
@@ -412,9 +366,8 @@ impl TfProfObserver {
         let mut table = StringTable::default();
         let mut blocks = Vec::new();
 
-        for (worker_index, worker) in workers.iter().enumerate() {
-            let timeline = worker.lock().unwrap_or_else(PoisonError::into_inner);
-            for (level_index, level) in timeline.segments.iter().enumerate() {
+        for (worker_index, worker) in self.timeline.workers().enumerate() {
+            for (level_index, level) in worker.store.iter().enumerate() {
                 if level.is_empty() {
                     continue;
                 }
@@ -426,7 +379,7 @@ impl TfProfObserver {
                     let delta_beg = beg_us.saturating_sub(previous_beg_us);
                     let duration = end_us.saturating_sub(beg_us);
                     let (name_off, name_len) = table.intern(&segment.name);
-                    let packed = (type_code(segment.task_type) << 5) | (name_len & 0x1F);
+                    let packed = (type_code(segment.payload) << 5) | (name_len & 0x1F);
                     segments.push((delta_beg, duration, name_off, packed));
                     previous_beg_us = beg_us;
                 }
@@ -478,26 +431,26 @@ impl TfProfObserver {
     ///
     /// Whatever writing to `writer` itself returns.
     pub fn summary(&self, writer: &mut impl Write) -> io::Result<()> {
-        let Some(workers) = self.workers.get() else {
+        let num_all_workers = self.timeline.num_workers();
+        if num_all_workers == 0 {
             return writeln!(writer, "==Observer {}: no tasks recorded", self.uid);
-        };
+        }
 
         let mut type_summaries: HashMap<TaskType, TaskSummary> = HashMap::new();
-        let mut per_worker = Vec::with_capacity(workers.len());
+        let mut per_worker = Vec::with_capacity(num_all_workers);
         let mut view_begin: Option<Instant> = None;
         let mut view_end: Option<Instant> = None;
 
-        for worker in workers {
-            let timeline = worker.lock().unwrap_or_else(PoisonError::into_inner);
+        for worker in self.timeline.workers() {
             let mut intervals = Vec::new();
             let mut count = 0u64;
             let mut min_span = 0u64;
             let mut max_span = 0u64;
-            for level in &timeline.segments {
+            for level in &worker.store {
                 for segment in level {
                     let span = micros_since(segment.end, segment.begin);
                     type_summaries
-                        .entry(segment.task_type)
+                        .entry(segment.payload)
                         .or_default()
                         .update(span);
 
@@ -523,7 +476,6 @@ impl TfProfObserver {
             wall_us = 1;
         }
 
-        let num_all_workers = workers.len();
         let mut wsum = Vec::new();
         for (id, (mut intervals, count, min_span, max_span)) in per_worker.into_iter().enumerate() {
             if intervals.is_empty() {
@@ -658,61 +610,43 @@ impl TfProfObserver {
 
 impl Observer for TfProfObserver {
     fn set_up(&self, num_workers: usize) {
-        let now = Instant::now();
-        let origin_us = u64::try_from(
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or(Duration::ZERO)
-                .as_micros(),
-        )
-        .unwrap_or(u64::MAX);
-        let _ = self.origin.set((now, origin_us));
-        let _ = self.workers.set(
-            (0..num_workers)
-                .map(|_| Mutex::new(WorkerTimeline::default()))
-                .collect(),
-        );
+        self.timeline.set_up(num_workers);
+        let _ = self.origin_us.set(unix_epoch_micros());
     }
 
     fn on_entry(&self, worker: WorkerView<'_>, _task: TaskView<'_>) {
-        let workers = self
-            .workers
-            .get()
-            .expect("Executor::make_observer calls set_up before registering this observer");
-        let mut timeline = workers[worker.id()]
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        timeline.stack.push(Instant::now());
+        self.timeline.on_entry(worker.id());
     }
 
     fn on_exit(&self, worker: WorkerView<'_>, task: TaskView<'_>) {
-        let workers = self
-            .workers
-            .get()
-            .expect("Executor::make_observer calls set_up before registering this observer");
-        let mut timeline = workers[worker.id()]
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-
-        // The depth *before* popping is upstream's `_stacks[w].size()` at
-        // the point it resizes `_timeline.segments[w]` to fit.
-        let depth_before_pop = timeline.stack.len();
-        if timeline.segments.len() < depth_before_pop {
-            timeline.segments.resize_with(depth_before_pop, Vec::new);
-        }
-
-        let begin = timeline
-            .stack
-            .pop()
-            .expect("on_exit always follows a matching on_entry on the same worker");
-        let level = timeline.stack.len();
-        timeline.segments[level].push(Segment {
-            name: task.name().to_string(),
-            task_type: task.task_type(),
-            begin,
-            end: Instant::now(),
-        });
+        self.timeline
+            .on_exit(worker.id(), |levels, level, begin, end| {
+                // Upstream resizes `_timeline.segments[w]` to `_stacks[w]`'s
+                // depth before the pop, which is this level plus one.
+                if levels.len() <= level {
+                    levels.resize_with(level + 1, Vec::new);
+                }
+                levels[level].push(Segment {
+                    name: task.name().to_string(),
+                    payload: task.task_type(),
+                    begin,
+                    end,
+                });
+            });
     }
+}
+
+/// Now, in microseconds since the Unix epoch, clamped to [`u64::MAX`] and
+/// floored at zero for a clock set before the epoch. The `origin_us` field
+/// says why this reading is taken at all.
+fn unix_epoch_micros() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_micros(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 /// `end - begin` in whole microseconds, floored at zero by
