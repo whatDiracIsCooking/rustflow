@@ -57,6 +57,11 @@
 //! were slow enough for a queue of waiters to build up. They are a counter
 //! increment, so it never does.
 //!
+//! The last section is not upstream's at all. A `Semaphore`'s `Debug` is this
+//! port's only window onto a counter upstream keeps to itself -- it has no
+//! query for its `_waiters` and prints nothing -- and #274's mutation run
+//! found nothing asserting what that window shows.
+//!
 //! One property these cases lean on throughout, and it is the scheduler's
 //! rather than the semaphores': runs of one taskflow serialise through that
 //! taskflow's run queue. So "a hundred runs" is a hundred runs one after
@@ -634,4 +639,30 @@ worker_matrix! {
         linear_chain_7_workers(7),
         linear_chain_8_workers(8),
     }
+}
+
+// ----------------------------------------------------------------------------
+// What a semaphore says about itself
+// ----------------------------------------------------------------------------
+
+/// A semaphore's `Debug` reports the counter, the maximum it may not be
+/// released past, and how many tasks are parked on it.
+///
+/// Hand-written, because all three live behind the one `Mutex` and a parked
+/// `Job` has no `Debug` of its own -- so the waiting list prints as its
+/// length. Upstream has no equivalent and no query for its `_waiters` either;
+/// what a reader of this port's diagnostics gets is this line.
+#[test]
+fn a_semaphores_debug_reports_its_counter_and_its_waiters() {
+    let semaphore = Semaphore::new(2);
+    assert_eq!(
+        format!("{semaphore:?}"),
+        "Semaphore { value: 2, max_value: 2, waiters: 0 }"
+    );
+
+    semaphore.reset_to(5);
+    assert_eq!(
+        format!("{semaphore:?}"),
+        "Semaphore { value: 5, max_value: 5, waiters: 0 }"
+    );
 }

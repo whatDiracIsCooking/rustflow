@@ -21,6 +21,13 @@
 //! yet -- so the module's `# Design` contract ("the closure-wrapper cases")
 //! is met directly against [`rustflow::algorithm::partitioner::ClosureWrapper`]
 //! instead.
+//!
+//! The cases under *The cut itself* are this port's own as well, and they are
+//! there because the coverage cases cannot be: "every index visited exactly
+//! once" holds for any chunking at all, so the arithmetic each strategy *is*
+//! -- the guided shrink and the threshold it stops shrinking at, the
+//! inclusive range a random chunk size is drawn from, the chunk size a setter
+//! sets -- went unasserted until #274's mutation run said so.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -331,4 +338,193 @@ fn a_closure_wrapper_that_skips_the_body_suppresses_the_chunk() {
         p.call(|| ran += 1);
     }
     assert_eq!(ran, 2);
+}
+
+// ============================================================================
+// The cut itself
+//
+// The coverage cases above are blind to *how* a range was cut: "every index
+// visited exactly once" holds for any chunking at all, which is what makes
+// them insensitive to the arithmetic each strategy is. These cases assert the
+// cut -- the chunk size each partitioner reports, the shape of the sequence
+// the guided loop hands out, and the range a random one draws from.
+// ============================================================================
+
+/// Every partitioner reports the chunk size it was built with and takes a new
+/// one: the single piece of state [`Partitioner`] itself has, and what each
+/// loop shape reads to size its chunks.
+#[test]
+fn every_partitioner_reports_and_replaces_its_chunk_size() {
+    fn round_trip<P: Partitioner>(mut p: P) {
+        assert_eq!(p.chunk_size(), 3);
+        p.set_chunk_size(7);
+        assert_eq!(p.chunk_size(), 7);
+    }
+
+    round_trip(StaticPartitioner::<DefaultClosureWrapper>::new(3));
+    round_trip(GuidedPartitioner::<DefaultClosureWrapper>::new(3));
+    round_trip(DynamicPartitioner::<DefaultClosureWrapper>::new(3));
+    round_trip(RandomPartitioner::<DefaultClosureWrapper>::new(3));
+
+    // And the setter is not just a field write: the chunks a later loop hands
+    // out are the size last set.
+    let mut p = DynamicPartitioner::<DefaultClosureWrapper>::new(2);
+    p.set_chunk_size(5);
+    let next = AtomicUsize::new(0);
+    let mut chunks = Vec::new();
+    p.loop_dynamic(10, 1, &next, |b, e| chunks.push((b, e)));
+    assert_eq!(chunks, vec![(0, 5), (5, 10)]);
+}
+
+/// The static loop stops *at* `n`: a range its chunk size divides exactly ends
+/// on the last full chunk, and a range of nothing is no chunks at all. Neither
+/// hands the body an empty chunk -- upstream's `while(curr_b < n)`.
+#[test]
+fn the_static_loop_hands_out_no_empty_chunk() {
+    let p = StaticPartitioner::<DefaultClosureWrapper>::new(3);
+
+    let mut chunks = Vec::new();
+    p.loop_static(9, 1, 0, p.chunk_size(), |b, e| chunks.push((b, e)));
+    assert_eq!(chunks, vec![(0, 3), (3, 6), (6, 9)]);
+
+    let mut empty_range = Vec::new();
+    p.loop_static(0, 1, 0, p.chunk_size(), |b, e| empty_range.push((b, e)));
+    assert!(empty_range.is_empty());
+}
+
+/// The guided loop hands out half of what is left per worker and shrinks with
+/// it: upstream's `q = p2 * r` for `p2 = 0.5 / w`, which this port computes as
+/// `r / (2 * w)`. One caller over an uncontended cursor draws the whole
+/// sequence itself, so the shape it promises can be asserted on one run -- the
+/// first chunk is `n / (2 * w)`, no chunk is larger than the one before it,
+/// and the tail is the configured floor.
+#[test]
+fn the_guided_loop_shrinks_its_chunks_with_the_remaining_work() {
+    const N: usize = 100;
+    const W: usize = 3;
+
+    let p = GuidedPartitioner::<DefaultClosureWrapper>::new(1);
+    let next = AtomicUsize::new(0);
+    let mut chunks = Vec::new();
+    p.loop_dynamic(N, W, &next, |b, e| chunks.push((b, e)));
+
+    // Contiguous and complete, which is the coverage cases' claim restated for
+    // a sequence one caller drew in order.
+    assert_eq!(chunks.first().copied().map(|(b, _)| b), Some(0));
+    assert_eq!(chunks.last().copied().map(|(_, e)| e), Some(N));
+    assert!(chunks.windows(2).all(|pair| pair[0].1 == pair[1].0));
+
+    let sizes: Vec<usize> = chunks.iter().map(|&(b, e)| e - b).collect();
+    assert_eq!(sizes[0], N / (2 * W));
+    assert!(
+        sizes.windows(2).all(|pair| pair[0] >= pair[1]),
+        "chunk sizes must not grow: {sizes:?}"
+    );
+    assert_eq!(*sizes.last().expect("a non-empty range is chunked"), 1);
+}
+
+/// The guided rule still applies *at* its own threshold: upstream's
+/// `if(r < p1)` switches to floor-size chunks strictly below
+/// `2 * w * (chunk_size + 1)` remaining, so a remainder of exactly that much
+/// is cut by the `r / (2 * w)` rule like any larger one.
+#[test]
+fn the_guided_loop_cuts_a_remainder_of_exactly_the_threshold_by_the_rule() {
+    const W: usize = 3;
+
+    let p = GuidedPartitioner::<DefaultClosureWrapper>::new(1);
+    let n = 2 * W * (p.chunk_size() + 1);
+
+    let next = AtomicUsize::new(0);
+    let mut chunks = Vec::new();
+    p.loop_dynamic(n, W, &next, |b, e| chunks.push((b, e)));
+
+    assert_eq!(chunks.first().copied(), Some((0, n / (2 * W))));
+    assert_eq!(chunks.last().copied().map(|(_, e)| e), Some(n));
+}
+
+/// A dynamic loop that finds the cursor already past the end hands out
+/// nothing, and the guided one leaves the cursor where it found it. Both
+/// matter because the cursor is shared with every other worker on the same
+/// range: a loop arriving late must neither run an empty chunk nor push the
+/// count past `n` for the next arrival to read.
+#[test]
+fn a_dynamic_loop_over_an_exhausted_cursor_hands_out_no_chunk() {
+    const N: usize = 16;
+    const W: usize = 3;
+
+    let guided = GuidedPartitioner::<DefaultClosureWrapper>::new(1);
+    let next = AtomicUsize::new(N);
+    let mut chunks = Vec::new();
+    guided.loop_dynamic(N, W, &next, |b, e| chunks.push((b, e)));
+    assert!(chunks.is_empty(), "guided: {chunks:?}");
+    assert_eq!(next.load(Ordering::Relaxed), N, "guided moved the cursor");
+
+    let dynamic = DynamicPartitioner::<DefaultClosureWrapper>::new(4);
+    let next = AtomicUsize::new(N);
+    let mut chunks = Vec::new();
+    dynamic.loop_dynamic(N, W, &next, |b, e| chunks.push((b, e)));
+    assert!(chunks.is_empty(), "dynamic: {chunks:?}");
+
+    let random = RandomPartitioner::<DefaultClosureWrapper>::new(0);
+    let next = AtomicUsize::new(N);
+    let mut chunks = Vec::new();
+    random.loop_dynamic(N, W, &next, |b, e| chunks.push((b, e)));
+    assert!(chunks.is_empty(), "random: {chunks:?}");
+}
+
+/// A random partitioner draws every chunk size uniformly from the inclusive
+/// range its `alpha` and `beta` fractions set, and the draws follow its seed:
+/// the same seed gives the same sequence and another seed gives another one.
+///
+/// Four claims, and each is one the module's `# Design` section makes: the
+/// fractions are kept as given rather than defaulted, the range is inclusive
+/// at both ends, every size but the last -- which the end of the range clamps
+/// -- is inside it, and a stored seed is what lets all of that be asserted on
+/// one run instead of sampled over many.
+#[test]
+fn random_chunk_sizes_are_drawn_from_the_whole_range_and_follow_the_seed() {
+    const N: usize = 1000;
+    const W: usize = 4;
+
+    // alpha * N * W = 4 and beta * N * W = 8, so the draws come from [4, 8] --
+    // a span small enough that every value in it is expected many times over
+    // the ~160 chunks a thousand indices take.
+    fn chunk_sizes(seed: u64) -> (Vec<usize>, (usize, usize)) {
+        let mut p = RandomPartitioner::<DefaultClosureWrapper>::with_alpha_beta(0.001, 0.002);
+        assert_eq!(p.alpha(), 0.001);
+        assert_eq!(p.beta(), 0.002);
+        p.set_seed(seed);
+        assert_eq!(p.seed(), seed);
+
+        let next = AtomicUsize::new(0);
+        let mut sizes = Vec::new();
+        p.loop_dynamic(N, W, &next, |b, e| sizes.push(e - b));
+        (sizes, p.chunk_size_range(N, W))
+    }
+
+    let (sizes, (lo, hi)) = chunk_sizes(0xC0FF_EE42);
+    assert_eq!((lo, hi), (4, 8));
+
+    let (last, rest) = sizes.split_last().expect("a thousand indices are chunked");
+    for size in rest {
+        assert!(
+            (lo..=hi).contains(size),
+            "a drawn chunk size must be in [{lo}, {hi}]: {sizes:?}"
+        );
+    }
+    assert!(
+        *last <= hi,
+        "the last chunk is clamped to the end, not grown"
+    );
+    for wanted in lo..=hi {
+        assert!(
+            rest.contains(&wanted),
+            "a uniform draw over [{lo}, {hi}] reaches {wanted}: {sizes:?}"
+        );
+    }
+
+    let (again, _) = chunk_sizes(0xC0FF_EE42);
+    assert_eq!(again, sizes, "the same seed draws the same sizes");
+    let (elsewhere, _) = chunk_sizes(0x5A5A_5A5A);
+    assert_ne!(elsewhere, sizes, "another seed draws other sizes");
 }

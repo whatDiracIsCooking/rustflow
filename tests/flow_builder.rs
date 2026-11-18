@@ -592,3 +592,32 @@ fn a_subflow_task_carries_its_own_graph() {
     assert_eq!(taskflow.task_ref(after).num_strong_dependencies(), 1);
     assert_eq!(taskflow.task_ref(after).num_weak_dependencies(), 0);
 }
+
+/// The two runtime handles are told apart by their own predicates, which is
+/// what `preempts_itself` reads: a `Handle::Runtime` sets `PREEMPTED` before
+/// its body runs and a `Handle::NonpreemptiveRuntime` never does, so a
+/// dispatch that confused them would resume a node that is not waiting to be.
+/// The flat `TaskType` folds both into `Runtime` and cannot say which.
+#[test]
+fn the_two_runtime_handles_are_told_apart_by_their_predicates() {
+    let mut taskflow = Taskflow::new();
+    let preemptive = taskflow.emplace_runtime(|_| {});
+    let nonpreemptive = taskflow.emplace_nonpreemptive_runtime(|_| {});
+
+    assert_eq!(taskflow.task_ref(preemptive).task_type(), TaskType::Runtime);
+    assert_eq!(
+        taskflow.task_ref(nonpreemptive).task_type(),
+        TaskType::Runtime
+    );
+
+    let graph = taskflow.graph();
+    assert!(graph.node(preemptive).handle().is_runtime());
+    assert!(!graph.node(preemptive).handle().is_nonpreemptive_runtime());
+    assert!(
+        graph
+            .node(nonpreemptive)
+            .handle()
+            .is_nonpreemptive_runtime()
+    );
+    assert!(!graph.node(nonpreemptive).handle().is_runtime());
+}
