@@ -18,16 +18,15 @@
 //!   wakes nothing and leaves the job parked on a free semaphore. The caller
 //!   keeps its own job, which is what it needs on the path where the acquire
 //!   *succeeds* anyway.
-//! - Releasing past the maximum is a [`SemaphoreError`] rather than
-//!   upstream's `TF_THROW`: what a task that over-releases has done is the
-//!   executor's decision, not this module's. The maximum it carries is read
-//!   back by `SemaphoreError::max_value`, which is `pub(crate)` because
-//!   nothing public hands a `SemaphoreError` out: the only release a caller
-//!   can reach is a task's own, through [`TaskMut::release`](crate::TaskMut::release),
+//! - Releasing past the maximum is a `SemaphoreError` rather than upstream's
+//!   `TF_THROW`: what a task that over-releases has done is the executor's
+//!   decision, not this module's. The error is `pub(crate)`, accessor and all,
+//!   because nothing public hands one out: the only release a caller can reach
+//!   is a task's own, through [`TaskMut::release`](crate::TaskMut::release),
 //!   and `src/executor/worker.rs` turns the failure of one into the panic
-//!   payload the run reports -- the text of this error, not the value. So
-//!   the number reaches a caller through `Display` and the accessor has no
-//!   caller outside the crate to serve.
+//!   payload the run reports -- the text of this error, not the value. So the
+//!   number reaches a caller through `Display`, and neither the type nor the
+//!   accessor has a caller outside the crate to serve.
 //! - Every query takes the lock, including [`Semaphore::max_value`], which
 //!   upstream reads unlocked even though `reset` writes it.
 
@@ -251,16 +250,16 @@ impl fmt::Debug for Semaphore {
 ///
 /// One way to fail, so a struct rather than an enum, carrying the maximum --
 /// the number upstream prints and what makes the message actionable.
+///
+/// Not `pub`: the `# Design` section above has why.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct SemaphoreError {
+pub(crate) struct SemaphoreError {
     max_value: usize,
 }
 
 impl SemaphoreError {
     /// The maximum value the release would have gone past, which is what
     /// [`Display`](fmt::Display) prints.
-    ///
-    /// Not `pub`: the `# Design` section above has why.
     #[must_use]
     pub(crate) const fn max_value(self) -> usize {
         self.max_value
