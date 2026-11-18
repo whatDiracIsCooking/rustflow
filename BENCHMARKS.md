@@ -1914,3 +1914,79 @@ counter traffic `L` adds without a second thread to spend it on). A
 `PipeType::Parallel` pipe's extra concurrency is a property of the worker
 pool, not of the pipe count or the line count on their own, and this row is
 where that shows most directly.
+
+## The #186 decision: a per-line slot's box, measured against a user-owned buffer
+
+#186 gave every line of a `DataPipeline` a `Mutex<Option<Box<dyn Any + Send>>>`
+slot -- 24 bytes on a 64-bit target -- so that a chain of typed `DataPipe`s
+can move a value from one pipe's callable to the next without upstream's
+`std::variant` over every pipe's own output type, which Rust has no anonymous
+equivalent of. #188 is where that choice is measured: `benches/data_pipeline.rs`
+times a `DataPipeline` against a `Pipeline` of the identical `S, P, S, P`
+shape carrying the same `f64` through a user-owned buffer
+(`tests/pipelines_compose.rs`'s own `Buffer`, narrowed to this shape) instead
+of the typed slot.
+
+**The allocation count is stated by inspection, not by a counting allocator.**
+Implementing `GlobalAlloc` to count heap operations is `unsafe`, which is out
+of scope for this issue; `src/pipeline/data_pipeline.rs`'s own
+`DataPipelineBuilder::pipe` body is read instead. Every pipe invocation ends
+by writing `Some(Box::new(output))` into its line's slot -- one allocation --
+and every invocation but a chain's first opens by `take`ing and downcasting
+the predecessor's box, which drops it once the value is moved out -- one
+deallocation. So a chain of `P = 4` pipes costs **4 allocations and 4
+deallocations a token**, independent of `lines` or `workers`: 3 of each
+within one token's own lap through the chain, plus the allocation that frees
+the previous token's last-pipe box when the next lap's first pipe overwrites
+the line's slot. The `Pipeline` variant allocates nothing per token; its
+buffer is built once, outside the measured loop.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id |
+| Date | 2026-11-18 |
+| **Load average** | **25.9 rising to 33.7 over the run** |
+
+**This box was not quiet.** Sibling agents' own `cargo` builds and test
+suites were running throughout -- "The machine, and what it was doing" above
+puts the absolute figures at ±25% on a load of 7 to 11, and the `pipeline`
+section above already had to call a load in the 50s "indicative at best"; a
+load of 26 to 34 sits between those two and gets the same treatment: read the
+absolute numbers as indicative, and the within-row ratio -- `typed` and
+`buffer` of one row, measured seconds apart in the same process -- as the
+figure worth trusting.
+
+| lines | size | workers | typed (`DataPipeline`) | buffer (`Pipeline`) |
+|---|---|---|---|---|
+| 1 | 1024 | 1 | 2.507 ms | 2.456 ms |
+| 1 | 16384 | 1 | 39.90 ms | 38.91 ms |
+| 8 | 1024 | 1 | 2.600 ms | 2.545 ms |
+| 8 | 16384 | 1 | 41.37 ms | 40.64 ms |
+| 1 | 1024 | 24 | 2.695 ms | 2.561 ms |
+| 1 | 16384 | 24 | 40.03 ms | 41.71 ms |
+| 8 | 1024 | 24 | 1.978 ms | 1.844 ms |
+| 8 | 16384 | 24 | 30.21 ms | 30.28 ms |
+
+**The two single-worker, 16384-token rows are the cleanest read**, since at
+one worker there is no cross-core traffic for the slot's extra allocation to
+contend with: `1l_1w` reads +0.99 ms over 16384 tokens (+60 ns a token) and
+`8l_1w` reads +0.73 ms (+45 ns a token), both in the direction the stated
+allocation count predicts -- a `Box::new` and, for three of the four pipes, a
+matching drop, that the buffer variant never pays. The two single-worker,
+1024-token rows agree in sign and are in the same range once the smaller
+token count is accounted for: +50 and +54 ns a token.
+
+**The two 24-worker rows do not agree in sign**, and that is the load talking
+rather than the slot: `1l_24w/16384` reads *typed faster* by 1.67 ms and
+`8l_24w/16384` reads the two within 0.08 ms of each other, both well inside
+what a load average above 25 does to a multi-worker id elsewhere in this
+file. So the one claim this table supports is the single-worker one -- **a
+per-line slot's `Box::new`-and-drop costs on the order of 45 to 60 ns a
+token** on top of a 32-iteration floating-point pipe body, which is small
+next to that body but is not nothing, and it is the allocator traffic the
+stated 4-per-token count predicts rather than a number pulled from nowhere.
+The 24-worker rows would need a quieter box to read past their own noise, and
+are left as measured rather than as a resolved claim.
