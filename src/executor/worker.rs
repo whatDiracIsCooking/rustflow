@@ -480,8 +480,20 @@ impl WorkerThread {
             // `wait` rather than raised on a worker. The successors below are
             // still released, as upstream's are; the early-out stops them.
             Handle::Static(work) => {
+                // Issue #245: claimed before the lock `work.invoke` takes and
+                // released once it has dropped, so a `Runtime::schedule`
+                // bypass that lands while this call is still running defers
+                // onto the claim instead of racing a second worker onto the
+                // same callable -- see `DispatchClaim`'s own docs. This arm
+                // never preempts, so "the guard has dropped" and "this node
+                // is idle again" are the same instant; the release belongs
+                // right here rather than anywhere later.
+                node.dispatch_claim().claim();
                 if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| work.invoke())) {
                     job.record_panic(payload);
+                }
+                if node.dispatch_claim().release() {
+                    self.schedule(job.clone());
                 }
                 Epilogue::Pending(Some(Release::Strong))
             }
@@ -491,18 +503,32 @@ impl WorkerThread {
             // Upstream's `_invoke_condition_task`: the static invoker plus a
             // return value, so a panic is recorded as a static task's is and
             // leaves an empty selection, which ends the branch.
-            Handle::Condition(work) => Epilogue::Pending(Some(Release::Selected(
-                panic::catch_unwind(AssertUnwindSafe(|| work.invoke()))
-                    .map_err(|payload| job.record_panic(payload))
-                    .ok(),
-            ))),
+            Handle::Condition(work) => {
+                node.dispatch_claim().claim();
+                let release = Release::Selected(
+                    panic::catch_unwind(AssertUnwindSafe(|| work.invoke()))
+                        .map_err(|payload| job.record_panic(payload))
+                        .ok(),
+                );
+                if node.dispatch_claim().release() {
+                    self.schedule(job.clone());
+                }
+                Epilogue::Pending(Some(release))
+            }
             // Upstream's `_invoke_multi_condition_task`, over however many
             // indices the body returns.
-            Handle::MultiCondition(work) => Epilogue::Pending(Some(Release::SelectedMany(
-                panic::catch_unwind(AssertUnwindSafe(|| work.invoke()))
-                    .map_err(|payload| job.record_panic(payload))
-                    .unwrap_or_default(),
-            ))),
+            Handle::MultiCondition(work) => {
+                node.dispatch_claim().claim();
+                let release = Release::SelectedMany(
+                    panic::catch_unwind(AssertUnwindSafe(|| work.invoke()))
+                        .map_err(|payload| job.record_panic(payload))
+                        .unwrap_or_default(),
+                );
+                if node.dispatch_claim().release() {
+                    self.schedule(job.clone());
+                }
+                Epilogue::Pending(Some(release))
+            }
             // The five dynamic-tasking handles, each upstream's
             // `_invoke_*_task` and each one line into the module that owns it.
             // Four of them may preempt this node rather than finish it, which

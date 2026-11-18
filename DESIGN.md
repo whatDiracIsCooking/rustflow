@@ -1021,6 +1021,68 @@ entry above does.
   upstream, it is not wired into upstream's own test `CMakeLists` -- so
   there is no upstream test this port is on the hook for, and nothing here
   builds toward one.
+- **`Runtime::schedule`'s hole is closed in the scheduler, not documented
+  and left to the caller** (issues #244, #245). `is_entered` -- the guard
+  the bullet above already covers one failure of -- only ever answers `true`
+  for the four handle kinds `preempts_itself` does, and only once their
+  dispatch arm has actually set `PREEMPTED`. Every other handle kind
+  (`Handle::Static`, either conditioner, `Handle::NonpreemptiveRuntime`) is
+  never "entered" by that reckoning even while its body is genuinely
+  running, and `Handle::Subflow` is not either for as long as its body is
+  still *building* the subgraph that would make it preempt -- so a
+  `schedule` bypass targeting any of those, while the target's callable is
+  actually locked, found nothing to stop it and could queue a second job
+  onto a callable the first had not finished with, tripping `lock_callable`'s
+  one-worker-per-node assertion.
+
+  **Issue #244 tried to close this from the caller first, and that attempt
+  is why #245 closes it in the scheduler instead.** A per-line
+  `{Idle, Running, RunningWithWake}` status in the pipeline, re-armed before
+  a line's body returns, fixed the *unbounded* version of the race -- and
+  found two further real bugs on the way, a `stop()` early return that
+  never released its claim and a `compare_exchange`/`fetch_max` gap that let
+  a release land on the `Idle` a raise then overwrote. It still reproduced
+  the panic at roughly 5 of 40 full-suite runs under `taskset -c 0,1`, with
+  zero instrumentation, because the instant that matters -- the callable's
+  `MutexGuard` actually dropping -- is several stack frames below the
+  line's own body, inside `NonpreemptiveRuntimeWork::invoke`. A caller can
+  flip its own status to `Idle` only *before* it returns; it has no frame to
+  run code *after* the guard it does not own has dropped. No caller-side
+  scheme can close that window, because no caller is the one that drops the
+  guard. The dispatch layer is, so the dispatch layer is where the claim
+  lives.
+
+  **The fix is a claim per node, `Node::dispatch_claim` in `src/graph.rs`,
+  independent of `PREEMPTED`.** Every dispatch arm that locks a node's
+  callable -- `Handle::Static`, both conditioners, `Handle::Subflow`,
+  `Handle::NonpreemptiveRuntime` -- claims it immediately before the lock
+  and releases it immediately after the guard has dropped, except
+  `Handle::Subflow`'s own preempting entry, which defers the release to its
+  second entry: the point the node is genuinely idle again, rather than the
+  point its body merely returned, since a fresh job racing the node's own
+  still-outstanding nested run would be exactly the double dispatch this
+  claim exists to prevent. `schedule_bypassing`'s own
+  `assert!(!is_entered(target))` is untouched -- #240's reasoning for keeping
+  `is_entered` answering a different question than this claim stands --
+  and what follows it now calls `DispatchClaim::wake` instead of queueing
+  outright: a claim already held defers (`PENDING` set) rather than races,
+  and the claim holder's own release queues the deferred job once it is
+  actually safe to. `Handle::Runtime`'s own `enter` and the two module
+  handles are deliberately **not** given a claim: `enter` sets `PREEMPTED`
+  *before* the body it locks ever runs, so `is_entered` already covers the
+  entire locked window for an ordinary runtime task, and the existing case
+  asserting `schedule` refuses an entered one is kept exactly as a caller
+  bug, not softened into a defer. The two module handles lock no callable at
+  all, so `lock_callable` cannot trip on either of them.
+
+  A node queued twice through two *unrelated* channels before either has
+  been claimed -- a real predecessor's release and a `schedule` bypass,
+  racing to be the one that queues the node at all -- is not this claim's
+  concern and is not newly introduced by it: `wake` only answers "is this
+  node's callable locked right now", the same question a `claim` already
+  held, taken by an in-flight dispatch, asks. `tests/loom_dispatch_claim.rs`
+  models the narrower, in-scope property on its own terms and names the
+  limit again.
 
 ## Decisions taken in M9
 

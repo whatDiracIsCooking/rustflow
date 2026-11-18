@@ -53,8 +53,28 @@ pub(crate) fn invoke(
     // entry. Upstream clears the subgraph here; the lease went home already.
     if node.nstate().load(Ordering::Relaxed) & Node::PREEMPTED != 0 {
         node.nstate().fetch_and(!Node::PREEMPTED, Ordering::Relaxed);
+
+        // Issue #245: this is the entry that actually finishes the node, so
+        // the dispatch claim -- held since before the body below locked
+        // `work`, straight through the preempted branch at the bottom of
+        // this function -- is released here rather than any earlier. A
+        // `schedule` bypass that landed anywhere in between, including the
+        // window before `PREEMPTED` was ever set, found the claim held and
+        // deferred onto it; this is where that deferral is finally honoured,
+        // with the node genuinely idle again rather than mid-preemption.
+        if node.dispatch_claim().release() {
+            worker.schedule(job.clone());
+        }
         return Some(Release::Strong);
     }
+
+    // Issue #245: claimed before `work` below locks, for `DispatchClaim`'s
+    // own reason -- a `Handle::Subflow` is not `is_entered` for any of the
+    // body's run, `PREEMPTED` only going on afterwards and only if the body
+    // built something to preempt for. The claim covers that whole window;
+    // see the release at the bottom of this function and the one above for
+    // where it is finally let go.
+    node.dispatch_claim().claim();
 
     // The body under upstream's `TF_EXECUTOR_EXCEPTION_HANDLER`, whose
     // `_process_exception` is `Job::record_panic`; `AssertUnwindSafe` is the
@@ -82,6 +102,14 @@ pub(crate) fn invoke(
         // bit tells the last one to re-queue this node.
         node.nstate().fetch_or(Node::PREEMPTED, Ordering::Relaxed);
 
+        // No `dispatch_claim().release()` here: `work`'s guard is already
+        // long dropped, but this node is about to be entered, and the
+        // second-entry branch above -- the point this node is genuinely
+        // idle again -- is where the claim is let go instead. Releasing it
+        // now would tell a concurrent `schedule` bypass this node is free
+        // to run again while its nested graph is still outstanding, which
+        // is exactly the double dispatch this claim exists to prevent.
+        //
         // Upstream's `_schedule_graph(worker, g, node->_topology, node)`,
         // whose `node` is a `Nested`: the subgraph's last job re-queues the
         // *job* this node was dequeued as.
@@ -98,6 +126,13 @@ pub(crate) fn invoke(
     // Nothing to run: a body that built nothing, or one that joined already;
     // the graph is in hand, so this is upstream's clear-unless-retain.
     return_subgraph(node, graph);
+
+    // This entry finishes the node without ever preempting it, so -- unlike
+    // the branch above -- the claim taken before `work` locked is let go
+    // right here, the same instant `Handle::Static`'s own arm does.
+    if node.dispatch_claim().release() {
+        worker.schedule(job.clone());
+    }
     Some(Release::Strong)
 }
 

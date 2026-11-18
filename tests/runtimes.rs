@@ -1206,3 +1206,156 @@ fn schedule_targets_a_nonpreemptive_node_whose_body_is_still_running() {
         );
     }
 }
+
+/// Issue #245, closing the hole #230 documented but could not close from the
+/// caller's side: `Runtime::schedule` on a nonpreemptive node whose body is
+/// genuinely running no longer races a second worker onto the same
+/// callable. It defers instead, and the claim holder's own release queues
+/// the deferred run once it is actually safe to.
+///
+/// The shape is
+/// [`schedule_targets_a_nonpreemptive_node_whose_body_is_still_running`]'s
+/// own, minus every bit of scaffolding that case's docs say exists only to
+/// keep the bypassed run *ineligible* to start before `line`'s first run has
+/// returned -- the `_fillers` and the `done` handshake `caller` waits on
+/// afterwards. None of that is needed once the scheduler keeps its own
+/// invariant: with every worker beyond `caller`'s free the moment `schedule`
+/// is called, this case puts the deferred run back in direct competition
+/// with the one still running, which is exactly what issue #245 closes.
+///
+/// `caller`'s own `schedule` call lands while `line`'s body is
+/// *deterministically* still inside its own lock, not merely probably so:
+/// `line` cannot pass its `spin_until` until `proceed` is `true`, and
+/// `caller` does not set `proceed` until after the call under test -- program
+/// order on `caller`'s own single thread, not timing. The `Release` on
+/// `started.store` and the `Acquire` on the load `caller`'s own `spin_until`
+/// reads carry that guarantee across threads too: everything sequenced
+/// before `line`'s `started.store` -- including the claim its dispatch arm
+/// takes before this body ever runs -- is visible to `caller` by the time it
+/// sees `started` turn `true`, so the bypass is guaranteed to find that claim
+/// held.
+#[test]
+fn schedule_defers_a_bypass_onto_a_nonpreemptive_node_still_running() {
+    for workers in 2..=4 {
+        let started = Arc::new(AtomicBool::new(false));
+        let proceed = Arc::new(AtomicBool::new(false));
+        let runs = Arc::new(AtomicI32::new(0));
+
+        let mut taskflow = Taskflow::new();
+        let line = {
+            let started = Arc::clone(&started);
+            let proceed = Arc::clone(&proceed);
+            let runs = Arc::clone(&runs);
+            taskflow.emplace_nonpreemptive_runtime(move |_| {
+                started.store(true, Ordering::Release);
+                spin_until("the caller to schedule this task", || {
+                    proceed.load(Ordering::Acquire)
+                });
+                runs.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        let _caller = {
+            let started = Arc::clone(&started);
+            let proceed = Arc::clone(&proceed);
+            taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
+                spin_until("the line task to start", || started.load(Ordering::Acquire));
+                // `line`'s dispatch claimed its callable before this body
+                // ever ran, by the ordering argument above, so this call
+                // lands while that claim is held: deferred rather than
+                // queued is the only way this can go without tripping
+                // `lock_callable`'s assertion -- every worker beyond this
+                // one is free right now, with nothing keeping it from
+                // stealing a job this call queued outright.
+                runtime.schedule(line);
+                proceed.store(true, Ordering::Release);
+            })
+        };
+
+        Executor::new(workers)
+            .run(&taskflow)
+            .wait()
+            .expect("no task panicked, in particular not `lock_callable`'s assertion");
+
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            2,
+            "{workers} worker(s): the body ran once as a source task and \
+             once more through the deferred bypass, with nothing lost"
+        );
+    }
+}
+
+/// Issue #245's other half: a target whose handle kind *does* preempt
+/// itself, caught in the window before it has. A `Handle::Subflow` is not
+/// `is_entered` for any of its body's own run -- `PREEMPTED` goes on only
+/// afterwards, and only if that body built a sourced, joinable subgraph --
+/// so `Runtime::schedule` targeting one while its body is still building a
+/// subgraph had nothing at all guarding it, same as a nonpreemptive node's
+/// whole run above.
+///
+/// `spawner`'s body builds exactly one child, so it preempts once it
+/// returns: the deferred bypass this case forces can only be honoured once
+/// the node is genuinely idle again, which is the *second* entry, after that
+/// one child has finished and re-queued it -- not the point the body merely
+/// stops running, which is the harder half of this hole and the reason
+/// `src/executor/subflow.rs`'s `invoke` defers its own release to that
+/// second entry rather than to the moment the body returns. `caller`'s own
+/// `schedule` call is placed and ordered exactly as the nonpreemptive case
+/// above, so it is just as deterministic: by the time `caller` observes
+/// `started`, `spawner`'s dispatch has already claimed its callable, and
+/// `caller`'s own bypass lands squarely inside that claim.
+#[test]
+fn schedule_defers_a_bypass_onto_a_subflow_node_still_building_its_subgraph() {
+    for workers in 2..=4 {
+        let started = Arc::new(AtomicBool::new(false));
+        let proceed = Arc::new(AtomicBool::new(false));
+        let runs = Arc::new(AtomicI32::new(0));
+
+        let mut taskflow = Taskflow::new();
+        let spawner = {
+            let started = Arc::clone(&started);
+            let proceed = Arc::clone(&proceed);
+            let runs = Arc::clone(&runs);
+            taskflow.emplace_subflow(move |subflow: &mut Subflow<'_>| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                started.store(true, Ordering::Release);
+                spin_until("the caller to schedule this task", || {
+                    proceed.load(Ordering::Acquire)
+                });
+                // A sourced, joinable subgraph: this entry preempts the node
+                // once it returns, which is what puts the deferred release
+                // at the second entry under test rather than at this one.
+                subflow.emplace(|| {});
+            })
+        };
+        let _caller = {
+            let started = Arc::clone(&started);
+            let proceed = Arc::clone(&proceed);
+            taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
+                spin_until("the subflow task to start", || {
+                    started.load(Ordering::Acquire)
+                });
+                // Called while `spawner`'s body is still inside its own
+                // lock and well before it has even set `PREEMPTED` -- the
+                // exact window `is_entered` cannot see, and every worker
+                // beyond this one is free to race onto that callable if
+                // this queued a job outright instead of deferring.
+                runtime.schedule(spawner);
+                proceed.store(true, Ordering::Release);
+            })
+        };
+
+        Executor::new(workers)
+            .run(&taskflow)
+            .wait()
+            .expect("no task panicked, in particular not `lock_callable`'s assertion");
+
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            2,
+            "{workers} worker(s): the body ran once, preempted for its own \
+             child, and ran a second time once the deferred bypass was \
+             honoured after that child finished"
+        );
+    }
+}
