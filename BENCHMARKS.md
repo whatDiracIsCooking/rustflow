@@ -43,12 +43,12 @@ criterion ids, which `cargo bench --all-features -- --list` counts.
   measures is a comparison between two C++ libraries rather than a shape of
   the executor.
 
-**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 39
+**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 41
 headings, and they are three kinds: the three method sections that follow this
 preamble, "The machine" through "The upstream C++ column is empty"; 21 shape
 sections carrying the 22 shapes, since `async_task` and `fibonacci` share "The
 two shapes #96 added", which measured the two together in a run of their own;
-and 15 per-decision measurement sections, each named for the issue that took
+and 17 per-decision measurement sections, each named for the issue that took
 it. A shape's section is its table, its sizes and its departures from
 upstream. A measurement section is one question, with the machine, the load
 and the method of its own run in it, and it ends either in a change that
@@ -205,7 +205,9 @@ rather than scaled. They also predate **#62**, which ported upstream's
 continuation optimisation and took 40 to 50% off this shape at 24 workers --
 far more than #40 and #74 together had added -- so the paragraph above about
 23 idle workers costing the busy one 40% is the old scheduler's behaviour.
-"The #62 measurement" below has the figures.
+"The #62 measurement" below has the figures, and "The #373 measurement" at the
+end of this file re-takes these four ids on a quiet box -- 131 ns a task at one
+worker against 128 at 24 -- and counts what the 23 workers actually do.
 
 ## binary_tree
 
@@ -4641,3 +4643,355 @@ and is reproducible with the same observer-weight instrument. It does not
 revisit #343's attribution, which stands unchanged. And it does not claim a
 figure: no criterion id was run for this section, because nothing in `src/`
 changed and no table here needed re-taking.
+
+## The #373 measurement: the 23 idle workers never wake, and the 40% was #62's
+
+**A chain at 24 workers costs what a chain at one worker costs, and the 23
+workers with nothing to do take no part in it whatsoever.** Over a
+16384-task run the counters read **zero** `explore_task` calls, zero steal
+attempts, zero `prepare_wait`/`commit_wait` pairs and zero unparks for 23 of
+the 24: one worker is woken by the run's single `notify_n(1)`, takes the one
+source out of a buffer, runs all 16384 links through #62's continuation, and
+parks. The "40% more per task at 24 workers" that the `linear_chain` table
+above records and that this issue was filed on is the pre-#62 scheduler's;
+re-taking the four ids on today's `main` puts the two worker counts within
+3% of each other, with the 24-worker side the *faster* one at the larger
+size.
+
+What a chain's per-task figure does move with is **where the box puts the one
+busy thread**. Held fixed with `taskset`, nine pool widths from 1 to 32 read
+the same 45.2 to 45.7 ns a task; the same program unpinned reads 61 ns a task
+when the worker that wakes shares an L3 with the thread that allocated the
+graph and 140 ns when it does not. And what the busy worker pays the
+*scheduler* turns out to be neither of the two candidates the issue named: not
+its own deque's cache line, which no other worker touches even once in a run,
+and not the notifier poke in `WorkerThread::schedule`, which is called zero
+times a run. It is one shared word per task that nothing reads -- an empty
+batch handed to `Buffers::push_bulk` on every task's release path -- and that
+is worth 11 to 15% of the run region. It does not reach the bar on the
+published ids, so nothing ships here and it is filed as #393.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads, two L3 instances (cpus 0-5,12-17 and 6-11,18-23) |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement -- the four `linear_chain` ids, re-taken, and the `devtools/bench-ab.sh` rounds; everything else below is counts and harness wall clocks, as #343's and #367's are |
+| Date | 2026-11-19 |
+| **Load average** | **1.01 to 2.61 before and after every measurement below, 2 or 3 runnable threads throughout, `/proc/pressure/cpu`'s `some avg10` at 0.00** |
+
+The box was this run's alone -- no sibling agent, nothing else building -- and
+`/proc/loadavg` was read either side of every measurement:
+
+| measurement | before | after |
+|---|---|---|
+| the four criterion ids | 1.87 2.07 2.01 | 1.91 2.06 2.00 |
+| the counters, both worker counts | 1.20 1.38 1.68 | 1.20 1.38 1.68 |
+| the steal-attempt sweep over chain lengths | 1.13 1.32 1.62 | 1.13 1.32 1.62 |
+| the width sweep, unpinned | 1.01 1.20 1.54 | 1.09 1.22 1.54 |
+| the width sweep, pinned | 1.10 1.17 1.49 | 2.61 1.49 1.59 |
+| the guard ablation, pinned then unpinned | 1.34 1.60 1.62 | 2.19 1.77 1.68 |
+| the alignment pair | 1.44 1.62 1.63 | 1.44 1.62 1.63 |
+| `bench-ab.sh`, 5 rounds | 1.68 1.45 1.57 | 2.00 1.75 1.67 |
+
+The one-minute figure never falls below 1.0 because it is decaying from this
+run's own benchmarks, each of which keeps one or two threads busy for a
+minute at a time; the runnable-task field and the pressure counter are the
+ones that say the box was otherwise idle.
+
+Every count below is a **delta across one run** of one chain: the pool is
+quiesced first (`Executor::num_waiters() == workers` confirmed before each
+window, and it was every time), both snapshots are taken on the submitting
+thread, and the counters are cache-padded per-worker words incremented with a
+relaxed `fetch_add` by their owner only. Nothing was committed: a `src/probe.rs`
+and its call sites in `worker.rs`, `notifier.rs` and `queue.rs` were reverted
+before the gate ran, which is #343's and #367's method. The shipped diff of
+this measurement is this section.
+
+### The counters: one worker, two `explore_task` calls, one park
+
+`linear_chain`'s own graph at its own two lengths, built by the harness the
+`rustflow` ids build, run from a fully parked pool. The single-run windows and
+a window of 100 back-to-back runs (which is what criterion's `iter` loop does)
+agree to the counter on every row, so one column serves for both. `L = 16384`
+is quoted; at `L = 1024` every row reads the same but the two timestamps,
++12.1 µs and +100.3 µs, and the two counts that scale with the task count.
+
+| counter, per run | 24 workers | 1 worker | what it is |
+|---|---|---|---|
+| workers parked when the window opened | **24 / 24** | 1 / 1 | `Executor::num_waiters()` |
+| workers that ran a job | **1** | 1 | all 16384 of them on it |
+| `explore_task` calls, whole pool | **2** | 2 | one to find the source, one to decide to park |
+| steal attempts on a worker deque | **0** | 0 | by victim index: none, against any deque |
+| steal attempts on a buffer | **1** | 1 | and it is a hit |
+| `explore_task` calls that spent the budget | **0** | 0 | 60 attempts, then 150 yielding ones |
+| `yield_now` calls in `explore_task` | **0** | 0 | |
+| `prepare_wait` / `commit_wait` | **1 / 1** | 1 / 1 | the busy worker's own park, after the last link |
+| `cancel_wait` | 0 | 0 | |
+| unparks delivered / parks that returned | 1 / 1 | 1 / 1 | |
+| `WorkerThread::schedule` calls | **0** | 0 | nothing is pushed after the source |
+| `notify_one` calls | **0** | 0 | |
+| `notify_n` calls | 1, asking for 1 | 1, asking for 1 | the external submission |
+| `Buffers::push_bulk` calls | **16385** | 16385 | one with an item in it; 16384 empty |
+| first job entered | +124.7 µs | +129.1 µs | after `run()`: the `set_up_graph` pass over 16384 nodes |
+| the only park committed | +1.485 ms | +1.293 ms | of a 1.489 ms and a 1.296 ms run |
+
+Four of those rows are the whole answer to the question this issue asked.
+
+- **The 23 are not idle-but-searching, they are absent.** Zero
+  `explore_task` calls means not one of them so much as reached the
+  `num_topologies()` fast path: they were parked before the window opened and
+  the run's one `notify_n(1)` woke exactly one of them. The counter the issue
+  asked for -- the time from the run's start until the last idle worker parks
+  -- therefore has no value to report, because **no idle worker parks inside a
+  chain's run at all**. The only `commit_wait` in the window is the busy
+  worker's own, at +1.485 ms of a 1.489 ms run, which is the run ending rather
+  than an idle worker settling.
+- **Nothing is ever pushed, so the notifier poke in `WorkerThread::schedule`
+  does not exist here.** That method is called **zero** times over a
+  16384-link run at either worker count: #62's continuation keeps every one of
+  the 16383 successors out of the queue, and the one job that is queued is
+  queued externally, into a *buffer*, by `Shared::bulk_schedule`. The second
+  candidate the issue named -- the contended cache line of the busy worker's
+  own deque -- is just as empty: the per-victim counters record no steal
+  attempt against that deque, or against any other worker's, over the whole
+  run. There is nothing for the 23 to contend *on*.
+- **One steal a run, exactly as #102's section measured it**, and it is a
+  buffer rather than a sibling. Its cost is the next subsection's.
+- **The first job enters at +125 µs, and that is not a dispatch latency.**
+  It is `set_up_graph`'s pass over the 16384 nodes inside `run()`, which
+  scales with the graph (12.1 to 12.9 µs at `L = 1024`) and is the same at both
+  worker counts. The dispatch latency proper -- `run()` to the body of a
+  one-task graph on a parked pool -- is 3.5 to 6.0 µs median at every pool
+  width from 1 to 24, with no trend in the width, which is #367's 6 µs
+  reproduced on a different shape.
+
+The first window after a quiesce is the one exception to the steal row, and it
+is worth keeping: the woken worker's `sticky_victim` is then whatever it last
+stole from, so one measured cold window cost **36 deque draws and 7 buffer
+draws** before the source turned up. In the steady state of a criterion
+measurement that is 1.00 attempts a run, for the reason the alignment
+subsection below gives.
+
+### The four ids, re-taken: 131 ns a task at one worker against 128 at 24
+
+One run of each id on today's `main`, the point estimate of the mean with half
+criterion's 95% interval as a ±, against the rows in the `linear_chain` table
+above -- which predate #40, #74 and #62 and are left as measured:
+
+| id | today's `main` | per task | the table above |
+|---|---|---|---|
+| `linear_chain/rustflow/1w/1024` | 158.0 µs ±1.0% | 154 ns | 136.1 µs |
+| `linear_chain/rustflow/24w/1024` | 161.9 µs ±0.3% | 158 ns | 217.9 µs |
+| `linear_chain/rustflow/1w/16384` | 2.145 ms ±0.6% | 131 ns | 2.046 ms |
+| `linear_chain/rustflow/24w/16384` | 2.095 ms ±0.2% | 128 ns | 2.872 ms |
+
+- **The gap the issue was filed on is gone, and #62's section said it would
+  be**: "after this change the two worker counts measure the same thing". At
+  16384 the 24-worker id is now **2.3% faster** than the one-worker id, at
+  1024 it is 2.5% slower, and both differences are a few times each id's own
+  interval rather than the 40% the old rows show.
+- **The 24-worker row is the one that moved**: −27% at 16384 and −26% at
+  1024 against the pre-#62 table, where the one-worker rows are within 5% of
+  what they were. That is the shape of a change that removed a hand-off, not one
+  that made a task cheaper.
+- **These are two runs of a four-id target, not a re-measurement pass.** The
+  table above is left alone deliberately: it is the historical row set with the
+  paragraph that says what it predates, and replacing it is a docs pass's job
+  rather than this section's.
+
+### It is the placement of one thread, not the width of the pool
+
+The decisive control. One chain per round on each of nine pools, **every pool
+alive throughout** so that the box carries the same 120 threads in every row
+and the only difference between two rows is how wide the pool the chain ran
+on was; rounds rotated so no width is always measured first; medians of 101
+rounds of the **run region only**, the graph's construction timed separately
+and excluded. The left-hand column is the whole process pinned to one CPU with
+`taskset -c 3`:
+
+| pool width | pinned: run | ns a task | unpinned: run |
+|---|---|---|---|
+| 1 | 0.747 ms | 45.6 | 1.022 ms |
+| 2 | 0.745 ms | 45.5 | 1.020 ms |
+| 4 | 0.746 ms | 45.5 | 1.024 ms |
+| 8 | 0.748 ms | 45.6 | 1.006 ms |
+| 12 | 0.746 ms | 45.5 | **2.300 ms** |
+| 16 | 0.744 ms | 45.4 | 1.010 ms |
+| 20 | 0.745 ms | 45.5 | 1.002 ms |
+| 24 | 0.745 ms | 45.5 | 1.006 ms |
+| 32 | 0.749 ms | 45.7 | 1.010 ms |
+
+- **Pinned, the pool's width is worth 0.7% across nine widths** -- 45.4 to
+  45.7 ns a task, every row inside every other row's [5th, 95th] band. A pool
+  32 workers wide on a 24-thread box costs a chain the same as a pool of one.
+  That is the issue's question answered from the timing side, and it agrees
+  with the counters: 23 parked threads that never run cannot cost anything,
+  and neither can 31.
+- **Unpinned, one row in nine is 2.3x the others, and it stays there** --
+  2.300 ms median, [2.230, 2.321] over 101 rounds, 140 ns a task against
+  61. The pool width is not what distinguishes it: what distinguishes it is
+  which core the notifier's one wake lands on. This part has two L3 instances,
+  the graph's 16384 nodes are allocated by the submitting thread, and a worker
+  on the far L3 reads every one of them cold. A separate run that records the
+  CPU of the first task's body found one 24-worker pool that ran every one of
+  201 rounds on `cpu8` at 0.780 ms and a one-worker pool that ran 184 of them
+  on `cpu23` at 1.028 ms -- a 30% spread between two placements on the *same*
+  L3, which is the rest of this effect and is the frequency and SMT story
+  rather than the cache one.
+- **So the published 2.1 ms is a placement as much as a measurement.**
+  Pinning the whole process to one CPU makes the chain *faster* (45 ns a task
+  against 61) because the thread that builds the graph and the worker that runs
+  it then share an L1; the three figures this shape can produce on this box --
+  45, 61 and 140 ns a task -- differ by where one thread sits and not by
+  anything the scheduler does.
+
+### What the busy worker does pay: an empty batch on every task's release path
+
+`WorkerThread::invoke_one`'s release hook runs on every job:
+
+```rust
+let mut woken = Vec::new();
+if let Err(error) = node.release_all(&mut woken) { /* ... */ }
+self.shared.bulk_schedule(woken);
+```
+
+`release_all` returns at once when the node has no semaphores, so `woken` is
+empty for every task of every shape in this file -- none of the 22 puts a
+semaphore on a task.
+`Shared::bulk_schedule` is called all the same, and `Buffers::push_bulk`
+advances `rotation` -- an atomic read-modify-write on a shared, deliberately
+padded cache line -- and divides by a runtime `num_buffers` **before** its loop
+discovers there is nothing to deal. The counter row above is that: 16385
+`push_bulk` calls over a 16384-task run, 16384 of them empty.
+
+Ablated in one process, with the guard behind a relaxed flag so that rounds
+alternate A, B, A, B inside one pool and one placement -- the run region only,
+medians of 101 rounds at `L = 16384` and 401 at `L = 1024`, each side's
+[5th, 95th] band beside it:
+
+| id, pinned to one CPU | A: as it ships | B: empty batch skipped | B/A | ns a task |
+|---|---|---|---|---|
+| 1 worker, 16384 | 0.791 ms [0.781, 0.798] | 0.688 ms [0.680, 0.696] | **0.870x** | 48.3 → 42.0 |
+| 24 workers, 16384 | 0.800 ms [0.787, 0.838] | 0.698 ms [0.687, 0.725] | **0.872x** | 48.8 → 42.6 |
+| 1 worker, 1024 | 0.0580 ms [0.053, 0.060] | 0.0510 ms [0.046, 0.052] | 0.889x | 56.5 → 50.2 |
+| 24 workers, 1024 | 0.0540 ms [0.054, 0.062] | 0.0480 ms [0.047, 0.070] | 0.882x | 53.2 → 46.9 |
+
+Two further unpinned repeats of the same four comparisons give 0.872x, 0.875x,
+0.884x, 0.887x and 0.854x, 0.855x, 0.870x, 0.863x: **twelve interleaved
+comparisons, every one between 0.854x and 0.889x, and 6 to 10 ns a task.** The
+bands are disjoint in all twelve. That is an atomic RMW and a 64-bit division
+on a path a chain takes 16384 times, and it is the only per-task cost this
+measurement found that the port could stop paying.
+
+**It does not reach the bar on the published ids, which is why nothing ships
+here.** `devtools/bench-ab.sh origin/main WORKTREE --bench linear_chain
+--rounds 5`, all four ids:
+
+| id | A median | B median | B/A | wider within-side spread | verdict |
+|---|---|---|---|---|---|
+| `1w/1024` | 152.7 µs | 148.2 µs | 0.971x | +23.3% | inside it |
+| `1w/16384` | 2.104 ms | 2.021 ms | 0.960x | +7.0% | inside it |
+| `24w/1024` | 161.8 µs | 162.8 µs | 1.006x | +25.7% | inside it |
+| `24w/16384` | 2.100 ms | 2.011 ms | 0.957x | +18.8% | inside it |
+
+Three of the four move the right way by about 4% and the script's verdict on
+every one of them is "inside it, not a result" -- which is the correct reading
+and not a formality. An id times the graph's construction and its drop as well
+as its run, so 13% of the run region is 4% of the id; and a round of this id
+on this box differs from the next round by 7 to 26%, because each round is a
+fresh process and gets a fresh placement for the one busy thread. The
+mechanism is real, the instrument that can see it is the pinned interleaved
+ablation above, and **#393** carries both.
+
+### The one steal, and what a stale sticky victim costs
+
+The rotation that the empty batches advance has a visible second-order effect,
+and it is why the steal row above reads 1.00 attempts a run. A chain advances
+`rotation` `L + 1` times a run; `(1024 + 1) % 5` and `(16384 + 1) % 5` are both
+**zero**, so at both published lengths the rotation comes back to the same
+buffer every run, the source lands there every run, and the woken worker's
+`sticky_victim` -- set to that buffer the first time -- hits on its first
+attempt for ever after. At a length where it does not, the source moves and
+the sticky victim misses. Counted over 50 runs at 24 workers, per run:
+
+| chain length | `(L + 1) % 5` | deque draws | buffer draws | `yield_now` calls |
+|---|---|---|---|---|
+| 1024 | 0 | **0.08** | 1.06 | 0.00 |
+| 1020 | 1 | 28.4 | 6.98 | 4.96 |
+| 1021 | 2 | 22.3 | 5.88 | 2.90 |
+| 1022 | 3 | 29.8 | 7.38 | 6.14 |
+| 1023 | 4 | 22.9 | 6.12 | 5.92 |
+| 4096 | 2 | 23.0 | 5.66 | 4.90 |
+
+That is one pass over `num_queues() == 29` as the expected draw count predicts,
+with the yielding tail entered on the one run in eight where 60 draws were not
+enough -- `explore_task` searches the whole victim space at random, so a job
+that can only be in one of five buffers still costs about 29 draws to find.
+**What it is worth is 0.6 µs a run**: 0.0544 ms against 0.0550 ms for
+`L = 1024` and `L = 1023` run on a pool each, interleaved, pinned, 401
+rounds. It is in this section because it is the whole of what the one steal of
+a chain costs, and it is not worth a change: 0.6 µs is 1% of the smaller id
+and 0.03% of the larger, and the random draw is upstream's own.
+
+### What upstream does, and the one place it differs
+
+**`_explore_task` at the pin is the same loop, line for line**: own
+`_sticky_victim` first, then a random victim out of
+`_workers.size() + _buffers.size()`, `MAX_STEALS = ((MAX_VICTIM + 1) << 1)`
+tight attempts and a 150-attempt yielding tail, then back to
+`_wait_for_task`'s two-phase guard with the buffer sweep before the sibling
+sweep. A chain gives that loop nothing to do at either end: upstream's
+`TF_INVOKE_CONTINUATION` keeps the successor exactly as this port's
+`update_cache` does, so upstream's 23 idle workers would also be parked for
+the whole run and its one woken worker would also draw over 29 queues to find
+one source in one of five buffers. Nothing in the steal loop is a port gap.
+
+**The release hook is the one place the port differs, and upstream is the one
+that guards it.** At the pin `_invoke` reads
+
+```cpp
+// if releasing semaphores exist, release them
+if(node->_semaphores && !node->_semaphores->to_release.empty()) {
+  SmallVector<Node*> waiters;
+  node->_release_all(waiters);
+  _bulk_schedule(worker, waiters.begin(), waiters.size());
+}
+```
+
+-- and the acquire hook above it is guarded the same way. A task with no
+semaphores on it therefore never reaches `_bulk_schedule` upstream, where this
+port's does on every job. (Upstream's call is also the *worker* overload,
+pushing onto the worker's own queue; the port's routes woken jobs to the shared
+buffers for the reason `invoke_one` states, and that difference is not this
+section's.) The port's guard is one line, it is #393, and this section is its
+measurement.
+
+### The decision: nothing ships, and what would reopen it
+
+**No change ships from this issue.** The bar is #342's, #343's and #367's: a
+mechanism the counters name, then an A/B outside both sides' spread. The
+mechanism is named and the A/B is inside the spread, so the shipped diff is
+this section.
+
+- **The question as asked is answered in the negative.** 23 idle workers cost
+  a chain nothing -- not a steal attempt, not a wake, not a park -- and a
+  pinned sweep over nine pool widths puts their cost at 0.7%, which is the
+  measurement's own resolution. The contended deque line and the
+  `WorkerThread::schedule` poke, the two candidates the issue offered, are
+  called zero times a run between them.
+- **The 40% in the table above is a historical figure and this section is
+  where that is now measured** rather than inferred from #62's A/B.
+- **What the chain's 128 ns a task is made of is not the steal loop.** 45 ns
+  of it is reachable by putting the builder and the runner on one core, and the
+  gap between 45, 61 and 140 ns a task is cache and placement. A reader looking
+  for the next win on this shape should look at what the 16384 nodes cost to
+  allocate, touch and free, which is where `binary_tree`'s section already
+  points, and not at the queues.
+- **What would reopen it** is a shape that leaves the pool's other workers
+  *awake* while one worker runs a serial chain -- a long chain next to a live
+  fan-out, which no id in this file builds. Every count here is from a pool
+  that is parked except for one worker, and a thief that is already awake has
+  a cost this section never measures: #367's losing thief, 150 to 285 attempts
+  at random over 29 victims, would be drawing on the chain's deque while it
+  runs.
