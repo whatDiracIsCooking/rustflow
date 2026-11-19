@@ -43,12 +43,12 @@ criterion ids, which `cargo bench --all-features -- --list` counts.
   measures is a comparison between two C++ libraries rather than a shape of
   the executor.
 
-**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 50
+**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 51
 headings, and they are three kinds: the three method sections that follow this
 preamble, "The machine" through "The upstream C++ column is empty"; 21 shape
 sections carrying the 22 shapes, since `async_task` and `fibonacci` share "The
 two shapes #96 added", which measured the two together in a run of their own;
-and 26 per-decision measurement sections, each named for the issue that took
+and 27 per-decision measurement sections, each named for the issue that took
 it. A shape's section is its table, its sizes and its departures from
 upstream. A measurement section is one question, with the machine, the load
 and the method of its own run in it, and it ends either in a change that
@@ -992,6 +992,13 @@ cells fell by 22 to 25% between them while the ratio against rayon held to
 within 10%. That is this box, not the variants, and it is why the rows carry
 two numbers.
 
+**This table is #96's and every row of it is superseded.** It is kept as the
+measurement the four bullets below are written against, two of which the file
+has since corrected in place; what the three `rustflow` ids read today is in
+"The #412 change" at the end of this file, re-taken at 1 and 24 workers --
+and there every one of them is *faster* at 24 workers than at one, where every
+row above is slower.
+
 What the table says:
 
 - **The two `rustflow` variants were the same scheduler and measured the
@@ -1014,11 +1021,15 @@ What the table says:
   **178 to 183 ns**, and "The #382 measurement" at the end of this file prices
   the two changes behind that: #376 took 12.5 to 16.5% off both routes at one
   worker, and #379 gave 8.6% of it back on the group route alone.
-- **24 workers make it 7x slower**, 335 µs to 2.3 ms for the same 986 children,
-  or ~2.4 µs each. This was the worst 1-to-24 scaling in the file and it is the
-  same cause as the stack cliff above: every child crossed into the shared
-  buffers and had to be stolen back out, and a parent that coruns was competing
-  for its own children with 23 other workers. Upstream's LIFO branch is what
+- **24 workers made it 7x slower**, 335 µs to 2.3 ms for the same 986
+  children, or ~2.4 µs each. This was the worst 1-to-24 scaling in the file,
+  and most of it was neither of the two causes this bullet goes on to name:
+  #412 found the corun reading its predicate once per 211-attempt search, and
+  with that fixed the same recursion is **1.5x to 2.2x faster** at 24 workers
+  than at one (`rustflow-runtime-group/24w/15`, 1.286 ms to 78.2 µs). What
+  this bullet says below is still the rest of it: every child of the group
+  route crossed into the shared buffers and had to be stolen back out, and a
+  parent that coruns was competing for its own children with 23 other workers. Upstream's LIFO branch is what
   this shape is built to exploit, and #119 gave it to the runtime variant --
   which is where a third of the one-worker time and a quarter to a third of the
   24-worker time went; see below. The group variant still pays this, and the
@@ -1042,7 +1053,9 @@ What the table says:
   is doing. rayon also barely notices 24 workers (12.7 to 23 µs) because most
   of its levels still run inline. The 100-150x ratio in the 24-worker rows is
   therefore a statement about work granularity: `fib(15)` has no work in it for
-  a scheduler to amortise against, and ours schedules every level of it.
+  a scheduler to amortise against, and ours schedules every level of it. That
+  ratio is **3.5x** in "The #412 change"'s re-taken rows; the statement about
+  granularity holds, and 100-150x was a defect on top of it.
 
 ## The #119 measurement: a task body's own queue, on a quiet box
 
@@ -3397,32 +3410,45 @@ number for doing less work.
 
 | size | workers | rustflow-group | rayon | upstream C++ |
 |---|---|---|---|---|
-| `MaxDepth = 3` | 1 | 237.1 µs ±0.7% | 29.05 µs ±0.4% | not published |
-| `MaxDepth = 3` | 24 | 539.9 µs ±1.5% | 33.08 µs ±1.6% | not published |
-| `MaxDepth = 4` | 1 | 2.296 ms ±0.8% | 254.3 µs ±0.3% | not published |
-| `MaxDepth = 4` | 24 | 2.465 ms ±1.9% | 119.8 µs ±0.6% | not published |
+| `MaxDepth = 3` | 1 | 200.95 µs ±0.23% | 29.45 µs ±0.19% | not published |
+| `MaxDepth = 3` | 24 | **130.61 µs ±0.44%** | 30.88 µs ±0.35% | not published |
+| `MaxDepth = 4` | 1 | 1.9252 ms ±0.37% | 254.94 µs ±0.17% | not published |
+| `MaxDepth = 4` | 24 | **1.1325 ms ±1.39%** | 120.38 µs ±0.27% | not published |
 
-**The port loses this shape by between 8 and 21x, and what to take from the
+Re-taken in "The #412 change" pass at the end of this file; the rows it
+replaces are 237.1 µs, 539.9 µs, 2.296 ms and 2.465 ms. Two to five of 20
+measurements were flagged as outliers on the 24-worker ids, which is where the
+widest interval is (±1.39%).
+
+**The port loses this shape by between 4 and 9x, and what to take from the
 table is the per-task constant rather than any of those ratios.** At
-`MaxDepth = 4` and one worker, 11110 spawned tasks in 2.296 ms is 207 ns a
-task against the rayon scope's 22.9 ns. **That constant is pre-#376**: the
-same id reads 2.016 ms on today's `main`, **181 ns a task**, and "The #382
-measurement" at the end of this file puts the whole of that 13.7% on one heap
-block fewer per free node -- 14.4% for #376 alone against −0.4% for #379. The body adds ten slots and returns, so
-essentially the whole 184 ns of difference is the submission path: a
+`MaxDepth = 4` and one worker, 11110 spawned tasks in 1.9252 ms is 173 ns a
+task against the rayon scope's 22.9 ns. **That constant is post-#376**: the
+first pass of this table read 2.296 ms, 207 ns a task, and "The #382
+measurement" at the end of this file puts 13.7% of the difference on one heap
+block fewer per free node -- 14.4% for #376 alone against −0.4% for #379 --
+with #412's A/B reading the one-worker cells at 0.962x and 0.969x, which is
+the ±4% band this box has on a one-worker nested recursion rather than a
+change in the constant. The body adds ten slots and returns, so
+essentially the whole 150 ns of difference is the submission path: a
 `silent_async` into the shared buffers, an `Arc<[AtomicU64; 10]>` allocated and
 dropped per interior node, and a `corun` whose waiting frame the tenth child
 releases -- #342 counted this shape and found no parent here re-queued at all.
 
-**24 workers make our column slower and rayon's faster, which is the most
-informative pair of rows here.** 237.1 to 539.9 µs at `MaxDepth = 3` and 2.296
-to 2.465 ms at 4, against rayon's 29.05 to 33.08 µs and 254.3 to 119.8 µs. A
+**24 workers used to make our column slower and rayon's faster, and that was
+the most informative pair of rows here until #412 fixed half of it.** The
+replaced rows read 237.1 to 539.9 µs at `MaxDepth = 3` and 2.296 to 2.465 ms
+at 4, against rayon's 29.05 to 33.08 µs and 254.3 to 119.8 µs; the rows above
+read 200.95 to 130.61 µs and 1.9252 to 1.1325 ms, so 23 more workers are now
+worth 1.5x and 1.7x rather than 2.3x and 1.1x against. What cost that was the
+corun's predicate -- each of the 1111 interior nodes waits for ten children,
+and before #412 a parent whose children had been stolen learned they were done
+one 211-attempt search late. **What is left is still the submission path**: a
 `TaskGroup`'s children go to the shared overflow buffers rather than to the
 submitting worker's own queue, so every one of those tasks is distributed by
-stealing; with 23 other workers contending for the buffers that costs more
-than the extra hands earn, and a tree of 11110 tasks of nothing never grows
-enough to carry it. These four rows price the submission path of the group
-route, and they are the baseline #342's A/B was measured against.
+stealing, and a tree of 11110 tasks of nothing never grows enough to carry
+that. These four rows price it for the group route, and the replaced ones are
+the baseline #342's A/B was measured against.
 
 **That attribution is confirmed by removing it**, which is what the "#380
 measurement" section below did: #377's `rustflow-runtime-group` id is this
@@ -3502,28 +3528,34 @@ hundred times.
 
 | size | workers | rustflow-group | rayon | upstream C++ |
 |---|---|---|---|---|
-| `q = 6` | 1 | 84.09 µs ±0.4% | 31.97 µs ±1.0% | not published |
-| `q = 6` | 24 | 829.7 µs ±6.5% | 28.20 µs ±2.0% | not published |
-| `q = 8` | 1 | 1.156 ms ±0.5% | 535.8 µs ±0.1% | not published |
-| `q = 8` | 24 | 2.946 ms ±4.6% | 184.5 µs ±1.1% | not published |
+| `q = 6` | 1 | 79.17 µs ±2.08% | 32.60 µs ±0.80% | not published |
+| `q = 6` | 24 | **41.12 µs ±0.72%** | 25.39 µs ±0.44% | not published |
+| `q = 8` | 1 | 1.0650 ms ±0.16% | 535.08 µs ±0.30% | not published |
+| `q = 8` | 24 | **374.89 µs ±2.91%** | 176.94 µs ±0.29% | not published |
 
-The two 24-worker `rustflow-group` cells carry ±6.5% and ±4.6%, the loosest in
-either recursive section, with 3 of 20 measurements flagged on `rayon/24w/8`.
-The gaps below are factors rather than percentages, so those widths change
-nothing about any of them.
+Re-taken in "The #412 change" pass at the end of this file; the rows it
+replaces are 84.09 µs, 829.7 µs, 1.156 ms and 2.946 ms, whose two 24-worker
+cells carried ±6.5% and ±4.6%. The loosest cell now is `rustflow-group/24w/8`
+at ±2.91%, with 5 of 20 measurements flagged on it. The gaps below are factors
+rather than percentages, so those widths change nothing about any of them.
 
-**The ragged tree costs the port less than the regular one at one worker and
-more at 24.** At `q = 8` and one worker it is 2.2x behind -- 1.156 ms against
-535.8 µs, or 562 ns a task against 261 over 2056 tasks, a figure the node
-changes leave where it was: #376 took 7.0% off it and #379 put 3.7% back, so
-"The #382 measurement" at the end of this file reads 556 to 564 ns there and
-calls the pair not resolved -- where `skynet` at one
-worker is 9.0x behind, because a `nqueens` body copies a board and prunes a
+**The ragged tree costs the port less than the regular one at one worker, and
+since #412 it costs less at 24 too.** At `q = 8` and one worker it is 2.0x
+behind -- 1.0650 ms against 535.08 µs, or 518 ns a task against 260 over 2056
+tasks, a figure the node changes leave where it was: #376 took 7.0% off it and
+#379 put 3.7% back, so "The #382 measurement" at the end of this file reads
+556 to 564 ns there and calls the pair not resolved, and #412's A/B reads this
+cell at 0.991x inside both spreads -- where `skynet` at one
+worker is 7.5x behind, because a `nqueens` body copies a board and prunes a
 column and so gives the submission path something to hide behind. At 24
-workers it goes the other way: 2.946 ms against 184.5 µs is 16x, with our
-column 2.5x slower than its own one worker while rayon's scope is 2.9x faster
-than its own -- a regression the shared buffers are the whole of, measured as
-such in the "#380 measurement" section below: the same recursion with its
+workers the replaced row went the other way: 2.946 ms against 184.5 µs was
+16x, with our column 2.5x slower than its own one worker while rayon's scope
+was 2.9x faster than its own. **The corun's predicate was most of that**:
+the row above reads 374.89 µs, 2.1x behind rayon and 2.8x faster than its own
+one-worker row, and the `rustflow-runtime-group` id of this shape goes past
+rayon outright (152.93 µs against 176.94) in #412's pass. The rest is the
+shared buffers, measured as such in the "#380 measurement" section below: the
+same recursion with its
 groups opened on the `Runtime` reads 897.52 µs at 24 workers against this
 column's 3.2976 ms in the same process, the largest of the five improvements
 that measurement found. Most interior nodes here wait on a handful of children rather
@@ -3771,19 +3803,32 @@ The eight ids are `merge_sort/{rustflow,rayon}/{1w,24w}/{10000,1000000}`.
 
 | size | workers | rustflow | rayon | upstream C++ |
 |---|---|---|---|---|
-| 10000 | 1 | 258.6 µs ±0.3% | 242.9 µs ±0.1% | not published |
-| 10000 | 24 | 869.0 µs ±2.1% | 139.4 µs ±1.4% | not published |
-| 1000000 | 1 | 55.33 ms ±0.3% | 55.33 ms ±0.1% | not published |
-| 1000000 | 24 | 17.31 ms ±2.3% | 18.91 ms ±2.4% | not published |
+| 10000 | 1 | 252.82 µs ±0.20% | 249.43 µs ±0.24% | not published |
+| 10000 | 24 | **132.39 µs ±0.16%** | 140.32 µs ±1.34% | not published |
+| 1000000 | 1 | 54.26 ms ±0.60% | 56.43 ms ±0.08% | not published |
+| 1000000 | 24 | **15.82 ms ±1.19%** | 18.16 ms ±3.02% | not published |
 
-Measured in the "#366 change" pass at the end of this file, on the same quiet
-box and under the same conditions "What is measured" names for the pass that
-first filled this table. `rustflow/24w/10000` is the widest of the eight at
-±2.1%, with one of 20 measurements flagged as an outlier.
+Re-taken in "The #412 change" pass at the end of this file, on the quiet box
+and under the conditions "What is measured" names; the rows this replaces --
+258.6 µs, 869.0 µs, 55.33 ms and 17.31 ms, from the "#366 change" pass -- are
+what the paragraphs below were written against, and the one they contradict
+says so. `rayon/24w/1000000` is the widest of the eight at ±3.02%, and every
+id was flagged with one or two outliers of 20.
 
-**The million-element one-worker row is now a dead tie, and the correction is
-the harness's rather than the scheduler's.** 55.331 ms against 55.334 ms --
-three microseconds apart on a 55 millisecond run. This section used to read
+**The 24-worker rows are #412's**, which is the change that moved this shape
+most: a corun now reads what it waits for after every failed steal rather than
+once a 211-attempt search, and `rustflow/24w/10000` goes from 869.0 µs to
+132.39 -- 6.2x behind rayon to 1.06x **ahead** of it, and 1.9x faster than its
+own one-worker row where it was 3.4x slower.
+
+**The million-element one-worker row measures the same merge on both sides,
+and the correction behind that is the harness's rather than the scheduler's.**
+The pass that found it read 55.331 ms against 55.334 -- three microseconds
+apart on a 55 millisecond run -- and the row above, re-taken by #412's pass,
+reads 54.26 against 56.43, our column 3.8% ahead; the fork is 1023 tasks
+either way, #412's A/B puts this id at 0.992x inside both spreads, and 3.8% is
+inside what this box moves between passes on a 55 ms region. This section used
+to read
 57.14 against 59.86 there and called the 4.6% a merge-loop difference it could
 not explain; it did not need explaining, because it was not there. Both
 columns were being charged for a per-iteration 8 MB input on top of the 8 MB
@@ -3796,24 +3841,31 @@ relaxed loads and stores costs the same as a merge through real `&mut [f64]`
 halves on this target, which is what the module docs claim for the departure
 and is the first row in this file to measure it.
 
-**The 24-worker million-element row still goes the port's way, and by the
-margin the replaced table read.** 17.31 ms against 18.91 ms, 8.5% apart with
-intervals of ±2.3% and ±2.4%, where the figures this pass replaced were
-17.39 and 19.16, 9.3% apart. Only our column moved with the harness change
+**The 24-worker million-element row goes the port's way, and by a margin three
+passes agree on.** 15.82 ms against 18.16 ms in #412's pass, 12.9% apart;
+17.31 against 18.91, 8.5% apart, in the harness pass below; 17.39 and 19.16,
+9.3% apart, before that. #412's A/B reads this id at 1.022x inside both
+spreads, so the 1.5 ms our column gained between the last two passes is the
+box rather than the change -- there is no corun wait to shorten behind twenty
+million compares, which is the finding the A/B's two unresolved cells are.
+Only our column moved with the harness change
 there (−11.4% against rayon's +3.6%, the latter inside its own interval), so
 the agreement of the two ratios is the useful part: at a million elements the
 recursion is 1023 spawned tasks against some twenty million compare-and-copy
 operations, and whatever this row is reading, it is not the fork.
 
 **The 10_000-element rows are the ones that answer the question this section
-exists for, and they go the other way.** 6.5% behind at one worker over 15
-spawned tasks, and 6.2x behind at 24 workers, where our 869.0 µs is 3.4x our
-own one-worker time and rayon's 139.4 µs is 1.7x faster than its own. Fifteen
-tasks whose leaves are 1024-element sorts, distributed by stealing out of the
-shared buffers with a frame parked in `corun` at every level, is the `skynet`
-and `integrate` finding at a thirtieth of their task count -- #342 counted
-4152 nested tear-downs here and no preempted parent among them, so the cost is
-the buffers and the frames rather than a re-queue. **The buffers are not what
+exists for, and #412 is what turned them round.** They used to read 6.5%
+behind at one worker over 15 spawned tasks and **6.2x behind at 24**, our
+869.0 µs being 3.4x our own one-worker time where rayon's 139.4 µs was 1.7x
+faster than its own; the rows above read 1.4% behind at one worker and **1.06x
+ahead at 24**, 1.9x faster than our own one-worker row. What the old 24-worker
+cell was is now measured rather than inferred: fifteen tasks whose leaves are
+1024-element sorts, each parent's frame waiting in a `corun` that could not
+notice its child finishing for a whole failed search. The frames and the
+buffers are the rest of it -- #342 counted 4152 nested tear-downs here and no
+preempted parent among them, so none of what is left is a re-queue. **The
+buffers are not what
 the 24-worker rows are, though**, and the "#380 measurement" section below is
 where that is measured: #377's `rustflow-runtime-group` id takes the buffers
 out of this recursion and read 907.76 µs and 73.408 ms against this column's
@@ -3918,31 +3970,41 @@ The eight ids are `integrate/{rustflow,rayon}/{1w,24w}/{1,2}`.
 
 | size | workers | rustflow | rayon | upstream C++ |
 |---|---|---|---|---|
-| `V = 1` | 1 | 277.4 µs ±1.5% | 20.02 µs ±0.4% | not published |
-| `V = 1` | 24 | 1.287 ms ±2.6% | 30.93 µs ±1.8% | not published |
-| `V = 2` | 1 | 636.6 µs ±0.6% | 41.86 µs ±0.6% | not published |
-| `V = 2` | 24 | 2.064 ms ±2.5% | 39.24 µs ±1.4% | not published |
+| `V = 1` | 1 | 257.13 µs ±0.37% | 19.09 µs ±0.08% | not published |
+| `V = 1` | 24 | **139.08 µs ±0.61%** | 28.00 µs ±0.57% | not published |
+| `V = 2` | 1 | 529.87 µs ±0.35% | 37.85 µs ±0.15% | not published |
+| `V = 2` | 24 | **286.45 µs ±0.49%** | 36.49 µs ±2.40% | not published |
 
-4 of 20 measurements were flagged as outliers on `rustflow/1w/1`; no interval
-in the table exceeds ±2.6%, which is nothing against the ratios in it.
+Re-taken in "The #412 change" pass at the end of this file; the rows it
+replaces are 277.4 µs, 1.287 ms, 636.6 µs and 2.064 ms. One or two of 20
+measurements were flagged as outliers on every id, and no interval in the
+table exceeds ±2.40%, which is nothing against the ratios in it.
 
-**This is the widest gap in the file -- 14x and 15x at one worker, 42x and 53x
-at 24 -- and it is the per-task constant with nothing in front of it.** A node
+**This was the widest gap in the file -- 14x and 15x at one worker, 42x and
+53x at 24 -- and the 24-worker end of that was the corun's predicate: #412
+takes `V = 2` at 24 workers from 2.064 ms to 286.45 µs, which is 7.9x behind
+rayon rather than 53x, and 1.9x faster than this shape's own one-worker row
+where it used to be 3.2x slower.** What is left is the per-task constant with
+nothing in front of it. A node
 bisects an interval, evaluates two trapezoids and compares them: five or six
 `f64` operations, where `merge_sort`'s million-element rows hide the same fork
 behind twenty million of them. At `V = 2` and one worker, 1852 spawned tasks in
-636.6 µs is 344 ns a task against the `rayon::join` column's 22.6 ns. **That
-constant is unchanged today, and not because nothing happened to it**: #376
-took 9.5% off it and #379 put 12.9% back, which is the largest regression "The
-#382 measurement" at the end of this file found and the reason #397 exists.
-The same id reads 625.7 µs there (338 ns a task) against the "#380
-measurement"'s 648.23 µs (350 ns), which is the few per cent this box moves
-between runs on it.
+529.87 µs is 286 ns a task against the `rayon::join` column's 20.4 ns -- and
+that one-worker constant is what #412 did *not* touch: the same id read 636.6 µs
+(344 ns) when this table was first filled and 625.7 µs in "The #382
+measurement", where #376 took 9.5% off it and #379 put 12.9% back, which is the
+largest regression that section found and the reason #397 exists. #412's A/B
+reads the one-worker cells at 0.971x and 0.983x, inside both sides' spreads, so
+the 530 against 626 is this box between passes rather than the change.
 
-The 24-worker rows then repeat `skynet`'s direction: ours goes from
-636.6 µs to 2.064 ms, 3.2x slower for 23 more workers, with each parent holding
-a frame in `corun` until its one child lands, while `rayon::join` on the same
-tree barely moves (41.86 to 39.24 µs). **What that regression is not is the
+The 24-worker rows used to repeat `skynet`'s direction -- 636.6 µs to 2.064 ms,
+3.2x slower for 23 more workers, with each parent holding a frame in `corun`
+until its one child lands, while `rayon::join` on the same tree barely moved
+(41.86 to 39.24 µs). **That regression was the corun's predicate**, and
+`BENCHMARKS.md`'s last section is where it goes: the parent's frame could not
+notice its one child finishing until a 211-attempt search had failed, so 23
+more workers bought 23 more searches. It is 139.08 µs and 286.45 µs now, below
+the one-worker rows on both sizes. **What it was not is the
 shared buffers**, which is this section's one correction from the "#380
 measurement" below: the `rustflow-runtime-group` id queues the same children on
 the submitting worker's own deque and read **29.854 ms and 65.129 ms** at 24
@@ -7194,7 +7256,10 @@ probes is the delta and not the base. The figures
 [`TaskGroup::corun`](src/task_group.rs) carries are therefore #380's raised by
 the delta measured here rather than replaced -- 1056 bytes a level and 1980
 levels on the id route, 1136 and 1842 on the runtime one, the depths scaled by
-the ratio each route's own bisection moved by (0.985 and 0.973).
+the ratio each route's own bisection moved by (0.985 and 0.973). (#412 later
+raised both by another 16 bytes a level the same way, so what the docs carry
+today is 1072 and 1152; "The #412 change" at the end of this file is that
+measurement.)
 
 Both deltas are a 1.5% and 2.7% shallower chain, which is not a size any shape
 in this file is chosen against: `fibonacci`'s sizes are set by the **id**
@@ -7700,3 +7765,340 @@ case is solved: under B, two workers on the zero-work `fibonacci` are still
 1.77x slower than one, which is what a stolen child costs when there is no
 third worker to hand the parent anything else to do, and rayon's 0.64x there
 is its inline-first `join` rather than a search it runs better.
+
+**Shipped.** #412 is the loop, and "The #412 change" below is its A/B, its
+re-published tables and what it cost. The one number this section left for it
+that came out otherwise is the stack: upstream's search holds locals the
+port's `explore_task` held in a frame of its own, and keeping that true cost
+one `#[inline(never)]` and 16 bytes a level anyway.
+
+## The #412 change: a corun re-reads its predicate after every failed steal, and 24 workers are worth having
+
+**`WorkerThread::corun_until` now carries upstream's own search, so a corun
+reads what it waits for after every failed steal attempt instead of once per
+211-attempt give-up -- and every one of the five nested shapes is now faster
+at 24 workers than at one, at both of its sizes, which `fibonacci`,
+`integrate`, `skynet` and `nqueens` had never been at any size in this
+file.**
+`fibonacci/rustflow-runtime-group/24w/15` goes from 1.286 ms to **78.16 µs**
+(0.061x), `nqueens/rustflow-group/24w/6` from 732.8 µs to **40.98 µs**
+(0.056x), `integrate/rustflow/24w/2` from 2.042 ms to **287.9 µs** (0.141x);
+20 of the 22 24-worker `rustflow` ids across the five shapes move outside both
+sides' spreads, and 20 of the 22 one-worker ids stay inside them, which is the
+bar #412's acceptance set. The 20 resolved cells improve by between **1.7x and
+25x**, and two shapes now beat rayon at 24 workers where none of the five did
+-- `merge_sort` at both sizes and `nqueens` at `side = 8` on the runtime
+route.
+
+What the diff is: the search is [`steal_until`](src/executor/worker.rs), a
+loop that steals, reads the predicate, yields past `MAX_STEALS` and never
+gives up on its own -- upstream's `explore:` label inside `_corun_until`.
+`explore_task` and `wait_for_task` are untouched, their 211-attempt give-up
+being what lets a worker *park*, which a corun never does. This is the fourth
+difference from upstream that `corun_until`'s docs did not list; the three
+they do list (one local job a round, never sleeping, ignoring `done`) are all
+still here and all still upstream's.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| A/B | `devtools/bench-ab.sh origin/main WORKTREE --bench <shape> --rounds 3 -- 'rustflow.*w/'`, one run per shape: two builds, two target directories, A then B in each of three rounds, each side's own spread reported before the ratio |
+| tables | `cargo bench --bench <shape>`, one run of each shape's whole target -- every id of it, rayon column included, in one process |
+| criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id |
+| stack probe | an `examples/probe_frames.rs` of its own, reverted before the gate: a chain of nested group coruns at one worker, one child a level, recording the address of a local per level; the deltas were identical to the byte on every level of 300 |
+| latency | `tests/corun.rs::a_corun_returns_within_fifty_microseconds_of_a_child_on_another_worker`, the debug profile the suite runs under, 200 rounds a run |
+| Date | 2026-11-19 |
+| **Load average** | **0.15 to 14.8 either side of each pass, the runnable-task field 1 to 3, and all of it this run's own** |
+
+The box was this run's alone -- no sibling agent, nothing else building. The
+A/B script records `/proc/loadavg` itself, at the start, after every round and
+at the end; the table runs were bracketed by hand:
+
+| pass | before | after |
+|---|---|---|
+| A/B, `nqueens` | 0.42 4.07 5.75 | 12.76 8.52 7.14 |
+| A/B, `fibonacci` | 11.74 8.38 7.11 | 12.31 9.73 7.86 |
+| A/B, `integrate` | 10.42 9.41 7.78 | 5.30 7.17 7.22 |
+| A/B, `merge_sort` | 4.56 6.95 7.15 | 12.27 8.81 7.81 |
+| A/B, `skynet` | 10.38 8.52 7.72 | 11.75 9.18 8.10 |
+| tables, `fibonacci` | 11.38 9.20 8.12 | 14.15 9.97 8.43 |
+| tables, `integrate` | 14.15 9.97 8.43 | 14.66 10.46 8.67 |
+| tables, `merge_sort` | 14.66 10.46 8.67 | 10.71 9.92 8.57 |
+| tables, `skynet` | 10.71 9.92 8.57 | 12.76 10.28 8.75 |
+| tables, `nqueens` | 12.76 10.28 8.75 | 14.84 10.93 9.05 |
+| the latency test, both loops | 0.15 2.62 5.69 | 0.68 2.59 5.61 |
+
+The stack probe is not in that table: an address delta is not a time, and the
+probe read the same figure to the byte on every level of every run.
+
+Every load average above is the measurement's own: a 24-worker id that
+searches for work runs 24 threads hot, which is the mechanism this section is
+about, and the one-minute figure tracks the id being measured rather than the
+box being busy.
+
+### The A/B: 44 ids, 20 of 22 at 24 workers outside both spreads
+
+Medians of three rounds a side, with the script's verdict: a change inside
+either side's own spread is not a result, and the ratio is divided by the
+wider of the two spreads to say which case it is in. **A/B figures are not
+published figures** -- these are one run of one filtered id set per shape,
+where the tables below are each shape's whole target.
+
+| shape | id | size | workers | A: `origin/main` | B: this change | B/A | verdict |
+|---|---|---|---|---|---|---|---|
+| `fibonacci` | `rustflow-group` | 12 | 1 | 77.49 µs | 75.55 µs | 0.975x | inside |
+| `fibonacci` | `rustflow-group` | 12 | 24 | 1.070 ms | **51.30 µs** | **0.048x** | a result |
+| `fibonacci` | `rustflow-group` | 15 | 1 | 288.2 µs | 278.6 µs | 0.967x | inside |
+| `fibonacci` | `rustflow-group` | 15 | 24 | 2.000 ms | **173.7 µs** | **0.087x** | a result |
+| `fibonacci` | `rustflow-runtime` | 12 | 1 | 44.48 µs | 46.02 µs | 1.034x | inside |
+| `fibonacci` | `rustflow-runtime` | 12 | 24 | 836.8 µs | **44.31 µs** | **0.053x** | a result |
+| `fibonacci` | `rustflow-runtime` | 15 | 1 | 174.6 µs | 181.1 µs | 1.037x | inside |
+| `fibonacci` | `rustflow-runtime` | 15 | 24 | 1.315 ms | **121.9 µs** | **0.093x** | a result |
+| `fibonacci` | `rustflow-runtime-group` | 12 | 1 | 41.98 µs | 43.41 µs | 1.034x | inside |
+| `fibonacci` | `rustflow-runtime-group` | 12 | 24 | 824.3 µs | **33.11 µs** | **0.040x** | a result |
+| `fibonacci` | `rustflow-runtime-group` | 15 | 1 | 161.2 µs | 161.2 µs | 1.000x | inside |
+| `fibonacci` | `rustflow-runtime-group` | 15 | 24 | 1.286 ms | **78.16 µs** | **0.061x** | a result |
+| `integrate` | `rustflow` | `V = 1` | 1 | 250.3 µs | 246.2 µs | 0.983x | inside |
+| `integrate` | `rustflow` | `V = 1` | 24 | 1.221 ms | **140.6 µs** | **0.115x** | a result |
+| `integrate` | `rustflow` | `V = 2` | 1 | 568.3 µs | 551.9 µs | 0.971x | inside |
+| `integrate` | `rustflow` | `V = 2` | 24 | 2.042 ms | **287.9 µs** | **0.141x** | a result |
+| `integrate` | `rustflow-runtime-group` | `V = 1` | 1 | 138.1 µs | 139.0 µs | 1.007x | inside |
+| `integrate` | `rustflow-runtime-group` | `V = 1` | 24 | 851.1 µs | **65.40 µs** | **0.077x** | a result |
+| `integrate` | `rustflow-runtime-group` | `V = 2` | 1 | 307.7 µs | 303.0 µs | 0.985x | inside |
+| `integrate` | `rustflow-runtime-group` | `V = 2` | 24 | 1.090 ms | **123.7 µs** | **0.113x** | a result |
+| `merge_sort` | `rustflow` | 10000 | 1 | 251.2 µs | 252.5 µs | 1.005x | inside |
+| `merge_sort` | `rustflow` | 10000 | 24 | 766.0 µs | **132.3 µs** | **0.173x** | a result |
+| `merge_sort` | `rustflow` | 1000000 | 1 | 54.49 ms | 54.08 ms | 0.992x | inside |
+| `merge_sort` | `rustflow` | 1000000 | 24 | 17.04 ms | 17.41 ms | 1.022x | inside |
+| `merge_sort` | `rustflow-runtime-group` | 10000 | 1 | 248.4 µs | 248.3 µs | 1.000x | inside |
+| `merge_sort` | `rustflow-runtime-group` | 10000 | 24 | 837.4 µs | **132.0 µs** | **0.158x** | a result |
+| `merge_sort` | `rustflow-runtime-group` | 1000000 | 1 | 54.62 ms | 53.20 ms | 0.974x | inside |
+| `merge_sort` | `rustflow-runtime-group` | 1000000 | 24 | 14.59 ms | 14.38 ms | 0.986x | inside |
+| `skynet` | `rustflow-group` | 3 | 1 | 205.4 µs | 199.0 µs | 0.969x | a result |
+| `skynet` | `rustflow-group` | 3 | 24 | 474.3 µs | **133.2 µs** | **0.281x** | a result |
+| `skynet` | `rustflow-group` | 4 | 1 | 1.960 ms | 1.885 ms | 0.962x | inside |
+| `skynet` | `rustflow-group` | 4 | 24 | 2.237 ms | **1.145 ms** | **0.512x** | a result |
+| `skynet` | `rustflow-runtime-group` | 3 | 1 | 141.2 µs | 142.3 µs | 1.007x | inside |
+| `skynet` | `rustflow-runtime-group` | 3 | 24 | 390.6 µs | **85.23 µs** | **0.218x** | a result |
+| `skynet` | `rustflow-runtime-group` | 4 | 1 | 1.304 ms | 1.351 ms | 1.036x | a result |
+| `skynet` | `rustflow-runtime-group` | 4 | 24 | 958.5 µs | **578.9 µs** | **0.604x** | a result |
+| `nqueens` | `rustflow-group` | 6 | 1 | 79.42 µs | 80.30 µs | 1.011x | inside |
+| `nqueens` | `rustflow-group` | 6 | 24 | 732.8 µs | **40.98 µs** | **0.056x** | a result |
+| `nqueens` | `rustflow-group` | 8 | 1 | 1.079 ms | 1.070 ms | 0.991x | inside |
+| `nqueens` | `rustflow-group` | 8 | 24 | 2.638 ms | **361.6 µs** | **0.137x** | a result |
+| `nqueens` | `rustflow-runtime-group` | 6 | 1 | 49.03 µs | 52.20 µs | 1.065x | inside |
+| `nqueens` | `rustflow-runtime-group` | 6 | 24 | 482.7 µs | **29.44 µs** | **0.061x** | a result |
+| `nqueens` | `rustflow-runtime-group` | 8 | 1 | 742.0 µs | 750.2 µs | 1.011x | inside |
+| `nqueens` | `rustflow-runtime-group` | 8 | 24 | 816.4 µs | **153.2 µs** | **0.188x** | a result |
+
+**Four of the 44 cells are the ones to read carefully, and two of them are
+the acceptance's own bar missed.**
+
+- **`merge_sort` at a million elements and 24 workers does not move** --
+  1.022x on the id route and 0.986x on the runtime route, both inside their
+  spreads -- and that is the shape saying what it is made of rather than the
+  fix failing. A million-element sort is twenty million compares, the
+  10000-element row of the same shape is 0.173x, and the published
+  24-worker/1000000 row improves anyway (16.68 ms against 17.61) because the
+  figures either side of it are one process apart. The acceptance asked for
+  every 24-worker id outside both spreads; these two are the exception, and
+  the reason is that a corun's wait is not what those rows measure.
+- **`skynet`'s two one-worker results point in opposite directions** --
+  `rustflow-group` at `MaxDepth = 3` reads 0.969x (a win) and
+  `rustflow-runtime-group` at `MaxDepth = 4` reads 1.036x (a loss), each just
+  past the 1.25x the script calls resolved. So what this is, is the band this
+  box has on a one-worker nested recursion: ±4%, with the verdict falling
+  either way inside it. **The acceptance's reason for expecting one worker not
+  to move is not quite the mechanism**: it said no corun there ever steals, and
+  one does -- a `silent_async` from a body goes to the shared buffers, which a
+  corun reaches by stealing -- but it never *waits*, there being no other
+  thread its child could be running on, so the first attempt of its first
+  search finds the child and neither loop has a predicate to re-read. An earlier pass of this A/B, before the search was moved into a function
+  of its own, put three `fibonacci` one-worker ids at +4 to +5% the same way;
+  with the frame fixed (below) those read −3.3% to +3.7% and all six are
+  inside their spreads.
+
+### The five shapes, re-published at 1 and 24 workers
+
+One `cargo bench --bench <shape>` per shape, every id of it in one process,
+quoted as criterion's point estimate with half the width of its 95% interval
+as a plus-or-minus. The "id route" column is each file's own `rustflow` column
+name -- `rustflow-group` in `fibonacci`, `skynet` and `nqueens`, plain
+`rustflow` in `merge_sort` and `integrate` -- and the runtime route is
+`rustflow-runtime-group`. `fibonacci` also has `rustflow-runtime`, which is
+quoted in its own paragraph below. **These are the figures the five shape
+sections above now carry**, except `fibonacci`'s, whose table stays #96's for
+the reason that section gives.
+
+**`fibonacci`**, `rustflow-group` / `rustflow-runtime-group` / rayon:
+
+| `n` | workers | id route | runtime route | rayon |
+|---|---|---|---|---|
+| 12 | 1 | 76.708 µs ±0.51% | 44.588 µs ±0.53% | 6.1088 µs ±1.41% |
+| 12 | 24 | 52.158 µs ±1.02% | **33.138 µs ±0.53%** | 15.124 µs ±0.35% |
+| 15 | 1 | 293.25 µs ±0.47% | 170.05 µs ±1.08% | 15.326 µs ±1.57% |
+| 15 | 24 | 174.55 µs ±0.87% | **77.225 µs ±0.35%** | 21.959 µs ±1.27% |
+
+`rustflow-runtime` reads 47.412 µs ±1.25% and 185.90 µs ±0.21% at one worker,
+44.305 µs ±0.59% and 121.97 µs ±1.75% at 24. **Every one of the three
+`rustflow` ids is now faster at 24 workers than at one** -- 1.7x, 1.5x and 2.2x
+at `n = 15` -- where the A side of the same three reads 6.9x, 7.5x and 8.0x
+*slower*. The gap to rayon at 24 workers and `n = 15` is 3.5x on the runtime
+route, where the A side of that cell against the same rayon column is 59x.
+
+**`integrate`**, `rustflow` / `rustflow-runtime-group` / rayon:
+
+| size | workers | id route | runtime route | rayon |
+|---|---|---|---|---|
+| `V = 1` | 1 | 257.13 µs ±0.37% | 137.30 µs ±1.65% | 19.086 µs ±0.08% |
+| `V = 1` | 24 | 139.08 µs ±0.61% | **64.580 µs ±0.64%** | 28.002 µs ±0.57% |
+| `V = 2` | 1 | 529.87 µs ±0.35% | 296.63 µs ±0.31% | 37.853 µs ±0.15% |
+| `V = 2` | 24 | 286.45 µs ±0.49% | **121.43 µs ±1.01%** | 36.490 µs ±2.40% |
+
+The widest gap in the file closes from 53x to **7.9x** on the id route and
+3.3x on the runtime route at `V = 2` and 24 workers, and both routes beat
+their own one-worker row (1.9x and 2.4x) where the id route was 3.2x slower.
+
+**`merge_sort`**, `rustflow` / `rustflow-runtime-group` / rayon:
+
+| size | workers | id route | runtime route | rayon |
+|---|---|---|---|---|
+| 10000 | 1 | 252.82 µs ±0.20% | 251.12 µs ±0.48% | **249.43 µs ±0.24%** |
+| 10000 | 24 | 132.39 µs ±0.16% | **132.10 µs ±0.15%** | 140.32 µs ±1.34% |
+| 1000000 | 1 | 54.261 ms ±0.60% | **54.126 ms ±0.47%** | 56.426 ms ±0.08% |
+| 1000000 | 24 | 15.821 ms ±1.19% | **14.304 ms ±2.69%** | 18.160 ms ±3.02% |
+
+**Both 24-worker rows now beat rayon**, by 1.06x at 10000 elements and 1.27x
+at a million on the runtime route, and the 10000-element row halves against
+one worker where it used to be 3.1x slower. The million-element rows are the
+two cells the A/B could not resolve, and the table says why: 15.8 ms of work
+against a wait of microseconds.
+
+**`skynet`**, `rustflow-group` / `rustflow-runtime-group` / rayon:
+
+| size | workers | id route | runtime route | rayon |
+|---|---|---|---|---|
+| `MaxDepth = 3` | 1 | 200.95 µs ±0.23% | 148.77 µs ±0.26% | 29.451 µs ±0.19% |
+| `MaxDepth = 3` | 24 | 130.61 µs ±0.44% | **84.984 µs ±0.41%** | 30.875 µs ±0.35% |
+| `MaxDepth = 4` | 1 | 1.9252 ms ±0.37% | 1.3765 ms ±0.24% | 254.94 µs ±0.17% |
+| `MaxDepth = 4` | 24 | 1.1325 ms ±1.39% | **573.17 µs ±0.56%** | 120.38 µs ±0.27% |
+
+The shape that gains least, and the one whose remaining gap is largest: 9.4x
+behind rayon at `MaxDepth = 4` and 24 workers on the id route, 4.8x on the
+runtime route, against 21x before. Its bodies hold no work at all and its
+`Arc<[AtomicU64; 10]>` a node is a per-task constant this change does not
+touch -- #382's territory.
+
+**`nqueens`**, `rustflow-group` / `rustflow-runtime-group` / rayon:
+
+| size | workers | id route | runtime route | rayon |
+|---|---|---|---|---|
+| `side = 6` | 1 | 79.169 µs ±2.08% | 50.853 µs ±2.39% | 32.599 µs ±0.80% |
+| `side = 6` | 24 | 41.123 µs ±0.72% | **29.167 µs ±0.20%** | 25.393 µs ±0.44% |
+| `side = 8` | 1 | 1.0650 ms ±0.16% | 746.15 µs ±0.26% | 535.08 µs ±0.30% |
+| `side = 8` | 24 | 374.89 µs ±2.91% | **152.93 µs ±0.99%** | 176.94 µs ±0.29% |
+
+**The runtime route beats rayon at `side = 8` and 24 workers** (152.93 µs
+against 176.94), which no `rustflow` id of this shape had done at any width,
+and the id route is 2.8x faster than its own one-worker row where it was 2.5x
+slower.
+
+Every id in these five tables was flagged with 1 to 5 outliers of 20 by
+criterion, 5 to 25%, which is this box under a 24-thread measurement; the
+widest interval in any cell is ±2.91% (`nqueens`'s `rustflow-group/24w/8`) and
+the widest in a `rustflow` 24-worker cell that carries a claim above is
+±2.69%. No ratio quoted in this section is inside the intervals it is drawn
+from.
+
+### What it costs: 16 bytes of a worker's stack a level
+
+A corun frame is a frame per nested level -- that is the bound
+[`TaskGroup::corun`](src/task_group.rs)'s docs state and the #359 section
+measures -- so a word the search holds across the job it found is a word a
+level. Three shapes of the same loop, on the same probe, at one worker:
+
+| the search | bytes a level, id route | runtime route |
+|---|---|---|
+| `origin/main`'s (a call to `explore_task`) | 1104 | 1216 |
+| one loop, with the invoke inside it | 1136 | 1248 |
+| an inlined `steal_until` | 1168 | 1280 |
+| **`steal_until`, `#[inline(never)]`** | **1120** | **1232** |
+
+The probe's absolute figures are its own frames as well as the scheduler's --
+it is a chain of one child a level carrying an `AtomicU64` and two `Arc`
+clones -- so what it measures is the **delta**, as #395's own probe above
+does. That delta is identical on both routes and identical to the byte on all
+300 levels of each run. The shipped form costs **16 bytes a level**, which is
+the `&mut` to the predicate it leaves addressable in the corun frame; writing
+the search as one loop with the invoke inside it costs 32, because the
+search's own locals are then live across the job, and letting it inline costs
+64.
+
+There is no unmoved control row to put beside those two, and that is the
+finding rather than a gap: where #395 changed what a *group* carries and could
+hold `Runtime::corun` fixed, this changes the loop every corun route in the
+crate shares, so every route moves and both rows move by the same 16 bytes.
+
+So the per-level figures [`TaskGroup::corun`](src/task_group.rs) carries are
+#395's raised by this delta, as #395's were #380's: **1072 bytes a level and
+1952 levels** of a chain on the id route, **1152 and 1818** on the runtime
+one, the depths scaled by the ratio each route's own per-level cost moved by
+(0.986 and 0.987). That is a 1.4% shallower chain, it moves no size in this
+file -- every published size still passed at one worker in this pass, and
+#359's cliffs sit a factor of four to ten in task count below their ceilings
+-- and it is the whole price of the change.
+
+### The latency, and the test that holds it
+
+`tests/corun.rs::a_corun_returns_within_fifty_microseconds_of_a_child_on_another_worker`
+is the acceptance's latency case: a two-worker executor, a child the coruning
+worker cannot pop, released by the corun's own first predicate read so that it
+finishes while the frame is already searching, and the sample is the child's
+stamp to the corun's return. 200 rounds a run, the debug profile the suite
+runs under.
+
+Each row is the medians, the smallest minimum and the largest maximum over the
+runs of that pair; `/proc/loadavg` read 0.15 to 0.77 one-minute either side of
+every one of them, the pinned runs under `taskset -c 0,1`.
+
+| loop | runs | median | min | max |
+|---|---|---|---|---|
+| `origin/main`, unpinned | 1 | 110.5 µs | 108.5 µs | 139.4 µs |
+| `origin/main`, pinned to two cores | 3 | 104.9 to 106.2 µs | 104.1 µs | 430.4 µs |
+| this change, unpinned | 3 | 0.24 to 0.31 µs | 0.22 µs | 3.2 µs |
+| this change, pinned to two cores | 3 | 0.27 to 0.36 µs | 0.24 µs | 6.5 µs |
+
+The unfixed loop's median *is* its failed search: a two-worker executor has
+two queues and `bit_width(2) = 2` buffers, so a search is `(4 + 1) * 2 + 150`
+= 160 attempts with 151 `yield_now` calls in it, and 105 µs over 151 yields is
+0.7 µs a yield in the debug profile. The fixed loop's median is two reads of
+an atomic and a steal attempt, and the two do not overlap by a factor of 290.
+The test asserts the **median** against 50 µs --
+half the smallest reading of the loop it guards against, 140x the one it
+guards -- because the slowest of 200 rounds is the box's rather than the
+loop's: one round in a few hundred is a frame descheduled between the stamp
+and its next attempt, 2.7 to 6.5 µs under the fixed loop and up to 430 under
+the unfixed one, and a bound loose enough never to call that a failure would
+be looser than the defect it is looking for.
+
+### What this does not reach
+
+- **The per-task constant.** `skynet` is still 9.4x behind rayon at 24
+  workers and `integrate` 7.9x, and both are the submission path and the
+  allocation a node makes rather than the wait: #382's territory, and #397's.
+- **The million-element `merge_sort` rows**, for the reason above -- there is
+  no wait there to shorten.
+- **The two-worker case.** #407's ablation left it 1.77x slower than one
+  worker on the zero-work `fibonacci`, which is what a stolen child costs when
+  there is no third worker to hand the parent anything else to do; this change
+  is that ablation, and the A/B above does not measure two workers.
+- **The scheduling loop.** `explore_task`'s 211-attempt give-up and its
+  `num_topologies` fast path are untouched and still wanted: they are what let
+  a worker reach the notifier and park, and #373 measured a parked worker as
+  free.
+
+#407 closes with this change; #406's handoff seam and #409's floor question
+are the two issues it was expected to move, and both now read against these
+figures rather than against #400's.

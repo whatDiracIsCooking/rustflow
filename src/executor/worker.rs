@@ -366,13 +366,33 @@ impl WorkerThread {
 
     /// The corun loop: keep running jobs -- this worker's own first, then
     /// anybody's -- until `stop` says that whatever this thread is waiting for has
-    /// happened. Upstream's `_corun_until`. Three things differ from
-    /// [`WorkerThread::run_until`], and all three are upstream's too: one local job
-    /// per round rather than a drain, a job run here being able to corun itself and
-    /// upstream's comment warning of "a very deep recursive corun"; never sleeping,
-    /// a worker parked here being one the run it waits for cannot use; and ignoring
-    /// the `done` flag, a corun being nested inside a task body, so that run is in
-    /// flight and the executor cannot be dropped.
+    /// happened. Upstream's `_corun_until`, including its search:
+    /// [`WorkerThread::steal_until`] is upstream's `explore:` label rather than
+    /// [`WorkerThread::explore_task`], which is what makes `stop` read **after
+    /// every failed steal attempt** and bounds this call's latency at one attempt
+    /// plus whatever job it is running when the predicate turns true.
+    ///
+    /// Three things differ from [`WorkerThread::run_until`], and all three are
+    /// upstream's too: one local job per round rather than a drain, a job run here
+    /// being able to corun itself and upstream's comment warning of "a very deep
+    /// recursive corun"; never sleeping, a worker parked here being one the run it
+    /// waits for cannot use; and ignoring the `done` flag, a corun being nested
+    /// inside a task body, so that run is in flight and the executor cannot be
+    /// dropped.
+    ///
+    /// There was a fourth, and it was the nested shapes' 24-worker regression
+    /// (issues #407 and #412): this loop used to spend a round in `explore_task`,
+    /// whose two exits both belong to the *scheduling* loop. Its give-up after
+    /// `(num_queues() + 1) * 2 + 150` attempts -- 211 at 24 workers, 150 of them
+    /// after a `thread::yield_now`, 137 to 150 µs -- exists so that
+    /// [`WorkerThread::wait_for_task`] can park, and a corun never parks; its
+    /// `num_topologies() == 0` fast path is for a worker with nothing to wait for,
+    /// where a corun is nested inside a running task body. So a parent whose child
+    /// had been stolen could not notice the child finishing until the search it was
+    /// in had failed to the last attempt, and `BENCHMARKS.md`'s "The #407
+    /// measurement" counted that as 94 to 103% of the pool's CPU on
+    /// `fibonacci(15)`. Upstream gives its own search up only when the predicate
+    /// says to, which is what this is.
     pub(crate) fn corun_until(&mut self, mut stop: impl FnMut() -> bool) {
         while !stop() {
             if let Some(job) = self.pop() {
@@ -380,10 +400,67 @@ impl WorkerThread {
                 continue;
             }
 
-            match self.explore_task() {
-                Stolen::Job(job) => self.invoke(job),
-                Stolen::Nothing | Stolen::Shutdown => thread::yield_now(),
+            match self.steal_until(&mut stop) {
+                Some(job) => self.invoke(job),
+                None => return,
             }
+        }
+    }
+
+    /// Steals until something turns up or `stop` says this frame has nothing
+    /// left to wait for: upstream's `explore:` label inside `_corun_until`, and
+    /// the search [`WorkerThread::corun_until`] has instead of
+    /// [`WorkerThread::explore_task`]'s. `None` means the predicate turned true.
+    ///
+    /// **A function of its own, and never inlined, so that its locals are not
+    /// the corun frame's.** The job it finds is run by its caller, after this
+    /// frame is gone, which is where `explore_task`'s caller runs one from too
+    /// -- and a corun frame is a frame per nested level, so a word held across
+    /// the job is a word a level off the nesting bound `TaskGroup::corun`'s docs
+    /// state. `BENCHMARKS.md`'s "The #412 change" measures the three shapes of
+    /// this: as one loop with the invoke inside it, the search cost 32 bytes a
+    /// level on both group routes; as an inlined call, 64; as this, 16, which is
+    /// the `&mut` to `stop` it leaves addressable in the caller.
+    #[inline(never)]
+    fn steal_until(&mut self, stop: &mut impl FnMut() -> bool) -> Option<Job> {
+        let max_victim = self.shared.num_queues();
+        // Upstream's `MAX_STEALS`: the same couple of passes over the queues
+        // `explore_task` yields after -- and all it is used for here, there
+        // being no attempt count this search gives up at.
+        let max_steals = (max_victim + 1) * 2;
+
+        let mut num_steals = 0;
+        let mut victim = self.sticky_victim;
+
+        loop {
+            if let Some(job) = self.steal_from(victim) {
+                // The queue that answered is where the next search starts, as
+                // it is in `explore_task`.
+                self.sticky_victim = victim;
+                return Some(job);
+            }
+
+            // The whole of the difference from `explore_task`: a failed attempt
+            // is followed by a read of the predicate, and nothing else ends
+            // this search.
+            if stop() {
+                return None;
+            }
+
+            num_steals += 1;
+            if num_steals > max_steals {
+                // Past `MAX_STEALS` upstream yields on every attempt and keeps
+                // stealing. The notifier is not the cheaper place to wait here,
+                // as it is for the scheduling loop: the run this frame waits
+                // for may be the one that would have had to wake it.
+                thread::yield_now();
+            }
+
+            // Empty: draw a new victim, never ourselves, as `explore_task`
+            // draws one.
+            let draw = usize::try_from(self.rng.next_u32())
+                .expect("a u32 fits in a usize on any target this crate supports");
+            victim = victim_excluding(draw, self.id, max_victim);
         }
     }
 

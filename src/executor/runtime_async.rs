@@ -854,12 +854,16 @@ mod tests {
     /// `Executor::run`, and a parented child does not raise it either, which
     /// is #115's rule.
     ///
-    /// **The flip side, for whoever adds a case here:** that same fast path
-    /// is why a hand-driven case must not call [`Runtime::corun`] with a
-    /// child outstanding. The corun loop would find nothing to steal, yield,
-    /// and go round again for ever -- a hang rather than a failure. Drive the
-    /// children with this instead, and leave the corun cases to
-    /// `tests/runtimes.rs`, where a real run holds the count above zero.
+    /// **The flip side, for whoever adds a case here:** a hand-driven case
+    /// must not call [`Runtime::corun`] with a child outstanding. The queue
+    /// above is the reason -- a corun loop pops the *real* worker 0's queue
+    /// and steals from the shared buffers, and a hand-driven submission went
+    /// to neither -- so the loop would search for ever: a hang rather than a
+    /// failure. The fast path above is no help there and no longer exists on
+    /// that path anyway, a corun's search being upstream's since #412, which
+    /// ends only when its predicate turns true. Drive the children with this
+    /// instead, and leave the corun cases to `tests/runtimes.rs`, where a
+    /// real run holds the count above zero.
     fn take_child_job(worker: &WorkerThread) -> Job {
         worker
             .pop()
