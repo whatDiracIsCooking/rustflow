@@ -213,7 +213,9 @@ Every line upstream shows is checked with `assert!` or `assert_eq!`, so a
 non-zero exit is the test, `devtools/run-examples.sh` runs every
 `examples/*.rs` that way, and the `examples` job of
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs that script on
-every PR.
+every PR -- followed, in the same job, by every benchmark id once in
+criterion's untimed `--test` mode, so the job holds both directories to "does
+it still run".
 
 By family: the static graph has `simple`, `run` and `visualization`; control
 flow has `condition`, `if_else`, `nested_if_else`, `multi_condition`,
@@ -239,7 +241,8 @@ alone, for the reason under "What is not ported".
   sit beside that gate without being part of it, all reports that exit 0
   whatever they find: `devtools/doc-ratio.sh`, `devtools/test-names.sh`,
   `devtools/coverage.sh` and `devtools/api-witness.py`. What decides a pass
-  is the gate plus `devtools/run-examples.sh`.
+  is the gate plus what CI's `examples` job runs: `devtools/run-examples.sh`
+  and the benchmarks' untimed smoke run.
 - **Two runtime dependencies**, `crossbeam-deque` and `crossbeam-utils`, and
   nothing else in the default build. "Dependency policy", below, is the rule
   that keeps it there.
@@ -263,6 +266,15 @@ alone, for the reason under "What is not ported".
   decision, and `TfProfObserver` is what is kept.
 - The serializer and the rest of upstream's `utility/` directory that `std`
   already covers.
+- Three of upstream's twenty-five benchmarks, where what they measure has no
+  counterpart here: `hetero_traversal`, which is the CUDA one; `mnist`, which
+  wants a dataset downloaded from Kaggle and an Eigen DNN out of
+  `3rd-party/`; and `thread_pool`, which compares `tf::Executor` against a
+  hand-rolled C++ thread-pool singleton over a shape
+  `embarrassing_parallelism` already covers.
+  [`BENCHMARKS.md`](BENCHMARKS.md)'s header and
+  [`DESIGN.md`](DESIGN.md)'s "Benchmarks and performance" have the reasons in
+  full; the other twenty-two are ported.
 
 Where the port's API differs from upstream's in shape rather than in
 coverage, [`DESIGN.md`](DESIGN.md) has one entry per decision, grouped by
@@ -276,26 +288,53 @@ what became of each item.
 ## Performance
 
 Every measured number this port has is in [`BENCHMARKS.md`](BENCHMARKS.md):
-upstream's benchmarks ported to criterion with a rayon baseline in the role
-TBB plays upstream, the machine and load each ran under, and the
-per-decision measurements behind [`DESIGN.md`](DESIGN.md). One result there
-is bad and tracked rather than filed away: a graph submitted from outside
-the pool reaches it only by stealing, so a graph of nothing but independent
-sources runs several times slower than rayon on the same box. The
-continuation optimisation that halved a chain's cost is also measured there.
-[`docs/porting.md`](docs/porting.md) has the summary of both. Benchmarks are
-deliberately outside the gate, since "how fast" is not a pass or a fail; what
-CI holds the suite to is that it still compiles and still runs, the
-`examples` job executing every benchmark id once, untimed, in criterion's
-`--test` mode.
+**twenty-two of upstream's twenty-five benchmarks**, ported to criterion with
+a rayon baseline in the role TBB plays upstream, 196 ids in all, each table
+beside the machine and the load it ran under, plus the per-decision
+measurements behind [`DESIGN.md`](DESIGN.md). Thirteen of the shapes are the
+benchmarks milestone's own -- `for_each`, `reduce_sum`, `scan`, `primes`,
+`mandelbrot`, `matrix_multiplication`, `black_scholes`, `wavefront`,
+`graph_pipeline`, `skynet`, `nqueens`, `merge_sort` and `integrate`, with
+upstream's `data_pipeline` shape joining the per-line slot measurement in one
+file -- and four of those are nested recursions whose published sizes are
+bounded by **the worker's stack rather than the clock**, a ceiling
+`TaskGroup::corun` and `Runtime::corun` each name where a caller writes the
+wait. Three benchmarks are declined, listed under "What is not ported" above.
+
+Two more of the milestone's measurements overturned what this repo had
+assumed, which is the use a measurement is for. "The #342 decision" counted the
+preempted-parent re-queue the port declines to optimise and found the suite
+performs it twelve times in all, every one of them in `pipeline` and none in
+any nested shape, so no size and no gap here turns on it. "The #343
+attribution" took the `for_each` gap apart and found the per-chunk cost to be
+15 ns and 1.3% of the run, this port's chunk loop rayon's equal, and what is
+left a fan-out that reaches only 15 to 19 of 24 workers -- which is the open
+lead, filed as an issue of its own rather than answered there. One older
+result is bad and tracked rather than filed away: a graph submitted from
+outside the pool reaches it only by stealing, so a graph of nothing but
+independent sources runs several times slower than rayon on the same box. The
+continuation optimisation that halved a chain's cost is measured there too,
+and [`docs/porting.md`](docs/porting.md) has the summary of both.
+
+Benchmarks are deliberately outside the gate, since "how fast" is not a pass
+or a fail; what CI holds the suite to is that it still compiles and still
+runs, the `examples` job executing every benchmark id once, untimed, in
+criterion's `--test` mode.
 
 ## Porting notes
 
 [`docs/porting.md`](docs/porting.md) is the record of how the port was
-built: the seven steps and three consolidation milestones it ran as, what
-each covers and what it left out, and where the two `unsafe` modules came
-from. The three rules below are the ones a contributor needs before touching
-anything.
+built: the seven steps, and the two consolidations and the parity pass that
+punctuate them, what each covers and what it left out, and where the two
+`unsafe` modules came from. A **benchmarks and performance** milestone ran
+after all of those, taking the suite from eight of upstream's shapes to
+twenty-two, taking three measurements that each corrected something this repo
+had asserted, and finding 24 of its 196 ids timing their own input setup. Its
+tables are in [`BENCHMARKS.md`](BENCHMARKS.md), and the decisions it took
+about the suite itself are in [`DESIGN.md`](DESIGN.md)'s "Benchmarks and
+performance" section -- the two it took about the scheduler being filed under
+the part of the port they decide, as every entry there is. The three rules
+below are the ones a contributor needs before touching anything.
 
 ### Upstream pin
 

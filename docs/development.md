@@ -89,14 +89,29 @@ or in CI builds the image, so that rebuild is the check that a `Dockerfile`
 edit works, and a container that predates a pin simply lacks the tool (the
 coverage script says so and names this command).
 
-Two more reports need nothing from the image, being POSIX `sh`, and both
+Three more instruments need nothing from the image. Two are POSIX `sh` and
 measure the documentation contract in [`DESIGN.md`](../DESIGN.md) rather than
 the code: `devtools/doc-ratio.sh` prints, per production file, how many of its
 lines are prose, doc example, `# Design` rationale and code, with the ratio of
 the first to the last, and `devtools/test-names.sh` snapshots and compares the
 set of test names, which is how a documentation pass shows it renamed no test.
-Like the two above they are reports: each exits 0 whatever it finds, and no CI
-job reads either.
+The third is Python 3 with nothing outside its standard library:
+`devtools/api-witness.py` counts the public declarations in `src/` that no
+test, example, benchmark or doc example witnesses, reading each call site
+against the type it reaches rather than against a bare function name.
+
+**Which of these decide anything: none of them.** All four of
+`devtools/doc-ratio.sh`, `devtools/test-names.sh`, `devtools/coverage.sh` and
+`devtools/api-witness.py` are **reports** — each exits 0 whatever it finds, no
+CI job reads any of them, and a number from one is something a reviewer reads
+rather than something that passes or fails. `test-names.sh diff` and
+`coverage.sh` exit non-zero only on a difference the PR running them asked
+about or a measurement that could not run at all; `api-witness.py` exits 2 for
+the same second reason. `cargo mutants` is in the same class, run by hand over
+a module at a time. What **gates** is the five-command `check` above, plus the
+two things CI's `examples` job runs: `devtools/run-examples.sh`, and every
+benchmark id once in criterion's untimed `--test` mode, which asks whether the
+suite still runs and deliberately times nothing.
 
 ### Credentials
 
