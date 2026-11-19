@@ -123,6 +123,50 @@ RUN set -eu \
 # Bump CLAUDE_CODE_VERSION and rebuild instead.
 ENV DISABLE_AUTOUPDATER=1
 
+# --- What the upstream C++ comparison needs ---------------------------------
+# `devtools/upstream-bench.sh` builds Taskflow v4.1.0's own benchmark binaries
+# from a clone outside this repo, so that BENCHMARKS.md's `upstream C++` column
+# can be filled by upstream's executor on this box rather than left empty. That
+# needs a C++ toolchain the Rust image has no other use for:
+#
+#   g++   the base image carries `gcc` but no C++ compiler at all, and upstream
+#         is header-only C++20.
+#   cmake upstream is built through CMake, 3.18 or newer by its own
+#         `cmake_minimum_required`.
+#   make  needed TWICE over, which is why it is spelled out rather than left to
+#         chance: cmake's default generator is Unix Makefiles, and upstream's
+#         `benchmarks/CMakeLists.txt` shells out to `make` at CONFIGURE time to
+#         build the TBB 2020.3 it vendors under `3rd-party/tbb` (every
+#         benchmark target links it, ours included). Debian only *recommends*
+#         make for cmake, and this file installs with --no-install-recommends.
+#
+# NOT version-pinned, unlike CARGO_DENY_VERSION and friends above, because
+# bookworm's archive is itself the pin: a Debian release serves one g++ and one
+# cmake for its life, so RUST_VERSION's `-bookworm` suffix already fixes these
+# as firmly as an ARG would. As built today that is g++ 12.2.0 and cmake
+# 3.25.1; `upstream-bench.sh` prints both, so a run that disagrees with this
+# line says the base image moved.
+#
+# Placed LAST on purpose, after the cargo installs rather than in the toolchain
+# layer at the top. Two reasons:
+#
+#   * The layer at the top is mirrored verbatim by .github/workflows/ci.yml.
+#     Adding a C++ toolchain there would cost every PR an apt install of
+#     something no CI job runs -- CI runs cargo, and the upstream comparison is
+#     a measurement taken by hand on one box.
+#   * Everything above this line is expensive to rebuild (three
+#     `cargo install`s from source). Appending here leaves all of it cached,
+#     so adding these three packages is a rebuild of seconds rather than
+#     minutes.
+#
+# As with the coverage tooling above, nothing in the gate or in CI builds this
+# image, so the only check that this layer works is a host-side
+# `devtools/devcontainer.sh rebuild`; `upstream-bench.sh` names that command
+# when it finds any of the three missing.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        g++ cmake make \
+    && rm -rf /var/lib/apt/lists/*
+
 # Pin HOME rather than inherit whatever /etc/passwd says for the runtime uid.
 # Two reasons, and the second is the load-bearing one:
 #
