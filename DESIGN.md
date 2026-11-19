@@ -718,6 +718,60 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   reopen the question is a benchmark shape that leaves parents preempted,
   rather than a quieter box.
 
+- **A fan-out stays `w - 1` individual pushes and `w - 1` pokes, because the
+  wake-ups were never the ceiling** (issue #367). A `for_each_by_index` at `w`
+  workers reaches 13 to 23 of 24 on this box rather than all of them, and #343
+  left the cause open between two candidates: the notifier losing wake-ups, or
+  the steal side. Counters settle it. Over twelve runs of the published shape
+  the submission issues 24 `notify_one` calls, which produce 24 or 25 `unpark`
+  calls and 23 to 25 returned parks -- the whole pool wakes, one worker per
+  push, with at most one poke per run spent on an empty notifier -- and a
+  counter summing every worker deque and every buffer at the moment each park
+  is committed reads **zero** parks taken while a job was queued anywhere. So
+  no notification is lost, none is owed, and the two-phase guard in
+  `wait_for_task` is doing its job. What is left is that the `w - 1` tasks all
+  go onto the submitting worker's single deque at about 2 µs each, so each is
+  taken by whichever already-awake thief wins the race for that one queue: a
+  winner's `sticky_victim` costs it 6 to 100 steal attempts, a loser draws at
+  random over `num_queues() == 29` and spends 150 to 285 before parking again.
+
+  **The candidate that was measured and declined is #378's**, a bulk push with
+  one `notify_n(w - 1)` in place of the per-task `notify_one`. It was
+  implemented behind a switch, counted, and reverted: the push loop costs the
+  same 45-60 µs for 23 tasks either way, because what it is made of is the
+  node, the two boxed closures and the deque push rather than the `unpark`;
+  the distinct-worker count stays inside the unbatched path's own run-to-run
+  range at 20, 100 and 500 µs bodies; and on the longest bodies two runs of
+  three recorded a submission stall of 0.8 to 1.1 ms, the burst of 23 unparks
+  from one call making 23 threads runnable at once on a 24-thread box and
+  costing the submitter its own core. The spill buffers are not implicated
+  either: an external bulk submission -- one `push_bulk` of 24, one
+  `notify_n(24)`, under a microsecond for the whole fan-out -- reaches the same
+  count as the worker path's 50 µs of drip-feeding, so dealing the work over
+  five queues instead of one changes nothing.
+
+  Upstream is identical here, which is why this is a shape of the design and
+  not a port gap: at the pin `Executor::_schedule(Worker&, Node*)` is one
+  `try_push` plus one `notify_one`, `_schedule_async_task` routes a worker's
+  `silent_async` straight into it, and `for_each.hpp` dispatches
+  `(++w == W) ? task() : rt.silent_async(task)`. Upstream's own bulk overload
+  exists and is spent on released successors and graph sources, never on a
+  runtime fan-out, and the commented-out experiment inside it records that
+  notifying earlier bought nothing. rayon reaches more workers on the same
+  shape for a different reason: its fan-out is a tree, `join_context` pushing
+  the right half onto the stealing worker's own deque and `Splitter::try_split`
+  resetting the split budget to the thread count whenever the job it splits was
+  stolen, so a late thief has many non-empty deques to find instead of one.
+  `SplittingPartitioner` (#374) is that mechanism ported, and the measurement
+  shows it reaching more workers on a cold pool at three to four times the
+  dispatch cost -- a trade #381 owns, not this entry. The counters, the
+  partitioner sweep, the worker-count sweep and the background-spinner control
+  are in [`BENCHMARKS.md`](BENCHMARKS.md) under "The #367 measurement"; what
+  would reopen the question is a box with more hardware threads than the pool
+  has workers, which would separate the arrival race from the machine's own
+  width -- at 24 workers on 24 threads they are confounded, and at every width
+  up to 20 the fan-out reaches every worker it has.
+
 ## Control flow and cancellation
 
 - **A failure inside a nested graph is delivered to whoever is waiting for
