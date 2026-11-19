@@ -51,10 +51,11 @@
 //! to 4% of it the counters below. `BENCHMARKS.md` has the ablations and what
 //! a block cost; `DESIGN.md` has why the node is two blocks and not one. The
 //! node's own block is recycled rather than freed when the worker that
-//! finished the task holds the last share of it, so a submission that names a
-//! worker writes into a block that worker parked whenever it has one --
-//! [`FreeNodes`], and `DESIGN.md` for why that list is one per worker and
-//! what it deliberately does not pool.
+//! finished the task holds the last share of it and a submission has drawn
+//! from its list before, so a submission that names a worker writes into a
+//! block that worker parked whenever it has one -- [`FreeNodes`], and
+//! `DESIGN.md` for why that list is one per worker, what it deliberately
+//! does not pool and what the draw condition is worth.
 
 use core::fmt;
 use std::any::Any;
