@@ -98,6 +98,33 @@
 //! `n` and `w`, asks this one for one call per share instead, since the
 //! balance it offers comes from re-splitting rather than from small chunks.
 //!
+//! **The default floor of one index is this type's most expensive setting,
+//! and it stays.** `BENCHMARKS.md`'s splitting measurement runs a
+//! `for_each_by_index` over a million indices at 24 workers, body one `tan`
+//! an index, at three floors:
+//!
+//! | floor | chunk tasks | distinct workers | wall |
+//! |---|---|---|---|
+//! | one index -- [`SplittingPartitioner::default()`] | 121-157 | 21-24 / 24 | 1.90-2.86 ms |
+//! | 4096 | 88-94 | 22-23 / 24 | 1.03-1.28 ms |
+//! | 65536 | 25 | 22 / 24 | 0.72-0.85 ms |
+//!
+//! The distinct-worker count -- the property this type exists for -- is flat
+//! across all three, so on that shape the default costs 2.5 to 3.5x and buys
+//! none of it. The floor sweep that followed, which moves the floor alone
+//! where those two rows move the chunk walk with it, is why it stays anyway:
+//! a floor worked out from `n` and `w` lands anywhere from 1.35x to 1.75x of
+//! the guided default against 2.0x to 2.5x for this one, but so does a floor
+//! high enough to split nothing, and no derived floor separates from another
+//! or from that control. What the sweep does separate is the *uncapped* chain
+//! a floor of one allows, at 9 to 13 µs of wall a split -- and that cost is
+//! the join a split opens rather than the split, which the same file bounds
+//! at 1 to 2 µs once the far half is joined by its own node. So raising the
+//! floor would tune a shipped default against a cost another change removes,
+//! while giving up what the depth buys: a worker arriving late to a share
+//! that was already stolen. A caller who wants the cheaper setting asks for
+//! it with [`SplittingPartitioner::new`].
+//!
 //! **It implements neither [`StaticLoop`] nor [`DynamicLoop`].** Both
 //! describe a walk a worker performs alone, over a `curr_b` or a shared
 //! cursor; a splitting walk is neither, because it needs a handle on the
@@ -809,8 +836,8 @@ fn draw_in_range(rng: &mut Xorshift64, lo: usize, hi: usize) -> usize {
 /// No upstream counterpart: the four partitioners above are
 /// `taskflow/algorithm/partitioner.hpp`'s, and this one is the port's own.
 /// The module's `# Design` section has the fan-out measurement it answers,
-/// why a share's home is a [`std::thread::ThreadId`], and why the chunk size
-/// is read as a splitting floor.
+/// why a share's home is a [`std::thread::ThreadId`], why the chunk size is
+/// read as a splitting floor, and what the default floor of one costs.
 ///
 /// ```
 /// use std::sync::atomic::{AtomicUsize, Ordering};
@@ -844,6 +871,8 @@ pub struct SplittingPartitioner<C: ClosureWrapper = DefaultClosureWrapper> {
     closure_wrapper: C,
 }
 
+/// A floor of one index and one chunk-body call per share. The module's
+/// `# Design` section has what that costs and why it is the default anyway.
 impl<C: ClosureWrapper + Default> Default for SplittingPartitioner<C> {
     fn default() -> Self {
         Self {

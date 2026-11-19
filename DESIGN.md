@@ -1888,9 +1888,27 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   the waiting worker searches instead and the whole of the splitting default's
   extra CPU is that search. `BENCHMARKS.md`'s "The #400 attribution" has the
   counters, the four candidates it dismisses and the two issues it filed; no
-  code changed for it, so the figures in this entry stand. The floor of 1 that
-  `default()` sets is the type's worst setting on every shape measured, which
-  is #401's to decide.
+  code changed for it, so the figures in this entry stand.
+
+  **The floor of 1 that `default()` sets is the type's worst setting on every
+  shape measured, and it stays** (issue #401). A sweep that holds the chunk
+  walk at one body call a share and moves only the floor -- which #381's 4096
+  and 65536 rows do not, both numbers being the floor and the walk at once --
+  finds one separation in it: the *uncapped* chain a floor of 1 allows costs
+  9 to 13 µs of wall a split over the same partitioner with its splits off, in
+  three passes, while every floor from `n / (2w)` to `n / (16w)` lands in one
+  band that separates neither from its neighbours nor from splitting nothing,
+  and no floor that splits comes within 1.5x of the guided default. So there
+  is no derived floor the figures pick, and the 9 to 13 µs is the join #400
+  attributed and #406 removes, which bounds a split at 1 to 2 µs instead. A
+  raise today would tune a shipped default against a cost another change
+  takes away and give up the depth of the chain, which is what lets a worker
+  arriving late to an already-stolen share take anything; a caller who wants
+  the cheap setting asks `new(k)` for it. What #401 changed is the price's
+  visibility: `src/algorithm/partitioner.rs`'s `# Design` section now carries
+  the three floors and what the default costs, and #409 re-takes the sweep
+  once #406 lands. The figures are in [`BENCHMARKS.md`](BENCHMARKS.md) under
+  "The #401 decision".
 
 - **`sort_by` keeps upstream's live partition, and the sort's own figures do
   not show it** (issues #375, #381). The pinned header defines two sort cores

@@ -43,12 +43,12 @@ criterion ids, which `cargo bench --all-features -- --list` counts.
   measures is a comparison between two C++ libraries rather than a shape of
   the executor.
 
-**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 47
+**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 48
 headings, and they are three kinds: the three method sections that follow this
 preamble, "The machine" through "The upstream C++ column is empty"; 21 shape
 sections carrying the 22 shapes, since `async_task` and `fibonacci` share "The
 two shapes #96 added", which measured the two together in a run of their own;
-and 23 per-decision measurement sections, each named for the issue that took
+and 24 per-decision measurement sections, each named for the issue that took
 it. A shape's section is its table, its sizes and its departures from
 upstream. A measurement section is one question, with the machine, the load
 and the method of its own run in it, and it ends either in a change that
@@ -6132,8 +6132,14 @@ And the same sweep at `n = 1000`, where the whole job is 10 to 12 µs of work:
   at 21 to 24 across all three: the floor buys nothing the type exists for and
   costs 2.5 to 3.5x. `SplittingPartitioner` is the port's own, so unlike
   `GuidedPartitioner`'s floor of 1 -- upstream's, which #343 declined to
-  change for that reason -- this default is ours to pick, and **#401** is that
-  decision with its figures.
+  change for that reason -- this default is ours to pick, and **#401** was
+  that decision with its figures. **It has since been taken, and the floor
+  stays**: "The #401 decision" at the end of this file swept the floor alone
+  -- holding the chunk walk at one body call a share, which the 4096 and 65536
+  rows above do not -- and found the band from `n / (2w)` to `n / (16w)`
+  separating neither from its neighbours nor from a floor that splits nothing,
+  with no splitting floor inside 1.5x of the guided default. The three rows
+  above are now in the type's own docs as the price of the default.
 - **The cold-pool advantage #367 read off run 0 does not reproduce here.**
   That section's partitioner table has guided at 13 of 24 on the first fan-out
   an executor ever ran against the splitting rows' 16 to 19, and called the
@@ -6257,9 +6263,10 @@ places.
 - **The three leads are filed.** #399 (the `&cmp` call shape, 1.7x on a
   one-worker sort), #400 (what 13 µs a re-split is made of), #401
   (`SplittingPartitioner::default()`'s floor). Each names a bar and none of
-  them is this section's to take. Two of them have since been taken: "The
-  #399 change" and "The #400 attribution" below are their sections, and the
-  second of those filed two of its own, #406 and #407.
+  them is this section's to take. All three have since been taken: "The #399
+  change", "The #400 attribution" and "The #401 decision" below are their
+  sections, and between them they filed three of their own -- #406 and #407
+  from the second, #409 from the third.
 
 **What this does not say.** It does not say `SplittingPartitioner` is useless:
 a box wider than its pool, a body longer than the arrival spread, or a cursor
@@ -6774,6 +6781,15 @@ to the 1 to 2 µs the four candidates bound, which would leave the floor
 costing almost nothing -- so a floor chosen against today's join is a floor
 chosen against a cost that the join is, and not against the splitting scheme.
 
+**"The #401 decision" below has since taken it, and it refines the first of
+those two numbers**: swept floor by floor with the chunk walk held fixed, the
+cost is not linear in splits. A chain capped at four levels by a floor of
+`n / (16w)` runs 73 to 85 splits for between 0.4 and 9.0 µs of wall each,
+where the uncapped chain this section counted runs 98 to 130 for 9 to 13 --
+so what the floor of one buys is depth rather than splits, and depth is what
+nests one corun's wait inside another's. The floor stays at one all the same,
+for the second number's reason.
+
 ### The decision: nothing ships here, and the join is two issues of its own
 
 The issue's own gate for a change was that the counters name one of its four
@@ -6810,3 +6826,204 @@ cost cannot come off *here* stated rather than asserted.
   families hand it out through a shared cursor, which nothing does. That is
   the structural reason the guided default is cheap at 24 workers and not an
   accident of its tuning.
+
+## The #401 decision: the floor stays at one index, and only an uncapped chain separates
+
+**`SplittingPartitioner::default()`'s floor of one index is the type's most
+expensive setting, and it stays.** A sweep that holds the chunk walk fixed and
+moves only the splitting floor finds exactly one separation in it: an
+*uncapped* chain of re-splits costs 9 to 13 µs of wall a split over the same
+partitioner with its splits turned off, in all three passes, while every
+bounded floor from `n / (2w)` to `n / (16w)` lands in one band that separates
+neither from its neighbours nor from not splitting at all. So nothing in the
+band is a floor to prefer on a figure, no floor that splits reaches the 1.5x
+of the guided default the issue asked for -- the closest row is the
+*non-splitting* control at 1.22 to 1.48x -- and the one property this type
+exists for reads at or above its own process's guided control in every pass
+only at the floor of one. What the saving would buy is the depth of the chain,
+which is permanent; what it would save is the join "The #400 attribution"
+above measured and **#406** owns, which is not.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| harness | #381's observer harness, not criterion: six runs a row, the pool confirmed fully parked (`Executor::num_waiters() == 24`) before each window, a fresh executor per row |
+| Date | 2026-11-19 |
+| **Load average** | **0.85 1.01 1.38 either side of pass 1, 0.24 0.71 1.22 either side of pass 2, 0.33 0.54 1.08 either side of pass 3** |
+
+The box was this run's alone: no sibling agent, no other `cargo`, and
+`/proc/loadavg`'s runnable-task field read 1 at every reading either side of
+all three passes. A figure below is **one** run of one row, quoted as the range
+over that row's six runs with that row's median beside it where a ratio is
+taken -- the convention #381's part 2 set for this harness. There is no
+best-of-anything here: the second pass is the first pass's row order reversed
+and is reported in full beside it, not instead of it.
+
+### Method: one process a pass, and the control is in it
+
+The harness is a rebuild of #381's -- a `for_each_by_index` over a million
+`AtomicU64` cells, each replaced by its own tangent, under a #343-shaped
+observer counting which worker enters each dispatched chunk task, with an
+untimed check of all million cells against a sequential `f64::tan` after every
+run, which every run of every row below passed. The graph is built outside the
+clock and only `Executor::run(..).wait()` is timed.
+
+**Its guided control reads 1.09-1.66 ms where #381's read 0.48-0.63 and
+#400's 0.79-0.96, so no row here is read against those.** It is a rebuilt
+harness on a box three passes of its own disagree by up to 1.4x about, which
+is the drift "The #400 attribution" names, and the answer is the same one:
+every row is read only against the control rows measured in the same process,
+and the pass's own order is reversed to check that the order is not the
+finding.
+
+What the sweep adds to #381's three rows is that it moves the floor **alone**.
+A `SplittingPartitioner::new(k)` sets the splitting floor and the chunk walk
+together -- `k` is both the size below which a share stops halving and the
+number of indices one chunk-body call covers -- so #381's 4096 and 65536 rows
+changed two things at once, and the `n <= chunk_size` early-out is a third. The
+sweep instead keeps `chunk_size` at `0`, one body call a share as `default()`
+has it, and derives the floor from `n` and `w` the way the ported four derive
+their chunk size: a temporary `n / (div * w)` in
+`SplittingPartitioner::split_floor`, selected per row inside one process. With
+`div` at zero that expression is today's floor of one index, which is the row
+labelled so; the knob adds one relaxed load per dispatch to the shipped path
+and nothing else, and pass 3 below is the shipped tree without it.
+
+Since each initial share is `n / w` of the range, a floor of `n / (div * w)`
+bounds the chain at `log2(div)` levels: `n / (2w)` splits a stolen share once
+and its halves never again, `n / (16w)` allows four levels, and today's floor
+of one allows fifteen, of which #400's depth histogram found five to eleven
+occupied.
+
+### The sweep: seven rows, two orders, and one separation
+
+Pass 1 runs the rows top to bottom, pass 2 bottom to top, in two processes of
+the same binary. "Tasks" counts the observer's chunk-task entries, which for a
+splitting row counts the re-splits; the inline share is no task and is not in
+it.
+
+| row | floor | tasks | distinct workers | wall, pass 1 | wall, pass 2 |
+|---|---|---|---|---|---|
+| guided, floor 1 (`DefaultPartitioner`) | 1 | 23 | 21-23 / 19-20 | 1.09-1.66 ms | 1.17-1.49 ms |
+| **splitting, floor 1 (`default()`)** | 1 | **115-141 / 116-149** | **23-24 / 19-24** | **2.06-2.96 ms** | **2.34-4.82 ms** |
+| splitting, `n / (2w)` | 20833 | 45-46 | 17-19 / 17-20 | 1.55-1.97 ms | 1.63-2.04 ms |
+| splitting, `n / (4w)` | 10416 | 65-69 | 20-21 / 18-20 | 1.62-1.99 ms | 1.76-2.00 ms |
+| splitting, `n / (8w)` | 5208 | 80-88 / 78-89 | 17-19 / 17-22 | 1.46-2.18 ms | 1.85-2.26 ms |
+| splitting, `n / (16w)` | 2604 | 83-102 / 94-108 | 18-21 / 22-24 | 1.85-2.83 ms | 1.62-1.96 ms |
+| splitting, 262144 -- above `n / w`, so nothing splits | 262144 | 23 | 22 / 14-18 | 1.21-1.70 ms | 1.53-1.85 ms |
+
+The same rows as medians, and as a ratio against the guided control measured
+in the same process, which is the only comparison this harness supports:
+
+| row | pass 1 median | ÷ guided | pass 2 median | ÷ guided |
+|---|---|---|---|---|
+| guided, floor 1 | 1.27 ms | 1.00x | 1.22 ms | 1.00x |
+| **splitting, floor 1** | **2.53 ms** | **1.99x** | **3.04 ms** | **2.48x** |
+| splitting, `n / (2w)` | 1.72 ms | 1.35x | 1.95 ms | 1.59x |
+| splitting, `n / (4w)` | 1.73 ms | 1.36x | 1.93 ms | 1.58x |
+| splitting, `n / (8w)` | 1.97 ms | 1.55x | 1.95 ms | 1.59x |
+| splitting, `n / (16w)` | 2.22 ms | 1.75x | 1.84 ms | 1.50x |
+| splitting, nothing splits | 1.55 ms | 1.22x | 1.81 ms | 1.48x |
+
+Four readings, in the order they decide the question.
+
+- **Only the uncapped chain separates, and it separates in both orders.** The
+  floor-1 row is the slowest of the seven in pass 1 and in pass 2, by 0.3 to
+  1.2 ms of median over the next row and 2.0x and 2.5x over its own process's
+  guided control. Against the non-splitting control of its own process that
+  is 9.0 µs and 12.6 µs of wall a split -- `(2.53 − 1.55) / 108` and
+  `(3.04 − 1.81) / 98` -- which is the 8 to 23 µs "The #400 attribution"
+  priced the join at, reproduced from the floor's side.
+- **The bounded floors are one band and the band resolves nothing.** Capping
+  the chain at one level or at four costs the same: 1.72, 1.73, 1.97 and
+  2.22 ms in pass 1 against 1.95, 1.93, 1.95 and 1.84 in pass 2, with each
+  row's own six runs spanning 0.4 to 1.0 ms. `n / (16w)` is the worst derived
+  row of pass 1 and the best of pass 2, which is the whole of what the band
+  says about which of them to prefer. Nor does the band separate from the
+  non-splitting control (1.55 and 1.81 ms): the gap is 0.03 to 0.67 ms, inside
+  the rows' own spreads either way. **So the cost is not linear in splits** --
+  73 splits at `n / (16w)` cost 0.4 µs each in pass 2 and 9.0 in pass 1, where
+  the floor-1 row's 98 to 108 cost 9 to 13 in every pass -- and what the
+  uncapped chain adds is not splits but *depth*: a parent's join contains its
+  children's, so the fifteen levels a floor of one allows is a nest of waits
+  where four levels is not.
+- **No floor that splits comes within 1.5x of the guided default.** The
+  derived band reads 1.35x to 1.75x of its own control in pass 1 and 1.50x to
+  1.59x in pass 2, and the closest row of the seven is the one that splits
+  *nothing*, at 1.22x and 1.48x. That last figure is the ceiling on what any
+  floor can recover: a splitting dispatch with its splits off is still 1.2 to
+  1.5x the guided cursor, because it hands each task `n / w` of the range
+  outright where the cursor hands out what is left, which is the mechanism
+  #381's counters named.
+- **The distinct-worker count does not survive the order reversal, and the
+  floor of one is the only row it ever favours.** The non-splitting control
+  reads 22 of 24 in pass 1 and 14 to 18 in pass 2; `n / (16w)` reads 18-21 and
+  then 22-24. A row moving by 8 of 24 between two passes of the same binary is
+  a count this harness cannot discriminate floors with, and that is the
+  reading, not a tie-break. What is consistent across all three passes is only
+  this: the floor-1 row reads 19 to 24 in every pass, at or above its own
+  process's guided control each time, and is the only row of the seven that
+  ever reaches 24 of 24.
+
+### Pass 3: the shipped tree, without the knob
+
+The same harness built against the tree as it ships -- no `split_floor` knob,
+`default()` and `new(262144)` reached through the public API -- three rows, six
+runs each, one process:
+
+| row | tasks | distinct workers | wall | median | ÷ guided | CPU |
+|---|---|---|---|---|---|---|
+| guided, floor 1 | 23 | 20-21 / 24 | 1.09-1.53 ms | 1.27 ms | 1.00x | 25.6-29.2 ms |
+| **splitting, floor 1 (`default()`)** | **99-155** | **22-24 / 24** | **1.76-4.08 ms** | **2.85 ms** | **2.25x** | 34.0-84.7 ms |
+| splitting, 262144 (nothing splits) | 23 | 20-21 / 24 | 1.48-1.76 ms | 1.67 ms | 1.32x | 26.3-32.8 ms |
+
+It reproduces pass 1 and pass 2 on all three rows -- 2.25x the guided control
+against 1.99x and 2.48x, 1.32x for the non-splitting row against 1.22x and
+1.48x, and 10.2 µs of wall a split against 9.0 and 12.6 -- so the sweep's knob
+was free and the figures above are figures about the shipped default.
+
+### The decision: the documented floor of one stays, with its price in its docs
+
+The issue's own acceptance was one of two outcomes, and the figures pick the
+second: no floor the sweep measured reads within 1.5x of the guided default
+without also giving up the splitting, so **`SplittingPartitioner::default()`
+keeps its floor of one index and `src/algorithm/partitioner.rs`'s `# Design`
+section now carries #381's three rows and what they cost.** Nothing in `src/`
+changes.
+
+- **The band offers no floor to prefer.** A default has to be one number.
+  `n / (2w)` and `n / (16w)` are 1.35x and 1.75x of the control in one pass
+  and 1.59x and 1.50x in the other, in opposite orders; picking either would
+  be picking inside a spread, which is the one thing this file's own rule
+  forbids.
+- **What the raise would save is the join, and the join is #406's.** The
+  separation the sweep does find -- 9 to 13 µs a split for an uncapped chain
+  -- is the wait "The #400 attribution" attributed in full, and that section
+  bounded the per-split cost at the 1 to 2 µs its four candidates account for
+  once the far half is joined by its own node instead of a `Runtime::scope`.
+  A floor raised today is therefore tuned against a cost that change removes,
+  and a shipped default is harder to move back than a floor is to raise.
+- **What the raise would cost is permanent.** A floor of `n / (2w)` is one
+  re-split a share and no more, which is the mitigation "The #400
+  attribution" called a mitigation and not a fix for exactly this reason: a
+  worker arriving late to an already-stolen share finds nothing to take. The
+  floor of one is also the only row above whose worker count reads at or above
+  its own guided control in all three passes.
+- **The caller who wants the cheap setting has it today.**
+  `SplittingPartitioner::new(k)` is a floor of `k`, and the type's docs now
+  say what the default costs against it, which is the part of the issue that
+  was missing rather than the default itself.
+- **#409 is filed to re-take this sweep once #406 lands**, with the same rows
+  and the same bar, because that is the change that makes the floor worth
+  re-deciding.
+
+**What this does not say.** It does not say the floor of one is good: it is
+2.0x, 2.5x and 2.25x its own guided control in three passes and the most
+expensive of the seven rows in both orders, and that is now in the type's
+docs rather than only in this file. It does not say a derived floor is wrong
+-- it says this sweep cannot tell `n / (2w)` from `n / (16w)` or from no
+splitting at all, which is a different claim and the reason nothing ships. And
+it does not re-measure the `rustflow-split` criterion ids: no code changed, so
+#381's part 2 table stands as taken.
