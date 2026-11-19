@@ -31,11 +31,11 @@
 //!   leading operand, plus exact equality with `Iterator::fold` on the
 //!   single-chunk path the docs do pin (`W <= 1` or `n <= chunk_size`).
 //! - **`sort` is not stable.** `Runtime::sort_by` ends in
-//!   `[T]::sort_unstable_by` at the leaves, and the three-way partition
-//!   above it reorders equal keys freely, so no case here checks the order
-//!   of equal elements. The permutation check on the tags replaces it: the
-//!   keys must match `[T]::sort_by`'s, and the elements must still be the
-//!   ones that went in.
+//!   `[T]::sort_unstable_by` at the leaves, and the partition above it
+//!   reorders equal keys freely, so no case here checks the order of equal
+//!   elements. The permutation check on the tags replaces it: the keys must
+//!   match `[T]::sort_by`'s, and the elements must still be the ones that
+//!   went in.
 //! - **`min_element`/`max_element` return an index, and ties are not
 //!   ordered.** The locals merge under the same lock `reduce`'s do, so the
 //!   case checks the *value* at the index against `Iterator::min`/`max`.
@@ -334,6 +334,93 @@ proptest! {
                 element.tag
             );
         }
+    }
+}
+
+/// The input shapes a pattern-defeating quicksort exists for: a partition
+/// that mishandles one of these is slow on it rather than wrong, so what the
+/// case below checks is that the pivot selection, the pattern-breaking swaps
+/// and the bad-partition fallback `src/algorithm/sort.rs` runs over them
+/// still come back with `[T]::sort_by`'s answer (#375).
+#[derive(Debug, Clone, Copy)]
+enum Pattern {
+    /// Already in the order the sort is asked for.
+    Sorted,
+    /// Exactly reversed.
+    Reversed,
+    /// Three distinct values, so most of a partition is equal to its pivot.
+    FewDistinct,
+    /// Ascending to the middle, then descending.
+    OrganPipe,
+}
+
+/// Draws one of the four pattern shapes.
+fn pattern() -> impl Strategy<Value = Pattern> {
+    prop_oneof![
+        Just(Pattern::Sorted),
+        Just(Pattern::Reversed),
+        Just(Pattern::FewDistinct),
+        Just(Pattern::OrganPipe),
+    ]
+}
+
+/// The `n` keys a [`Pattern`] stands for.
+fn pattern_keys(pattern: Pattern, n: usize) -> Vec<i64> {
+    let key = |i: usize| i64::try_from(i).expect("a pattern length fits an i64");
+    (0..n)
+        .map(|i| match pattern {
+            Pattern::Sorted => key(i),
+            Pattern::Reversed => key(n - 1 - i),
+            Pattern::FewDistinct => key(i % 3),
+            Pattern::OrganPipe => key(i.min(n - 1 - i)),
+        })
+        .collect()
+}
+
+/// The lengths the pattern cases draw over, longer than [`LENGTHS`]: a
+/// [`Wide`] input this long clears the 128-element cutoff several times
+/// over, so a case reaches the partitions that inherit a pivot from the one
+/// above them and not just the first.
+const PATTERN_LENGTHS: RangeInclusive<usize> = 0..=600;
+
+proptest! {
+    /// `Runtime::sort_by` over each [`Pattern`] agrees with `[T]::sort_by`
+    /// and brings back the elements that went in. What this adds over
+    /// `sort_by_matches_std_sort_by` is the input shape: a drawn vector is
+    /// almost never sorted, reversed or an organ pipe, and those are the
+    /// shapes the partition treats specially (#375).
+    #[test]
+    fn sort_by_matches_std_sort_by_on_pattern_inputs(
+        pattern in pattern(),
+        n in PATTERN_LENGTHS,
+        workers in WORKERS,
+    ) {
+        let keys = pattern_keys(pattern, n);
+        let mut want_keys = keys.clone();
+        want_keys.sort_by(i64::cmp);
+
+        let data: Vec<Wide> = keys
+            .into_iter()
+            .enumerate()
+            .map(|(tag, key)| Wide {
+                key,
+                tag,
+                pad: [tag_byte(tag); 512],
+            })
+            .collect();
+
+        let got = in_runtime(workers, move |rt: &mut Runtime<'_>| {
+            let mut data = data;
+            rt.sort_by(&mut data, |a: &Wide, b: &Wide| a.key.cmp(&b.key));
+            data
+        });
+
+        let got_keys: Vec<i64> = got.iter().map(|w| w.key).collect();
+        prop_assert_eq!(got_keys, want_keys);
+
+        let mut tags: Vec<usize> = got.iter().map(|w| w.tag).collect();
+        tags.sort_unstable();
+        prop_assert_eq!(tags, (0..n).collect::<Vec<usize>>());
     }
 }
 
