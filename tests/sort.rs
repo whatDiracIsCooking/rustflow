@@ -38,7 +38,7 @@ const SIZES: [usize; 5] = [0, 1, 10, 100, 50_000];
 
 /// A linear congruential generator rather than `rand`: deterministic, so a
 /// failure reproduces, and spread enough to exercise every branch of the
-/// three-way partition (runs both above and below the pivot, and ties).
+/// partition (runs both above and below the pivot, and ties).
 fn scattered(n: usize, modulus: i64) -> Vec<i64> {
     let mut state = 0x2545_f491_4f6c_dd1du64;
     (0..n)
@@ -127,8 +127,7 @@ worker_matrix! {
 // ----------------------------------------------------------------------------
 
 /// Upstream's `Object`: ordered by a derived `sum()` rather than by field
-/// order, which also produces plenty of ties for the three-way partition's
-/// middle zone to collect.
+/// order, which also produces plenty of ties for the partition to place.
 #[derive(Clone)]
 struct Object {
     integers: [i64; 10],

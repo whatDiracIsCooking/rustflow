@@ -21,33 +21,85 @@
 //! port follows `[T]::sort`/`[T]::sort_by`'s own split of exactly the same
 //! two signatures rather than inventing a shape of its own.
 //!
-//! **The 3-way partition this issue asks for is not the one upstream's
-//! `make_sort_task` runs.** The pinned header defines two sort cores side by
-//! side -- `parallel_pdqsort` and this algorithm's own `parallel_3wqsort` --
-//! but `make_sort_task` only ever calls the first; the call to
-//! `parallel_3wqsort` is commented out. That leaves `parallel_3wqsort`'s own
-//! pivot picker, `pseudo_median_of_nine`, calling a `sort3` helper that is
-//! not defined anywhere in the pinned tree. Nothing upstream catches this:
-//! a function template's body is not checked for a name two-phase lookup
-//! cannot resolve until something instantiates the template, and nothing
-//! does. This port implements the behaviour the name promises -- plain
-//! median-of-three at or below `NINTHER_THRESHOLD`, Tukey's ninther above it
-//! -- in exactly the shape `parallel_pdqsort`'s *own* pivot selection already
-//! uses a few lines above the dead call: the one version of this choice the
-//! pinned header does compile and run. `choose_pivot` is that shape,
-//! standing in for the uninstantiable `pseudo_median_of_nine`.
+//! **The partition is `parallel_pdqsort`'s, and the three-way split this
+//! port used to run is this port's departure from it.** The pinned header
+//! defines two sort cores side by side -- `parallel_pdqsort` and
+//! `parallel_3wqsort` -- and `make_sort_task` only ever calls the first;
+//! the call to the second is commented out. A single-pivot three-way split
+//! costs strictly more comparisons and swaps per level than a
+//! pattern-defeating partition does on the same input, so what the loop
+//! runs now is upstream's live core: `choose_pivot`'s ninther,
+//! `partition_right` with the elements equal to the pivot going right,
+//! `partition_left` instead when the pivot repeats the element before the
+//! range, `insertion_sort` below a small threshold and again as the partial
+//! pass that checks a partition which came back already partitioned,
+//! `break_patterns`' swaps when one comes back badly unbalanced, and a
+//! budget of such partitions past which the range is finished sequentially.
+//! The sequential cutoff and the fork structure are the ones already
+//! ported, unchanged.
+//!
+//! The rest of this section is where that core departs from a transcription
+//! of upstream's.
+//!
+//! **`*(begin - 1)` becomes the first element of the slice.** Upstream
+//! reads the element *before* the range twice: to find that the pivot
+//! repeats it, so the block of elements equal to the pivot can be dropped
+//! rather than recursed into, and to drop a bounds check from its insertion
+//! sort. A `&mut [T]` cannot be indexed below zero, and the element cannot
+//! be copied out either -- `T` need not be [`Clone`], and the suite's own
+//! move-only case is not -- so a range that is not the leftmost one is
+//! carried as a slice whose element `0` *is* that predecessor, with the
+//! range itself starting at `1`. One split at the end of each frame hands
+//! both halves what they need: the left child keeps this frame's
+//! predecessor, and the right half's is the pivot the partition just
+//! placed.
+//!
+//! **The pivot stays in the slice.** Upstream's `T pivot(std::move(*begin))`
+//! both speeds up the comparisons against it and leaves a hole at `*begin`
+//! to write into; moving a value out of a slice needs `unsafe` or [`Clone`]
+//! in Rust, so every comparison reads element `0` in place and the pivot
+//! reaches its final index by one [`<[T]>::swap`] rather than two moves.
+//!
+//! **Pivot selection picks an index instead of sorting the sample.**
+//! Upstream's four `sort3` calls choose the ninther and leave the nine
+//! sampled elements partly sorted on the way out; `choose_pivot` computes
+//! the median index and its caller swaps that one element to the front,
+//! which moves two elements rather than up to twelve and still leaves the
+//! one thing `partition_right` needs of it -- an element not less than the
+//! pivot somewhere above it, which is what makes its first scan stop in
+//! bounds.
+//!
+//! **One insertion sort, with the move budget as an argument.** Upstream's
+//! `insertion_sort` and `partial_insertion_sort` differ only in whether
+//! they give up once eight elements have been shifted, so this port takes
+//! that budget as a parameter rather than writing the loop twice. The shift
+//! itself is [`<[T]>::rotate_right`] over the elements the new one passes,
+//! where upstream moves the element into a local and walks the hole it
+//! leaves down: one `memmove` either way, and the same comparisons in the
+//! same order. `unguarded_insertion_sort` is not ported at all -- it is
+//! that same loop minus one bounds check.
+//!
+//! **The guaranteed fallback is `[T]::sort_unstable_by`.** Once the budget
+//! of badly unbalanced partitions runs out, upstream finishes the range
+//! with `std::make_heap` and `std::sort_heap`, holding the worst case at
+//! `O(n log n)`. `[T]::sort_unstable_by` documents that same worst case, so
+//! this port spends the budget exactly where upstream spends it and lets
+//! `std` be the floor under it, rather than carrying a hand-rolled heap
+//! sort whose only caller is one branch.
 //!
 //! **Tail-recursion elimination survives as one [`Runtime::scope`] call per
 //! stack frame, not a C++ `goto`.** Upstream's `while(true)` spawns the left
 //! partition through `rt.silent_async` and loops back onto the right one in
-//! the same frame, so only the left side ever grows the call stack.
-//! `sort_range` keeps exactly that shape: one `scope` wraps the whole loop,
-//! [`crate::Scope::spawn_runtime`] fires the left half into a fresh node
-//! every time the loop spawns one, and the loop itself reassigns its own
-//! `data` binding to the right half and continues -- so the join
-//! [`Runtime::scope`] performs happens once per frame, after every left
-//! child the loop ever spawned, exactly where upstream's implicit per-node
-//! join falls.
+//! the same frame, so only the left side ever grows the call stack. The loop
+//! keeps exactly that shape: one `scope` wraps it, [`crate::Scope::spawn_runtime`]
+//! fires the left half into a fresh node every time the loop spawns one, and
+//! the loop itself reassigns its own `data` binding to the right half and
+//! continues -- so the join [`Runtime::scope`] performs happens once per
+//! frame, after every left child the loop ever spawned, exactly where
+//! upstream's implicit per-node join falls. Upstream's two other loop-carried
+//! values travel the same way: the `leftmost` flag and the remaining budget
+//! of bad partitions are copied into each spawned child and updated in place
+//! for the next turn of the loop.
 
 use std::cmp::Ordering;
 use std::mem::size_of;
@@ -80,15 +132,27 @@ const fn parallel_sort_cutoff<T>() -> usize {
     }
 }
 
-/// Above this many elements, pivot selection widens from a plain
-/// median-of-three to Tukey's ninther: `parallel_pdqsort`'s own
-/// `ninther_threshold`, this module's `# Design` section says why it is this
-/// module's pivot threshold too.
+/// Above this many elements pivot selection widens from a plain
+/// median-of-three to Tukey's ninther, and [`break_patterns`] widens from
+/// two swaps a side to six: upstream's `ninther_threshold`.
 const NINTHER_THRESHOLD: usize = 128;
+
+/// Below this many elements a range is insertion-sorted rather than
+/// partitioned, and a side shorter than this is left out of
+/// [`break_patterns`]' shuffle: upstream's `insertion_sort_threshold`.
+const INSERTION_SORT_THRESHOLD: usize = 24;
+
+/// How many elements the partial pass of [`insertion_sort`] may shift before
+/// giving up: upstream's `partial_insertion_sort_limit`.
+const PARTIAL_INSERTION_SORT_LIMIT: usize = 8;
 
 /// Returns whichever of `a`, `b`, `c` indexes the median value, without
 /// moving anything: the three-comparison branch every median-of-three
 /// implementation shares.
+///
+/// Whichever index it returns, one of the other two holds an element not
+/// less than that one -- the guarantee [`choose_pivot`] passes on to
+/// [`partition_right`].
 fn median3_index<T, C>(data: &[T], a: usize, b: usize, c: usize, cmp: &C) -> usize
 where
     C: Fn(&T, &T) -> Ordering,
@@ -111,12 +175,18 @@ where
 }
 
 /// Picks the pivot index for `data`'s next partition: a plain median-of-three
-/// at or below [`NINTHER_THRESHOLD`], Tukey's ninther above it -- the module
-/// docs' `# Design` section says why this, rather than upstream's own dead
-/// `pseudo_median_of_nine`, is what this port runs. `data` must be non-empty.
+/// at or below [`NINTHER_THRESHOLD`], Tukey's ninther above it --
+/// `parallel_pdqsort`'s own pivot selection, as an index rather than a
+/// sorted sample for the reason the module's `# Design` section gives.
+/// `data` must be non-empty.
+///
+/// The three finalists the last [`median3_index`] compares are at distinct
+/// indices, so swapping the median it returns to the front can only move
+/// its not-less-than witness to another index above the front:
+/// [`partition_right`]'s precondition, established here.
 ///
 /// [`parallel_sort_cutoff`]'s smallest bucket is exactly
-/// [`NINTHER_THRESHOLD`], and [`sort_range`] only ever calls this once
+/// [`NINTHER_THRESHOLD`], and [`sort_loop`] only ever calls this once
 /// `data.len()` has already cleared that cutoff -- so the plain
 /// median-of-three branch below is never actually taken, in this port or in
 /// `parallel_pdqsort`'s identical two-branch pivot selection upstream. It
@@ -139,63 +209,230 @@ where
     }
 }
 
-/// Three-way-partitions `data` around `data[0]`: upstream's
-/// `parallel_3wqsort`'s own inline loop. On return, every element less than
-/// the pivot is in `data[..l)`, every element equal to it is in
-/// `data[l..=r]`, and every element greater than it is in `data[r + 1..]`.
-/// The two `bool`s report whether a less-than or a greater-than element was
-/// ever found, upstream's `is_swapped_l`/`is_swapped_r`.
+/// Insertion-sorts `data`, giving up and returning `false` once more than
+/// `move_budget` elements have been shifted: upstream's
+/// `partial_insertion_sort` at [`PARTIAL_INSERTION_SORT_LIMIT`], and its
+/// plain `insertion_sort` at [`usize::MAX`], where the budget cannot run out
+/// and the answer is always `true`. `data` is sorted when it returns `true`
+/// and a permutation of what went in either way.
+fn insertion_sort<T, C>(data: &mut [T], cmp: &C, move_budget: usize) -> bool
+where
+    C: Fn(&T, &T) -> Ordering,
+{
+    let mut shifted = 0usize;
+
+    for cur in 1..data.len() {
+        if shifted > move_budget {
+            return false;
+        }
+
+        // Compared first so that an element already in place costs one
+        // comparison and no move, as upstream's own loop does.
+        if cmp(&data[cur], &data[cur - 1]) == Ordering::Less {
+            let mut pos = cur - 1;
+            while pos > 0 && cmp(&data[cur], &data[pos - 1]) == Ordering::Less {
+                pos -= 1;
+            }
+            data[pos..=cur].rotate_right(1);
+            shifted += cur - pos;
+        }
+    }
+
+    true
+}
+
+/// Partitions `data` around the pivot at `data[0]`, elements equal to the
+/// pivot going right: upstream's `partition_right`. Returns the pivot's
+/// final index `p` -- `data[..p]` is then less than `data[p]` and
+/// `data[p + 1..]` is not -- and whether `data` was already partitioned
+/// that way on entry, upstream's `already_partitioned`.
 ///
-/// `data` must have at least two elements.
-fn three_way_partition<T, C>(data: &mut [T], cmp: &C) -> (usize, usize, bool, bool)
+/// Some element of `data[1..]` must be not less than `data[0]`, which is
+/// what [`choose_pivot`] leaves behind and what stops the first scan below
+/// in bounds. `data` must have at least two elements.
+fn partition_right<T, C>(data: &mut [T], cmp: &C) -> (usize, bool)
+where
+    C: Fn(&T, &T) -> Ordering,
+{
+    // The first element not less than the pivot. The precondition is what
+    // keeps this index inside `data`.
+    let mut first = 1;
+    while cmp(&data[first], &data[0]) == Ordering::Less {
+        first += 1;
+    }
+
+    // The last element less than the pivot, searched leftwards. With
+    // `first == 1` nothing below it is known to be less than the pivot, so
+    // that search needs the bound upstream guards it with; above it,
+    // `data[first - 1]` is itself less than the pivot and stops the scan.
+    let mut last = data.len();
+    if first == 1 {
+        while first < last {
+            last -= 1;
+            if cmp(&data[last], &data[0]) == Ordering::Less {
+                break;
+            }
+        }
+    } else {
+        loop {
+            last -= 1;
+            if cmp(&data[last], &data[0]) == Ordering::Less {
+                break;
+            }
+        }
+    }
+
+    let already_partitioned = first >= last;
+
+    // Each swap puts an element less than the pivot at `first` and one not
+    // less than it at `last`, so the two scans that follow guard each other
+    // and neither can leave `1..data.len()`.
+    while first < last {
+        data.swap(first, last);
+        loop {
+            first += 1;
+            if cmp(&data[first], &data[0]) != Ordering::Less {
+                break;
+            }
+        }
+        loop {
+            last -= 1;
+            if cmp(&data[last], &data[0]) == Ordering::Less {
+                break;
+            }
+        }
+    }
+
+    // `first >= 1` throughout, so the pivot's resting place is in bounds,
+    // and the element sitting there is less than the pivot: one swap does
+    // what upstream's two moves through its local copy do.
+    let pivot_pos = first - 1;
+    data.swap(0, pivot_pos);
+    (pivot_pos, already_partitioned)
+}
+
+/// Partitions `data` around the pivot at `data[0]`, elements equal to the
+/// pivot going *left*: upstream's `partition_left`. Returns the pivot's
+/// final index `p`, with `data[..=p]` then not greater than `data[p]` and
+/// `data[p + 1..]` greater than it.
+///
+/// `data` must have at least two elements, and nothing else: the pivot is
+/// still in the slice, so the leftward scan below stops at element `0` at
+/// the latest, where upstream's wants the pivot to be a median instead.
+fn partition_left<T, C>(data: &mut [T], cmp: &C) -> usize
 where
     C: Fn(&T, &T) -> Ordering,
 {
     let n = data.len();
-    let mut l = 0usize;
-    let mut r = n - 1;
-    let mut f = 1usize;
-    let mut found_less = false;
-    let mut found_greater = false;
 
-    while f <= r {
-        if cmp(&data[f], &data[l]) == Ordering::Less {
-            data.swap(l, f);
-            found_less = true;
-            l += 1;
-            f += 1;
-        } else if cmp(&data[l], &data[f]) == Ordering::Less {
-            data.swap(r, f);
-            found_greater = true;
-            // Sound: the loop condition just above requires `f <= r`, and
-            // neither bound has moved yet this iteration, so `r >= f >= 1`
-            // and `r - 1` cannot underflow.
-            r -= 1;
-        } else {
-            f += 1;
+    // The last element not greater than the pivot.
+    let mut last = n;
+    loop {
+        last -= 1;
+        if cmp(&data[0], &data[last]) != Ordering::Less {
+            break;
         }
     }
 
-    // `f - l >= 1` is a loop invariant -- a "less" step moves both `l` and
-    // `f` by one, a "greater" step moves neither, and the remaining branch
-    // moves only `f` -- and the loop exits with `f == r + 1` exactly, since
-    // each step changes `f` or `r` by at most one. Together: `l <= r`, so
-    // `r - l` below never underflows.
-    (l, r, found_less, found_greater)
+    // The first element greater than the pivot. With `last` at the end
+    // nothing above it is known to be greater, so that search takes the
+    // bound; otherwise `data[last + 1]` is greater and stops the scan.
+    let mut first = 0;
+    if last == n - 1 {
+        while first < last {
+            first += 1;
+            if cmp(&data[0], &data[first]) == Ordering::Less {
+                break;
+            }
+        }
+    } else {
+        loop {
+            first += 1;
+            if cmp(&data[0], &data[first]) == Ordering::Less {
+                break;
+            }
+        }
+    }
+
+    // As in `partition_right`, each swap leaves the pair that guards the two
+    // scans behind it, and `first >= 1` keeps both off the pivot.
+    while first < last {
+        data.swap(first, last);
+        loop {
+            last -= 1;
+            if cmp(&data[0], &data[last]) != Ordering::Less {
+                break;
+            }
+        }
+        loop {
+            first += 1;
+            if cmp(&data[0], &data[first]) == Ordering::Less {
+                break;
+            }
+        }
+    }
+
+    data.swap(0, last);
+    last
 }
 
-/// Sorts `data` in place: upstream's `parallel_3wqsort(rt, first, last,
-/// compare)`, over a half-open `&mut [T]` rather than a closed iterator
-/// pair. Only called once `data.len()` is already known to exceed the
-/// cutoff and there is more than one worker to spend on it --
+/// Swaps a few elements on each side of the pivot at `data[pivot]` to break
+/// the input pattern a badly unbalanced partition is evidence of: the
+/// shuffle upstream runs inline under `highly_unbalanced`.
+///
+/// Every swap stays on one side of `data[pivot]` and the pivot itself does
+/// not move, so the partition survives and the caller recurses into both
+/// halves without redoing it. `pivot` must be an index of `data`.
+fn break_patterns<T>(data: &mut [T], pivot: usize) {
+    let n = data.len();
+    let left_len = pivot;
+    let right_len = n - pivot - 1;
+
+    // Each `>= INSERTION_SORT_THRESHOLD` guard is what keeps the arithmetic
+    // below in bounds: a quarter of a side that long is at least 6, so no
+    // index reaches past the pivot or past either end, and the wider set of
+    // swaps needs the far longer side `NINTHER_THRESHOLD` asks for.
+    if left_len >= INSERTION_SORT_THRESHOLD {
+        let quarter = left_len / 4;
+        data.swap(0, quarter);
+        data.swap(pivot - 1, pivot - quarter);
+        if left_len > NINTHER_THRESHOLD {
+            data.swap(1, quarter + 1);
+            data.swap(2, quarter + 2);
+            data.swap(pivot - 2, pivot - (quarter + 1));
+            data.swap(pivot - 3, pivot - (quarter + 2));
+        }
+    }
+
+    if right_len >= INSERTION_SORT_THRESHOLD {
+        let quarter = right_len / 4;
+        data.swap(pivot + 1, pivot + 1 + quarter);
+        data.swap(n - 1, n - quarter);
+        if right_len > NINTHER_THRESHOLD {
+            data.swap(pivot + 2, pivot + 2 + quarter);
+            data.swap(pivot + 3, pivot + 3 + quarter);
+            data.swap(n - 2, n - (1 + quarter));
+            data.swap(n - 3, n - (2 + quarter));
+        }
+    }
+}
+
+/// Sorts a range in place: upstream's `parallel_pdqsort(rt, begin, end,
+/// comp, bad_allowed, leftmost)`, over a `&mut [T]` rather than an iterator
+/// pair. Only called once the range is already known to exceed the cutoff
+/// and there is more than one worker to spend on it --
 /// [`Runtime::sort_by`]'s own short-circuit is the entry upstream's
 /// `make_sort_task` runs first.
-fn sort_range<T, C>(rt: &mut Runtime<'_>, data: &mut [T], cmp: &C)
+///
+/// `data` is that range when `leftmost`; otherwise `data[0]` is the element
+/// before it -- not greater than any of `data[1..]`, which is the range --
+/// per the module's `# Design` section.
+fn sort_range<T, C>(rt: &mut Runtime<'_>, data: &mut [T], leftmost: bool, bad_allowed: u32, cmp: &C)
 where
     T: Send,
     C: Fn(&T, &T) -> Ordering + Sync,
 {
-    rt.scope(|s| sort_loop(s, data, cmp));
+    rt.scope(|s| sort_loop(s, data, leftmost, bad_allowed, cmp));
 }
 
 /// The body of [`sort_range`]'s `rt.scope`, pulled out to its own function
@@ -206,42 +443,91 @@ where
 /// own named lifetime does not have that problem; this is the same
 /// "iterative `&mut` reborrow" shape `std`'s own `split_first_mut`-driven
 /// loops use.
-fn sort_loop<'scope, T, C>(s: &Scope<'scope, '_, '_>, mut data: &'scope mut [T], cmp: &'scope C)
-where
+///
+/// `data`, `leftmost` and `bad_allowed` are [`sort_range`]'s own, with the
+/// same meaning.
+fn sort_loop<'scope, T, C>(
+    s: &Scope<'scope, '_, '_>,
+    mut data: &'scope mut [T],
+    mut leftmost: bool,
+    mut bad_allowed: u32,
+    cmp: &'scope C,
+) where
     T: Send,
     C: Fn(&T, &T) -> Ordering + Sync,
 {
     let cutoff = parallel_sort_cutoff::<T>();
 
     loop {
-        let n = data.len();
-        if n <= cutoff {
-            data.sort_unstable_by(cmp);
+        // Upstream's `begin`, as an index: `data[..begin]` is the
+        // predecessor this frame was handed, empty on the leftmost range.
+        let begin = usize::from(!leftmost);
+        let n = data.len() - begin;
+
+        if n < INSERTION_SORT_THRESHOLD {
+            // Always `true` at this budget; the range is sorted.
+            insertion_sort(&mut data[begin..], cmp, usize::MAX);
             return;
         }
 
-        let pivot = choose_pivot(data, cmp);
-        data.swap(0, pivot);
+        if n <= cutoff {
+            data[begin..].sort_unstable_by(cmp);
+            return;
+        }
 
-        let (l, r, found_less, found_greater) = three_way_partition(data, cmp);
+        let pivot = choose_pivot(&data[begin..], cmp);
+        data.swap(begin, begin + pivot);
 
-        let (left, rest) = data.split_at_mut(l);
-        if l > 1 && found_less {
+        // Upstream's `!leftmost && !comp(*(begin - 1), *begin)`: the pivot
+        // is not greater than a predecessor that is not greater than
+        // anything in the range, so every element equal to the pivot is a
+        // sorted block this frame drops rather than recurses into.
+        if !leftmost && cmp(&data[begin - 1], &data[begin]) != Ordering::Less {
+            let pivot_pos = begin + partition_left(&mut data[begin..], cmp);
+            data = &mut data[pivot_pos..];
+            continue;
+        }
+
+        let (pivot_rel, already_partitioned) = partition_right(&mut data[begin..], cmp);
+        let left_len = pivot_rel;
+        let right_len = n - pivot_rel - 1;
+        let pivot_pos = begin + pivot_rel;
+
+        if left_len < n / 8 || right_len < n / 8 {
+            // Upstream's `if (--bad_allowed == 0)`, which cannot underflow
+            // here because the fallback is taken at one rather than at zero.
+            if bad_allowed <= 1 {
+                data[begin..].sort_unstable_by(cmp);
+                return;
+            }
+            bad_allowed -= 1;
+            break_patterns(&mut data[begin..], pivot_rel);
+        } else if already_partitioned
+            && insertion_sort(
+                &mut data[begin..pivot_pos],
+                cmp,
+                PARTIAL_INSERTION_SORT_LIMIT,
+            )
+            && insertion_sort(
+                &mut data[pivot_pos + 1..],
+                cmp,
+                PARTIAL_INSERTION_SORT_LIMIT,
+            )
+        {
+            return;
+        }
+
+        // One split for both halves: `left` keeps this frame's predecessor
+        // ahead of its own range, and `right` begins at the pivot, which is
+        // the predecessor of the range the next turn of the loop sorts.
+        let (left, right) = data.split_at_mut(pivot_pos);
+        if left_len > 1 {
             s.spawn_runtime(move |child: &mut Runtime<'_>| {
-                sort_range(child, left, cmp);
+                sort_range(child, left, leftmost, bad_allowed, cmp);
             });
         }
-
-        // `rest` starts at the pivot's final resting place (global index
-        // `l`), so the greater-than section begins `r - l + 1` elements into
-        // it -- `r >= l` is `three_way_partition`'s own invariant.
-        let right_start = r - l + 1;
-        let right_len = rest.len() - right_start;
-        if right_len > 1 && found_greater {
-            data = &mut rest[right_start..];
-        } else {
-            return;
-        }
+        data = right;
+        leftmost = false;
     }
 }
 
@@ -254,7 +540,7 @@ impl<'rt> Runtime<'rt> {
     /// has the table) runs `data.sort_unstable_by(cmp)` directly, with no
     /// [`Runtime::scope`] at all -- upstream's own `W <= 1 || N <=
     /// parallel_sort_cutoff<...>()` short-circuit. Above both, the sort runs
-    /// through `sort_range`'s parallel three-way partition.
+    /// through the parallel pattern-defeating partition.
     ///
     /// ```
     /// use rustflow::prelude::*;
@@ -285,7 +571,12 @@ impl<'rt> Runtime<'rt> {
             return;
         }
 
-        sort_range(self, data, &cmp);
+        // Upstream's `static_cast<int>(log2(size_t(end - beg)))`: how many
+        // badly unbalanced partitions the recursion tolerates before it
+        // falls back. The length cleared the cutoff above, so it is not 0.
+        let bad_allowed = data.len().ilog2();
+
+        sort_range(self, data, true, bad_allowed, &cmp);
     }
 
     /// Sorts `data` in place using `T`'s own order: upstream's
@@ -392,6 +683,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -400,8 +692,8 @@ mod tests {
 
     /// Deterministic but scattered: not sorted, not reverse-sorted, with
     /// repeats -- a linear congruential generator rather than `rand`, so the
-    /// sequence (and therefore which branch of [`three_way_partition`] each
-    /// element takes) is the same on every run.
+    /// sequence (and therefore which scan of [`partition_right`] each
+    /// element stops) is the same on every run.
     fn scattered(n: usize, modulus: i64) -> Vec<i64> {
         let mut state = 0x2545_f491_4f6c_dd1du64;
         (0..n)
@@ -437,7 +729,8 @@ mod tests {
     }
 
     /// Every ordering of three distinct values, plus a tie: the three
-    /// comparisons [`median3_index`] branches on, each exercised both ways.
+    /// comparisons [`median3_index`] branches on, each exercised both ways,
+    /// and the not-less-than witness it promises in every one of them.
     #[test]
     fn median3_index_returns_the_middle_value() {
         let cmp = i64::cmp;
@@ -453,57 +746,15 @@ mod tests {
             (1, 5, 5),
         ] {
             let data = [x, y, z];
-            let median = data[median3_index(&data, 0, 1, 2, &cmp)];
+            let median_index = median3_index(&data, 0, 1, 2, &cmp);
             let mut sorted = data;
             sorted.sort_unstable();
-            assert_eq!(median, sorted[1], "data = {data:?}");
+            assert_eq!(data[median_index], sorted[1], "data = {data:?}");
+            assert!(
+                (0..3).any(|i| i != median_index && data[i] >= data[median_index]),
+                "data = {data:?}"
+            );
         }
-    }
-
-    /// [`three_way_partition`]'s three boundary shapes: every element less
-    /// than the pivot, every element greater, and every element equal --
-    /// each of which leaves one of its two `bool`s `false` and the
-    /// corresponding section empty, per the function's own doc comment.
-    #[test]
-    fn three_way_partition_handles_every_element_on_one_side() {
-        let cmp = i64::cmp;
-
-        // Pivot (`5`) is the maximum: nothing is greater.
-        let mut all_less = [5i64, 1, 2, 3, 4];
-        let (l, r, found_less, found_greater) = three_way_partition(&mut all_less, &cmp);
-        assert!(found_less);
-        assert!(!found_greater);
-        assert!(all_less[..l].iter().all(|&v| v < 5));
-        assert!(all_less[l..=r].iter().all(|&v| v == 5));
-        assert!(all_less[r + 1..].is_empty());
-
-        // Pivot (`1`) is the minimum: nothing is less.
-        let mut all_greater = [1i64, 5, 4, 3, 2];
-        let (l, r, found_less, found_greater) = three_way_partition(&mut all_greater, &cmp);
-        assert!(!found_less);
-        assert!(found_greater);
-        assert!(all_greater[..l].is_empty());
-        assert!(all_greater[l..=r].iter().all(|&v| v == 1));
-        assert!(all_greater[r + 1..].iter().all(|&v| v > 1));
-
-        // Every element equals the pivot: the whole range is the middle
-        // zone, and neither `bool` is set.
-        let mut all_equal = [7i64; 6];
-        let (l, r, found_less, found_greater) = three_way_partition(&mut all_equal, &cmp);
-        assert!(!found_less);
-        assert!(!found_greater);
-        assert_eq!((l, r), (0, all_equal.len() - 1));
-
-        // A mix, with ties on both sides of the pivot, is the shape the
-        // public entry points exercise at scale; this is the hand-checkable
-        // size of it.
-        let mut mixed = [4i64, 2, 4, 6, 1, 4, 6, 3];
-        let (l, r, found_less, found_greater) = three_way_partition(&mut mixed, &cmp);
-        assert!(found_less);
-        assert!(found_greater);
-        assert!(mixed[..l].iter().all(|&v| v < 4));
-        assert!(mixed[l..=r].iter().all(|&v| v == 4));
-        assert!(mixed[r + 1..].iter().all(|&v| v > 4));
     }
 
     /// [`choose_pivot`] always returns an in-bounds index, below and above
@@ -518,6 +769,181 @@ mod tests {
             let data = scattered(n, 1000);
             let pivot = choose_pivot(&data, &cmp);
             assert!(pivot < n, "n = {n}");
+        }
+    }
+
+    /// Checks [`partition_right`]'s postcondition and returns the pivot
+    /// value, so that each case below states only what is specific to it.
+    fn check_partition_right(data: &mut [i64], expected_pivot: i64) -> (usize, bool) {
+        let before = {
+            let mut sorted = data.to_vec();
+            sorted.sort_unstable();
+            sorted
+        };
+
+        let (pivot_pos, already_partitioned) = partition_right(data, &i64::cmp);
+
+        assert_eq!(data[pivot_pos], expected_pivot);
+        assert!(data[..pivot_pos].iter().all(|&v| v < expected_pivot));
+        assert!(data[pivot_pos + 1..].iter().all(|&v| v >= expected_pivot));
+
+        let mut after = data.to_vec();
+        after.sort_unstable();
+        assert_eq!(after, before);
+
+        (pivot_pos, already_partitioned)
+    }
+
+    /// [`partition_right`] over the shapes its two scans and its
+    /// `already_partitioned` answer turn on: a range already split that way,
+    /// one that is not, a pivot that is the minimum (nothing goes left) and
+    /// a range of one repeated value. Each case puts a median at `data[0]`
+    /// first, which is the precondition the function states.
+    #[test]
+    fn partition_right_splits_around_the_pivot() {
+        // Already partitioned: `4` is the median of `4`, `1` and `5`, and
+        // everything below it already precedes everything above.
+        let (pivot_pos, already_partitioned) =
+            check_partition_right(&mut [4i64, 1, 2, 3, 9, 5, 7], 4);
+        assert_eq!(pivot_pos, 3);
+        assert!(already_partitioned);
+
+        // Not partitioned: the same values, interleaved.
+        let (pivot_pos, already_partitioned) =
+            check_partition_right(&mut [4i64, 9, 1, 7, 2, 5, 3], 4);
+        assert_eq!(pivot_pos, 3);
+        assert!(!already_partitioned);
+
+        // The pivot is the minimum: nothing is less than it, so it stays at
+        // the front and the whole rest of the range is the right side.
+        let (pivot_pos, already_partitioned) =
+            check_partition_right(&mut [1i64, 9, 4, 7, 2, 5, 3], 1);
+        assert_eq!(pivot_pos, 0);
+        assert!(already_partitioned);
+
+        // Every element equal to the pivot: equal goes right, so this is the
+        // minimum case again, and it is the shape `partition_left` exists to
+        // stop the recursion repeating.
+        let (pivot_pos, already_partitioned) = check_partition_right(&mut [7i64; 6], 7);
+        assert_eq!(pivot_pos, 0);
+        assert!(already_partitioned);
+
+        // Ties on both sides of the pivot, the shape the public entry points
+        // meet at scale, at a hand-checkable size.
+        let (pivot_pos, _) = check_partition_right(&mut [4i64, 2, 4, 6, 1, 4, 6, 3], 4);
+        assert_eq!(pivot_pos, 3);
+    }
+
+    /// [`partition_left`] over the two shapes its guarded first scan turns
+    /// on -- an element not greater than the pivot at the very end of the
+    /// range, and one further in -- plus the all-equal range that is the
+    /// reason upstream has this partition at all. Equal elements go left,
+    /// so the pivot's resting place is the *last* of them.
+    #[test]
+    fn partition_left_puts_the_equal_elements_on_the_left() {
+        let cmp = i64::cmp;
+
+        // `2` repeats, with greater elements interleaved: the equal block
+        // ends up below the pivot's index and nothing equal is left above.
+        let mut interleaved = [2i64, 2, 2, 5, 2, 7];
+        let pivot_pos = partition_left(&mut interleaved, &cmp);
+        assert!(interleaved[..=pivot_pos].iter().all(|&v| v == 2));
+        assert!(interleaved[pivot_pos + 1..].iter().all(|&v| v > 2));
+        assert_eq!(pivot_pos, 3);
+
+        // The last element is itself equal to the pivot, which is the case
+        // upstream guards the first scan for.
+        let mut equal_at_the_end = [2i64, 9, 2, 5, 2, 2];
+        let pivot_pos = partition_left(&mut equal_at_the_end, &cmp);
+        assert!(equal_at_the_end[..=pivot_pos].iter().all(|&v| v == 2));
+        assert!(equal_at_the_end[pivot_pos + 1..].iter().all(|&v| v > 2));
+        assert_eq!(pivot_pos, 3);
+
+        // All equal: the whole range is the left side, and the frame that
+        // called this has nothing left to recurse into.
+        let mut all_equal = [4i64; 5];
+        let pivot_pos = partition_left(&mut all_equal, &cmp);
+        assert_eq!(pivot_pos, all_equal.len() - 1);
+    }
+
+    /// [`insertion_sort`] at both budgets: unlimited, where it matches
+    /// `std`; at [`PARTIAL_INSERTION_SORT_LIMIT`] over a range one adjacent
+    /// swap away from sorted, where it stays inside the budget and sorts;
+    /// and at that budget over a reversed range, where it gives up and
+    /// leaves a permutation of the input behind.
+    #[test]
+    fn insertion_sort_sorts_within_its_budget_and_gives_up_past_it() {
+        let cmp = i64::cmp;
+
+        let mut unlimited = scattered(40, 100);
+        let mut expected = unlimited.clone();
+        expected.sort_unstable();
+        assert!(insertion_sort(&mut unlimited, &cmp, usize::MAX));
+        assert_eq!(unlimited, expected);
+
+        let mut nearly_sorted: Vec<i64> = (0..40).collect();
+        nearly_sorted.swap(10, 11);
+        assert!(insertion_sort(
+            &mut nearly_sorted,
+            &cmp,
+            PARTIAL_INSERTION_SORT_LIMIT
+        ));
+        assert_eq!(nearly_sorted, (0..40).collect::<Vec<i64>>());
+
+        let mut reversed: Vec<i64> = (0..40).rev().collect();
+        assert!(!insertion_sort(
+            &mut reversed,
+            &cmp,
+            PARTIAL_INSERTION_SORT_LIMIT
+        ));
+        let mut recovered = reversed;
+        recovered.sort_unstable();
+        assert_eq!(recovered, (0..40).collect::<Vec<i64>>());
+    }
+
+    /// [`break_patterns`] over every branch of its index arithmetic -- a
+    /// side too short to shuffle, one long enough for two swaps, one long
+    /// enough for six -- checking what the function promises its caller: the
+    /// pivot does not move, no element crosses it, and a side that is long
+    /// enough really is shuffled.
+    #[test]
+    fn break_patterns_shuffles_each_side_without_crossing_the_pivot() {
+        for &(n, pivot) in &[
+            (20usize, 10usize),
+            (50, 10),
+            (50, 40),
+            (100, 50),
+            (400, 200),
+        ] {
+            let original: Vec<i64> = (0..n)
+                .map(|v| i64::try_from(v).expect("n is small"))
+                .collect();
+            let mut data = original.clone();
+            break_patterns(&mut data, pivot);
+
+            let boundary = i64::try_from(pivot).expect("n is small");
+            assert_eq!(data[pivot], boundary, "(n, pivot) = ({n}, {pivot})");
+            assert!(
+                data[..pivot].iter().all(|&v| v < boundary),
+                "(n, pivot) = ({n}, {pivot})"
+            );
+            assert!(
+                data[pivot + 1..].iter().all(|&v| v > boundary),
+                "(n, pivot) = ({n}, {pivot})"
+            );
+
+            let mut recovered = data.clone();
+            recovered.sort_unstable();
+            assert_eq!(recovered, original, "(n, pivot) = ({n}, {pivot})");
+
+            let left_len = pivot;
+            let right_len = n - pivot - 1;
+            let shuffled = data != original;
+            assert_eq!(
+                shuffled,
+                left_len >= INSERTION_SORT_THRESHOLD || right_len >= INSERTION_SORT_THRESHOLD,
+                "(n, pivot) = ({n}, {pivot})"
+            );
         }
     }
 
@@ -552,5 +978,84 @@ mod tests {
 
         assert_eq!(*sorted.lock().expect("uncontended"), expected);
         assert_eq!(*sorted_by.lock().expect("uncontended"), expected);
+    }
+
+    /// The four input shapes a pattern-defeating quicksort exists for, each
+    /// through the parallel path at a length that recurses several levels
+    /// deep: an already sorted range, a reversed one, one of three distinct
+    /// values -- which is what sends the recursion through
+    /// [`partition_left`] -- and an organ pipe (#375).
+    #[test]
+    fn sort_matches_std_on_the_patterns_the_partition_defeats() {
+        let n = 50_000usize;
+        let index = |i: usize| i64::try_from(i).expect("n is small");
+        let patterns: [(&str, Vec<i64>); 4] = [
+            ("sorted", (0..n).map(index).collect()),
+            ("reversed", (0..n).rev().map(index).collect()),
+            ("few distinct", (0..n).map(|i| index(i % 3)).collect()),
+            (
+                "organ pipe",
+                (0..n).map(|i| index(i.min(n - 1 - i))).collect(),
+            ),
+        ];
+
+        for (name, raw) in patterns {
+            let mut expected = raw.clone();
+            expected.sort_unstable();
+
+            let data = Arc::new(Mutex::new(raw));
+            let mut taskflow = Taskflow::new();
+            {
+                let data = Arc::clone(&data);
+                taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
+                    runtime.sort(&mut data.lock().expect("uncontended"));
+                });
+            }
+
+            Executor::new(4)
+                .run(&taskflow)
+                .wait()
+                .expect("no task panicked");
+
+            assert_eq!(*data.lock().expect("uncontended"), expected, "{name}");
+        }
+    }
+
+    /// The pattern defeat itself, as a comparison count rather than a time:
+    /// an already sorted range costs one partition plus the partial
+    /// insertion sort over each of its halves, which is linear in the length
+    /// and spawns nothing, where falling through to the recursion would
+    /// descend to the cutoff and compare `n log n` times (#375).
+    #[test]
+    fn an_already_sorted_range_costs_a_linear_number_of_comparisons() {
+        let n = 50_000usize;
+        let raw: Vec<i64> = (0..n)
+            .map(|i| i64::try_from(i).expect("n is small"))
+            .collect();
+
+        let comparisons = Arc::new(AtomicUsize::new(0));
+        let data = Arc::new(Mutex::new(raw));
+
+        let mut taskflow = Taskflow::new();
+        {
+            let comparisons = Arc::clone(&comparisons);
+            let data = Arc::clone(&data);
+            taskflow.emplace_runtime(move |runtime: &mut Runtime<'_>| {
+                let counted = |a: &i64, b: &i64| {
+                    comparisons.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    a.cmp(b)
+                };
+                runtime.sort_by(&mut data.lock().expect("uncontended"), counted);
+            });
+        }
+
+        Executor::new(4)
+            .run(&taskflow)
+            .wait()
+            .expect("no task panicked");
+
+        let counted = comparisons.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(counted < 4 * n, "{counted} comparisons for {n} elements");
+        assert!(data.lock().expect("uncontended").is_sorted());
     }
 }
