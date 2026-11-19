@@ -2298,11 +2298,14 @@ magnitude past it.
 
 Unlike the six shapes above, this one mutates its input in place, so a plain
 `Bencher::iter` would sort already-sorted data on every sample after the
-first. Each sample here is `Bencher::iter_batched` instead: a fresh shuffle
-in the untimed setup, consumed by the timed sort -- `benches/sort.rs`'s own
-module docs say so, and it is why this table carries no "construction-only"
-column the way `embarrassing_parallelism`'s does: the untimed setup already
-isolates the one cost this shape has that rayon's does not.
+first. Each iteration here is `Bencher::iter_batched_ref` instead, whose
+untimed setup re-shuffles the one buffer the id owns -- `benches/sort.rs`'s
+own module docs say so, and it is why this table carries no
+"construction-only" column the way `embarrassing_parallelism`'s does: the
+untimed setup already isolates the one cost this shape has that rayon's does
+not. That buffer is allocated before anything is timed, where upstream's
+file-level global lives; the "#366 change" section at the end of this file is
+why, and is where these figures come from.
 
 | | |
 |---|---|
@@ -2310,20 +2313,29 @@ isolates the one cost this shape has that rayon's does not.
 | `available_parallelism` | 24 |
 | OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
 | criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id |
-| Date | 2026-11-18 |
-| **Load average** | **11.3 falling to 8.3 over the run** |
+| Date | 2026-11-19 |
+| **Load average** | **6.6 falling to 4.8 over the run, all of it this run's own decay** |
 
-Three sibling agents' `cargo` builds were running on this box throughout, so
-this is not a quiet machine -- "The machine, and what it was doing" above has
-the same caveat for the original four shapes, and it applies here unchanged:
-read the within-row comparison, not the absolute figure.
+The figures below are the #366 pass's, on a quiet box: no sibling agent and
+nothing else building, with the load average above being the tail of the
+shape measured before this one. They replace a set taken at a load of 11.3
+with three other agents building, which is why the two differ by more than
+this change does -- the controlled before-and-after of the change itself is
+tabulated in the "#366 change" section and moved no id of this shape by more
+than 5.6%.
 
 | size | workers | rustflow | rayon | upstream C++ |
 |---|---|---|---|---|
-| 1000 | 1 | 21.61 µs ±1.9% | 12.85 µs ±0.5% | not published |
-| 1000 | 24 | 23.14 µs ±1.7% | 16.87 µs ±1.4% | not published |
-| 1000000 | 1 | 37.12 ms ±0.2% | 25.28 ms ±0.3% | not published |
-| 1000000 | 24 | 10.82 ms ±1.4% | 3.428 ms ±1.0% | not published |
+| 1000 | 1 | 19.51 µs ±0.3% | 12.38 µs ±1.3% | not published |
+| 1000 | 24 | 23.00 µs ±0.7% | 16.12 µs ±1.3% | not published |
+| 1000000 | 1 | 36.26 ms ±0.2% | 24.84 ms ±0.1% | not published |
+| 1000000 | 24 | 15.51 ms ±7.8% | 3.370 ms ±0.5% | not published |
+
+**`rustflow/24w/1000000` is the one id of this shape too wide to read as a
+point**: ±7.8%, where its baseline beside it is ±0.5%. It is quoted rather
+than dropped and rather than re-run -- one run per id is the rule this pass
+is measured under -- but it means "about 15 ms" and nothing finer, and the
+before-and-after of this change could not resolve it either (p = 0.76).
 
 At 1000 elements -- below this type's parallel cutoff on every worker count --
 both columns take their serial path, so the gap is construction and dispatch
@@ -2334,9 +2346,10 @@ and tears both down, where rayon's `install` has no graph to build at all.
 do.
 
 At 1000000 elements the parallel path runs on both sides, and the gap widens
-rather than closes: rayon is 3.6x faster at one worker and 3.2x at 24. Two
-differences compound rather than one. `Runtime::sort_by`'s own partition is a
-single-pivot, three-way split per level against `par_sort_unstable`'s own
+rather than closes: rayon is 1.5x faster at one worker and 4.6x at 24, the
+second figure as wide as the id it comes from. Two differences compound
+rather than one. `Runtime::sort_by`'s own partition is a single-pivot,
+three-way split per level against `par_sort_unstable`'s own
 pattern-defeating quicksort, so this crate does strictly more comparisons and
 swaps for the same input; and every spawned half goes through this crate's
 own node machinery -- `Scope::spawn_runtime`, a fresh arena, a join -- where
@@ -2662,9 +2675,13 @@ module docs and matter to the comparison. The `rustflow` column's vector is a
 slice of `AtomicU64` holding `f64` bit patterns, because the ported body is
 one `Fn(IndexRange<usize>)` shared by every chunk and so cannot hold a
 `&mut [f64]`; the baseline keeps a plain `Vec<f64>`, since `par_iter_mut`
-hands each element a real `&mut f64`. And each sample runs on a freshly
-generated vector through `iter_batched`, as `sort`'s does, because this shape
-mutates its input in place and upstream regenerates `vec` once per round.
+hands each element a real `&mut f64`. And each iteration runs on freshly
+generated values, because this shape mutates its input in place and upstream
+regenerates `vec` once per round: each id owns **one** buffer, allocated
+before anything is timed as upstream allocates `vec` in `main`, which
+`iter_batched_ref`'s untimed setup rewrites between iterations. The "#366
+change" section at the end of this file is why the harness is that shape
+rather than a fresh allocation per iteration.
 
 Both columns are checked before either is timed: `benches/for_each.rs`'s
 `verify` runs each variant once per size and worker count, outside any
@@ -2676,43 +2693,54 @@ producing a figure.
 
 | size | workers | rustflow | rayon | upstream C++ |
 |---|---|---|---|---|
-| 1000 | 1 | 19.78 µs ±5.1% | 12.12 µs ±8.5% | not published |
-| 1000 | 24 | 44.86 µs ±1.2% | 31.52 µs ±2.8% | not published |
-| 1000000 | 1 | 9.243 ms ±2.1% | 7.869 ms ±0.6% | not published |
-| 1000000 | 24 | 1.658 ms ±0.7% | 765.6 µs ±1.2% | not published |
+| 1000 | 1 | 14.40 µs ±0.3% | 10.37 µs ±1.8% | not published |
+| 1000 | 24 | 45.12 µs ±3.3% | 28.47 µs ±0.6% | not published |
+| 1000000 | 1 | 8.088 ms ±0.1% | 7.875 ms ±0.0% | not published |
+| 1000000 | 24 | 622.4 µs ±1.0% | 720.7 µs ±0.9% | not published |
 
-The 1000-element one-worker rows carry the loosest intervals in this pass after
-`reduce_sum`'s -- ±5.1% and ±8.5% -- and 4 of 20 measurements were flagged as
-outliers on `rustflow/1w/1000000` and on `rayon/24w/1000000`. A twelve
-microsecond run is a thousand `tan` calls and a pool hand-off, which is little
-for twenty samples to average over; read the ratios below against those widths
-rather than past them.
+Measured in the "#366 change" pass at the end of this file, on the same quiet
+box and under the same conditions "What is measured" names for the pass that
+first filled this table. `rustflow/24w/1000` carries the widest interval of
+the eight at ±3.3%, with 4 of 20 measurements flagged as outliers; 5 of 20
+were flagged on `rayon/1w/1000000`, whose interval is ±0.03%, and 3 of 20 on
+`rustflow/24w/1000000`. A ten microsecond run is a thousand `tan` calls and a
+pool hand-off, which is little for twenty samples to average over; read the
+ratios below against those widths rather than past them.
 
 **This is the closest the port comes to its baseline on a fan-out shape, and
-it is still behind at every row**: 1.63x at 1000 and one worker, 1.42x at 1000
-and 24, 1.17x at a million and one worker, 2.17x at a million and 24. The
-one-worker million-element row is the honest best case -- 9.24 ns an element
-against 7.87 ns, a gap of 1.4 ns on a body that is most of the 7.87 by itself.
-What opens the gap again at 24 workers is the split rather than the body:
-rayon turns its 7.869 ms into 765.6 µs, a 10.3x speed-up, where we turn
-9.243 ms into 1.658 ms, 5.6x. Neither is near linear, since a million `tan`s
-is a few milliseconds of arithmetic over a memory pass and both columns are
-partly bound by the array; the factor of nearly two between the two speed-ups
-is the partitioner's and the per-chunk dispatch's, which is what this shape
-isolates.
+at the largest size it is not behind at all**: 1.39x behind at 1000 and one
+worker, 1.58x behind at 1000 and 24, 1.03x behind at a million and one worker,
+and 0.86x -- 622.4 µs against 720.7 µs -- at a million and 24. The one-worker
+million-element row is a near tie, 8.09 ns an element against 7.87 ns, on a
+body that is most of the 7.87 by itself. Both columns then scale about as far
+as a memory-bound pass over eight megabytes lets them: rayon turns its
+7.875 ms into 720.7 µs, 10.9x, and we turn 8.088 ms into 622.4 µs, 13.0x.
+**Read the 24-worker row as a tie and not as a win** -- #343's section below
+measured this id's own between-run spread at 1.6x on our side against 1.06x
+on rayon's, which is wider than the 14% between the two columns here.
 
-**Read that last sentence against the "#343 attribution" section at the end of
-this file, which takes it apart and finds it wrong on both counts**: the
-per-chunk cost is 15 ns and 1.3% of the run, and most of the 24-worker gap in
-the table above is this harness's own per-iteration input buffer rather than
-either schedule.
+**Nothing in `src/` changed to move that row, and it is not the port getting
+faster.** This section used to read 2.17x at a million elements and 24 workers
+and used to attribute the factor to the partitioner and the per-chunk
+dispatch. #343's counters found both halves of that wrong -- a chunk costs
+15 ns and the 547 of them are 1.3% of the run -- and found most of the
+published gap to be the benchmark harness's own per-iteration input buffer.
+The "#366 change" section took the buffer out of the timed region and
+re-measured: of the ~1.0 ms that left this id, 0.73 ms fell inside the clock
+as the release of an 8 MB input and 0.28 ms fell around it, both of them
+because the setup kept **two** 8 MB blocks live per iteration rather than one.
+What is above is what was underneath. The one mechanism those counters did
+name -- the fan-out reaching only 15 to 19 of the 24 workers -- is filed
+outside this milestone and is unaffected either way.
 
 **The cross-table comparison this section was added for.** At 24 workers
-`for_each` spends 1.66 ns an element end to end (1.658 ms over a million),
+`for_each` spends 0.62 ns an element end to end (622.4 µs over a million),
 where `embarrassing_parallelism` above spends 176 ns a task (11.54 ms over
 65536) of which some 153 ns is not the body. Splitting an index range is
-therefore two orders of magnitude cheaper a unit of work than enqueuing a node
-per unit -- which is what that table's declaration-only id was pointing at.
+therefore nearly three orders of magnitude cheaper a unit of work than
+enqueuing a node per unit -- which is what that table's declaration-only id
+was pointing at, and the factor is larger than this section first reported
+because the figure it divided was the harness's as much as the schedule's.
 Read the order of magnitude and not the digits: those rows come from a
 different run, at a load of 7.9 to 10.6, with a different body and a different
 size.
@@ -3544,11 +3572,16 @@ The `rayon` column does get real `&mut [f64]` halves out of `split_at_mut`,
 since a `join` body may borrow the frame that forked it; that asymmetry is in
 the baseline's favour, like the `Vec<f64>` the `for_each` baseline keeps.
 
-Each sample runs on a fresh shuffle through `Bencher::iter_batched`, reusing
-the `sort` section's pattern for its reason: the input is mutated in place, so
-criterion's plain `iter` would time a sort of already-sorted data on every
-sample after the first. The merge buffer is allocated inside the timed region
-on both sides, where upstream's `std::vector<T> buffer(data.size())` is.
+Each iteration runs on a fresh shuffle through `Bencher::iter_batched_ref`,
+reusing the `sort` section's pattern for its reason: the input is mutated in
+place, so criterion's plain `iter` would time a sort of already-sorted data
+on every sample after the first. Each id owns one array, allocated before
+anything is timed and re-shuffled by that untimed setup, for the reason the
+"#366 change" section at the end of this file measures. The *merge* buffer is
+a different question and is still allocated inside the timed region on both
+sides, where upstream's `std::vector<T> buffer(data.size())` is: it is part
+of the algorithm being compared rather than part of its input, and both
+columns pay it.
 
 The check is in the untimed part of the run, before any id of a size is
 timed: both columns sort one shuffle at each size and worker count, and each
@@ -3563,38 +3596,50 @@ The eight ids are `merge_sort/{rustflow,rayon}/{1w,24w}/{10000,1000000}`.
 
 | size | workers | rustflow | rayon | upstream C++ |
 |---|---|---|---|---|
-| 10000 | 1 | 268.5 µs ±1.6% | 247.5 µs ±0.3% | not published |
-| 10000 | 24 | 835.1 µs ±4.7% | 145.0 µs ±0.8% | not published |
-| 1000000 | 1 | 57.14 ms ±0.3% | 59.86 ms ±1.1% | not published |
-| 1000000 | 24 | 17.39 ms ±1.1% | 19.16 ms ±2.5% | not published |
+| 10000 | 1 | 258.6 µs ±0.3% | 242.9 µs ±0.1% | not published |
+| 10000 | 24 | 869.0 µs ±2.1% | 139.4 µs ±1.4% | not published |
+| 1000000 | 1 | 55.33 ms ±0.3% | 55.33 ms ±0.1% | not published |
+| 1000000 | 24 | 17.31 ms ±2.3% | 18.91 ms ±2.4% | not published |
 
-`rustflow/24w/10000` is ±4.7% with 4 of 20 measurements flagged as outliers,
-and 5 of 20 were flagged on each of the million-element one-worker ids, whose
-intervals are ±0.3% and ±1.1%.
+Measured in the "#366 change" pass at the end of this file, on the same quiet
+box and under the same conditions "What is measured" names for the pass that
+first filled this table. `rustflow/24w/10000` is the widest of the eight at
+±2.1%, with one of 20 measurements flagged as an outlier.
 
-**The two million-element rows go the port's way, and they are not a scheduler
-result.** 57.14 ms against 59.86 ms at one worker and 17.39 ms against
-19.16 ms at 24 -- 4.6% and 9.3%, both outside either id's interval. At a
-million elements the recursion is 1023 spawned tasks against some twenty
-million compare-and-copy operations, and at one worker nothing is stolen and
-nothing is contended, so a 4.6% difference there can only be in the merge loop
-and the buffer rather than in the fork: the `rustflow` column merges through a
-slice of `AtomicU64` with relaxed loads and stores, which is the instruction
-sequence a plain `f64` merge compiles to on this target, and the rayon column
-gets real `&mut [f64]` halves. Which way round that asymmetry would be expected
-to fall is the point: it falls the other way, by five percent, and this table
-cannot say why.
+**The million-element one-worker row is now a dead tie, and the correction is
+the harness's rather than the scheduler's.** 55.331 ms against 55.334 ms --
+three microseconds apart on a 55 millisecond run. This section used to read
+57.14 against 59.86 there and called the 4.6% a merge-loop difference it could
+not explain; it did not need explaining, because it was not there. Both
+columns were being charged for a per-iteration 8 MB input on top of the 8 MB
+merge buffer each of them allocates *inside* the timed region -- the live pair
+the "#366 change" section finds to be the expensive case, rather than the free
+itself -- and taking the input out moved our id by 5.2% and rayon's by 6.9%,
+in the same direction and by amounts that leave the two on top of each other.
+What the row says now is that the merge through a slice of `AtomicU64` with
+relaxed loads and stores costs the same as a merge through real `&mut [f64]`
+halves on this target, which is what the module docs claim for the departure
+and is the first row in this file to measure it.
+
+**The 24-worker million-element row still goes the port's way, and by the
+margin the replaced table read.** 17.31 ms against 18.91 ms, 8.5% apart with
+intervals of ±2.3% and ±2.4%, where the figures this pass replaced were
+17.39 and 19.16, 9.3% apart. Only our column moved with the harness change
+there (−11.4% against rayon's +3.6%, the latter inside its own interval), so
+the agreement of the two ratios is the useful part: at a million elements the
+recursion is 1023 spawned tasks against some twenty million compare-and-copy
+operations, and whatever this row is reading, it is not the fork.
 
 **The 10_000-element rows are the ones that answer the question this section
-exists for, and they go the other way.** 8.5% behind at one worker over 15
-spawned tasks, and 5.8x behind at 24 workers, where our 835.1 µs is 3.1x our
-own one-worker time and rayon's 145.0 µs is 1.7x faster than its own. Fifteen
+exists for, and they go the other way.** 6.5% behind at one worker over 15
+spawned tasks, and 6.2x behind at 24 workers, where our 869.0 µs is 3.4x our
+own one-worker time and rayon's 139.4 µs is 1.7x faster than its own. Fifteen
 tasks whose leaves are 1024-element sorts, distributed by stealing out of the
 shared buffers with a parent re-queued at every level, is the `skynet` and
-`integrate` finding at a thirtieth of their task count. What the million-element
-rows add is the other half of it: this fork is expensive per task and the per
-task cost is all it is, so a shape with enough work per level buries it
-entirely.
+`integrate` finding at a thirtieth of their task count. What the
+million-element rows add is the other half of it: this fork is expensive per
+task and the per task cost is all it is, so a shape with enough work per level
+buries it entirely.
 
 ## integrate
 
@@ -3712,7 +3757,8 @@ fanned out by rayon instead of by this executor, is *faster* than rayon's own
 range split on the same body and the same buffer. What is left is two things
 that have nothing to do with chunks: **the fan-out reaches only 15 to 19 of the
 24 workers** in an uninstrumented-length run, and **most of the published gap
-is the benchmark harness's own per-iteration input buffer**.
+was the benchmark harness's own per-iteration input buffer**, which #366's
+section below has since taken out of the timed region and re-measured without.
 
 **No shipped code changed**, and the decision at the end says why. Nothing in
 `src/` carries a counter from this run either: everything below was counted
@@ -3721,8 +3767,10 @@ its own chunks, and `Executor::make_observer` counts which worker entered each
 dispatched task -- so there was nothing a `cfg` was needed for. (A new `cfg`
 name would also have to be declared in `Cargo.toml`'s `check-cfg`, since
 `unexpected_cfgs` is a warning and the gate denies warnings.) The `for_each`
-table above is therefore untouched, and the two ids it reads were re-run as
-published rather than replaced.
+table above was therefore untouched by *this* run, whose two headline ids were
+re-run as published rather than replaced; #366 has since replaced that table
+from a pass of its own, and every figure in this section is this run's as
+measured.
 
 | | |
 |---|---|
@@ -3747,7 +3795,9 @@ difference between them turns out to be most of the finding:
   `ceil(iters/1000)`, which is **1** for every sample either id of this shape
   reaches, so each iteration allocates and writes a fresh 8 MB input outside
   the timer and *frees it inside* -- the bench's own closure takes the input by
-  value. The `for_each` table is regime B.
+  value. The `for_each` table was regime B when this run was made; #366 moved
+  that shape, `sort` and `merge_sort` to regime A, which is what its section
+  below measures.
 
 ### The counters: what the chunk loop actually runs
 
@@ -3926,6 +3976,17 @@ worse spread, not 2.17x.** `reduce_sum` and `scan` are not affected the same
 way -- both use plain `Bencher::iter` over an input allocated once -- so this
 is a `for_each`-shaped finding and not a suite-wide correction.
 
+**#366 is where that tie was published.** It audited all 196 ids for the same
+pattern, found it in the three shapes that build an input per iteration --
+this one, `sort` and `merge_sort` -- moved the input out of the timed region
+on each and re-measured: `for_each/24w/1000000` reads **622.4 µs against the
+baseline's 720.7 µs**, which is this subsection's own prediction. It also
+names the mechanism this one could only point at: what costs is the **pair**
+of 8 MB blocks the `rustflow` setup kept live per iteration, 0.73 ms of it
+inside the clock as the second block's release and 0.28 ms around it. A single
+8 MB input freed inside the timed region costs nothing measurable, which is
+why the `rayon` column of the same row never carried the term.
+
 ### At a thousand elements the shape is four fifths overhead
 
 The other published row, `n = 1000` at 24 workers, is a different regime and
@@ -3992,3 +4053,219 @@ problem: this port's chunk loop is rayon's equal on the same fan-out. The gap
 that remains on a fan-out shape is **how the first `w` tasks reach `w`
 workers**, which is the same handoff that section priced at ~100 ns a task and
 not a per-item cost at all.
+
+## The #366 change: three tables stopped timing their own input
+
+The section above found its control by accident. `rayon-cells` runs **no code
+of this crate at all** -- rayon's split, rayon's pool, our atomic cells -- and
+it read 775 µs on its own against 1636 µs when its input was built the way
+`benches/for_each.rs` built the `rustflow` column's. A harness term that large
+is not a background detail of a table whose headline gap was 900 µs, so this
+pass audited every id in the suite for the pattern, took the input out of the
+timed region where it found it, and re-measured.
+
+**No shipped code changed.** Nothing under `src/` is touched by this section,
+no bench's size, worker count, sample settings or id name changed, and
+`cargo bench -- --list` prints the same 196 ids it did before. What changed is
+three files' timed regions. **A figure that moves below is therefore the
+artefact leaving, not the port getting faster**, and the sections those
+figures live in say so where the move was large enough to change what they
+claim.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id -- unchanged, every target |
+| Date | 2026-11-19 |
+| **Load average, before run** | **`for_each` 0.17, `sort` 5.49, `merge_sort` 3.75** |
+| **Load average, after run** | **`for_each` 2.25, `sort` 6.58, `merge_sort` 4.78** |
+
+The box was this pass's alone: no sibling agent, nothing else building, and
+`/proc/loadavg` read either side of every run (the raw logs name them one by
+one). A shape's "before" reading is its predecessor's decaying tail rather
+than zero, exactly as the pass "What is measured" above describes, whose
+conditions this one matches: every id is **one** run, criterion's twenty
+samples are the statistic, and the quoted ± is half the width of criterion's
+95% confidence interval for the mean.
+
+### The audit: 196 ids, and the three shapes that had it
+
+Read "setup inside the timed region" as: the timed closure allocates, fills or
+frees a buffer that is the shape's *input* rather than part of the work being
+compared. Building the taskflow inside the timed region is not that -- it is
+what "ours includes building the graph" means, and it is upstream's own
+measured region.
+
+| group | ids | verdict |
+|---|---|---|
+| `async_task` | 12 | clean -- no input buffer at all; the `N` submissions are the subject |
+| `binary_tree` | 8 | clean -- no input buffer; the graph is the measured subject |
+| `black_scholes` | 8 | clean -- `Options::generate` and both price buffers allocated once per id |
+| `data_pipeline` | 6 | **inside, left** -- the first pipe *is* the token source, and a `DataPipeline` cannot be re-run: its token count is consumed |
+| `data_pipeline_slot` | 16 | **inside, left** -- as `data_pipeline`; the per-line slot is the measured subject |
+| `embarrassing_parallelism` | 10 | clean -- no input buffer; `rustflow-build` times a build and a drop deliberately |
+| `fibonacci` | 12 | clean -- no input buffer |
+| `for_each` | 8 | **inside, moved** -- a `Vec<f64>` and a `Vec<AtomicU64>` per iteration, 8 MB each at the larger size |
+| `graph_pipeline` | 6 | **inside, left** -- the `LevelGraph` input is outside; the pipeline and its per-run accumulator are inside and cannot be reused, and the `mpsc` baseline spawns its own threads there by design |
+| `graph_traversal` | 8 | clean -- `LevelGraph::new` once per id outside |
+| `integrate` | 8 | clean -- no buffer; the input is one `f64` |
+| `linear_chain` | 4 | clean -- no input buffer |
+| `mandelbrot` | 8 | clean -- the image is allocated once per id and every sample overwrites all of it |
+| `matrix_multiplication` | 8 | clean -- all three matrices allocated once per id; the init phases inside are upstream's own work |
+| `merge_sort` | 8 | **inside, moved** -- one input per iteration, 8 MB at the larger size; the *merge* buffer stays, where upstream's is |
+| `nqueens` | 8 | clean -- the board is `side` bytes, upstream's own, and the recursion allocates one per node regardless |
+| `pipeline` | 14 | **inside, left** -- as `data_pipeline` |
+| `primes` | 8 | clean -- no buffer; the input is one integer |
+| `reduce_sum` | 8 | clean -- one read-only vector per id, allocated outside |
+| `scan` | 6 | clean -- input and output allocated once per id |
+| `skynet` | 8 | clean -- no input buffer |
+| `sort` | 8 | **inside, moved** -- one input per iteration, 8 MB at the larger size |
+| `wavefront` | 6 | clean -- the matrix is allocated once per id, and its sweep is a fixed point so reuse is sound |
+
+So 24 of the 196 ids had it and all 24 are the three shapes that mutate their
+input in place -- which is the same reason they were the three already using
+`iter_batched`. The four pipeline groups keep theirs, with the reason in the
+rows above: a pipeline's input is the token stream its first pipe produces,
+and there is nothing to hoist.
+
+### What changed in the three, and why `PerIteration`
+
+Each of the 24 ids now owns **one** buffer, allocated before anything is timed
+-- where `mandelbrot`'s image and `matrix_multiplication`'s matrices already
+were, and where upstream allocates `vec` in `main` -- and
+`Bencher::iter_batched_ref`'s untimed setup rewrites it from the same
+generator between iterations. Two things move out of the timed region
+together: the allocation and fill, which `iter_batched` already kept out, and
+the **free**, which it did not -- its timed closure takes the input by value,
+so the input's destructor runs inside the measured region.
+`iter_batched_ref` drops it after the clock stops.
+
+**The batch size is `BatchSize::PerIteration`, and with one buffer per id it
+is the only correct one.** `LargeInput` is `ceil(iters/1000)` and `SmallInput`
+`ceil(iters/10)`: a batch of `k` would call the setup `k` times before timing
+`k` runs, which over one shared buffer means one effective re-shuffle and `k`
+sorts of already-sorted data. `PerIteration` pins the batch to 1, so the
+guarantee does not depend on how many iterations criterion picks. It costs two
+`Instant::now` calls an iteration, about 40 ns, which against the shortest of
+these ids -- 10.4 µs -- is under half a percent, and both the before and the
+after figures below are flat-sampled means, so the two are comparable.
+
+The one wrinkle is that a `rayon` column needs `&mut [f64]` while its buffer
+has to be reachable from the untimed setup as well, which a `RefCell` around
+the buffer settles: nothing but the benchmark thread ever borrows it, the
+borrow is a flag, and `par_iter_mut` and `par_sort_unstable_by` still get a
+real `&mut`. The `rustflow` columns need no such thing -- their arrays are
+already shared through an `Arc`, for the reason their module docs give.
+
+### What the artefact was, taken apart
+
+One shape, one id, four harnesses, `for_each/rustflow/24w/1000000`. Each row
+is one criterion run of that id on this box; nothing differs between them but
+the input's lifetime. The shipped `rustflow` setup was
+`cells(&inputs(size))`: an 8 MB `Vec<f64>` allocated, filled and dropped, and
+an 8 MB `Vec<AtomicU64>` built from it -- **two** blocks per iteration, where
+the `rayon` column's `inputs(size)` is one.
+
+| harness | buffers per iteration | input freed | figure |
+|---|---|---|---|
+| `iter_batched`, `LargeInput` -- what the table used to be measured through | 2 | inside | 1.634 ms |
+| `iter_batched_ref`, `PerIteration` -- same setup, free after the clock stops | 2 | outside | 908.8 µs |
+| `iter_batched`, `LargeInput` -- the cells built straight from the generator | 1 | inside | 626.4 µs |
+| `iter_batched_ref`, `PerIteration` -- **one** buffer per id, refilled untimed | 0 | n/a | 622.4 µs |
+
+**It is the pair that costs, not the free.** Row 3 is the control that says
+so: it frees an 8 MB input inside the timed region exactly as row 1 does and
+pays nothing for it, because an allocator handed the same size back and forth
+recycles the chunk, where two live 8 MB blocks per iteration leave it
+releasing and re-taking pages from the kernel every time. That is also why the
+`rayon` column of this shape never moved while ours fell by 62% -- it churns
+one block an iteration, which is the cheap case -- and why the 10_000-element
+`merge_sort` ids, whose inputs are 80 KB, show nothing at all.
+
+So the ~1.0 ms this id shed is one term with two halves: with the pair in
+place, 0.73 ms of it fell inside the clock as the second block's free and
+0.28 ms fell around it as pages the timed pass then had to walk. Criterion
+keeps a per-iteration allocation out of the *clock*; it cannot keep it out of
+the *machine*, which is why rows 3 and 4 and not row 2 are the artefact-free
+ones. The three figures that agree -- 626.4 µs, 622.4 µs and #343's own
+regime A at 631 µs, measured by three different harnesses -- are the check
+that nothing else moved with the harness.
+
+### The before and the after, all 24 ids
+
+Each side is one run of each id, the before on `origin/main` and the after on
+this change, back to back on the quiet box above, with `change` as criterion's
+own comparison of the two and `p` its own test. Nothing below is a repeat
+sweep or a best of several.
+
+| id | before | after | change | p |
+|---|---|---|---|---|
+| `for_each/rustflow/1w/1000` | 14.35 µs | 14.39 µs | +0.4% | 0.29 |
+| `for_each/rayon/1w/1000` | 10.54 µs | 10.37 µs | −0.5% | 0.44 |
+| `for_each/rustflow/1w/1000000` | 8.762 ms | 8.088 ms | **−7.7%** | 0.00 |
+| `for_each/rayon/1w/1000000` | 7.746 ms | 7.875 ms | +1.3% | 0.00 |
+| `for_each/rustflow/24w/1000` | 45.68 µs | 45.12 µs | −1.4% | 0.28 |
+| `for_each/rayon/24w/1000` | 30.39 µs | 28.47 µs | −6.2% | 0.00 |
+| `for_each/rustflow/24w/1000000` | 1.634 ms | 622.4 µs | **−61.7%** | 0.00 |
+| `for_each/rayon/24w/1000000` | 730.4 µs | 720.7 µs | +0.3% | 0.75 |
+| `sort/rustflow/1w/1000` | 19.30 µs | 19.51 µs | +1.1% | 0.01 |
+| `sort/rayon/1w/1000` | 13.03 µs | 12.38 µs | −5.0% | 0.00 |
+| `sort/rustflow/1w/1000000` | 36.12 ms | 36.26 ms | +0.4% | 0.00 |
+| `sort/rayon/1w/1000000` | 24.95 ms | 24.84 ms | −0.2% | 0.03 |
+| `sort/rustflow/24w/1000` | 21.77 µs | 23.00 µs | +5.6% | 0.00 |
+| `sort/rayon/24w/1000` | 16.06 µs | 16.12 µs | +0.7% | 0.45 |
+| `sort/rustflow/24w/1000000` | 14.61 ms | 15.51 ms | −1.6% | 0.76 |
+| `sort/rayon/24w/1000000` | 3.360 ms | 3.370 ms | +0.8% | 0.09 |
+| `merge_sort/rustflow/1w/10000` | 270.7 µs | 258.6 µs | −5.0% | 0.00 |
+| `merge_sort/rayon/1w/10000` | 249.0 µs | 242.9 µs | −2.3% | 0.00 |
+| `merge_sort/rustflow/1w/1000000` | 58.36 ms | 55.33 ms | **−5.2%** | 0.00 |
+| `merge_sort/rayon/1w/1000000` | 59.43 ms | 55.33 ms | **−6.9%** | 0.00 |
+| `merge_sort/rustflow/24w/10000` | 840.7 µs | 869.0 µs | +4.4% | 0.04 |
+| `merge_sort/rayon/24w/10000` | 142.4 µs | 139.4 µs | −1.6% | 0.05 |
+| `merge_sort/rustflow/24w/1000000` | 19.73 ms | 17.31 ms | **−11.4%** | 0.00 |
+| `merge_sort/rayon/24w/1000000` | 18.25 ms | 18.91 ms | +3.6% | 0.07 |
+
+`change` is criterion's own figure against the run before it, which is why it
+is not always the ratio of the two columns to the digit: it compares sample
+distributions, not the two point estimates. A difference inside an id's own
+interval is not a result -- the rule this file's "What is measured" states for
+every A/B in it -- and `sort/rustflow/24w/1000000` is the one id of the 24 too
+wide to read either way, ±7.8% before and after.
+
+Four things in that table are worth naming.
+
+- **Three ids moved by more than 7%**, and all three are a million-element
+  input: `for_each`'s two `rustflow` ids and `merge_sort/rustflow/24w/1000000`.
+  Three more moved between 5% and 7%, two of them the million-element
+  one-worker `merge_sort` pair. A 10_000-element `merge_sort` input is 80 KB,
+  served out of the allocator's own arena, and nothing there moves beyond this
+  box's drift.
+- **The 1000-element ids moved by up to 6% in both directions**, which is that
+  drift and not this change: there is no 8 MB block anywhere near them, their
+  inputs are 8 KB, and `for_each/rayon/24w/1000` reading 6.2% faster has the
+  same standing as `sort/rustflow/24w/1000` reading 5.6% slower.
+- **`sort` barely moved anywhere**, which is the control inside this pass. Its
+  input is a single `Vec<f64>` on both sides rather than `for_each`'s pair, so
+  there is no alternating allocation to pay for, and at a million elements the
+  sort itself is 36 ms -- an order of magnitude more than the term that was
+  hiding in it. Its table is replaced all the same, because its figures
+  predated the quiet box.
+- **Three ids read slower by more than 2%**: `sort/rustflow/24w/1000` by 5.6%,
+  `merge_sort/rustflow/24w/10000` by 4.4% and
+  `merge_sort/rayon/24w/1000000` by 3.6%, the last inside its own ±2.4% at
+  p = 0.07. For the two small ones the per-iteration clock pair is a larger
+  share of a 20 µs run and criterion's flat sampling has fewer iterations to
+  average within a sample, which is the price named above, paid where it shows.
+
+### What this does not say
+
+It does not say the port got faster: `git diff` for this change touches
+`benches/` and this file. It does not revisit #343's decision, which stands --
+the per-chunk cost is still 15 ns, the fan-out still reaches 15 to 19 of 24
+workers, and that is still the open question, filed outside this milestone. And
+it does not make the 24-worker `for_each` row a win for the port: #343
+measured that id's between-run spread at 1.6x on our side against 1.06x on
+rayon's, so 622 µs against 721 µs is the tie that section predicted, now
+published as one.

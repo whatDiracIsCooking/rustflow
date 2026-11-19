@@ -56,12 +56,18 @@
 //! `merge_sort_taskflow` submits `msort(executor, vec)`, which allocates the
 //! buffer and then submits the recursion again and blocks a worker on its
 //! `wait()` -- and both wrap the same work, so this port submits one root
-//! task and waits its handle, which is what the shape is for. And each sample
-//! runs on a fresh shuffle through [`criterion::Bencher::iter_batched`], as
-//! `benches/sort.rs` does and for its reason: the input is mutated in place,
-//! so criterion's plain `iter` would time a sort of already-sorted data on
-//! every sample after the first. The buffer stays inside the timed region,
-//! where upstream's `std::vector<T> buffer(data.size())` is.
+//! task and waits its handle, which is what the shape is for. And each
+//! iteration runs on a fresh shuffle through
+//! [`criterion::Bencher::iter_batched_ref`], as `benches/sort.rs` does and
+//! for its reason: the input is mutated in place, so criterion's plain
+//! `iter` would time a sort of already-sorted data on every sample after
+//! the first. Each id owns one array, allocated before anything is timed and
+//! re-shuffled by that untimed setup, with `BatchSize::PerIteration` as the
+//! only batch size that is correct for one buffer -- a batch of `k` would
+//! shuffle once and sort `k` times. The *merge* buffer stays inside the
+//! timed region on both sides, where upstream's
+//! `std::vector<T> buffer(data.size())` is. `BENCHMARKS.md`'s "#366 change"
+//! section has the measurement behind the split.
 //!
 //! Correctness is checked before any id is timed: both columns sort one
 //! shuffle at each size and worker count outside every measured region, and
@@ -71,6 +77,7 @@
 //! sorted sequence of a multiset of `f64`s is unique whatever order the
 //! halves were merged in.
 
+use std::cell::RefCell;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -112,16 +119,37 @@ const MEASUREMENT: Duration = Duration::from_secs(3);
 /// congruential generator rather than `rand`, so a run is reproducible.
 /// `benches/sort.rs`'s generator, element for element, so that the two
 /// shapes sort the same data.
-fn shuffled(n: usize) -> Vec<f64> {
+fn generated(n: usize) -> impl Iterator<Item = f64> {
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-    (0..n)
-        .map(|_| {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            (state >> 11) as f64
-        })
-        .collect()
+    (0..n).map(move |_| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 11) as f64
+    })
+}
+
+/// [`generated`]'s first `n` values as a vector: what each id's own array is
+/// allocated as, and what [`verify`] compares against.
+fn shuffled(n: usize) -> Vec<f64> {
+    generated(n).collect()
+}
+
+/// Rewrites `data` from [`generated`], allocating nothing: the untimed setup
+/// that hands every iteration the same unsorted input the one before it was
+/// handed.
+fn reshuffle(data: &mut [f64]) {
+    let values = generated(data.len());
+    for (slot, value) in data.iter_mut().zip(values) {
+        *slot = value;
+    }
+}
+
+/// [`reshuffle`] through the cell array the `rustflow` recursion sorts.
+fn reshuffle_cells(cells: &[AtomicU64]) {
+    for (cell, value) in cells.iter().zip(generated(cells.len())) {
+        cell.store(value.to_bits(), Ordering::Relaxed);
+    }
 }
 
 /// `data` as the cell array the `rustflow` recursion sorts through. See the
@@ -360,21 +388,38 @@ fn bench_merge_sort(c: &mut Criterion) {
         for size in SIZES {
             verify(size, workers, &executor, &pool);
 
+            // One array per id, allocated here and re-shuffled by the
+            // untimed setup of every iteration. Allocating it per iteration
+            // instead puts an 8 MB allocation, fill and free either side of
+            // the timed region and part of it *inside*, which is what
+            // `BENCHMARKS.md`'s "#366 change" section measures. The merge
+            // buffer is a different question and stays where upstream puts
+            // it, inside.
+            let cells = cells(&shuffled(size));
             group.bench_function(
                 BenchmarkId::new(format!("rustflow/{workers}w"), size),
                 |b| {
-                    b.iter_batched(
-                        || cells(&shuffled(size)),
-                        |cells| sort_rustflow(black_box(&cells), &executor),
-                        BatchSize::LargeInput,
+                    b.iter_batched_ref(
+                        || reshuffle_cells(&cells),
+                        |_: &mut ()| sort_rustflow(black_box(&cells), &executor),
+                        BatchSize::PerIteration,
                     );
                 },
             );
+
+            // A `RefCell` only so that the untimed setup and the timed
+            // closure can each reach this id's one array; nothing but this
+            // thread ever borrows it, and the recursion still gets the
+            // `&mut [f64]` its `split_at_mut` needs.
+            let data = RefCell::new(shuffled(size));
             group.bench_function(BenchmarkId::new(format!("rayon/{workers}w"), size), |b| {
-                b.iter_batched(
-                    || shuffled(size),
-                    |mut data| sort_rayon(black_box(&mut data), &pool),
-                    BatchSize::LargeInput,
+                b.iter_batched_ref(
+                    || reshuffle(&mut data.borrow_mut()),
+                    |_: &mut ()| {
+                        let mut data = data.borrow_mut();
+                        sort_rayon(black_box(&mut data), &pool);
+                    },
+                    BatchSize::PerIteration,
                 );
             });
         }
