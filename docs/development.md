@@ -89,6 +89,43 @@ or in CI builds the image, so that rebuild is the check that a `Dockerfile`
 edit works, and a container that predates a pin simply lacks the tool (the
 coverage script says so and names this command).
 
+One more thing is in the image for a measurement rather than for the build:
+`g++`, `cmake` and `make`, in the last layer of the
+[`Dockerfile`](../Dockerfile) and there for `devtools/upstream-bench.sh`, which
+builds **Taskflow v4.1.0's own benchmark binaries** and runs them on this box.
+That is what can fill [`BENCHMARKS.md`](../BENCHMARKS.md)'s `upstream C++`
+column, which is otherwise empty for every shape because upstream publishes no
+figures at all — so the one comparison that can say whether a nested shape's
+scaling is the Taskflow design's or this port's is upstream's own executor on
+the same CPU. The script clones upstream at the pin into a scratch directory
+**outside** the repo — never vendored, because `LICENSE-TASKFLOW` covers the
+translated code in `src/` and `benches/` and not a checkout — configures it
+with the benchmark targets on and tests and examples off, and builds the five
+nested shapes' targets: `bench_skynet`, `bench_nqueens`, `bench_integrate`,
+`bench_fibonacci` and `bench_merge_sort`.
+
+```sh
+devtools/upstream-bench.sh --list        # the plan, with no network and no toolchain
+devtools/upstream-bench.sh               # clone, build, run the five
+devtools/upstream-bench.sh --build-only  # stop after the build
+devtools/upstream-bench.sh --bench nqueens --threads 1
+```
+
+**The image has to be rebuilt before it will run.** Exactly as for the
+coverage pins above, nothing in the gate or in CI builds the image, so a
+container created before that layer existed has none of the three tools; the
+script says so and names `devtools/devcontainer.sh rebuild`, which is
+host-only. `--list` needs none of them, so it is also how to tell which kind of
+container you are sitting in. Three things from its `--help` are worth knowing
+before reading a number out of it, all three measured rather than assumed: the
+`runtime` column upstream prints is **milliseconds**; upstream's binaries sweep
+a size *range* per process, so a cell of our tables is a row of its output and
+`integrate`'s two sizes are not on upstream's grid at all; and
+`bench_merge_sort` **deadlocks at one worker** in upstream's own harness, which
+leaves that one cell unobtainable this way. Like the reports below it is one
+run per row with no repeat count, so a quiet box matters as much as it does for
+`devtools/bench-ab.sh`.
+
 Three more instruments need nothing from the image. Two are POSIX `sh` and
 measure the documentation contract in [`DESIGN.md`](../DESIGN.md) rather than
 the code: `devtools/doc-ratio.sh` prints, per production file, how many of its
@@ -100,14 +137,15 @@ The third is Python 3 with nothing outside its standard library:
 test, example, benchmark or doc example witnesses, reading each call site
 against the type it reaches rather than against a bare function name.
 
-**Which of these decide anything: none of them.** All four of
-`devtools/doc-ratio.sh`, `devtools/test-names.sh`, `devtools/coverage.sh` and
-`devtools/api-witness.py` are **reports** — each exits 0 whatever it finds, no
-CI job reads any of them, and a number from one is something a reviewer reads
-rather than something that passes or fails. `test-names.sh diff` and
-`coverage.sh` exit non-zero only on a difference the PR running them asked
-about or a measurement that could not run at all; `api-witness.py` exits 2 for
-the same second reason. `cargo mutants` is in the same class, run by hand over
+**Which of these decide anything: none of them.** All five of
+`devtools/doc-ratio.sh`, `devtools/test-names.sh`, `devtools/coverage.sh`,
+`devtools/api-witness.py` and `devtools/upstream-bench.sh` are **reports** —
+each exits 0 whatever it finds, no CI job reads any of them, and a number from
+one is something a reviewer reads rather than something that passes or fails.
+`test-names.sh diff` and `coverage.sh` exit non-zero only on a difference the
+PR running them asked about or a measurement that could not run at all;
+`api-witness.py` exits 2 for the same second reason, and `upstream-bench.sh`
+for a missing tool or a clone, configure, build or run that failed. `cargo mutants` is in the same class, run by hand over
 a module at a time. What **gates** is the five-command `check` above, plus the
 two things CI's `examples` job runs: `devtools/run-examples.sh`, and every
 benchmark id once in criterion's untimed `--test` mode, which asks whether the
