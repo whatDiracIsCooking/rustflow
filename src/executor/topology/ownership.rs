@@ -62,7 +62,7 @@ use super::run::{Cancellable, Topology};
 use crate::executor::Shared;
 use crate::executor::async_node::AsyncNode;
 use crate::executor::subflow;
-use crate::graph::{Graph, Handle, NodeBase, Task};
+use crate::graph::{Graph, Handle, Node, NodeBase, Task};
 use crate::taskflow::Flow;
 
 /// Which graph a [`Job`]'s [`Task`] indexes, and what keeps that graph alive:
@@ -80,9 +80,12 @@ pub(crate) enum GraphOwner {
     /// A graph that one node of another graph owns: an adopted module's graph,
     /// and a subflow's subgraph.
     Inside(Arc<Inside>),
-    /// The one-node arena an async task is, which belongs to no taskflow and to
-    /// no node. The share is upstream's reference count on the node, held while
-    /// the job is queued.
+    /// The free-standing node an async task is, which belongs to no taskflow,
+    /// to no node and to no graph at all: the one arm whose job resolves
+    /// through a field rather than by index, which is why
+    /// [`GraphOwner::try_graph`] is an `Option` and [`GraphOwner::graph`]
+    /// panics. The share is upstream's reference count on the node, held
+    /// while the job is queued.
     Async(Arc<AsyncNode>),
 }
 
@@ -278,31 +281,76 @@ impl GraphOwner {
         }))
     }
 
-    /// The graph this owner names: upstream's `Graph&`, resolved rather than
-    /// passed. Every borrow it hands out is derived from `&self`, which is
-    /// what keeps the whole of this safe.
+    /// The node `task` names: upstream's `Node*`, which it queues and this
+    /// port resolves. One `match` arm per kind of owner, the async arm
+    /// handing back the node it holds inline where the other three index into
+    /// the graph they name.
     ///
     /// # Panics
     ///
     /// Panics if a node on the path is not a live node of its graph, which an
     /// owner the scheduler built cannot have -- see [`Job::node`].
-    pub(crate) fn graph(&self) -> &Graph {
+    pub(crate) fn node(&self, task: Task) -> &Node {
         match self {
-            Self::Run(storage) => storage.graph(),
-            Self::Flow(flow) => flow.graph(),
-            Self::Inside(inside) => inside.graph(),
-            Self::Async(node) => node.graph(),
+            Self::Run(storage) => storage.graph().node(task),
+            Self::Flow(flow) => flow.graph().node(task),
+            Self::Inside(inside) => inside.graph().node(task),
+            Self::Async(node) => {
+                debug_assert_eq!(
+                    task,
+                    AsyncNode::TASK,
+                    "a job of a free node names the one node that owner is"
+                );
+                node.node()
+            }
+        }
+    }
+
+    /// The graph this owner names: upstream's `Graph&`, resolved rather than
+    /// passed. Every borrow it hands out is derived from `&self`, which is
+    /// what keeps the whole of this safe. For the node to *run* ask
+    /// [`GraphOwner::node`]; this is for the other nodes of the same graph --
+    /// a successor to release, a bypass target -- and for the graph's
+    /// identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a node on the path is not a live node of its graph, which an
+    /// owner the scheduler built cannot have -- see [`Job::node`].
+    ///
+    /// Panics if this is a free async node, which lives in no graph: a caller
+    /// that may hold one asks [`GraphOwner::try_graph`] instead, and
+    /// `DESIGN.md`'s entry on what a free node is has which callers those
+    /// are.
+    pub(crate) fn graph(&self) -> &Graph {
+        self.try_graph()
+            .expect("a free async node lives in no graph, so it has no other node to name")
+    }
+
+    /// The same, as the `None` a free async node is: the shape for the three
+    /// paths every job reaches, which are the node's own dispatch, the
+    /// observer views and [`Job::runs_inside`].
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`GraphOwner::graph`] does, bar the free node.
+    pub(crate) fn try_graph(&self) -> Option<&Graph> {
+        match self {
+            Self::Run(storage) => Some(storage.graph()),
+            Self::Flow(flow) => Some(flow.graph()),
+            Self::Inside(inside) => Some(inside.graph()),
+            Self::Async(_) => None,
         }
     }
 
     /// Whether the graph this names has a task a run could start at:
-    /// `Flow::has_source_task` over any owner. Every arm that runs a nested graph
-    /// asks first: one with nothing to start at queues no job, so a node preempted
-    /// for it would never be resumed.
+    /// `Flow::has_source_task` over any owner, and `false` for the one owner
+    /// that is no graph. Every arm that runs a nested graph asks first: one
+    /// with nothing to start at queues no job, so a node preempted for it
+    /// would never be resumed.
     pub(crate) fn has_source_task(&self) -> bool {
-        self.graph()
-            .iter()
-            .any(|(_, node)| node.num_predecessors() == 0)
+        self.try_graph()
+            .is_some_and(|graph| graph.iter().any(|(_, node)| node.num_predecessors() == 0))
     }
 
     /// Takes the leased graph back out of this owner, if this is the last share of
@@ -427,7 +475,7 @@ impl Inside {
             return leased;
         }
 
-        match self.owner.graph().node(self.node).handle() {
+        match self.owner.node(self.node).handle() {
             Handle::AdoptedModule(graph) => graph,
             // Unreachable for an owner the scheduler built: it was made from
             // the very handle the dispatch arm was holding, and a handle can
@@ -451,7 +499,7 @@ impl Drop for Inside {
     /// owning.
     fn drop(&mut self) {
         if let Some(graph) = self.leased.take() {
-            subflow::return_subgraph(self.owner.graph().node(self.node), graph);
+            subflow::return_subgraph(self.owner.node(self.node), graph);
         }
     }
 }

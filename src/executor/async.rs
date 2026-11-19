@@ -46,11 +46,10 @@
 //! under. And a dependent submission's join counter starts at one, as the
 //! submitting thread's own guard.
 //!
-//! What a submission costs was measured rather than argued: ~415 ns for an
-//! externally submitted `silent_async`, 87% of it the three heap blocks and
-//! 320 bytes a free node is and 2 to 4% the counters below. `BENCHMARKS.md`
-//! has the ablations, and `DESIGN.md` has why the three blocks cannot be
-//! two.
+//! What a submission costs was measured rather than argued: most of an
+//! externally submitted `silent_async` is the free node's heap blocks, and 2
+//! to 4% of it the counters below. `BENCHMARKS.md` has the ablations and what
+//! a block cost; `DESIGN.md` has why the node is two blocks and not one.
 
 use core::fmt;
 use std::any::Any;

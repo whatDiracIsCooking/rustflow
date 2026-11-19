@@ -567,11 +567,11 @@ fn dump_node(
         }
         // A module task owns no graph either, and does not reach this function
         // at all: [`dump_graph`] sends it to [`dump_module_node`]. Neither
-        // async handle owns a graph: the one-node graph a free async task is
-        // belongs to the task rather than to the handle, and nothing dumps
-        // one -- a free node is in no taskflow to be dumped. What reaches
-        // here is an async handle somebody put in a graph through
-        // [`Graph::add_node`], and it is a plain node like any other.
+        // async handle owns a graph: the node a free async task is belongs to
+        // the task rather than to the handle, and is in no graph -- and so in
+        // no taskflow -- to be dumped. What reaches here is an async handle
+        // somebody put in a graph through [`Graph::add_node`], and it is a
+        // plain node like any other.
         Handle::Placeholder
         | Handle::Static(_)
         | Handle::Condition(_)

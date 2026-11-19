@@ -47,8 +47,8 @@
 //! target writes its nodes only through their atomic state words.
 //!
 //! **The two async variants are a node's *handle*, not a way to build one.**
-//! The node such a task is lives in a one-node graph of its own rather than
-//! in a taskflow's arena -- `executor::async_node` owns it -- so nothing on
+//! The node such a task is lives in no graph at all rather than in a
+//! taskflow's arena -- `executor::async_node` owns it -- so nothing on
 //! [`FlowBuilder`](crate::FlowBuilder) produces either. They differ in who
 //! may wait for the task and in what the node keeps besides its body: a
 //! dependent-async node holds the successors upstream keeps in `_edges`

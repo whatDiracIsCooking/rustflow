@@ -402,10 +402,12 @@ pub struct Node {
 }
 
 impl Node {
-    /// Creates a node outside any graph. Private to the `graph` module because
-    /// the edge lists are arena indices, which are meaningless until
-    /// [`Graph`](super::Graph) owns the node.
-    pub(super) fn new(name: String, handle: Handle) -> Self {
+    /// Creates a node outside any graph, with no edges: the edge lists are
+    /// arena indices, so a node that no [`Graph`](super::Graph) owns must
+    /// stay without them, and only a caller that adds none may keep one.
+    /// Crate-private for the one such caller -- the executor's `AsyncNode`,
+    /// whose node is free-standing and indexes nothing.
+    pub(crate) fn new(name: String, handle: Handle) -> Self {
         Self {
             name,
             handle,
