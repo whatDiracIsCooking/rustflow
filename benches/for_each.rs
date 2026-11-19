@@ -25,12 +25,16 @@
 //! on, so the per-element cost is upstream's; the baseline keeps a plain
 //! `Vec<f64>`, since `par_iter_mut` hands each element a real `&mut f64`.
 //!
-//! Each sample runs on a fresh vector through
-//! `criterion::Bencher::iter_batched`, as `benches/sort.rs` does and for the
-//! same reason: this shape mutates its input in place, and upstream
-//! regenerates `vec` once per round, so criterion's plain `iter` would
-//! measure `tan` composed with itself a hundred times over instead of
-//! `tan` once.
+//! Each sample runs on freshly generated values, because this shape mutates
+//! its input in place and criterion's plain `iter` would otherwise measure
+//! `tan` composed with itself a hundred times over instead of `tan` once.
+//! Each id owns **one** buffer, allocated before anything is timed as
+//! upstream allocates `vec` in `main`, and
+//! `criterion::Bencher::iter_batched_ref`'s untimed setup rewrites it from
+//! the generator between iterations. `BatchSize::PerIteration` is the only
+//! correct batch size for that: a batch of `k` would refill once and run
+//! `k` times. `BENCHMARKS.md`'s "#366 change" section has the measurement
+//! that made this the shape of the harness.
 //!
 //! Correctness is checked in the untimed part of the run: before any id of a
 //! size is timed, both variants run once at that size and worker count and
@@ -40,6 +44,7 @@
 //! `benches/reduce_sum.rs`'s: each output here depends on exactly one input
 //! element, and both columns call the same `f64::tan` on it.
 
+use std::cell::RefCell;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,18 +81,40 @@ const MEASUREMENT: Duration = Duration::from_secs(3);
 /// `[0, RAND_MAX]`, so that `tan` is evaluated where it is well conditioned
 /// and the reference below is a meaningful comparison rather than a race
 /// between two argument reductions.
-fn inputs(n: usize) -> Vec<f64> {
+fn generated(n: usize) -> impl Iterator<Item = f64> {
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-    (0..n)
-        .map(|_| {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            // 53 bits of mantissa over 2^53: the whole of an `f64`'s
-            // precision in `[0, 1)`, and no rounding on the way in.
-            (state >> 11) as f64 / 9_007_199_254_740_992.0
-        })
-        .collect()
+    (0..n).map(move |_| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        // 53 bits of mantissa over 2^53: the whole of an `f64`'s precision
+        // in `[0, 1)`, and no rounding on the way in.
+        (state >> 11) as f64 / 9_007_199_254_740_992.0
+    })
+}
+
+/// [`generated`]'s first `n` values as a vector: what a `rayon` id's own
+/// buffer is allocated as, and what [`verify`] compares against.
+fn inputs(n: usize) -> Vec<f64> {
+    generated(n).collect()
+}
+
+/// Rewrites `data` from [`generated`], allocating nothing.
+///
+/// The untimed setup of a `rayon` id: the buffer is the id's own, so each
+/// iteration is handed the same input the one before it was.
+fn refill(data: &mut [f64]) {
+    let values = generated(data.len());
+    for (slot, value) in data.iter_mut().zip(values) {
+        *slot = value;
+    }
+}
+
+/// [`refill`] through the cell vector the `rustflow` body writes.
+fn refill_cells(cells: &[AtomicU64]) {
+    for (cell, value) in cells.iter().zip(generated(cells.len())) {
+        cell.store(value.to_bits(), Ordering::Relaxed);
+    }
 }
 
 /// `data` as the cell vector the `rustflow` body writes through. See the
@@ -174,21 +201,36 @@ fn bench_for_each(c: &mut Criterion) {
         for size in SIZES {
             verify(size, workers, &executor, &pool);
 
+            // One buffer per id, allocated here and rewritten by the untimed
+            // setup of every iteration. Allocating it per iteration instead
+            // puts an 8 MB allocation, fill and free either side of the
+            // timed region and ~0.7 ms of it *inside*, which is what
+            // `BENCHMARKS.md`'s "#366 change" section measures.
+            let cells = cells(&inputs(size));
             group.bench_function(
                 BenchmarkId::new(format!("rustflow/{workers}w"), size),
                 |b| {
-                    b.iter_batched(
-                        || cells(&inputs(size)),
-                        |cells| for_each_rustflow(black_box(&cells), &executor),
-                        BatchSize::LargeInput,
+                    b.iter_batched_ref(
+                        || refill_cells(&cells),
+                        |_: &mut ()| for_each_rustflow(black_box(&cells), &executor),
+                        BatchSize::PerIteration,
                     );
                 },
             );
+
+            // A `RefCell` only so that the untimed setup and the timed
+            // closure can each reach this id's one buffer; nothing but this
+            // thread ever borrows it, and `par_iter_mut` still gets the
+            // `&mut [f64]` the module docs require.
+            let data = RefCell::new(inputs(size));
             group.bench_function(BenchmarkId::new(format!("rayon/{workers}w"), size), |b| {
-                b.iter_batched(
-                    || inputs(size),
-                    |mut data| for_each_rayon(black_box(&mut data), &pool),
-                    BatchSize::LargeInput,
+                b.iter_batched_ref(
+                    || refill(&mut data.borrow_mut()),
+                    |_: &mut ()| {
+                        let mut data = data.borrow_mut();
+                        for_each_rayon(black_box(&mut data), &pool);
+                    },
+                    BatchSize::PerIteration,
                 );
             });
         }
