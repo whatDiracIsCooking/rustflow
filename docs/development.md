@@ -93,11 +93,13 @@ One more thing is in the image for a measurement rather than for the build:
 `g++`, `cmake` and `make`, in the last layer of the
 [`Dockerfile`](../Dockerfile) and there for `devtools/upstream-bench.sh`, which
 builds **Taskflow v4.1.0's own benchmark binaries** and runs them on this box.
-That is what can fill [`BENCHMARKS.md`](../BENCHMARKS.md)'s `upstream C++`
-column, which is otherwise empty for every shape because upstream publishes no
-figures at all — so the one comparison that can say whether a nested shape's
-scaling is the Taskflow design's or this port's is upstream's own executor on
-the same CPU. The script clones upstream at the pin into a scratch directory
+That is what filled [`BENCHMARKS.md`](../BENCHMARKS.md)'s `upstream C++`
+column for the five nested shapes, which is empty for the other seventeen
+because upstream publishes no figures at all — the one comparison that can say
+whether a nested shape's scaling is the Taskflow design's or this port's being
+upstream's own executor on the same CPU. That run is #384, and "The #384
+measurement" at the end of that file is its output and its reading.
+The script clones upstream at the pin into a scratch directory
 **outside** the repo — never vendored, because `LICENSE-TASKFLOW` covers the
 translated code in `src/` and `benches/` and not a checkout — configures it
 with the benchmark targets on and tests and examples off, and builds the five

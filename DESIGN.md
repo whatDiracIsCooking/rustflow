@@ -843,6 +843,25 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   constant (#382's territory) or the two-worker case, where a stolen child
   still costs the parent a wait with nobody to hand it other work.
 
+  **Upstream's own executor on this box says whose regression it was: the
+  port's** (issue #384). #372 and #412 were both opened on the premise that
+  five nested shapes being *slower* at 24 workers than at one was this port
+  and not Taskflow's design, and that premise is a claim about the design
+  which no rayon baseline can test. Upstream's own `bench_skynet`,
+  `bench_nqueens`, `bench_integrate`, `bench_fibonacci` and
+  `bench_merge_sort`, built from a clone at this repo's pin and run on the
+  same CPU, are **faster at 24 workers than at one on every shape and size
+  they can be asked for** -- 4.3x, 5.4x and 6.9x at the sizes large enough to
+  carry 24 workers -- with the one cell that reads the other way inside the
+  spread of a single untimed call. So the design scales on these shapes, the
+  regression was the port's, and both changes that recovered it were
+  port-fidelity corrections rather than scheduler design: the queue a group's
+  child is pushed onto (#372) and the predicate a corun re-reads (#412). What
+  the comparison does *not* settle is the absolute standing of the two, which
+  is nine calls of one build of one compiler; the figures, the caveats and the
+  one shape where this port's column is ahead are in
+  [`BENCHMARKS.md`](BENCHMARKS.md) under "The #384 measurement".
+
 ## Control flow and cancellation
 
 - **A failure inside a nested graph is delivered to whoever is waiting for
