@@ -7,6 +7,9 @@
 //! [`DynamicPartitioner`] hand chunks out from a shared cursor -- guided
 //! shrinking the chunk as the remaining work does, dynamic keeping it fixed
 //! -- and [`RandomPartitioner`] draws the chunk size itself from a range.
+//! A fifth, [`SplittingPartitioner`], is the port's own: its chunk re-splits
+//! when another worker steals it, so a worker that misses the first fan-out
+//! can still take a share.
 //!
 //! # Design
 //!
@@ -55,13 +58,67 @@
 //! sizes being unpredictable, and a fixed seed is what lets a test assert
 //! on one run rather than sampling many.
 //!
+//! **`SplittingPartitioner` answers a measured fan-out, and is ours.** The
+//! four types above hand a fixed number of chunk tasks -- one per worker --
+//! to a single deque, and `BENCHMARKS.md`'s own fan-out measurement found
+//! that reaching only 15 to 19 of 24 workers: a worker that misses the steal
+//! window has no way to take a share afterwards, because nothing a running
+//! chunk does makes more work visible. Rayon's splitter has no such window,
+//! and [`SplittingPartitioner`] is that property ported to this scheduler
+//! rather than to upstream's: a chunk task that finds itself running on a
+//! thread other than the one that spawned it hands half of its remaining
+//! share to a fresh task under its own node before walking the rest, so each
+//! steal makes one more share stealable. A chunk running where it was
+//! spawned does not split, which is what bounds the extra tasks by the
+//! number of steals rather than by the size of the range. The default stays
+//! [`GuidedPartitioner`], upstream's own.
+//!
+//! **A share's home is a [`std::thread::ThreadId`], not a worker index.**
+//! The split test wants "was this task stolen", and the natural spelling is
+//! [`Runtime::worker_id`](crate::Runtime::worker_id) against an id recorded
+//! where the task was spawned. Half the spawn sites cannot reach one:
+//! [`crate::Scope`] -- all the slice, reduce and find algorithms have at the
+//! point they fan out -- exposes `spawn` and `spawn_runtime` and nothing
+//! about the worker it would spawn from, and an executor's own worker-id
+//! lookup is a map keyed by [`std::thread::ThreadId`] to begin with. So the
+//! home recorded at spawn and the identity compared at entry are both thread
+//! ids, one hop before the index upstream's `this_worker_id` would hand
+//! back; a pool thread is a worker for the executor's whole life, so the two
+//! comparisons answer the same question. The split *half* still needs a
+//! [`Runtime`], which is why a splitting chunk task is
+//! spawned runtime-bodied where the ported families' are not.
+//!
+//! **The chunk size is the splitting floor, and `0` means one call per
+//! share.** A share stops splitting once either half would fall below the
+//! configured chunk size (`0` meaning one index), which is the only bound a
+//! steal-driven split needs: nothing splits without a steal, so the extra
+//! tasks are counted by contention rather than by `n`. The same number is
+//! how far a task's own walk sub-divides its share before calling the chunk
+//! body -- and `0`, which asks the ported families to work a size out from
+//! `n` and `w`, asks this one for one call per share instead, since the
+//! balance it offers comes from re-splitting rather than from small chunks.
+//!
+//! **It implements neither [`StaticLoop`] nor [`DynamicLoop`].** Both
+//! describe a walk a worker performs alone, over a `curr_b` or a shared
+//! cursor; a splitting walk is neither, because it needs a handle on the
+//! scheduler to hand its far half to. What it implements instead is the
+//! per-algorithm driving trait each family already has --
+//! [`crate::algorithm::SlicePartitioner`],
+//! [`crate::algorithm::reduce::ReducePartitioner`],
+//! [`crate::algorithm::find::FindPartitioner`] and
+//! [`crate::algorithm::for_each_index::IndexDispatch`] -- so every algorithm
+//! takes it unchanged -- each of them separately sealed in its own module,
+//! so a fifth partitioner is an impl in each.
+//!
 //! **Omitted:** upstream's `PartitionerLike` concept and `is_partitioner_v`
 //! check that a type derives from `PartitionerBase`. A `P: Partitioner`
 //! bound already is that check; nothing else needs to restate it.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread::{self, ThreadId};
 
-use crate::Xorshift64;
+use crate::runtime::Runtime;
+use crate::{Scope, Xorshift64};
 
 /// Which of the two scheduling families a partitioner belongs to: upstream's
 /// `PartitionerType`. [`StaticLoop`] is implemented only by a
@@ -744,9 +801,324 @@ fn draw_in_range(rng: &mut Xorshift64, lo: usize, hi: usize) -> usize {
     lo + draw % span
 }
 
+/// A partitioner whose chunk re-splits when it is stolen: a chunk task that
+/// starts on a thread other than the one that spawned it hands half of its
+/// remaining share to a new task before walking the rest, down to a floor of
+/// one chunk size.
+///
+/// No upstream counterpart: the four partitioners above are
+/// `taskflow/algorithm/partitioner.hpp`'s, and this one is the port's own.
+/// The module's `# Design` section has the fan-out measurement it answers,
+/// why a share's home is a [`std::thread::ThreadId`], and why the chunk size
+/// is read as a splitting floor.
+///
+/// ```
+/// use std::sync::atomic::{AtomicUsize, Ordering};
+/// use std::sync::Arc;
+///
+/// use rustflow::algorithm::partitioner::{DefaultClosureWrapper, SplittingPartitioner};
+/// use rustflow::prelude::*;
+/// use rustflow::Executor;
+///
+/// let visits = Arc::new(AtomicUsize::new(0));
+/// let counted = Arc::clone(&visits);
+///
+/// let mut taskflow = Taskflow::new();
+/// taskflow.for_each_index(
+///     0_usize,
+///     10_000,
+///     1,
+///     move |_| {
+///         counted.fetch_add(1, Ordering::Relaxed);
+///     },
+///     // Every algorithm takes it where it takes one of the ported four.
+///     SplittingPartitioner::<DefaultClosureWrapper>::new(64),
+/// );
+///
+/// Executor::new(4).run(&taskflow).wait().expect("no task panicked");
+/// assert_eq!(visits.load(Ordering::Relaxed), 10_000);
+/// ```
+#[derive(Clone, Debug)]
+pub struct SplittingPartitioner<C: ClosureWrapper = DefaultClosureWrapper> {
+    chunk_size: usize,
+    closure_wrapper: C,
+}
+
+impl<C: ClosureWrapper + Default> Default for SplittingPartitioner<C> {
+    fn default() -> Self {
+        Self {
+            chunk_size: 0,
+            closure_wrapper: C::default(),
+        }
+    }
+}
+
+impl<C: ClosureWrapper> SplittingPartitioner<C> {
+    /// A splitting partitioner whose shares stop splitting at `chunk_size`
+    /// and whose chunk body is called once per `chunk_size` indices (`0`
+    /// meaning a floor of one index and one call per share), with a
+    /// default-constructed closure wrapper.
+    #[must_use]
+    pub fn new(chunk_size: usize) -> Self
+    where
+        C: Default,
+    {
+        Self {
+            chunk_size,
+            closure_wrapper: C::default(),
+        }
+    }
+
+    /// [`SplittingPartitioner::new`] with an explicit closure wrapper, which
+    /// wraps each chunk task -- including each task a split created.
+    ///
+    /// ```
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    /// use std::sync::Arc;
+    ///
+    /// use rustflow::algorithm::partitioner::SplittingPartitioner;
+    /// use rustflow::prelude::*;
+    /// use rustflow::Executor;
+    ///
+    /// let tasks = Arc::new(AtomicUsize::new(0));
+    /// let counted = Arc::clone(&tasks);
+    /// let part = SplittingPartitioner::with_closure_wrapper(16, move |body: &mut dyn FnMut()| {
+    ///     counted.fetch_add(1, Ordering::Relaxed);
+    ///     body();
+    /// });
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// taskflow.for_each_index(0_usize, 1_000, 1, |_| {}, part);
+    /// Executor::new(4).run(&taskflow).wait().expect("no task panicked");
+    ///
+    /// // One per worker's own share, and one more for every share a steal
+    /// // re-split -- which is how many there are is up to the run.
+    /// assert!(tasks.load(Ordering::Relaxed) >= 4);
+    /// ```
+    #[must_use]
+    pub fn with_closure_wrapper(chunk_size: usize, closure_wrapper: C) -> Self {
+        Self {
+            chunk_size,
+            closure_wrapper,
+        }
+    }
+
+    /// The size below which neither half of a split may fall: the configured
+    /// chunk size, or `1` when none was configured.
+    pub(crate) fn split_floor(&self) -> usize {
+        self.chunk_size.max(1)
+    }
+}
+
+impl<C: ClosureWrapper> Partitioner for SplittingPartitioner<C> {
+    type Wrapper = C;
+    /// Work is assigned while the loop runs rather than before it, which is
+    /// the dynamic family's own property; the shared cursor is not, and the
+    /// module's `# Design` section says why no loop trait fits.
+    const PARTITIONER_TYPE: PartitionerType = PartitionerType::Dynamic;
+
+    fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
+    fn set_chunk_size(&mut self, chunk_size: usize) {
+        self.chunk_size = chunk_size;
+    }
+
+    fn closure_wrapper(&self) -> &C {
+        &self.closure_wrapper
+    }
+
+    fn closure_wrapper_mut(&mut self) -> &mut C {
+        &mut self.closure_wrapper
+    }
+}
+
+/// One chunk task's own share of a parallel loop, as [`SplittingPartitioner`]
+/// halves it: an index range for the index-driven algorithms, a `&mut [T]`
+/// for the slice-driven ones.
+pub(crate) trait SplitShare: Sized {
+    /// How many indices, or elements, this share covers.
+    fn size(&self) -> usize;
+
+    /// Splits this share into its first `mid` and the rest. `mid` is always
+    /// in `1..size()`.
+    fn split(self, mid: usize) -> (Self, Self);
+}
+
+impl SplitShare for (usize, usize) {
+    fn size(&self) -> usize {
+        self.1 - self.0
+    }
+
+    fn split(self, mid: usize) -> (Self, Self) {
+        let at = self.0 + mid;
+        ((self.0, at), (at, self.1))
+    }
+}
+
+impl<T> SplitShare for &mut [T] {
+    fn size(&self) -> usize {
+        // Spelled through the slice rather than as `self.len()`, which would
+        // resolve back to this method on `&&mut [T]`.
+        <[T]>::len(self)
+    }
+
+    fn split(self, mid: usize) -> (Self, Self) {
+        self.split_at_mut(mid)
+    }
+}
+
+/// Where a share of `size` splits, or `None` when either half would fall
+/// below `floor` (itself read as at least `1`).
+pub(crate) fn split_point(size: usize, floor: usize) -> Option<usize> {
+    let smallest = floor.max(1).checked_mul(2)?;
+    (size >= smallest).then_some(size / 2)
+}
+
+/// The contiguous shares `[0, n)` starts out as, one per worker, in index
+/// order and never empty: the same spread
+/// [`StaticPartitioner::adjusted_chunk_size`] computes, which is where a
+/// splitting run begins rather than where it ends.
+pub(crate) fn index_shares(n: usize, w: usize) -> Vec<(usize, usize)> {
+    if w == 0 {
+        return Vec::new();
+    }
+    let mut shares = Vec::with_capacity(w.min(n));
+    let mut begin = 0usize;
+    for i in 0..w {
+        let size = n / w + usize::from(i < n % w);
+        if size == 0 {
+            break;
+        }
+        shares.push((begin, begin + size));
+        begin += size;
+    }
+    shares
+}
+
+/// [`index_shares`]'s carve of a `&mut [T]`: the same contiguous spread, as
+/// sub-slices rather than index pairs.
+pub(crate) fn slice_shares<T>(data: &mut [T], w: usize) -> Vec<&mut [T]> {
+    let sizes = index_shares(data.len(), w);
+    let mut shares = Vec::with_capacity(sizes.len());
+    let mut rest = data;
+    for (b, e) in sizes {
+        let (head, tail) = rest.split_at_mut(e - b);
+        shares.push(head);
+        rest = tail;
+    }
+    shares
+}
+
+/// Walks `[b, e)` in steps of `chunk_size`, calling `f` once per chunk and
+/// stopping as soon as it returns `true`; a `chunk_size` of `0` hands the
+/// whole range to one call. [`SplittingPartitioner`]'s own chunk loop, where
+/// the ported families have [`StaticLoop`] and [`DynamicLoop`].
+pub(crate) fn walk_chunks(
+    b: usize,
+    e: usize,
+    chunk_size: usize,
+    mut f: impl FnMut(usize, usize) -> bool,
+) {
+    if chunk_size == 0 {
+        if b < e {
+            f(b, e);
+        }
+        return;
+    }
+    let mut curr = b;
+    while curr < e {
+        let next = curr.saturating_add(chunk_size).min(e);
+        if f(curr, next) {
+            return;
+        }
+        curr = next;
+    }
+}
+
+/// Runs one chunk task's `share`, splitting it first if this thread is not
+/// `home` -- the thread the task was spawned on: the far half goes to a task
+/// of its own under this task's node, joined before this call returns, and
+/// `work` walks the near half here. `work` is called exactly once per share
+/// the split leaves behind, and every index of `share` is covered by exactly
+/// one of them.
+pub(crate) fn run_share<'a, S, W>(
+    rt: &mut Runtime<'_>,
+    home: ThreadId,
+    share: S,
+    floor: usize,
+    work: W,
+) where
+    S: SplitShare + Send + 'a,
+    W: Fn(S) + Clone + Send + 'a,
+{
+    let here = thread::current().id();
+    let mid = if here == home {
+        None
+    } else {
+        split_point(share.size(), floor)
+    };
+
+    match mid {
+        None => work(share),
+        Some(mid) => {
+            let (near, far) = share.split(mid);
+            let far_work = work.clone();
+            rt.scope(move |s: &Scope<'a, '_, '_>| {
+                // `here`, not `home`: the far half's own home is wherever it
+                // is being handed out from, so the worker that steals it is
+                // the one that splits it again.
+                s.spawn_runtime(move |rt: &mut Runtime<'_>| {
+                    run_share(rt, here, far, floor, far_work);
+                });
+                work(near);
+            });
+        }
+    }
+}
+
+/// Spawns one chunk task per share under `scope`, each recording this thread
+/// as its home, and runs the last share inline: upstream's `(++w == W) ?
+/// task() : rt.silent_async(task)` for [`SplittingPartitioner`]. The inline
+/// share is already running on its home thread, so it never splits.
+pub(crate) fn spawn_shares<'scope, S, W>(
+    scope: &Scope<'scope, '_, '_>,
+    shares: impl IntoIterator<Item = S>,
+    floor: usize,
+    work: W,
+) where
+    S: SplitShare + Send + 'scope,
+    W: Fn(S) + Clone + Send + 'scope,
+{
+    let home = thread::current().id();
+    let mut pending: Option<S> = None;
+    for share in shares {
+        if share.size() == 0 {
+            continue;
+        }
+        if let Some(previous) = pending.replace(share) {
+            let work = work.clone();
+            scope.spawn_runtime(move |rt: &mut Runtime<'_>| {
+                run_share(rt, home, previous, floor, work);
+            });
+        }
+    }
+    if let Some(last) = pending {
+        work(last);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::time::Duration;
+
     use super::*;
+    use crate::algorithm::AlgorithmBuilder;
+    use crate::observer::{Observer, TaskView, WorkerView};
+    use crate::{Executor, FlowBuilder, TaskType, Taskflow};
 
     /// Upstream's formula: the given chunk size when non-zero, or `n / w`
     /// with the `n % w` leftover iterations spread one each over the
@@ -837,5 +1209,190 @@ mod tests {
         };
         skip.invoke(|| trace.borrow_mut().push("never"));
         assert_eq!(*trace.borrow(), vec!["before", "body", "after", "skipped"]);
+    }
+
+    /// A share stops splitting once either half would fall below the floor,
+    /// and the floor is at least one index however the chunk size is set.
+    #[test]
+    fn a_share_splits_in_half_down_to_the_floor() {
+        assert_eq!(split_point(64, 1), Some(32));
+        assert_eq!(split_point(2, 1), Some(1));
+        assert_eq!(split_point(1, 1), None);
+        // A floor of 8 needs 16 to split, and the halves are 8 each.
+        assert_eq!(split_point(16, 8), Some(8));
+        assert_eq!(split_point(15, 8), None);
+        // `0` is read as `1`, and a floor past half of `usize` can never be
+        // doubled, so nothing splits rather than wrapping.
+        assert_eq!(split_point(4, 0), Some(2));
+        assert_eq!(split_point(usize::MAX, usize::MAX), None);
+    }
+
+    /// The shares a run starts from tile `[0, n)` in order, never empty, and
+    /// stop at `n` when there are more workers than indices.
+    #[test]
+    fn the_starting_shares_tile_the_range() {
+        assert_eq!(index_shares(10, 3), vec![(0, 4), (4, 7), (7, 10)]);
+        assert_eq!(index_shares(2, 5), vec![(0, 1), (1, 2)]);
+        assert_eq!(index_shares(0, 4), Vec::new());
+        assert_eq!(index_shares(4, 0), Vec::new());
+
+        let shares = index_shares(1000, 24);
+        assert_eq!(shares.first(), Some(&(0, 42)));
+        assert_eq!(shares.last().map(|&(_, e)| e), Some(1000));
+        for pair in shares.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0);
+        }
+    }
+
+    /// Runs `body` as the one runtime task of a fresh taskflow on a fresh
+    /// `workers`-wide executor, the shape every case below that needs a real
+    /// [`Runtime`] takes.
+    fn in_runtime<F>(workers: usize, body: F)
+    where
+        F: FnMut(&mut Runtime<'_>) + Send + 'static,
+    {
+        let mut taskflow = Taskflow::new();
+        taskflow.emplace_runtime(body);
+        Executor::new(workers)
+            .run(&taskflow)
+            .wait()
+            .expect("no task panicked");
+    }
+
+    /// The shares one [`run_share`] call ended up handing to its work
+    /// closure, sorted. A `home` of `None` is the worker the call runs on --
+    /// a task on its home thread -- which the test thread's own id is not.
+    fn record_shares(
+        home: Option<ThreadId>,
+        share: (usize, usize),
+        floor: usize,
+    ) -> Vec<(usize, usize)> {
+        let seen: Arc<Mutex<Vec<(usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        in_runtime(1, move |rt: &mut Runtime<'_>| {
+            let recorded = Arc::clone(&recorded);
+            let work = move |range: (usize, usize)| {
+                recorded
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(range);
+            };
+            let home = home.unwrap_or_else(|| thread::current().id());
+            run_share(rt, home, share, floor, work);
+        });
+
+        let mut got = std::mem::take(&mut *seen.lock().unwrap_or_else(PoisonError::into_inner));
+        got.sort_unstable();
+        got
+    }
+
+    /// An id no task will ever run on: a thread's own, read once and then
+    /// joined. `std` does not reuse a `ThreadId`, so it stays foreign.
+    fn a_foreign_thread_id() -> ThreadId {
+        thread::spawn(|| thread::current().id())
+            .join()
+            .expect("the probe thread does not panic")
+    }
+
+    /// A chunk that starts where it was spawned walks its whole share: the
+    /// half of the mechanism that keeps the extra tasks counted by steals
+    /// rather than by the size of the range.
+    #[test]
+    fn a_share_running_on_its_home_thread_does_not_split() {
+        assert_eq!(record_shares(None, (0, 64), 1), vec![(0, 64)]);
+    }
+
+    /// A chunk that starts anywhere else hands half of its share to a task
+    /// of its own, and the two halves still cover the share exactly.
+    #[test]
+    fn a_share_running_on_a_foreign_thread_splits_once() {
+        let foreign = Some(a_foreign_thread_id());
+        assert_eq!(record_shares(foreign, (0, 64), 1), vec![(0, 32), (32, 64)]);
+        // The far half's own home is wherever it was handed out from, so it
+        // does not split again on the worker that is already running it.
+        assert_eq!(record_shares(foreign, (0, 4), 1), vec![(0, 2), (2, 4)]);
+        // Nothing splits below the floor, foreign thread or not.
+        assert_eq!(record_shares(foreign, (0, 64), 64), vec![(0, 64)]);
+    }
+
+    /// Counts the chunk tasks a run spawns: an [`Observer`] sees one
+    /// [`TaskType::Async`] entry per chunk task a partitioner hands to the
+    /// pool, and none for the share that runs inline or for the runtime task
+    /// driving them.
+    #[derive(Default)]
+    struct ChunkCounter {
+        /// Entries seen so far.
+        entries: AtomicUsize,
+    }
+
+    impl Observer for ChunkCounter {
+        fn set_up(&self, _num_workers: usize) {}
+
+        fn on_entry(&self, _worker: WorkerView<'_>, task: TaskView<'_>) {
+            if task.task_type() == TaskType::Async {
+                self.entries.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        fn on_exit(&self, _worker: WorkerView<'_>, _task: TaskView<'_>) {}
+    }
+
+    /// Runs `visits` indices through `for_each_index` on a `workers`-wide
+    /// executor under a [`SplittingPartitioner`], and reports how many chunk
+    /// tasks the run spawned. `pause` is how long each index takes, which is
+    /// what decides whether the worker holding the shares runs them itself
+    /// or another worker steals one.
+    fn count_chunk_tasks(workers: usize, visits: usize, pause: Duration) -> usize {
+        let executor = Executor::new(workers);
+        let counter = executor.make_observer(ChunkCounter::default());
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&seen);
+        let mut taskflow = Taskflow::new();
+        taskflow.for_each_index(
+            0_usize,
+            visits,
+            1,
+            move |_| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                thread::sleep(pause);
+            },
+            SplittingPartitioner::<DefaultClosureWrapper>::new(1),
+        );
+        executor.run(&taskflow).wait().expect("no task panicked");
+
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            visits,
+            "every index is visited"
+        );
+        counter.entries.load(Ordering::Relaxed)
+    }
+
+    /// The property the whole type exists for: at 24 workers over a range
+    /// too long for one worker to walk alone, the chunk tasks outnumber the
+    /// workers, which only a share that was stolen and re-split can do --
+    /// the four ported partitioners spawn exactly `w - 1`, one per worker
+    /// bar the inline one, however the run goes.
+    ///
+    /// The sleep is the forcing: it keeps the worker that submitted the
+    /// shares busy inside its own, so the other 23 reach theirs by stealing
+    /// rather than by waiting for it.
+    #[test]
+    fn a_chunk_stolen_by_another_worker_splits() {
+        const WORKERS: usize = 24;
+        let spawned = count_chunk_tasks(WORKERS, WORKERS * 64, Duration::from_micros(100));
+        assert!(
+            spawned > WORKERS,
+            "{spawned} chunk tasks at {WORKERS} workers: no share was stolen and re-split"
+        );
+    }
+
+    /// One worker has nobody to steal from it, so nothing splits -- and at
+    /// one worker the algorithms' own `w <= 1` short-circuit walks the range
+    /// in the calling task, so no chunk task is spawned at all.
+    #[test]
+    fn one_worker_splits_nothing() {
+        assert_eq!(count_chunk_tasks(1, 256, Duration::ZERO), 0);
     }
 }

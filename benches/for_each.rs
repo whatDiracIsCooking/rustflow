@@ -43,6 +43,12 @@
 //! being timed. The comparison is exact rather than a tolerance, unlike
 //! `benches/reduce_sum.rs`'s: each output here depends on exactly one input
 //! element, and both columns call the same `f64::tan` on it.
+//!
+//! A third column, `rustflow-split`, runs the identical task under
+//! `SplittingPartitioner` -- the port's own chunk scheme, whose share
+//! re-splits when another worker steals it -- so the two rustflow ids differ
+//! only in how a chunk reaches a worker. No figure for it is claimed here:
+//! the milestone's A/B issue is what measures the pair.
 
 use std::cell::RefCell;
 use std::hint::black_box;
@@ -53,6 +59,8 @@ use std::time::Duration;
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
 use rustflow::Executor;
+use rustflow::algorithm::for_each_index::IndexDispatch;
+use rustflow::algorithm::partitioner::{DefaultClosureWrapper, SplittingPartitioner};
 use rustflow::algorithm::{DefaultPartitioner, IndexRange};
 use rustflow::prelude::*;
 
@@ -99,6 +107,14 @@ fn inputs(n: usize) -> Vec<f64> {
     generated(n).collect()
 }
 
+/// The partitioner behind the `rustflow-split` ids: the port's own
+/// splitting scheme, with no configured chunk size, where the `rustflow` ids
+/// take the default guided one. No figure is claimed for either here -- the
+/// milestone's A/B issue measures them.
+fn splitting() -> SplittingPartitioner<DefaultClosureWrapper> {
+    SplittingPartitioner::default()
+}
+
 /// Rewrites `data` from [`generated`], allocating nothing.
 ///
 /// The untimed setup of a `rayon` id: the buffer is the id's own, so each
@@ -133,7 +149,13 @@ fn read_back(cells: &[AtomicU64]) -> Vec<f64> {
 
 /// Upstream's `for_each_taskflow`: a fresh [`Taskflow`], one
 /// `for_each_by_index` task over the whole index range, run to completion.
-fn for_each_rustflow(cells: &Arc<Vec<AtomicU64>>, executor: &Executor) {
+///
+/// Generic over the partitioner so that the `rustflow` and `rustflow-split`
+/// ids are the same code under the two chunk schemes -- see the module docs.
+fn for_each_rustflow<P>(cells: &Arc<Vec<AtomicU64>>, executor: &Executor, part: P)
+where
+    P: IndexDispatch + Clone + Send + 'static,
+{
     let mut taskflow = Taskflow::new();
     let body_cells = Arc::clone(cells);
     taskflow.for_each_by_index(
@@ -145,7 +167,7 @@ fn for_each_rustflow(cells: &Arc<Vec<AtomicU64>>, executor: &Executor) {
                 cell.store(x.tan().to_bits(), Ordering::Relaxed);
             }
         },
-        DefaultPartitioner::default(),
+        part,
     );
     executor.run(&taskflow).wait().expect("no task panicked");
 }
@@ -168,13 +190,24 @@ fn verify(size: usize, workers: usize, executor: &Executor, pool: &rayon::Thread
     let input = inputs(size);
     let expected: Vec<f64> = input.iter().map(|d| d.tan()).collect();
 
+    // Both buffers built before `cells` shadows the function of the same
+    // name, and one per id so that neither reads the other's work.
+    let split_cells = cells(&input);
     let cells = cells(&input);
-    for_each_rustflow(&cells, executor);
+    for_each_rustflow(&cells, executor, DefaultPartitioner::default());
     let actual = read_back(&cells);
     let mismatch = actual.iter().zip(&expected).position(|(a, b)| a != b);
     assert_eq!(
         mismatch, None,
         "rustflow/{workers}w at size {size}: first element not equal to its own tangent"
+    );
+
+    for_each_rustflow(&split_cells, executor, splitting());
+    let actual = read_back(&split_cells);
+    let mismatch = actual.iter().zip(&expected).position(|(a, b)| a != b);
+    assert_eq!(
+        mismatch, None,
+        "rustflow-split/{workers}w at size {size}: first element not equal to its own tangent"
     );
 
     let mut data = input;
@@ -206,13 +239,35 @@ fn bench_for_each(c: &mut Criterion) {
             // puts an 8 MB allocation, fill and free either side of the
             // timed region and ~0.7 ms of it *inside*, which is what
             // `BENCHMARKS.md`'s "#366 change" section measures.
+            // Built before `cells` shadows the function of the same
+            // name; one buffer per id, never shared between two.
+            let split_cells = cells(&inputs(size));
             let cells = cells(&inputs(size));
             group.bench_function(
                 BenchmarkId::new(format!("rustflow/{workers}w"), size),
                 |b| {
                     b.iter_batched_ref(
                         || refill_cells(&cells),
-                        |_: &mut ()| for_each_rustflow(black_box(&cells), &executor),
+                        |_: &mut ()| {
+                            for_each_rustflow(
+                                black_box(&cells),
+                                &executor,
+                                DefaultPartitioner::default(),
+                            );
+                        },
+                        BatchSize::PerIteration,
+                    );
+                },
+            );
+
+            group.bench_function(
+                BenchmarkId::new(format!("rustflow-split/{workers}w"), size),
+                |b| {
+                    b.iter_batched_ref(
+                        || refill_cells(&split_cells),
+                        |_: &mut ()| {
+                            for_each_rustflow(black_box(&split_cells), &executor, splitting());
+                        },
                         BatchSize::PerIteration,
                     );
                 },

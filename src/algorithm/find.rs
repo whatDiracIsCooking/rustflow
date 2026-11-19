@@ -80,14 +80,15 @@ use crate::Scope;
 use crate::algorithm::SliceSource;
 use crate::algorithm::partitioner::{
     ClosureWrapper, DynamicLoop, DynamicPartitioner, GuidedPartitioner, Partitioner,
-    RandomPartitioner, StaticLoop, StaticPartitioner,
+    RandomPartitioner, SplittingPartitioner, StaticLoop, StaticPartitioner, index_shares,
+    spawn_shares, walk_chunks,
 };
 use crate::runtime::Runtime;
 
 /// Closes [`FindPartitioner`] against implementations outside this crate,
 /// the same restriction [`crate::algorithm::SlicePartitioner`] carries, for
-/// the same reason: only the four concrete partitioners below can answer
-/// either loop shape.
+/// the same reason: only the five concrete partitioners below can answer a
+/// loop shape.
 mod sealed {
     /// Marker a type must carry to implement [`super::FindPartitioner`].
     pub trait Sealed {}
@@ -144,6 +145,7 @@ impl<C: ClosureWrapper> sealed::Sealed for StaticPartitioner<C> {}
 impl<C: ClosureWrapper> sealed::Sealed for GuidedPartitioner<C> {}
 impl<C: ClosureWrapper> sealed::Sealed for DynamicPartitioner<C> {}
 impl<C: ClosureWrapper> sealed::Sealed for RandomPartitioner<C> {}
+impl<C: ClosureWrapper> sealed::Sealed for SplittingPartitioner<C> {}
 
 impl<C: ClosureWrapper + Sync> FindPartitioner for StaticPartitioner<C> {
     fn drive_find<'scope, T, Pred>(
@@ -312,6 +314,79 @@ impl<C: ClosureWrapper + Sync> FindPartitioner for RandomPartitioner<C> {
         Cmp: Fn(&T, &T) -> bool + Sync,
     {
         drive_reduce_dynamic(self, scope, data, w_total, cmp, best, cursor);
+    }
+}
+
+impl<C: ClosureWrapper + Sync> FindPartitioner for SplittingPartitioner<C> {
+    /// One task per worker over a contiguous share of `data`, each stopping
+    /// its own scan at the first match it sees; a share that splits leaves a
+    /// second task scanning the far half, whose own match folds into `best`
+    /// the same way. `cursor` is unused: nothing here is drawn from a shared
+    /// point.
+    fn drive_find<'scope, T, Pred>(
+        &'scope self,
+        scope: &Scope<'scope, '_, '_>,
+        data: &'scope [T],
+        w_total: usize,
+        predicate: &'scope Pred,
+        best: &'scope AtomicUsize,
+        _cursor: &'scope AtomicUsize,
+    ) where
+        T: Sync,
+        Pred: Fn(&T) -> bool + Sync,
+    {
+        let chunk_size = self.chunk_size();
+        let wrapper = self.closure_wrapper();
+        let work = move |(b, e): (usize, usize)| {
+            wrapper.invoke(|| {
+                walk_chunks(b, e, chunk_size, |part_b, part_e| {
+                    scan_chunk(data, part_b, part_e, predicate, best)
+                });
+            });
+        };
+        spawn_shares(
+            scope,
+            index_shares(data.len(), w_total),
+            self.split_floor(),
+            work,
+        );
+    }
+
+    /// One task per worker over a contiguous share of `data`, folding its
+    /// own local best and merging it once; a share that splits takes a
+    /// second local with it.
+    fn drive_reduce<'scope, T, Cmp>(
+        &'scope self,
+        scope: &Scope<'scope, '_, '_>,
+        data: &'scope [T],
+        w_total: usize,
+        cmp: &'scope Cmp,
+        best: &'scope Mutex<usize>,
+        _cursor: &'scope AtomicUsize,
+    ) where
+        T: Sync,
+        Cmp: Fn(&T, &T) -> bool + Sync,
+    {
+        let chunk_size = self.chunk_size();
+        let wrapper = self.closure_wrapper();
+        let work = move |(b, e): (usize, usize)| {
+            wrapper.invoke(|| {
+                let mut local: Option<usize> = None;
+                walk_chunks(b, e, chunk_size, |part_b, part_e| {
+                    fold_chunk(data, part_b, part_e, cmp, &mut local);
+                    false
+                });
+                if let Some(candidate) = local {
+                    merge_best(data, cmp, best, candidate);
+                }
+            });
+        };
+        spawn_shares(
+            scope,
+            index_shares(data.len(), w_total),
+            self.split_floor(),
+            work,
+        );
     }
 }
 

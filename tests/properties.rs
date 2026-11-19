@@ -70,7 +70,7 @@ use rustflow::Executor;
 use rustflow::algorithm::index_range::{IndexRange, IndexRanges};
 use rustflow::algorithm::partitioner::{
     DefaultClosureWrapper, DynamicLoop, DynamicPartitioner, GuidedPartitioner, RandomPartitioner,
-    StaticLoop, StaticPartitioner,
+    SplittingPartitioner, StaticLoop, StaticPartitioner,
 };
 use rustflow::prelude::*;
 
@@ -142,7 +142,7 @@ where
         .expect("the runtime task ran")
 }
 
-/// Which partitioner family a case runs under: the four
+/// Which partitioner family a case runs under: the five
 /// `src/algorithm/partitioner.rs` ships, picked per case so that every
 /// property below is checked against all of them.
 #[derive(Debug, Clone, Copy)]
@@ -155,6 +155,11 @@ enum Family {
     Dynamic,
     /// [`RandomPartitioner`].
     Random,
+    /// [`SplittingPartitioner`], the port's own: the only one here whose
+    /// chunk count depends on which worker picks a chunk up, so a case that
+    /// covers its range exactly under this one covers it under a steal that
+    /// re-split a share.
+    Splitting,
 }
 
 /// Draws one of the four partitioner families.
@@ -164,6 +169,7 @@ fn family() -> impl Strategy<Value = Family> {
         Just(Family::Guided),
         Just(Family::Dynamic),
         Just(Family::Random),
+        Just(Family::Splitting),
     ]
 }
 
@@ -192,6 +198,10 @@ macro_rules! with_family {
             }
             Family::Random => {
                 let $part = RandomPartitioner::<DefaultClosureWrapper>::new($chunk);
+                $body
+            }
+            Family::Splitting => {
+                let $part = SplittingPartitioner::<DefaultClosureWrapper>::new($chunk);
                 $body
             }
         }
@@ -867,6 +877,32 @@ fn dynamic_chunks<P: DynamicLoop + Sync>(part: &P, n: usize, w: usize) -> Vec<(u
     chunks.into_inner().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The chunk sequence a [`SplittingPartitioner`] hands out for `n`
+/// iterations over `w` workers. The one family collected from a real run on
+/// a real executor rather than from a loop trait: it implements neither, and
+/// its sequence depends on which worker picks a share up, so an interleaving
+/// that re-split a share is the thing worth tiling.
+fn splitting_chunks(chunk: usize, n: usize, w: usize) -> Vec<(usize, usize)> {
+    let seen: Arc<Mutex<Vec<(usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+    let visited = Arc::clone(&seen);
+    in_runtime(w, move |rt: &mut Runtime<'_>| {
+        rt.for_each_by_index(
+            IndexRange::new(0_usize, n, 1),
+            move |piece: IndexRange<usize>| {
+                visited
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push((piece.begin(), piece.end()));
+            },
+            SplittingPartitioner::<DefaultClosureWrapper>::new(chunk),
+        );
+    });
+
+    let mut chunks = std::mem::take(&mut *seen.lock().unwrap_or_else(PoisonError::into_inner));
+    chunks.sort_unstable();
+    chunks
+}
+
 proptest! {
     /// Whichever family it belongs to, a partitioner's chunks tile `[0, n)`:
     /// no index is skipped and none is handed out twice, for a chunk size of
@@ -891,6 +927,7 @@ proptest! {
             Family::Random => {
                 dynamic_chunks(&RandomPartitioner::<DefaultClosureWrapper>::new(chunk), n, workers)
             }
+            Family::Splitting => splitting_chunks(chunk, n, workers),
         };
 
         covers_range_once(&chunks, n)?;

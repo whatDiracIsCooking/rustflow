@@ -23,6 +23,13 @@
 //! wheel, and both columns run that same function: the count they
 //! agree on is asserted against a single-threaded reference before either is
 //! measured, so a wrong answer fails the benchmark rather than being timed.
+//!
+//! A third column, `rustflow-split`, runs the identical task under
+//! `SplittingPartitioner` at the same `primes_chunk` -- the port's own chunk
+//! scheme, whose share re-splits when another worker steals it. This is the
+//! shape it was built for, the cost of a chunk rising with the index. No
+//! figure for it is claimed here: the milestone's A/B issue is what measures
+//! the pair.
 
 use std::hint::black_box;
 use std::sync::{Arc, Mutex};
@@ -32,7 +39,10 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rustflow::Executor;
 use rustflow::algorithm::index_range::IndexRange;
-use rustflow::algorithm::partitioner::{DefaultClosureWrapper, DynamicPartitioner};
+use rustflow::algorithm::partitioner::{
+    DefaultClosureWrapper, DynamicPartitioner, SplittingPartitioner,
+};
+use rustflow::algorithm::reduce::ReducePartitioner;
 use rustflow::prelude::*;
 
 #[path = "common/baseline.rs"]
@@ -86,7 +96,10 @@ fn is_prime(n: usize) -> bool {
 
 /// Upstream's `primes_taskflow`: one `reduce_by_index` task over
 /// `[1, value)`, run to completion, answering the count it folded.
-fn primes_rustflow(value: usize, executor: &Executor) -> usize {
+fn primes_rustflow<P>(value: usize, executor: &Executor, part: P) -> usize
+where
+    P: ReducePartitioner + Clone + Send + 'static,
+{
     let mut taskflow = Taskflow::new();
     // Upstream's `size_t sum = 0` lives on the stack of the function that
     // builds the taskflow and is read after the run; the port's algorithm
@@ -109,12 +122,25 @@ fn primes_rustflow(value: usize, executor: &Executor) -> usize {
             residual
         },
         |a: &usize, b: &usize| a + b,
-        DynamicPartitioner::<DefaultClosureWrapper>::new(PRIMES_CHUNK),
+        part,
     );
 
     executor.run(&taskflow).wait().expect("no task panicked");
 
     *sum.lock().expect("uncontended after the run")
+}
+
+/// Upstream's own chunk scheme for this shape, behind the `rustflow` ids.
+fn dynamic() -> DynamicPartitioner<DefaultClosureWrapper> {
+    DynamicPartitioner::new(PRIMES_CHUNK)
+}
+
+/// The partitioner behind the `rustflow-split` ids: the port's own splitting
+/// scheme at the same [`PRIMES_CHUNK`], so the two ids differ in how a chunk
+/// reaches a worker and in nothing else. No figure is claimed for either
+/// here -- the milestone's A/B issue measures them.
+fn splitting() -> SplittingPartitioner<DefaultClosureWrapper> {
+    SplittingPartitioner::new(PRIMES_CHUNK)
 }
 
 /// The same count as a rayon parallel iterator, in the role TBB's
@@ -151,9 +177,14 @@ fn bench_primes(c: &mut Criterion) {
             // answer fails the benchmark here rather than being measured
             // below.
             assert_eq!(
-                primes_rustflow(size, &executor),
+                primes_rustflow(size, &executor, dynamic()),
                 expected,
                 "rustflow counts the primes below {size} at {workers} worker(s)"
+            );
+            assert_eq!(
+                primes_rustflow(size, &executor, splitting()),
+                expected,
+                "rustflow-split counts the primes below {size} at {workers} worker(s)"
             );
             assert_eq!(
                 primes_rayon(size, &pool),
@@ -164,7 +195,13 @@ fn bench_primes(c: &mut Criterion) {
             group.bench_function(
                 BenchmarkId::new(format!("rustflow/{workers}w"), size),
                 |b| {
-                    b.iter(|| primes_rustflow(black_box(size), &executor));
+                    b.iter(|| primes_rustflow(black_box(size), &executor, dynamic()));
+                },
+            );
+            group.bench_function(
+                BenchmarkId::new(format!("rustflow-split/{workers}w"), size),
+                |b| {
+                    b.iter(|| primes_rustflow(black_box(size), &executor, splitting()));
                 },
             );
             group.bench_function(BenchmarkId::new(format!("rayon/{workers}w"), size), |b| {

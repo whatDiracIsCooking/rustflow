@@ -40,6 +40,12 @@
 //!   `par_iter` visit each line exactly once, so every lock is taken by its
 //!   line's only writer -- two uncontended atomics a line, against the
 //!   hundreds of transcendental calls a line of this kernel costs.
+//!
+//! A third column, `rustflow-split`, runs the identical task under
+//! `SplittingPartitioner` at the same chunk of one line -- the port's own
+//! chunk scheme, whose share re-splits when another worker steals it. No
+//! figure for it is claimed here: the milestone's A/B issue is what measures
+//! the pair.
 
 use std::hint::black_box;
 use std::sync::{Arc, Mutex};
@@ -48,7 +54,10 @@ use std::time::Duration;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use rustflow::Executor;
-use rustflow::algorithm::partitioner::{DefaultClosureWrapper, DynamicPartitioner};
+use rustflow::algorithm::for_each_index::IndexDispatch;
+use rustflow::algorithm::partitioner::{
+    DefaultClosureWrapper, DynamicPartitioner, SplittingPartitioner,
+};
 use rustflow::prelude::*;
 
 #[path = "common/baseline.rs"]
@@ -158,7 +167,10 @@ fn escape_line(i: usize, n: usize, line: &mut [u32]) {
 
 /// Upstream's `mandelbrot_taskflow`: one `for_each_index` over the `H` lines
 /// with a dynamic chunk of one, run to completion.
-fn mandelbrot_rustflow(n: usize, image: &Image, executor: &Executor) {
+fn mandelbrot_rustflow<P>(n: usize, image: &Image, executor: &Executor, part: P)
+where
+    P: IndexDispatch + Clone + Send + 'static,
+{
     let mut taskflow = Taskflow::new();
     let lines = Arc::clone(image);
 
@@ -170,10 +182,25 @@ fn mandelbrot_rustflow(n: usize, image: &Image, executor: &Executor) {
             let mut line = lines[i].lock().expect("this line's only writer");
             escape_line(i, n, &mut line);
         },
-        DynamicPartitioner::<DefaultClosureWrapper>::new(1),
+        part,
     );
 
     executor.run(&taskflow).wait().expect("no task panicked");
+}
+
+/// Upstream's own chunk scheme for this shape, behind the `rustflow` ids:
+/// one line a chunk.
+fn dynamic() -> DynamicPartitioner<DefaultClosureWrapper> {
+    DynamicPartitioner::new(1)
+}
+
+/// The partitioner behind the `rustflow-split` ids: the port's own splitting
+/// scheme at the same chunk of one line, so the two ids differ in how a
+/// chunk reaches a worker and in nothing else -- which is the whole question
+/// for an image whose lines cost wildly different amounts. No figure is
+/// claimed for either here; the milestone's A/B issue measures them.
+fn splitting() -> SplittingPartitioner<DefaultClosureWrapper> {
+    SplittingPartitioner::new(1)
 }
 
 /// The same render as a rayon parallel iterator over the same lines, in the
@@ -236,8 +263,12 @@ fn bench_mandelbrot(c: &mut Criterion) {
             // check renders into a buffer of its own so that a variant which
             // skips a line fails here rather than reading the other's work.
             let checked = image(size);
-            mandelbrot_rustflow(size, &checked, &executor);
+            mandelbrot_rustflow(size, &checked, &executor, dynamic());
             assert_image(&checked, expected, &format!("rustflow at {workers}w"));
+
+            let checked = image(size);
+            mandelbrot_rustflow(size, &checked, &executor, splitting());
+            assert_image(&checked, expected, &format!("rustflow-split at {workers}w"));
 
             let checked = image(size);
             mandelbrot_rayon(size, &checked, &pool);
@@ -249,7 +280,15 @@ fn bench_mandelbrot(c: &mut Criterion) {
             group.bench_function(
                 BenchmarkId::new(format!("rustflow/{workers}w"), size),
                 |b| {
-                    b.iter(|| mandelbrot_rustflow(black_box(size), &buffer, &executor));
+                    b.iter(|| mandelbrot_rustflow(black_box(size), &buffer, &executor, dynamic()));
+                },
+            );
+            group.bench_function(
+                BenchmarkId::new(format!("rustflow-split/{workers}w"), size),
+                |b| {
+                    b.iter(|| {
+                        mandelbrot_rustflow(black_box(size), &buffer, &executor, splitting());
+                    });
                 },
             );
             group.bench_function(BenchmarkId::new(format!("rayon/{workers}w"), size), |b| {

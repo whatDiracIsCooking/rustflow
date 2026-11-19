@@ -63,7 +63,7 @@ every async submission a `_named` twin, and fixed two scheduler defects its
 own panic matrix found. **Benchmarks and performance** ran last and is the one
 of the four that changed no API at all: it took the suite from eight of
 upstream's shapes to twenty-two — thirteen new `[[bench]]` targets for 22 in
-`Cargo.toml` and 196 criterion ids — on `benches/common` for the fixtures a
+`Cargo.toml` and 212 criterion ids — on `benches/common` for the fixtures a
 target may share, `devtools/bench-ab.sh` for an interleaved A/B between two
 refs, and a CI step that smoke-runs every id. Four of its measurements
 overturned something this repo had asserted: a nested `corun` costs about a
