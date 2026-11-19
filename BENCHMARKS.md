@@ -43,12 +43,12 @@ criterion ids, which `cargo bench --all-features -- --list` counts.
   measures is a comparison between two C++ libraries rather than a shape of
   the executor.
 
-**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 41
+**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 42
 headings, and they are three kinds: the three method sections that follow this
 preamble, "The machine" through "The upstream C++ column is empty"; 21 shape
 sections carrying the 22 shapes, since `async_task` and `fibonacci` share "The
 two shapes #96 added", which measured the two together in a run of their own;
-and 17 per-decision measurement sections, each named for the issue that took
+and 18 per-decision measurement sections, each named for the issue that took
 it. A shape's section is its table, its sizes and its departures from
 upstream. A measurement section is one question, with the machine, the load
 and the method of its own run in it, and it ends either in a change that
@@ -1012,7 +1012,14 @@ What the table says:
   for its own children with 23 other workers. Upstream's LIFO branch is what
   this shape is built to exploit, and #119 gave it to the runtime variant --
   which is where a third of the one-worker time and a quarter to a third of the
-  24-worker time went; see below. The group variant still pays this.
+  24-worker time went; see below. The group variant still pays this, and the
+  buffers turn out to be only half of what it pays: the "#380 measurement"
+  section below adds the fourth id, a group opened on the `Runtime`, and that
+  id halves the one-worker cost (175 ns a child against 347) while reading
+  38.178 ms at 24 workers against the `rustflow-group` id's 2.2967 in the same
+  process. What the route costs this shape is upstream's `FibonacciSwapped`
+  ordering, which leaves one child outstanding at a time for 23 awake workers
+  to race for, and that section's ablation prices the two causes apart.
 - **`rayon::join` costs ~13 ns a level at one worker**, 26x less, and that is
   the comparison being made rather than a scheduler being beaten: a `join`
   nobody steals from *is* direct recursion -- two closure calls and one atomic
@@ -1181,7 +1188,13 @@ the same quantity, so that the per-level figure rests on more than one of them:
 
 The last column is a slope over three stack sizes for the group route and a
 single cliff divided by its stack size for the runtime one, which is why the
-group figure has the extra digit.
+group figure has the extra digit. **Re-read on today's `main`** by #380's
+probe, the same chain measures 1040 bytes a level through `Executor::task_group`
+and 832 through `Runtime::corun`, with a third route to read -- 1104 through
+`Runtime::task_group`, which did not exist when this section was taken. The
+type on the frame and the chain's own body have both moved since, so "The #380
+measurement" below carries that table rather than this one being corrected: a
+per-level figure belongs to the binary it was measured in.
 
 The group-route cliff rows the slope is taken from, at one worker:
 
@@ -3309,6 +3322,15 @@ than the extra hands earn, and a tree of 11110 tasks of nothing never grows
 enough to carry it. These four rows price the submission path of the group
 route, and they are the baseline #342's A/B was measured against.
 
+**That attribution is confirmed by removing it**, which is what the "#380
+measurement" section below did: #377's `rustflow-runtime-group` id is this
+same recursion with each node's group opened on the `Runtime` running it, so
+its children go onto that worker's own queue instead, and in the same process
+it reads 1.0090 ms at `MaxDepth = 4` and 24 workers against this column's
+2.5976 -- the first group-route id in this file to get anything at all out of
+23 more workers on a tree whose bodies hold no work. The figures for it are in that section rather than in the table
+above, which this pass did not re-take.
+
 What the shape is here to measure is the group route's cost per interior node,
 and the mechanism is **not** the one this section first claimed. Each of the
 `(10^MaxDepth - 1) / 9` interior nodes is a parent, but it is an anchored
@@ -3395,7 +3417,11 @@ worker is 9.0x behind, because a `nqueens` body copies a board and prunes a
 column and so gives the submission path something to hide behind. At 24
 workers it goes the other way: 2.946 ms against 184.5 µs is 16x, with our
 column 2.5x slower than its own one worker while rayon's scope is 2.9x faster
-than its own. Most interior nodes here wait on a handful of children rather
+than its own -- a regression the shared buffers are the whole of, measured as
+such in the "#380 measurement" section below: the same recursion with its
+groups opened on the `Runtime` reads 897.52 µs at 24 workers against this
+column's 3.2976 ms in the same process, the largest of the five improvements
+that measurement found. Most interior nodes here wait on a handful of children rather
 than on ten, so each parent's own share of the group route -- a `task_group()`
 opened, a `parts` vector allocated, a frame parked in `corun` until the anchor
 clears -- is amortised over a handful of submissions instead of ten, which is
@@ -3682,7 +3708,14 @@ tasks whose leaves are 1024-element sorts, distributed by stealing out of the
 shared buffers with a frame parked in `corun` at every level, is the `skynet`
 and `integrate` finding at a thirtieth of their task count -- #342 counted
 4152 nested tear-downs here and no preempted parent among them, so the cost is
-the buffers and the frames rather than a re-queue. What the
+the buffers and the frames rather than a re-queue. **The buffers are not what
+the 24-worker rows are, though**, and the "#380 measurement" section below is
+where that is measured: #377's `rustflow-runtime-group` id takes the buffers
+out of this recursion and reads 907.76 µs and 73.408 ms against this column's
+535.29 µs and 15.606 ms in the same process. What it cannot keep is the
+ordering -- the group holds the `Runtime` the left half needs, so the right
+half is submitted after the left is sorted rather than before -- and that
+section's ablation puts the whole of the difference on the ordering. What the
 million-element rows add is the other half of it: this fork is expensive per
 task and the per task cost is all it is, so a shape with enough work per level
 buries it entirely.
@@ -3734,15 +3767,16 @@ first to abort -- so **the 24-worker end of this shape is not what the sizes are
 chosen against**; the one-worker end is, as it is for every shape in this file.
 The demand is a property of the tree and of the frame rather than of one task
 count: this recursion carries five `f64`s and a slot and costs 616 bytes a
-node, where `skynet`'s ten-slot frame costs 1055. This shape has no runtime
-variant, which is the route that would lift it -- upstream's
-`integrate/taskflow.cpp` is written on `task_group()` and the port follows it,
-so the column in the table below is a `TaskGroup` column and the ceiling above
-is `TaskGroup`'s. The resume that was expected to raise that ceiling does not.
+node, where `skynet`'s ten-slot frame costs 1055. The column in the table
+below is a `TaskGroup` column, because upstream's `integrate/taskflow.cpp` is
+written on `task_group()` and the port follows it, so the ceiling above is the
+id route's; #377 added a second column, `rustflow-runtime-group`, whose groups
+are opened on the `Runtime` instead and whose ceiling the "#380 measurement"
+section below reports. The resume that was expected to raise that ceiling does not.
 #342 measured it: the frames that make this cliff are a `corun`'s rather than
 a preempted node's -- 10720 nested tear-downs here and `PREEMPTED` on none of
 them -- so **no size in this section moves on account of #342**, and what
-would lift the cliff is the runtime route this shape does not take.
+lifts the cliff is the route rather than the resume.
 
 The answer is checked twice before any id is timed, both outside every
 measured region, because the two checks catch different failures. **Against
@@ -3786,10 +3820,17 @@ behind twenty million of them. At `V = 2` and one worker, 1852 spawned tasks in
 636.6 µs is 344 ns a task against the `rayon::join` column's 22.6 ns.
 
 The 24-worker rows then repeat `skynet`'s direction: ours goes from
-636.6 µs to 2.064 ms, 3.2x slower for 23 more workers, because a `TaskGroup`'s
-children are distributed by stealing out of the shared buffers and each parent
-holds a frame in `corun` until its one child lands, while `rayon::join` on the
-same tree barely moves (41.86 to 39.24 µs). Read with the #359 section above,
+636.6 µs to 2.064 ms, 3.2x slower for 23 more workers, with each parent holding
+a frame in `corun` until its one child lands, while `rayon::join` on the same
+tree barely moves (41.86 to 39.24 µs). **What that regression is not is the
+shared buffers**, which is this section's one correction from the "#380
+measurement" below: the `rustflow-runtime-group` id queues the same children on
+the submitting worker's own deque and reads **29.854 ms and 65.129 ms** at 24
+workers against this column's 1.4389 and 2.4263 in the same process, where at
+one worker it halves it (322.42 µs against 648.23 at `V = 2`). One child
+outstanding at a time is what this recursion has, on either route, and giving
+23 awake workers a single-job deque to race for is worth twenty-fold here --
+the mechanism that section's ablation, width sweep and handoff counts pin. Read with the #359 section above,
 the two measurements are one finding from two directions: a nested corun
 through this route costs about a kilobyte of stack and a few hundred
 nanoseconds a task, and both are the queue destination rather than `corun`
@@ -4995,3 +5036,374 @@ this section.
   a cost this section never measures: #367's losing thief, 150 to 285 attempts
   at random over 29 victims, would be drawing on the chain's deque while it
   runs.
+
+## The #380 measurement: the route halves a task, the ordering sets the width
+
+**At one worker a group opened on a `Runtime` costs half what a group opened
+on the `Executor` costs a task -- 175 ns a spawned child against 347 on
+`fibonacci` at `n = 15`, which is #119's 340-against-201 prior reproduced on
+today's `main` and a little better.** At 24 workers the route is not what
+decides the number. Two of the five shapes improve by 61% and 73%,
+and one of them is the first group-route id in this file to *scale* from 1 to
+24 workers on a tree whose bodies hold no work to scale with. The other three
+get **4.7x to 27x worse** at their larger size and 1.7x to 21x at their
+smaller one, and the ablation below puts all of that on the **ordering**
+rather than on the queue: `Runtime::task_group`
+borrows the runtime for the group's whole life, so a body with an inline
+branch of its own has to submit its child *after* that branch instead of
+before it, which leaves one child outstanding at a time for 23 awake thieves
+to race for. The **id** route under the same ordering is just as slow (44.0 ms
+against the runtime route's 35.4 on `fib(15)` at 24 workers, ranges
+overlapping, where the id route with the submission first is 2.66 ms), and the
+same route with the submission first is the fastest of the five variants
+measured. So the route is a per-task win at every width, the forced ordering
+is a loss that is worth more than the win on three of the five shapes, and
+#395 is where the ordering is taken up.
+
+This is also the shape #373's last bullet asked for and said it had not
+measured: a serial spine next to a pool of workers that are **awake** rather
+than parked. 23 thieves drawing on one deque that holds a single job cost
+59 µs a handoff here, against the 12 µs the same recursion pays when there is
+something else in the queue for them to find.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id -- the five shapes' `rustflow*` ids, one `cargo bench --bench <name>` each; the stack, ablation, width and handoff figures below are a probe's own wall clocks and counts, as #343's, #367's and #373's are |
+| `ulimit -s` | 8192 KiB |
+| Date | 2026-11-19 |
+| **Load average** | **1.08 to 9.71 before and after each measurement, 2 or 3 runnable threads throughout, and all of it this run's own** |
+
+The box was this run's alone -- no sibling agent, nothing else building -- and
+`/proc/loadavg` was read either side of every measurement:
+
+| measurement | before | after |
+|---|---|---|
+| `skynet`, the 8 `rustflow*` ids | 1.44 1.44 1.49 | 8.14 2.97 2.00 |
+| `nqueens`, 8 ids | 7.04 2.91 1.99 | 9.71 3.93 2.36 |
+| `integrate`, 8 ids | 8.37 3.83 2.35 | 9.46 4.58 2.66 |
+| `merge_sort`, 8 ids | 7.12 4.36 2.62 | 5.50 4.26 2.65 |
+| `fibonacci`, 12 ids | 3.12 3.80 2.57 | 6.93 4.61 2.91 |
+| the frame-address and cliff bisections | 1.59 3.22 2.63 | 1.16 2.62 2.48 |
+| the skynet tree at one worker, to `MaxDepth = 8` | 1.17 2.65 2.48 | 1.98 2.72 2.51 |
+| the five-variant ablation | 2.07 2.73 2.51 | 2.14 2.73 2.52 |
+| the pool-width sweep | 1.22 2.21 2.35 | 1.22 2.21 2.35 |
+| the handoff counts | 1.08 1.99 2.26 | 1.08 1.99 2.26 |
+
+The one-minute figure reaching 8 and 9 after three of the criterion shapes is
+those shapes' own 24-worker ids decaying -- a shape's "before" reading is its
+predecessor's tail, which is the condition "What is measured" names -- and the
+runnable-task field was 2 or 3 at every one of those twenty readings. The
+probe measurements below ran after the criterion ones and read 1.1 to 2.1,
+which is this run's own decay and nothing else.
+
+Every criterion figure is **one** run of one id, quoted as the point estimate
+of the mean with half the width of criterion's 95% interval as a
+plus-or-minus percentage. The two routes' ids are in the **same process** for
+each shape, which is what #377 built them for: a row below is two columns
+measured seconds apart under the same load.
+
+### The figures: five shapes, two routes, two worker counts
+
+The id route is each file's own column name -- `rustflow-group` in `skynet`,
+`nqueens` and `fibonacci`, plain `rustflow` in `merge_sort` and `integrate` --
+and the runtime route is `rustflow-runtime-group` everywhere. The sizes and
+the bodies are each shape's published ones, unchanged.
+
+| shape | size | workers | id route | runtime route | B/A |
+|---|---|---|---|---|---|
+| `skynet` | `MaxDepth = 3` | 1 | 209.19 µs ±0.21% | **141.79 µs ±0.22%** | 0.68 |
+| `skynet` | `MaxDepth = 3` | 24 | 530.08 µs ±1.38% | **427.70 µs ±0.79%** | 0.81 |
+| `skynet` | `MaxDepth = 4` | 1 | 2.0196 ms ±0.28% | **1.3441 ms ±0.63%** | 0.67 |
+| `skynet` | `MaxDepth = 4` | 24 | 2.5976 ms ±1.40% | **1.0090 ms ±0.63%** | **0.39** |
+| `nqueens` | `q = 6` | 1 | 85.172 µs ±0.17% | **51.502 µs ±0.11%** | 0.60 |
+| `nqueens` | `q = 6` | 24 | 846.97 µs ±1.30% | **557.79 µs ±1.12%** | 0.66 |
+| `nqueens` | `q = 8` | 1 | 1.1889 ms ±0.14% | **802.39 µs ±0.47%** | 0.67 |
+| `nqueens` | `q = 8` | 24 | 3.2976 ms ±4.51% | **897.52 µs ±0.62%** | **0.27** |
+| `fibonacci` | `n = 12` | 1 | 88.633 µs ±0.71% | **45.806 µs ±0.30%** | 0.52 |
+| `fibonacci` | `n = 12` | 24 | **1.1550 ms ±1.02%** | 9.3732 ms ±2.61% | **8.1** |
+| `fibonacci` | `n = 15` | 1 | 342.36 µs ±0.50% | **172.75 µs ±0.36%** | 0.50 |
+| `fibonacci` | `n = 15` | 24 | **2.2967 ms ±1.90%** | 38.178 ms ±1.66% | **16.6** |
+| `merge_sort` | 10000 | 1 | 254.94 µs ±0.13% | 255.13 µs ±0.21% | 1.00 |
+| `merge_sort` | 10000 | 24 | **535.29 µs ±11.5%** | 907.76 µs ±7.35% | 1.70 |
+| `merge_sort` | 1000000 | 1 | 55.495 ms ±0.37% | 54.788 ms ±0.12% | 0.99 |
+| `merge_sort` | 1000000 | 24 | **15.606 ms ±0.76%** | 73.408 ms ±1.72% | **4.70** |
+| `integrate` | `V = 1` | 1 | 297.36 µs ±0.11% | **144.49 µs ±0.15%** | 0.49 |
+| `integrate` | `V = 1` | 24 | **1.4389 ms ±2.18%** | 29.854 ms ±2.07% | **20.7** |
+| `integrate` | `V = 2` | 1 | 648.23 µs ±0.11% | **322.42 µs ±0.13%** | 0.50 |
+| `integrate` | `V = 2` | 24 | **2.4263 ms ±3.78%** | 65.129 ms ±2.59% | **26.8** |
+
+`fibonacci` carries a third `rustflow` column, `rustflow-runtime` -- the same
+recursion through a runtime task with **no group**, which is the same queue
+destination as the runtime route and the natural ordering -- and it is the
+control that makes the ablation below readable: 47.700 µs ±0.32% and
+181.33 µs ±0.39% at one worker, 902.13 µs ±0.98% and 1.3767 ms ±1.10% at
+24 workers. That column is the fastest of the three at 24 workers and the
+second fastest of the three at one.
+
+Every ratio in the table bar one is outside both sides' intervals by a wide
+margin. The exception is the pair of `merge_sort` ties at one worker -- 0.99
+and 1.00, which is a shape whose timed region is twenty million compares and
+fifteen or a thousand spawned tasks, so neither route has anything to show
+there and the row says so. `merge_sort/24w/10000` is the loosest cell in the
+table at ±11.5% against ±7.35%, and 1.70 still clears it: 590 µs is the id
+route's upper bound against the runtime route's 836 µs lower one.
+
+### One worker: 175 ns a child against 347, and a `Route` is all it is
+
+Per spawned task, at one worker, over each shape's published task count:
+
+| shape | size | spawned tasks | id route | runtime route | per task |
+|---|---|---|---|---|---|
+| `fibonacci` | `n = 15` | 986 | 342.36 µs | 172.75 µs | **347 ns → 175 ns** |
+| `skynet` | `MaxDepth = 4` | 11110 | 2.0196 ms | 1.3441 ms | 182 ns → 121 ns |
+| `nqueens` | `q = 8` | 2056 | 1.1889 ms | 802.39 µs | 578 ns → 390 ns |
+| `integrate` | `V = 2` | 1852 | 648.23 µs | 322.42 µs | 350 ns → 174 ns |
+| `merge_sort` | 1000000 | 1023 | 55.495 ms | 54.788 ms | not a submission figure |
+
+The `fibonacci` row is the one to read against the prior, because it is the
+shape #119 measured: **347 ns a child on the id route against 175 on the
+runtime route**, where #119 read 340 against 201 for the same `n` through
+`Runtime::silent_async_runtime`. The same id's `rustflow-runtime` column reads
+184 ns a child here, so a group on the runtime route is not more expensive
+than a runtime task's own submission -- it is 5% cheaper, outside both
+intervals, and the ablation says why: at one worker the ordering the group
+forces is itself worth a little (0.269 ms against 0.337 for the id route,
+0.183 against 0.185 for the runtime one), because a parent that has nothing
+outstanding until it waits pops its one child back with no window for anybody
+to take it.
+
+`nqueens` and `integrate` carry real arithmetic in a body, which is why their
+per-task figures are larger on both routes; what the route moves is the same
+170 to 180 ns of submission on `fibonacci` and `integrate` and 61 ns on
+`skynet`, whose groups carry ten children each rather than one, so a level's
+fixed cost is spread over ten submissions there. Nothing in these rows is
+about the 24-worker tables: at one worker there is no thief, and the whole
+difference is a buffer push plus a steal back out against a push and a pop on
+the same end of one deque.
+
+### 24 workers: two shapes scale, three fall over
+
+The 1-to-24 ratio of each route against *itself*, which is the question the
+issue asked:
+
+| shape | size | id route, 1 → 24 | runtime route, 1 → 24 |
+|---|---|---|---|
+| `skynet` | `MaxDepth = 3` | 2.53x slower | 3.02x slower |
+| `skynet` | `MaxDepth = 4` | 1.29x slower | **1.33x faster** |
+| `nqueens` | `q = 6` | 9.94x slower | 10.8x slower |
+| `nqueens` | `q = 8` | 2.77x slower | **1.12x slower** |
+| `fibonacci` | `n = 12` | 13.0x slower | 205x slower |
+| `fibonacci` | `n = 15` | 6.71x slower | 221x slower |
+| `merge_sort` | 10000 | 2.10x slower | 3.56x slower |
+| `merge_sort` | 1000000 | 3.56x faster | 1.34x slower |
+| `integrate` | `V = 1` | 4.84x slower | 207x slower |
+| `integrate` | `V = 2` | 3.74x slower | 202x slower |
+
+**`skynet` at `MaxDepth = 4` scales where the id route regresses**: 1.3441 ms
+to 1.0090 ms, against the id route's 2.0196 to 2.5976 the other way. That is a
+tree of 11110 bodies that add ten slots and return getting something out of 23
+more workers, which is a first for a group-route id on a shape with no work in
+it -- `merge_sort`'s million-element row scales on the id route too, but what
+it has to scale with is twenty million compares rather than a submission path.
+`nqueens` at `q = 8`
+is the same statement one notch weaker -- a 2.77x regression becomes 1.12x,
+which is 898 µs against 802 and is a regression no longer worth the name. Both
+are shapes whose parent submits **all** of its children and then waits: ten
+per group in `skynet`, one per surviving placement in `nqueens`, with no
+inline branch between the submissions and the `corun`. For those two the
+attribution the `skynet` and `nqueens` sections above make -- the shared
+buffers and the stealing they force -- is **confirmed by removing it**, which
+is what those two sections now say.
+
+The small sizes of both shapes still regress on both routes (`MaxDepth = 3` at
+3.02x, `q = 6` at 10.8x), and that is #343's and #367's finding rather than
+this one's: 1110 and 152 tasks of nothing cannot pay for the arrival spread of
+24 workers whatever queue they are pushed onto.
+
+The three shapes that fall over -- `fibonacci`, `integrate`, `merge_sort` --
+are exactly the three whose body **computes one branch inline between
+submitting the other and waiting for it**: upstream's tail optimisation, which
+is what `fibonacci/taskflow.cpp`, `merge_sort/taskflow.cpp` and
+`integrate/taskflow.cpp` all write. On the runtime route they cannot write it
+that way round. `Runtime::task_group` borrows the `&mut Runtime` for as long
+as the group lives and the inline branch needs that same runtime to open a
+group of its own, so the branch has to run *before* the group is opened --
+upstream's own `FibonacciSwapped` ordering, which `DESIGN.md` records as what
+the route costs a body, `benches/fibonacci.rs`'s header names for its own
+column, and the recursions in `benches/merge_sort.rs` and
+`benches/integrate.rs` each carry a line about. The consequence is one child
+outstanding at a time, and the next three subsections are what that costs.
+
+### The ablation: it is the ordering and not the route
+
+Five variants of the same `fib(15)`, driven straight by a probe outside the
+crate rather than under criterion, nine rounds each, median of the nine with
+the range beside it. The first two are the id route with the submission first
+and last; the next two are the runtime route with no group, the same two ways
+round; the fifth is the runtime-route group, which can only be written the
+second way:
+
+| variant | queue destination | submission | 1 worker | 24 workers |
+|---|---|---|---|---|
+| `group` | shared buffers | first | 0.337 ms (0.332-0.346) | **2.659 ms** (1.943-6.259) |
+| `group-swapped` | shared buffers | last | 0.269 ms (0.256-0.397) | **44.010 ms** (41.911-47.063) |
+| `runtime` | worker's own deque | first | 0.185 ms (0.181-0.234) | **1.655 ms** (1.315-3.444) |
+| `runtime-swapped` | worker's own deque | last | 0.183 ms (0.182-0.236) | **40.610 ms** (36.092-48.750) |
+| `rtgroup`, the measured route | worker's own deque | last, forced | 0.189 ms (0.184-0.249) | **35.433 ms** (31.703-43.365) |
+
+Read down the 24-worker column and the ordering is the only thing that
+matters: 2.7 and 1.7 ms with the submission first, 44.0, 40.6 and 35.4 with it
+last, on **both** queue destinations. The three slow variants' ranges overlap
+each other, so this instrument does not separate them -- what it does say is
+that the runtime route is no worse than the id route under the same ordering
+and is the faster of the two under either. Read down the one-worker column and
+the destination is the only thing that matters: 0.34 and 0.27 ms into the
+buffers, 0.18 to 0.19 onto the worker's own deque, with the ordering worth
+nothing there or a little in the swapped direction.
+
+That is the whole of the 24-worker table's bad half, and it is why #395 asks
+for an API rather than a scheduler change: the figure the runtime route would
+read with the submission first is the `runtime` row, 1.655 ms, which is
+**below** the id route's own 2.659.
+
+### It grows with the width of the pool, and stops at the cores
+
+The forced ordering against nine pool widths, same probe, seven rounds each,
+with the natural ordering through the same queue beside it:
+
+| workers | `rtgroup`, submission last | `runtime`, submission first |
+|---|---|---|
+| 1 | 0.181 ms | 0.182 ms |
+| 2 | 0.371 ms | 0.770 ms |
+| 3 | 1.004 ms | -- |
+| 4 | 2.168 ms | 0.791 ms |
+| 6 | 8.718 ms | -- |
+| 8 | 15.003 ms | 0.945 ms |
+| 12 | 37.158 ms | -- |
+| 16 | 36.606 ms | -- |
+| 24 | 36.015 ms | 2.331 ms |
+
+The cost is monotone in the width up to **12**, which is this box's core count
+rather than its thread count, and flat from there to 24. That is the signature
+of thieves rather than of lost parallelism: the serial time is 0.18 ms, so what
+the other 35.8 ms is made of is the work of the workers that have nothing to
+do, and adding a worker without a core to put it on adds nothing more. The
+natural ordering through the same queue rises from 0.18 to 2.33 ms over the
+same sweep, which is the arrival spread every shape in this file pays.
+
+### The handoff, counted: 60% of the children change worker, at 59 µs each
+
+The same recursion with each body asking whether it is running on the worker
+that submitted it -- `Runtime::worker_id` against the id its parent passed
+down -- summed over the 1973 bodies `fib(15)` enters, 986 of which are
+spawned tasks. Three runs each:
+
+| variant | workers | bodies | migrations | wall clock | wall per migration |
+|---|---|---|---|---|---|
+| `runtime`, submission first | 1 | 1973 | **0** | 0.21-0.31 ms | -- |
+| `rtgroup`, submission last | 1 | 1973 | **0** | 0.19-0.28 ms | -- |
+| `runtime`, submission first | 24 | 1973 | 99-146 | 1.24-1.75 ms | 12.0-13.6 µs |
+| `rtgroup`, submission last | 24 | 1973 | **559-592** | 33.0-35.0 ms | 58.7-61.5 µs |
+
+At one worker neither variant migrates once: the parent pops the child it
+pushed, every time, which is the LIFO property the route is for. At 24 workers
+the natural ordering migrates 10 to 15% of its children and the forced
+ordering migrates **57 to 60%** of them -- the parent pushes its one child and
+loses the race for it to a thief more often than not. The last column divides
+the whole run by its migrations, so it is an upper bound on a handoff rather
+than a breakdown of one; what it bounds is 59 µs against the natural
+ordering's 12, and the difference between those two is that a migration in the
+natural ordering overlaps with the parent's own inline branch while a
+migration in the forced one is the serial spine stopping dead until the thief
+finishes the subtree. What a handoff is made of -- failed steal attempts,
+`explore_task`'s yield budget, a park that should not have happened -- is not
+counted here and is the counter #395 would want.
+
+### Where the new route's stack cliff sits
+
+#359's method, re-run for all three routes in one binary: a chain of nested
+coruns, one child a level so that the nesting is the depth and nothing else,
+with the per-level cost read twice -- off the frame addresses, and off the
+slope of the cliff against `RUST_MIN_STACK`.
+
+| route | bytes/level by frame address | by the cliff slope, 1 → 4 MiB | deepest chain at the default stack | first that aborts |
+|---|---|---|---|---|
+| `Executor::task_group`, the id route | 1040 | 1040.3 | **2010** | 2011 |
+| `Runtime::task_group`, the runtime route | 1104 | 1104.2 | **1893** | 1894 |
+| `Runtime::corun`, no group at all | 832 | 832.0 | 2513 | 2514 |
+
+The frame-address column is uniform to the byte over twelve levels on each
+route, which is what makes it a frame size rather than an average, and the
+slope column is an independent reading of the same quantity over three stack
+sizes:
+
+| route | 1 MiB | 2 MiB, and unset, which is identical | 4 MiB |
+|---|---|---|---|
+| id route | 1002 / 1003 | 2010 / 2011 | 4026 / 4027 |
+| runtime route | 944 / 945 | 1893 / 1894 | 3793 / 3794 |
+| `Runtime::corun` | 1252 / 1253 | 2513 / 2514 | 5033 / 5034 |
+
+These are measured here rather than quoted from #359's 992 and 928, because
+both the type on the frame and the chain's body have moved since: a
+`TaskGroup` now carries #372's `Route`, and the runtime route's corun holds
+the borrow of the worker across the wait. What the paragraph in
+`src/task_group.rs` needs is the two routes measured in one binary, which is
+this table. The 6 to 7 KiB each row falls short of its stack size by is the
+same fixed part #359 named: the worker loop's own frames below the first
+level.
+
+**For a chain the two routes are within 6% of each other, and for a tree they
+are not comparable at all**, which is the distinction `TaskGroup::corun`'s
+docs are about. A chain has one task outstanding per level, so both routes
+nest per level; a tree's id route nests per outstanding *task*. The same
+ten-way `skynet` tree at one worker, through each route, run straight:
+
+| route | deepest `MaxDepth` that completes at one worker | first that aborts |
+|---|---|---|
+| id route | 4 (11110 tasks) | 5 |
+| runtime route | **8, the top of upstream's sweep** (111 million tasks, 13.5 s) | not reached |
+
+The id route's row reproduces #340's and #359's figures exactly, which is what
+makes the probe trustworthy for the other one; the runtime route's row is
+#359's `Runtime::corun` finding holding for a group opened on a `Runtime` as
+well -- the whole of upstream's skynet sweep on one worker, in the ten
+kilobytes nine levels of 1104 bytes come to, where the id route overflows at
+`MaxDepth = 5` and #359 costed upstream's own top at some 11 GiB through it. That is the half of this measurement with no trade-off
+in it: on the stack the runtime route is better by orders of magnitude at
+every size, and the 6% deeper chain the id route carries is not a size any
+shape in this file is chosen against.
+
+### The decision: both routes stay, and the guidance is the ordering
+
+**Both routes stay, and the id route is not "the slow route" -- it is the
+route that does not borrow the runtime.** That is what the figures argue for,
+and the `DESIGN.md` entry under "Dynamic tasking" is where the decision is.
+
+- **Open the group on a `Runtime` when the parent submits every child before
+  it waits.** That is `skynet`, `nqueens`, and any fan-out of a fixed set:
+  about a third faster per task at one worker, 61% and 73% faster at 24, the
+  only route on which `skynet` gets anything at all out of 23 extra workers,
+  and a stack bound per level of recursion rather than per outstanding task,
+  which is worth four `skynet` levels and the whole of upstream's sweep.
+- **Keep the id route for a body that has work of its own to do between the
+  submission and the wait.** On the runtime route it cannot: the group holds
+  the runtime, the inline branch needs it, so the submission goes last and
+  that costs 4.7x to 27x at 24 workers -- far more than the route's own 50%
+  per-task saving is worth. Three of this file's five nested shapes are that
+  body, because upstream's tail optimisation is that body.
+- **Nothing here is a scheduler change, and the one candidate is an API**
+  (#395): a scoped form that hands a body a group and a reborrowed `Runtime`
+  together, so that the fast ordering and the fast queue can be had at once.
+  The figure it would be measured against is in the ablation above -- the
+  `runtime` row's 1.655 ms, below the id route's own 2.659 -- and the bar #395
+  carries is the `rustflow-group` id's 2.2967 ms ±1.90%.
+- **What this does not say.** It does not say the runtime route is slower at
+  24 workers: under the ordering the id route uses it is faster, and under the
+  ordering it forces the id route is just as slow. It does not re-publish any
+  shape's table, which is why the five sections above point here instead of
+  carrying a `rustflow-runtime-group` column of their own. And it does not
+  revisit the small sizes' 24-worker regressions (`MaxDepth = 3`, `q = 6`),
+  which are #343's and #367's arrival spread rather than either route's.

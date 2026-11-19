@@ -65,7 +65,10 @@ impl Executor {
     /// This is the route for a body that has no [`Runtime`] of its own, and
     /// the group it opens holds the opening worker's *id*:
     /// [`Runtime::task_group`] is the route that holds the worker itself, and
-    /// `DESIGN.md` has what that buys a recursion of groups.
+    /// `DESIGN.md` has what that buys a recursion of groups. What this route
+    /// keeps in exchange is the runtime it does not borrow: a body may spawn
+    /// siblings, corun its own node or run a branch of its own -- including
+    /// one that opens groups -- while a group opened here is still open.
     ///
     /// ```
     /// use std::sync::Arc;
@@ -717,13 +720,19 @@ impl<'a> TaskGroup<'a> {
     /// worker picks up while waiting runs on the waiting frame, so what
     /// decides the nesting is which job it is handed. Opened from a
     /// [`Runtime`], this wait pops the children it queued itself, newest
-    /// first, and nests one frame -- about a kilobyte in a release build --
-    /// per level of *recursion*. Opened from the [`Executor`], it is handed
-    /// the oldest job in the pool instead, so it nests one frame per task
-    /// still outstanding, which at one worker is the whole subtree. That
-    /// bound is the caller's to respect, in one of three ways: open the group
-    /// from a `Runtime` where the shape allows, keep the tasks outstanding
-    /// under one corun bounded, or raise the stack with `RUST_MIN_STACK`.
+    /// first, and nests one frame per level of *recursion*: 1104 bytes a
+    /// level in a release build, so a chain of them is 1893 levels deep on
+    /// std's default 2 MiB worker stack. Opened from the [`Executor`], it is
+    /// handed the oldest job in the pool instead and nests one frame per task
+    /// still outstanding, which at one worker is the whole subtree: 1040
+    /// bytes a level and 2010 levels of a chain, but a *tree* meets that
+    /// ceiling at its task count rather than at its depth, which is the
+    /// difference that matters -- upstream's ten-way `skynet` completes at
+    /// `MaxDepth = 8` through a `Runtime` on one worker and overflows at 5
+    /// through the `Executor`. That bound is the caller's to respect, in one
+    /// of three ways: open the group from a `Runtime` where the shape allows,
+    /// keep the tasks outstanding under one corun bounded, or raise the stack
+    /// with `RUST_MIN_STACK`.
     /// `DESIGN.md`'s "Executor core" has the decision behind it and
     /// `BENCHMARKS.md` the measurements.
     ///

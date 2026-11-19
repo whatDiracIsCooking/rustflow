@@ -1048,6 +1048,38 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   sixteen spawning forms of its own would have bought the accessor back and
   neither of the other two, so the routes are one type and one enum.
 
+- **Both routes stay, and which one a body wants is decided by its own
+  *ordering* rather than by the queue** (issue #380). The A/B of the two
+  routes over the five nested benchmark shapes says two things that point
+  opposite ways, and [`BENCHMARKS.md`](BENCHMARKS.md)'s "The #380 measurement"
+  has the figures behind both. The runtime route is the cheaper submission at
+  every pool width -- about half the cost of a spawned task at one worker --
+  and it is the only route whose stack demand is per level of recursion, so a
+  parent that submits all of its children and *then* waits is strictly better
+  off on it: upstream's `skynet` and `nqueens` improve on it where the id
+  route regresses as workers are added. But a parent that computes one branch
+  **inline** between submitting the other and waiting for it -- upstream's
+  tail optimisation, which its `fibonacci`, `merge_sort` and `integrate`
+  benchmarks all write -- cannot write that on the runtime route at all,
+  because the group borrows the runtime that inline branch needs. Its
+  submission therefore goes last, one child is outstanding at a time, and at
+  24 workers that costs between 1.7 and 27 times the id route depending on the
+  shape, which is more than the route's own saving by an order of magnitude.
+  The measurement's ablation puts the whole of that on the ordering: the *id*
+  route under the same ordering is just as slow, and the runtime route under
+  the id route's ordering is the fastest of the five variants it measured.
+
+  So the id route is **kept, and it is not "the slow route"** -- it is the
+  route that does not borrow the runtime, which is what a tail-optimised
+  recursion needs and is worth more at width than the queue is. That is the
+  distinction `src/task_group.rs` draws between the two constructors, rather
+  than one of speed, and `TaskGroup::corun` carries the stack half of it with
+  both cliffs measured. What would collapse the choice back to a single route
+  is an API that lets a body on the runtime route submit *before* its inline
+  branch runs -- a scoped form handing out a group and a reborrowed `Runtime`
+  together, say -- which is #395's question and is deliberately not decided
+  here.
+
 ## The async family
 
 - **`async` is `spawn`, and nothing else in the family is renamed** (issue
