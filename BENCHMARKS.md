@@ -43,12 +43,12 @@ criterion ids, which `cargo bench --all-features -- --list` counts.
   measures is a comparison between two C++ libraries rather than a shape of
   the executor.
 
-**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 46
+**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 47
 headings, and they are three kinds: the three method sections that follow this
 preamble, "The machine" through "The upstream C++ column is empty"; 21 shape
 sections carrying the 22 shapes, since `async_task` and `fibonacci` share "The
 two shapes #96 added", which measured the two together in a run of their own;
-and 22 per-decision measurement sections, each named for the issue that took
+and 23 per-decision measurement sections, each named for the issue that took
 it. A shape's section is its table, its sizes and its departures from
 upstream. A measurement section is one question, with the machine, the load
 and the method of its own run in it, and it ends either in a change that
@@ -6123,7 +6123,10 @@ And the same sweep at `n = 1000`, where the whole job is 10 to 12 µs of work:
   measurement" priced a plain fan-out push, node and two boxed closures and
   deque push and `notify_one`, at about **2 µs**. A split is one
   `Scope::spawn_runtime` of a half share, so the gap is not accounted for by
-  the submission, and **#400** is the counter run that attributes it.
+  the submission. **#400 has since attributed it, and it is none of the four
+  candidates this section listed**: it is the join that `Scope::spawn_runtime`
+  obliges, whose wait cannot park and costs 143 to 172 µs of CPU a round.
+  "The #400 attribution" below is that run.
 - **The default floor is the type's worst setting.** 1.90-2.86 ms at floor 1,
   1.03-1.28 at 4096, 0.72-0.85 at 65536, with the distinct-worker count flat
   at 21 to 24 across all three: the floor buys nothing the type exists for and
@@ -6233,7 +6236,9 @@ places.
   default, at a cost this section now states.** It reaches 21 to 24 of 24
   workers against the guided default's 21 to 22, and the counters say the
   static share rather than the re-split is what does that; the re-splits
-  themselves cost 12 to 16 µs each, and the whole scheme 1.27x to 33.8x of the
+  themselves cost 12 to 16 µs each -- which "The #400 attribution" below
+  resolves into the join each one opens, at 160 to 476 µs of CPU a split --
+  and the whole scheme 1.27x to 33.8x of the
   shipped ids' wall at 24 workers, including 1.48x and 1.70x on `mandelbrot`,
   the shape whose imbalance it was built for.
   `DefaultPartitioner = GuidedPartitioner<>` therefore stays what #343 left
@@ -6252,8 +6257,9 @@ places.
 - **The three leads are filed.** #399 (the `&cmp` call shape, 1.7x on a
   one-worker sort), #400 (what 13 µs a re-split is made of), #401
   (`SplittingPartitioner::default()`'s floor). Each names a bar and none of
-  them is this section's to take. The first of them has since been taken:
-  "The #399 change" below is its section.
+  them is this section's to take. Two of them have since been taken: "The
+  #399 change" and "The #400 attribution" below are their sections, and the
+  second of those filed two of its own, #406 and #407.
 
 **What this does not say.** It does not say `SplittingPartitioner` is useless:
 a box wider than its pool, a body longer than the arrival spread, or a cursor
@@ -6561,3 +6567,246 @@ async submission path, and neither `integrate` nor `fibonacci` calls
   cost 4 and 400, with its node drawn from the list for all but one child in
   121392 at one worker. No time, where it is drawn; nothing, now, where it is
   not.
+
+## The #400 attribution: a re-split costs the join it opens, and the join never parks
+
+**The 14 µs a re-split is not the spawn, not the thread-id check, not a
+re-walk and not the migration: it is the explicit join the split opens, and
+that join's wait is 143 to 172 µs of CPU a round.** `run_share` hands its far
+half to a `Runtime::scope` and walks the near half inside it, so the scope's
+own `Runtime::try_corun` has to wait for the far half before the splitting
+task can finish; a corun cannot park, by the design its own module docs state,
+so the waiting worker searches instead -- 210 steal attempts and 150
+`thread::yield_now` calls per failed `WorkerThread::explore_task` -- and does
+it again until the half it is waiting for completes. The arithmetic closes
+exactly: at `n = 1e6` and 24 workers the splitting default burns **33.4 to
+79.1 ms** of CPU against the same partitioner's non-splitting **17.9 to
+22.6 ms**, and subtracting the measured spin from each of the six runs leaves
+**17.2 to 20.6 ms** every time -- inside the non-splitting row's own range. An
+ablation that replaces the scope's join with the node's own preemptive one
+brings the wall to **1.01-1.26 ms** against 2.14-4.19, and the CPU to
+18.6-21.0 ms, with **zero** corun calls.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| harness | #381's observer harness, not criterion: six runs a row, the pool confirmed fully parked (`Executor::num_waiters() == 24`) before each window, a fresh executor per row |
+| Date | 2026-11-19 |
+| **Load average** | **0.15 0.30 1.13 before the pass and 0.15 0.30 1.13 after it, with nothing else on the box** |
+
+The box was this run's alone: no sibling agent, no other `cargo`, and
+`/proc/loadavg`'s runnable-task field read 1 or 2 at every reading either side
+of all three builds. Every figure below is **one** run of one row, quoted as
+the range over that row's six runs, which is the convention #381's part 2 set
+for this harness; there is no best-of-anything here, and a row is only read
+against the control rows measured in the same process, because the three
+builds' own controls differ by up to 1.4x between processes and the box's
+drift is the reason.
+
+### Method: one harness, three builds, four rows each
+
+The harness is #381's: a `for_each_by_index` over a million `AtomicU64` cells,
+each replaced by its own tangent, under a #343-shaped observer that counts
+which worker enters each dispatched async task. What is added to it here is
+three things. A counter bank in `run_share` and in `WorkerThread::corun_until`
+-- splits, entries, body calls, covered indices, and the nanoseconds of each
+of the split's three phases on the splitting worker. A CPU reading either side
+of the timed region, summing `sum_exec_runtime` out of every
+`/proc/self/task/<tid>/schedstat`, which is what separates a wait that costs
+cores from a wait that costs only latency. And an untimed correctness check
+after every run, comparing all million cells against a sequential `f64::tan`,
+so a build that loses an index fails here rather than producing a fast figure
+-- every run of every build below passed it.
+
+The three builds are today's tree and two ablations, selected at run time so
+that one binary carries all three:
+
+- **A, today's tree.** `run_share` opens a `Runtime::scope` per split.
+- **B, the far half detached.** The far half goes to
+  `Runtime::silent_async_runtime` under the splitting task's *own* node and the
+  body returns: the preemption protocol `executor::runtime`'s module docs set
+  out joins it, so the worker goes back to its scheduling loop -- where, with
+  nothing to do, it *parks* -- instead of waiting in a corun. This is an
+  ablation and not a candidate change: it needs the far half's body to be
+  `'static`, which the index family's own three borrowed entry points do not
+  give, and the decision below says what shipping it would take.
+- **C, the chain capped at one.** Today's scope, but a share that has already
+  been split never splits again -- the far half records the thread it is
+  handed out *on* as its home, so it reads as un-stolen wherever it lands.
+
+### The counters: 23 shares, 98 to 130 splits, and one body call each
+
+Build A, the `splitting floor 1 (default)` row, six runs. "Entries" is
+`run_share` calls, which the observer's own async-task count matches exactly
+in every run -- the one inline share runs on the calling worker and is no
+task. "Spin" is time in a `corun_until` round that found nothing to steal.
+
+| run | entries | home | splits | bodies | indices covered | spawn, µs | near walk, ms | join, ms | spin, ms | corun rounds / pops / steals / yields | CPU, ms | wall, ms |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 121 | 23 | 98 | 121 | 1000000 | 116 | 12.4 | 63.1 | 15.7 | 199 / 23 / 66 / 110 | 33.4 | 2.14 |
+| 2 | 124 | 23 | 101 | 124 | 1000000 | 107 | 15.9 | 82.4 | 26.5 | 242 / 23 / 65 / 154 | 44.3 | 2.48 |
+| 3 | 141 | 23 | 118 | 141 | 1000000 | 873 | 15.8 | 73.5 | 19.8 | 226 / 23 / 85 / 118 | 39.8 | 2.14 |
+| 4 | 153 | 23 | 130 | 153 | 1000000 | 111 | 16.2 | 251.9 | 61.9 | 518 / 23 / 95 / 400 | 79.1 | 4.19 |
+| 5 | 147 | 23 | 124 | 147 | 1000000 | 102 | 16.3 | 106.1 | 25.9 | 285 / 23 / 96 / 166 | 46.5 | 2.48 |
+| 6 | 123 | 23 | 100 | 123 | 1000000 | 70 | 15.2 | 92.4 | 28.6 | 276 / 23 / 63 / 190 | 46.9 | 2.51 |
+
+Four things to read off it before any candidate is priced.
+
+- **Exactly 23 entries of every run find themselves at home, and they are the
+  far halves nobody stole.** The dispatch spawns 23 shares and runs the 24th
+  inline; all 23 spawned ones are stolen, every run, so all 23 split. The
+  other 23 un-split entries are the far halves the splitting worker's own
+  corun popped back off its own queue -- `pops` is 23 in all six runs, which is
+  the same number from the other side.
+- **`corun` calls equal splits, every run.** One scope, one `try_corun`, one
+  split: the join is not amortised over anything.
+- **Nothing is walked twice.** `bodies` equals `entries` in all six runs, and
+  the covered indices sum to `n` exactly, so every index is visited by exactly
+  one body call and no share re-walks what it handed off.
+- **The chain is deep.** Counted by the depth a split happens at, the six
+  runs give 23 / 20-23 / 17-23 / 13-22 / 8-16 / 5-11 / 2-6 over the first
+  seven levels, with the eleven-and-deeper bucket non-empty in three of them.
+  A share is re-split four or five times over, and each level is a frame
+  waiting on the level below it.
+
+### The four candidates the issue listed, priced and dismissed
+
+| candidate | what the counters say | share of the 14 µs |
+|---|---|---|
+| the runtime-bodied spawn a split needs | the whole scope-open-plus-`spawn_runtime` phase is 70 to 116 µs over 98 to 130 splits -- **0.7 to 1.2 µs a split**, two `Instant::now()` calls of the measurement included -- in five runs of six, and 873 µs in the sixth, where one spawn stalled | under a tenth, and consistent with "The #380 measurement"'s 347 ns a child plus a scope frame |
+| the `ThreadId` compare and the `Runtime::worker_id` lookup | the read and the compare total 5.2 to 6.4 µs over 121 to 153 entries -- **41 to 45 ns an entry**, which is two `Instant::now()` calls and no measurable remainder -- and `Runtime::worker_id` is never called on this path at all | nothing |
+| the share's own re-walk after the handoff | `bodies == entries` and the covered indices sum to `n` in every run | zero |
+| the cache traffic of a half share changing worker | the splitting row's body time is 14.3 to 18.1 ns an index against the non-splitting row's 13.3 to 16.9, which is **inside the control's own range** and so not a result; build B bounds it instead, its body time reading 13.7 to 15.7 ns against its own control's 13.7 to 14.3 -- at most **1.4 ns an index**, 1.3 ms of CPU a run, under 1.2 µs of wall a split | under a tenth |
+
+So the four together account for about 1 to 2 µs of the 14, which leaves the
+join.
+
+### Where it goes: a wait that cannot park, and a search that costs 143 µs to fail
+
+The join's own clock is the `join, ms` column, and it is the wrong number to
+divide: a parent's join contains its children's, so 251.9 ms over a 4.19 ms
+run is nested double counting rather than a thread-time total. What is not
+double counted is the CPU, and it attributes the whole of the difference:
+
+| row (build A) | wall, ms | CPU, ms | CPU − spin, ms |
+|---|---|---|---|
+| guided, floor 1 (`DefaultPartitioner`) | 0.79-0.96 | 18.0-20.4 | -- |
+| splitting, floor 1 (`default()`) | **2.14-4.19** | **33.4-79.1** | **17.2-20.6** |
+| splitting, 262144 -- above `n/w`, so nothing splits | 1.06-1.34 | 17.9-22.6 | -- |
+| guided, 262144 | 3.10-4.89 | 15.5-17.8 | -- |
+
+**The splitting default's CPU minus its own measured spin lands inside the
+non-splitting row's CPU in all six runs**, 17.2-20.6 against 17.9-22.6, so the
+extra 13 to 59 ms of CPU a run *is* the spin and not work the split added.
+Per split that is **160 to 476 µs of CPU**, and the run's own concurrency --
+16 to 19 cores' worth, by the CPU-over-wall ratio -- turns it into the 8 to
+23 µs of wall a split that the published 14 µs is. Spin time is wall time on
+the waiting worker rather than a CPU reading of its own; that the two agree to
+the control's range is what says the waiting worker is on a core while it
+waits.
+
+Per failed round the spin is **143, 172, 167, 155, 156 and 151 µs** in the six
+runs, which is where the cost actually lives, and
+`WorkerThread::explore_task`'s own give-up policy is the whole of it. At 24
+workers a victim is one of `num_queues()` = 24 queues plus
+`bit_width(24)` = 5 spill buffers, so `max_steals` is `(29 + 1) * 2` = 60
+attempts; past that it yields on every attempt and gives up 150 attempts
+later. A round that finds nothing therefore costs **210 steal attempts and
+150 `sched_yield` calls**, each attempt a contended pop on another worker's
+deque. `corun_until` then yields once more and runs the round again, because
+the one thing it must not do is sleep: "a worker parked here being one the run
+it waits for cannot use" is its own comment, and it is right -- but it means a
+corun that waits a long time pays this search over and over, and that a worker
+which would otherwise have *parked* instead hammers every deque in the pool.
+That last part is what the fourth candidate was half-seeing: the splitting
+row's per-index body cost is a little above the non-splitting row's, and build
+B shows most of that gap is the searching, not the migration.
+
+### The ablation: the join replaced by the node's own, and the cost is gone
+
+Three builds, four rows, six runs a row, all in one pass and each row read
+against the controls of its own build.
+
+| row | A: today | B: far half detached | C: chain capped at one |
+|---|---|---|---|
+| guided, floor 1 | 0.79-0.96 ms | 0.90-1.24 ms | 1.16-1.27 ms |
+| **splitting, floor 1** | **2.14-4.19 ms** | **1.01-1.26 ms** | **1.27-1.49 ms** |
+| splitting, 262144 | 1.06-1.34 ms | 1.00-1.04 ms | 1.11-1.27 ms |
+| guided, 262144 | 3.10-4.89 ms | 2.73-3.82 ms | 2.89-3.36 ms |
+| splitting floor 1: CPU | 33.4-79.1 ms | 18.6-21.0 ms | 25.0-29.0 ms |
+| splitting floor 1: tasks | 121-153 | 127-175 | 46 |
+| splitting floor 1: splits | 98-130 | 59-91 | 23 |
+| splitting floor 1: corun calls | 98-130 | **0** | 23 |
+| splitting floor 1: spin | 15.7-61.9 ms | **0** | 2.1-3.3 ms |
+
+- **B removes the whole of it.** With the far half joined by its own node the
+  splitting default reads 1.01-1.26 ms against its own build's non-splitting
+  row at 1.00-1.04 and its guided default at 0.90-1.24 -- level with both,
+  where today it is 2 to 4x them -- and its CPU, 18.6-21.0 ms, is its own
+  control's. It also *splits more freely* while costing less, because a worker
+  that is no longer stuck in a join is a worker that can steal: 127 to 175
+  tasks against today's 121 to 153.
+- **B's absolute figures do not clear the issue's 1.2 ms on their own**, and
+  the controls say why rather than excusing it: that build's own guided
+  default read 0.90-1.24 ms where build A's read 0.79-0.96, so the process
+  carried about 25% of drift and the bar is inside it. What B clears
+  unambiguously is the comparison the bar was a proxy for -- the splitting
+  default level with the non-splitting row in the same process.
+- **C is a mitigation and not a fix.** Capping the chain at one level cuts
+  splits from ~115 to 23 and the spin with them, and lands 1.27-1.49 ms
+  against its own controls' 1.11-1.27 -- a residual 1.15x, which is the 23
+  joins it still opens. It also takes the property the type exists for away:
+  23 splits is one re-split per share and no more, so a worker arriving late
+  to a *stolen* share has nothing to take.
+
+### What this leaves for the floor
+
+The cost is **per split**, so the floor is a linear multiplier on it and
+nothing else: `default()`'s floor of 1 buys 98 to 130 splits and 98 to 130
+joins, a floor above `n / w` buys none, and #381's 4096 row sits in between at
+88 to 94 tasks and 1.03-1.28 ms. #401 is the floor's decision and this section
+does not take it, but it owes two numbers to it. The first is that the floor
+prices nothing except the number of splits, each of which costs 160 to 476 µs
+of CPU on today's tree. The second is that build B drops that per-split cost
+to the 1 to 2 µs the four candidates bound, which would leave the floor
+costing almost nothing -- so a floor chosen against today's join is a floor
+chosen against a cost that the join is, and not against the splitting scheme.
+
+### The decision: nothing ships here, and the join is two issues of its own
+
+The issue's own gate for a change was that the counters name one of its four
+candidates. They name none of them: each of the four is priced above at
+between nothing and a tenth of the cost, and what is left is a mechanism the
+issue did not list. So this closes as an attribution, with the reason the
+cost cannot come off *here* stated rather than asserted.
+
+- **The join is required where it stands.** `Scope`'s soundness argument is
+  that `Runtime::scope` does not return until its children are joined -- its
+  own module docs rest the two `transmute` calls `Scope::spawn` and
+  `Scope::spawn_runtime` make on exactly that -- and `run_share`'s share and
+  work are `'a`-bounded, not `'static`, because `spawn_shares` hands the
+  slice, reduce and find algorithms shares that borrow their caller's data.
+- **The cheaper join needs a `'static` body, and three call sites do not have
+  one.** Build B's route is `Runtime::silent_async_runtime`, whose bound is
+  `Send + 'static`. The owned entry points (`make_for_each_index_task` and its
+  two siblings) do satisfy it; `Runtime::for_each_index`,
+  `Runtime::for_each_by_index` and `Runtime::for_each_by_index_nd` do not --
+  they submit through a `Scope` precisely so that a body may borrow a local --
+  and `IndexDispatch::dispatch` is one method over both, so `spawn_splitting`
+  cannot name the detached route from inside it. Giving it one means a handoff
+  seam through `dispatch`: a new parameter and a new bound on a public trait
+  method, which is a surface change and not a tuning. **#406** is that change,
+  with build B's figures as its bar.
+- **The search the wait performs is scheduler-wide**, not this partitioner's:
+  210 steal attempts and 150 `sched_yield`s per failed round costs 143 to
+  172 µs of CPU to establish that a 24-worker pool is busy, and every
+  `Runtime::scope`, `Runtime::corun`, `TaskGroup::corun` and algorithm corun
+  pays it on the same terms. `src/executor/worker.rs` is where that lives and
+  it is outside this issue's files. **#407** is that one.
+- **What the splitting scheme is actually paying for** is that it hands work
+  out through a *task*, which something has to join, where the four ported
+  families hand it out through a shared cursor, which nothing does. That is
+  the structural reason the guided default is cheap at 24 workers and not an
+  accident of its tuning.
