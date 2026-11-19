@@ -37,8 +37,9 @@
 //! touches it; this port's task bodies are `Send + 'static`, so the sharing
 //! has to be spelled out anyway.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rustflow::Executor;
 use rustflow::prelude::*;
@@ -336,4 +337,139 @@ fn a_coruned_taskflow_is_editable_the_instant_corun_returns() {
             "a corun returned while a share of the taskflow it ran was still held"
         );
     }
+}
+
+// --------------------------------------------------------
+// Testcase: how late a corun may be
+// --------------------------------------------------------
+
+/// Nanoseconds since `base`, the one clock both sides of a round read.
+fn since(base: Instant) -> u64 {
+    u64::try_from(base.elapsed().as_nanos()).expect("a test's own elapsed nanos fit in a u64")
+}
+
+/// A corun returns within a bounded time of the thing it waits for happening
+/// on another worker, which is the latency #412 changed and the sentence
+/// `DESIGN.md` makes about `corun`.
+///
+/// One round is a child the coruning worker *cannot* pop: the body spawns one
+/// `silent_async`, waits outside the corun until that child reports itself
+/// running (so another worker has it), then coruns on a predicate the child's
+/// own stamp satisfies. The child is held on a spin until the corun's first
+/// predicate read releases it, so the stamp lands while the frame is already
+/// inside the loop's search -- which is the position the whole issue is about.
+/// The sample is `stamp -> corun returned`, and nothing else is in it: the
+/// predicate reads the stamp itself rather than the child's tear-down, so a
+/// round measures the loop's re-check granularity and not the executor's
+/// accounting.
+///
+/// **The bound is 50 µs on the median of 200 rounds**, and both halves of that
+/// are measured rather than picked. Until #412 this frame could not read its
+/// predicate between the first steal attempt of a search and the last: a failed
+/// search was `(num_queues() + 1) * 2 + 150` attempts, 150 of them each after a
+/// `yield_now`, so the median round was a whole search long. Against the
+/// unfixed loop this case reads a median of **105 to 111 µs, pinned to two
+/// cores and not, with no round of any run under 104**; against today's it
+/// reads a median of **0.24 to 0.36 µs**. 50 µs is half the smallest reading
+/// of the loop this guards against and 140x the one it guards.
+///
+/// The median rather than the maximum because the slowest sample is the box's
+/// rather than the loop's: today's loop puts one round of the 200 at 2.7 to 6.5
+/// µs -- a frame descheduled between the stamp and its next attempt -- and a
+/// bound loose enough never to call that a failure would be looser than the
+/// defect it is looking for. A statistic the defect moves wholesale needs no
+/// such slack. `BENCHMARKS.md`'s "The #412 change" has both loops' spreads.
+///
+/// Two workers is the smallest pool that has the shape at all, and the
+/// quietest: one worker to run the body and one to take the child. At one
+/// worker a corun still steals -- a `silent_async` from a body goes to the
+/// shared buffers -- but it never *waits*, there being no other thread the
+/// child could be running on, so the first attempt of the first search finds
+/// it and neither loop has anything to re-read.
+#[test]
+fn a_corun_returns_within_fifty_microseconds_of_a_child_on_another_worker() {
+    /// Rounds, each one child. The median of these is the assertion.
+    const ROUNDS: usize = 200;
+    /// The bound the docs above derive.
+    const BOUND: Duration = Duration::from_micros(50);
+    /// How long a round waits for some worker to pick the child up before
+    /// calling it a hang rather than a latency.
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    let executor = Arc::new(Executor::new(2));
+    let samples = Arc::new(Mutex::new(Vec::with_capacity(ROUNDS)));
+    let base = Instant::now();
+
+    let mut taskflow = Taskflow::new();
+    taskflow.emplace({
+        let executor = Arc::clone(&executor);
+        let samples = Arc::clone(&samples);
+        move || {
+            for round in 0..ROUNDS {
+                let started = Arc::new(AtomicBool::new(false));
+                let release = Arc::new(AtomicBool::new(false));
+                let stamp = Arc::new(AtomicU64::new(0));
+
+                executor.silent_async({
+                    let started = Arc::clone(&started);
+                    let release = Arc::clone(&release);
+                    let stamp = Arc::clone(&stamp);
+                    move || {
+                        started.store(true, Ordering::Release);
+                        while !release.load(Ordering::Acquire) {
+                            std::hint::spin_loop();
+                        }
+                        stamp.store(since(base), Ordering::Release);
+                    }
+                });
+
+                // Outside the corun, so that what the corun waits for is a
+                // child no `pop` of its own can reach.
+                let deadline = Instant::now() + PATIENCE;
+                while !started.load(Ordering::Acquire) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "round {round}: no other worker took the child"
+                    );
+                    std::thread::yield_now();
+                }
+
+                executor
+                    .corun_until(|| {
+                        release.store(true, Ordering::Release);
+                        stamp.load(Ordering::Acquire) != 0
+                    })
+                    .expect("a worker may corun");
+
+                let returned = since(base);
+                let stamped = stamp.load(Ordering::Acquire);
+                samples
+                    .lock()
+                    .expect("no round panicked holding this lock")
+                    .push(returned.saturating_sub(stamped));
+            }
+        }
+    });
+
+    executor
+        .run(&taskflow)
+        .wait()
+        .expect("the body that coruns");
+    executor.wait_for_all();
+
+    let mut samples = samples
+        .lock()
+        .expect("no round panicked holding this lock")
+        .clone();
+    assert_eq!(samples.len(), ROUNDS, "every round took a sample");
+    samples.sort_unstable();
+    let median = Duration::from_nanos(samples[ROUNDS / 2]);
+
+    assert!(
+        median < BOUND,
+        "a corun was {median:?} late on the median of {ROUNDS} rounds, bound {BOUND:?} \
+         (min {:?}, max {:?})",
+        Duration::from_nanos(samples[0]),
+        Duration::from_nanos(samples[ROUNDS - 1])
+    );
 }

@@ -357,7 +357,10 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   pool never loses a thread to waiting and no amount of nesting can drain it.
   Three consequences a caller feels. The wait is not ordered, a corunning
   worker running whatever it can steal, so a corun returns no sooner than the
-  inner run finishes and no later than the next job it picked up is done. It is
+  inner run finishes and no later than the next job it picked up is done —
+  a bound on one steal attempt rather than on a search, the loop re-reading
+  what it waits for after every attempt that found nothing, which is #412 and
+  is upstream's `_corun_until` structure. It is
   for a worker of *that* executor and nothing else, any other thread getting
   `CorunError::NotAWorker` rather than the blocking wait, which would be a
   mistake about which thread the code is on. And nesting a run on a *different*
@@ -787,16 +790,17 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   queue, both upstream's -- and the figures are in
   [`BENCHMARKS.md`](BENCHMARKS.md) under "The #381 measurement".
 
-- **A corun learns its child is done one failed search late, and that search
-  is 211 attempts long** (issue #407). `WorkerThread::corun_until` reads its
-  predicate once a round and spends the round in `explore_task`, the scheduling
+- **A corun learnt its child was done one failed search late, and that search
+  was 211 attempts long** (issues #407 and #412, **fixed**).
+  `WorkerThread::corun_until` read its
+  predicate once a round and spent the round in `explore_task`, the scheduling
   loop's search with the scheduling loop's give-up: `(num_queues() + 1) * 2`
   attempts, then 150 more each after a `thread::yield_now`, 137 to 150 µs on
-  this box at 24 workers. A parent whose child was stolen therefore returns no
-  sooner than that round ends, however quickly the child finished -- which
-  makes this entry's own "a corun returns no sooner than the inner run
-  finishes and no later than the next job it picked up is done" false today,
-  by one search. Upstream's `_corun_until` at the pin reads `stop_predicate()`
+  this box at 24 workers. A parent whose child was stolen therefore returned no
+  sooner than that round ended, however quickly the child finished -- which
+  made the entry above's "a corun returns no sooner than the inner run
+  finishes and no later than the next job it picked up is done" false by one
+  search. Upstream's `_corun_until` at the pin reads `stop_predicate()`
   after **every** failed steal, yields past `MAX_STEALS` and never gives up on
   its own; the three differences `corun_until`'s docs list (one local job a
   round, never sleeping, ignoring `done`) are upstream's too, and this fourth
@@ -811,11 +815,31 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   zero-work shape at 24 workers, 255 µs against 2.147 ms at 1 µs bodies and
   1.131 ms against 2.733 ms at 10 µs, CPU at 0.22x, 0.25x and 0.50x, and it is
   the first time 24 workers beat one on `fibonacci` or `integrate`.
-  **The fix is #412**, a port-fidelity correction rather than a scheduler
-  design, and it ships with a criterion A/B and a latency test rather than as
-  a measurement issue's diff; #407 closes with it. The sweep, the counters,
-  upstream's loop and the ablation are in [`BENCHMARKS.md`](BENCHMARKS.md)
-  under "The #407 measurement". What it does not reach is the per-child
+
+  **#412 shipped that loop**, as `WorkerThread::steal_until`: a search that
+  steals, reads the predicate, yields past `MAX_STEALS` and gives up only when
+  the predicate says to, which is a port-fidelity correction rather than a
+  scheduler design. `explore_task` and `wait_for_task` keep their 211-attempt
+  give-up, that being what lets a worker reach the notifier and park, which a
+  corun never does. The A/B moves **20 of the 22** 24-worker `rustflow` ids
+  across `fibonacci`, `integrate`, `merge_sort`, `skynet` and `nqueens`
+  outside both sides' spreads -- `nqueens/rustflow-group/24w/6` 0.056x,
+  `fibonacci/rustflow-runtime-group/24w/15` 0.061x,
+  `integrate/rustflow/24w/2` 0.141x -- and leaves 20 of the 22 one-worker ids
+  inside them; the two exceptions either end are `merge_sort`'s
+  million-element rows, where twenty million compares bury the wait, and two
+  `skynet` one-worker cells that read ±4% in opposite directions. Every one of
+  the five shapes is now faster at 24 workers than at one, and three of them
+  beat rayon at 24 where none did. What it costs is **16 bytes of a worker's
+  stack a level**, the `&mut` to the predicate the search leaves addressable:
+  the search is a function of its own and `#[inline(never)]` for exactly that,
+  which the measurement shows is worth 16 bytes a level against writing it as
+  one loop (32) or letting it inline (64). The per-level figures
+  `TaskGroup::corun`'s docs carry move with it, and no size in the suite does.
+  #407 closed with it. The sweep, the counters, upstream's loop and the
+  ablation are in [`BENCHMARKS.md`](BENCHMARKS.md) under "The #407
+  measurement", and the A/B, the re-published tables, the stack probe and the
+  latency test under "The #412 change". What neither reaches is the per-child
   constant (#382's territory) or the two-worker case, where a stolen child
   still costs the parent a wait with nobody to hand it other work.
 
