@@ -4087,12 +4087,13 @@ first half of it:
 - The mechanism the counters *do* name -- `w` tasks on one queue reaching 15 to
   19 of 24 workers -- is not reachable from `src/algorithm/for_each_index.rs`
   at all. It is the steal loop and the notifier, i.e. #60's and #102's
-  territory, and the next measurement is theirs: count, inside
+  territory, and the next measurement was theirs: count, inside
   `WorkerThread`'s steal loop, how many of the `w - 1` pokes wake a worker that
   then fails to steal a task that is sitting in the victim's deque, and whether
   a poke spent on an already-awake worker is what the late arrivals are
-  missing. Until that is counted, the fan-out's 1.33x to 1.6x of lost
-  parallelism is named but not explained.
+  missing. **"The #367 measurement" below is that count**, and the answer is
+  that the pokes all land: every worker wakes, none parks on available work,
+  and what is left is the single queue the `w` tasks are pushed onto.
 
 What this does close is the question #60's last paragraph left open. "A
 splittable source range" is exactly what `for_each_by_index` with a
@@ -4311,10 +4312,332 @@ Four things in that table are worth naming.
 
 It does not say the port got faster: `git diff` for this change touches
 `benches/` and this file. It does not revisit #343's decision, which stands --
-the per-chunk cost is still 15 ns, the fan-out still reaches 15 to 19 of 24
-workers, and that is still the open question, filed outside this milestone as
-#367. And
+the per-chunk cost is still 15 ns, and the fan-out still reaches 15 to 19 of 24
+workers under the instrument that counted them, which "The #367 measurement"
+below takes apart. And
 it does not make the 24-worker `for_each` row a win for the port: #343
 measured that id's between-run spread at 1.6x on our side against 1.06x on
 rayon's, so 622 µs against 721 µs is the tie that section predicted, now
 published as one.
+
+## The #367 measurement: the wake-ups are not the ceiling, the one queue is
+
+**The notifier wake-ups on the worker path are not the ceiling.** Every one of
+the 24 workers is woken on every run of the fan-out, every wake-up is
+delivered, and no worker ever parks while a job is queued anywhere -- the
+counters below put all three of those at the limit rather than near it. What
+is left when the wake-ups are excluded is the **steal** side: the `w - 1`
+chunk tasks of a fan-out all go onto **one** worker's deque, pushed one at a
+time at about 2 µs each, so each is taken by whichever already-awake thief
+wins the race for that single queue, and a worker that loses has nothing left
+to find. The number therefore moves with how many threads the box has spare
+and with the dispatch's *shape* -- a flat `w`-way push against a tree that
+re-splits on the stealing worker -- and not with the partitioner, the chunk
+count, the submission path or the wake count.
+
+This is the measurement #343's last subsection asked for, in the same style:
+counters, ablations, and a decision at the end. It is also the gate on #378
+("One wake per fan-out: a bulk push on the worker path"), and the answer is
+that #378 ships no code: the batched poke was implemented and counted here,
+and it changes neither the worker count nor the submission's own cost.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| criterion | not used: this section is counts and harness wall clocks, as #343's is |
+| Date | 2026-11-19 |
+| **Load average** | **1.02 to 1.45 before and after every shape below, with `/proc/pressure/cpu`'s `some avg10` at 0.00 and 2 runnable threads at rest** |
+
+The box was this run's alone, and `/proc/loadavg` was read either side of every
+shape (the raw logs name each pair). The one-minute figure never fell below 1.0
+because it is still decaying from this run's own `cargo build`; the pressure
+counter and the runnable-task field are the ones that say the box was idle.
+**One shape was measured while a build really was still finishing, at a load
+average of 3.90 decaying to 2.07, and it is quoted below because the
+difference it makes is itself a result**: the same program that reaches 19 to
+21 of 24 workers on the quiet box reached 13 to 17 under that decay.
+
+Every count below is a **delta across one run** of one fan-out: the pool is
+quiesced first (`Executor::num_waiters() == 24` confirmed before each window,
+and it was 24 every time), both snapshots are taken on the submitting thread,
+and the counters are per-thread cache-padded words incremented with a relaxed
+`fetch_add` by their owner only. Nothing was committed: `src/probe.rs` and the
+call sites in `notifier.rs`, `worker.rs`, `queue.rs`, `runtime.rs` and
+`for_each_index.rs` were reverted before the gate ran, which is #343's and
+#102's method. The shipped diff of this measurement is this section and a
+`DESIGN.md` entry.
+
+### The wake accounting: 24 pokes, 24 unparks, 24 wake-ups, 0 lost
+
+`for_each_by_index` over a million elements at 24 workers, default guided
+partitioner, through the same `Taskflow` the `for_each` table's `rustflow` id
+builds. Twelve consecutive runs, the pool parked between each:
+
+| counter | per run | what it is |
+|---|---|---|
+| workers parked when the window opened | **24 / 24** | `Executor::num_waiters()` |
+| `notify_one` calls | **24** | 23 from the fan-out's `silent_async` calls, 1 from the tear-down |
+| of them, popping a parked waiter | **23 or 24** | the notifier's waiter stack |
+| of them, resolving a pre-waiter's ticket | 0 or 1 | a worker caught inside the two-phase window |
+| of them, finding the notifier empty | 0 or 1 | a wake spent on nobody |
+| `notify_n` calls | 1, asking for 1 | the run's own single source node, through the buffers |
+| `unpark` calls issued | **24 or 25** | `Thread::unpark`, counted at the call |
+| parks that returned | **23 to 25** | every worker woke |
+| **parks taken while any queue held a job** | **0** | summed over every worker queue and buffer, at every park |
+| wake-ups whose next sweep found a job | 13 to 21 | |
+| wake-ups whose next sweep found nothing | 0 to 4 | |
+| steal attempts | 1988 to 4741 | |
+| steal attempts that took a job | 21 to 25 | 24 tasks exist |
+| `explore_task` calls that spent the whole budget | 0 to 14 | 62 attempts, then 150 more with a yield |
+
+Three of those rows close the question the issue was filed on.
+
+- **The pokes are not lost and they are not wasted.** 24 `notify_one` calls
+  produce 24 or 25 `unpark` calls and 23 to 25 returned parks: the submission
+  wakes the whole pool, one worker per push, and at most one poke per run is
+  spent on an empty notifier. There is no notification to add and none to
+  save.
+- **No worker ever sleeps on available work.** The "parked while any queue
+  held a job" counter sums every worker deque and every buffer at the moment
+  each park is committed, and it reads **zero** in every run of every shape in
+  this section. A worker that loses is not a worker that missed a wake-up; it
+  is a worker that looked, found the queue genuinely empty, and parked again.
+  The two-phase guard in `wait_for_task` is doing exactly what it is for.
+- **The jobs all get taken, by fewer workers than there are jobs.** Steal hits
+  match the task count every run, but the per-worker breakdown shows a handful
+  of workers taking two, three or four while four to nine take none, and the
+  losers are the ones with the long steal counts: a winner's `sticky_victim`
+  already points at the producer's queue and costs it 6 to 100 attempts, while
+  a loser draws victims at random out of `num_queues() == 29` and spends 150
+  to 285 before giving up.
+
+The observer that counts *which* worker entered each task reads 13 to 21
+distinct workers over those twelve runs, with first entries 5 to 92 µs apart
+and the occasional straggler at 0.4 to 1.4 ms -- a task entered that late
+finds the shared cursor past the end and returns without calling the body
+once, which is #343's finding reproduced. Under the decaying build load the
+same twelve runs read 13 to 18.
+
+### What the submission costs, and what one wake per fan-out buys
+
+The same question asked of a shape with no cursor in it: a runtime task that
+hands the pool `w` bodies of a fixed length and runs the last one itself, with
+the body marking its own worker. The runtime body times its own push loop,
+which is the producer's serial cost. Four submission paths, three body
+lengths, three runs each:
+
+| path | what the submission is | push window, 23-24 tasks | distinct workers, 24 bodies of 20 / 100 / 500 µs |
+|---|---|---|---|
+| worker, poke per task | 23 × (`push` + `notify_one`) | **45 to 60 µs** | 16-18 / 17-23 / 17-20 |
+| worker, one batched poke | 23 × `push`, then one `notify_n(23)` | **44 to 59 µs** | 19-21 / 18-23 / 17-19 |
+| external, poke per task | 24 × (`push_bulk(1)` + `notify_n(1)`) | 39 to 58 µs | 18-21 / 18-23 / 17-20 |
+| external, one bulk poke | one `push_bulk(24)` + one `notify_n(24)` | **under 1 µs** | 20-21 / 21-23 / 13-19 |
+
+- **A fan-out task costs the submitter about 2 µs**, and that is the same
+  whether the wake goes with each push or once at the end: 45-60 µs against
+  44-59 µs for the same 23 tasks. The `unpark` is not what the push loop is
+  made of -- the node, the two boxed closures and the deque push are -- so
+  there is no ~23-syscall saving to collect. For scale, a single job handed to
+  a fully parked pool reaches its body in **6 µs** (median of 20; 5 µs best,
+  43 µs worst), so the producer finishes the fan-out at about the same time
+  the eighth worker arrives.
+- **#378's mechanism buys nothing.** One `notify_n(23)` in place of 23
+  `notify_one` calls leaves the distinct count inside the unbatched path's own
+  run-to-run range at all three body lengths, and it has a failure mode the
+  unbatched path never showed: at 500 µs bodies, two of three runs recorded a
+  push window of **807 µs and 1062 µs** instead of ~50, with 13 of 24 workers
+  reached -- the burst of 23 unparks from one call makes 23 threads runnable at
+  once on a 24-thread box and the submitter loses its own core part-way
+  through. That is a mechanism the counters name, pointing the other way.
+- **The spill buffers do not serialise an external submission.** The external
+  path costs the same ~2 µs a task as the worker path when it is one job at a
+  time, and a *bulk* external submission -- one `push_bulk` of 24 items dealt
+  round-robin over the `bit_width(24) == 5` buffers, one `notify_n(24)` --
+  costs **under a microsecond for the whole fan-out** and still reaches the
+  same 13 to 23 workers. Dealing the work over five queues instead of one is
+  not enough spread to change the count, and nothing in `Buffers` is the
+  bottleneck. #102's five buffers are not implicated either way.
+
+### It does not move with the partitioner or the chunk count
+
+The same shape under every partitioner the port has, `n = 1000000` at 24
+workers, three runs each. "Tasks" is the observer's own entry count, so for the
+splitting rows it counts the re-splits as well:
+
+| partitioner | tasks | distinct workers, run 0 / 1 / 2 | wall, run 1 / 2 |
+|---|---|---|---|
+| guided, floor 1 (`DefaultPartitioner`, 547 chunks) | 25 | **13** / 23 / 23 | 854 / 817 µs |
+| static, chunk 0 (24 chunks) | 24-25 | 17 / 24 / 23 | 1401 / 1063 µs |
+| guided, 4096 (126 chunks) | 25 | 17 / 22 / 23 | 859 / 824 µs |
+| dynamic, 4096 (245 chunks) | 25 | 16 / 23 / 23 | 781 / 776 µs |
+| random, 4096 | 25 | 13 / 10 / 15 | 10518 / 9642 µs |
+| splitting, default | 108-138 | 16 / 23 / 23 | 2487 / 2805 µs |
+| splitting, 4096 | 85-94 | 19 / 23 / 23 | 1467 / 1591 µs |
+| splitting, 65536 | 25 | 23 / 23 / 23 | 1211 / 1017 µs |
+
+- **The chunk count spans 24 to 547 and the worker count does not follow it.**
+  Static's 24 chunks and guided's 547 reach the same 23 to 24 workers in the
+  steady state, which is what #343 already concluded from the other side: the
+  chunk loop is not the gap.
+- **Run 0 is the first fan-out that executor ever ran, and it is the low one
+  in seven rows of eight.** A cold pool reaches 13 to 19 where the same code
+  reaches 22 to 24 one millisecond later. An idle-gap sweep (fresh executor,
+  eight runs, gaps of 0 to 50 ms with no quiesce) puts the whole range at 17 to
+  23 with no clean trend, so pool temperature moves the number by several
+  workers without being the cause of the ceiling.
+- **`SplittingPartitioner` is the one knob that moves the count where it is
+  low**, and it is not free: 16 and 19 against guided's 13 on the cold run,
+  equal at 23 once warm, for a wall of 1.5 to 2.8 ms against 0.8. Its own
+  figures belong to #381, which owns the `rustflow-split` ids; what this
+  section claims about it is only the mechanism -- its 85 to 138 tasks come
+  from shares re-splitting on the worker that stole them, so the fan-out's
+  *producers* multiply instead of its tasks all leaving one deque. 60 to 113
+  of its `notify_one` calls find the notifier empty, which costs a fence and
+  nothing else.
+- **`RandomPartitioner` at 4096 is a different animal** -- 9.6 to 11.7 ms, 10
+  to 15 workers -- and is in the table only so that the row is not missing.
+  Diagnosing it is not this issue's.
+
+### It does move with the width of the pool against the width of the box
+
+The decisive sweep. One executor per worker count, `n = 1000000`, guided and
+splitting, two runs each:
+
+| workers | guided: distinct | guided: wall | splitting: distinct |
+|---|---|---|---|
+| 4 | **4 / 4**, 4 / 4 | 2.43, 3.01 ms | 4 / 4, 4 / 4 |
+| 8 | **8 / 8**, 8 / 8 | 1.70, 2.15 ms | 8 / 8, 8 / 8 |
+| 12 | **12 / 12**, 12 / 12 | 1.28, 1.42 ms | 12 / 12, 12 / 12 |
+| 16 | **16 / 16**, 16 / 16 | 0.93, 1.06 ms | 16 / 16, 16 / 16 |
+| 20 | **20 / 20**, 20 / 20 | 0.85, 0.95 ms | 20 / 20, 20 / 20 |
+| 24 | **14 / 24**, 16 / 24 | 1.27, 1.56 ms | 18 / 24, 17 / 24 |
+| 32 | 15 / 32, 25 / 32 | 1.14, 1.32 ms | 24 / 32, 21 / 32 |
+
+**Up to 20 workers on a 24-thread box the fan-out reaches every worker, every
+time, and the shortfall appears exactly when the pool is as wide as
+`available_parallelism`.** A pool of 20 has four hardware threads spare for
+the submitting worker to keep its core, the waiting thread, the observer and
+the kernel; a pool of 24 has none, so four to ten workers do not reach a core
+inside the ~50 µs window in which the jobs exist, and by the time they do the
+queue is empty -- which is the "parked while work was queued = 0" row again,
+seen from the machine's side.
+
+The control confirms it from the other direction: a **20**-worker pool, 20
+bodies of 500 µs, with `k` extra threads spinning in the background, counted
+with the lightest instrument in this section (one thread-local read per body):
+
+| background spinners | distinct of 20, six runs | rayon's pool, same shape, interleaved |
+|---|---|---|
+| 0 | 17, 14, 18, 15, 15, 14 | 18, 18, 19, 19, 20, 20 |
+| 2 | 14, 16, 17, 14, 14, 17 | 20, 20, 20, 20, 20, 20 |
+| 4 | 13, 13, 14, 14, 14, 14 | 18, 19, 19, 19, 19, 19 |
+| 8 | 10, 12, 14, 13, 14, 13 | 19, 16, 16, 15, 15, 15 |
+
+Taking the slack away takes workers away from the fan-out, on both sides. What
+the right-hand column also says is that **rayon loses fewer of them**, and the
+next subsection is why.
+
+### What upstream does, and what rayon does
+
+**Upstream does exactly what this port does, line for line.** At the pinned
+tag, `Executor::_schedule(Worker&, Node*)` is one `worker._wsq.try_push(node)`
+-- spilling to the buffers if the bounded queue is full, which a crossbeam
+deque never is -- followed by one `_notifier.notify_one()`, under a comment
+saying that since v3.5 it uses no "complicated notification mechanism" because
+"the experimental result has shown no significant advantage".
+`_schedule_async_task` in `async.hpp` routes a worker's `silent_async`
+straight into that overload, and `for_each.hpp`'s dispatch is
+`(++w == W) ? task() : rt.silent_async(task)`. So upstream's own `for_each`
+fan-out is `W - 1` individual pushes onto the submitting worker's queue and
+`W - 1` individual `notify_one` calls, which is what
+`src/algorithm/for_each_index.rs` and `WorkerThread::schedule` do here. The
+steal side matches too: `_explore_task` is the same walk from
+`w._sticky_victim` with `MAX_STEALS = ((MAX_VICTIM + 1) << 1)` and a
+150-attempt yielding tail, and `_wait_for_task` the same two-phase guard with
+the buffer sweep before the sibling sweep.
+
+Upstream *has* the bulk path #378 proposed -- `_bulk_schedule(Worker&, I,
+size_t)`, one `try_bulk_push` then one `notify_n(num_nodes)` -- and spends it
+on a node's released successors and on `_schedule_graph`'s source nodes,
+never on a runtime fan-out. Its own commented-out experiment sits in that
+function: notifying before spilling, with the note that "the experiment does
+not show any benefit for doing this". The port's `Shared::bulk_schedule`
+already carries both the path and that finding, measured, in the "#60"
+section above. **The ceiling is therefore a shape of the design and not a
+port-specific gap.**
+
+**rayon's `ThreadPool` differs in two ways, and only the second one matters.**
+When a `par_iter` lands on an idle pool from a non-worker thread,
+`Registry::in_worker_cold` pushes **one** job into the injector and blocks the
+caller on a latch; `Registry::inject` then calls
+`Sleep::new_injected_jobs(1, queue_was_empty)`, and a worker's own
+`WorkerThread::push` calls `Sleep::new_internal_jobs(1, queue_was_empty)`.
+`Sleep::new_jobs` wakes `min(num_jobs, num_sleepers)` threads when the queue
+was already non-empty and **nothing at all** when `num_awake_but_idle >=
+num_jobs`: rayon counts its awake-but-idle threads and declines to spend a
+wake it does not need, where this port's notifier cannot see an awake worker
+at all -- a spinning worker is simply absent from its state word, which is why
+`notify_one` is cheap and why one poke per run here lands on nobody. That is a
+difference in wake *economy*, and the counters above say the port is not
+losing anything to it.
+
+What does matter is that **rayon's fan-out is a tree and ours is flat**.
+`bridge_producer_consumer` splits the range in half and runs the two halves
+through `join_context`, which pushes the right half onto the *calling*
+worker's own deque; `Splitter::try_split` then resets the remaining split
+budget to `current_num_threads()` whenever the job it is splitting **was
+stolen** ("This job was stolen! Reset the number of desired splits to the
+thread count"). So a worker that steals late does not take one of `w` equal
+chunks off one queue -- it takes half of what is left and immediately becomes
+a producer on a queue of its own. After `k` generations there are up to `2^k`
+non-empty deques for a searching thief to find, against this port's one, and a
+thief's random draw over `num_queues()` hits a non-empty queue far sooner. A
+rayon worker also spins `ROUNDS_UNTIL_SLEEPY = 32` rounds and one more before
+it sleeps, where `explore_task` spends 62 attempts and then 150 yielding ones,
+so the port is not the impatient one.
+
+That tree is precisely the mechanism `SplittingPartitioner` (#374) ports, and
+the partitioner table above is it working: the splitting rows reach more
+workers than guided on the cold run and match it warm, with 85 to 138 tasks
+where guided has 25. It is also why it is not simply better -- the tree costs
+three to four times the dispatch.
+
+### The decision: nothing ships, and what would reopen it
+
+**No change ships, and #378 is the one this closes.** The bar is #342's and
+#343's: a mechanism the counters name, then an A/B outside both sides' spread.
+The one candidate reaches neither half.
+
+- **One wake per fan-out has no mechanism left to fix.** 24 pokes deliver 24
+  unparks and 24 wake-ups; no worker parks on available work; the push loop
+  costs the same 2 µs a task with the pokes batched; and the batched variant
+  stalled the submitter for 0.8 to 1.1 ms in two runs of three on the longest
+  bodies. There is nothing here to A/B, so #381's bulk-wake column has nothing
+  to measure and #378 closes with this section as its answer.
+- **The ceiling that is left is one queue and one producer**, and both are
+  upstream's design at the pin. Changing either is not a fixup: a fan-out that
+  pushed into `w` different deques would be writing other workers' queues,
+  which the port's `WorkerQueue` is `!Sync` precisely to forbid, and a fan-out
+  that built a tree is `SplittingPartitioner`, which already exists, is already
+  benched, and costs three to four times the dispatch to run.
+- **Four to ten workers of 24 on this box are not the scheduler's to give.**
+  The worker-count sweep reaches `w` of `w` at every width up to 20 and the
+  background-spinner control takes workers away from rayon too. A pool as wide
+  as `available_parallelism` has no thread to spare for the thread that is
+  submitting, and that is the shape of the box rather than of the queue.
+- **What would reopen it** is a counter this section does not have: the
+  distinct-worker count on a box with more hardware threads than the pool has
+  workers *and* a fan-out longer than the arrival spread, which would separate
+  the two causes that are confounded at 24 workers here. Failing that, a
+  measurement that the tree dispatch can be made cheap enough to be the default
+  -- which is #381's question about `SplittingPartitioner`, not this one's.
+
+**What this does not say.** It does not say the fan-out reaches all 24 workers:
+it reaches 13 to 23, the median of the quiet-box runs being about 20, and the
+"15 to 19" that #343 published and #367 was filed on sits inside that range
+and is reproducible with the same observer-weight instrument. It does not
+revisit #343's attribution, which stands unchanged. And it does not claim a
+figure: no criterion id was run for this section, because nothing in `src/`
+changed and no table here needed re-taking.
