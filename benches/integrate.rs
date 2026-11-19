@@ -39,18 +39,19 @@
 //! orders the child's store against this frame's load is the `corun`. No
 //! `unsafe` and no shared mutable range anywhere in the shape.
 //!
-//! **Which half the runtime route refines inline, and why it is the other
-//! one.** A group opened on a [`Runtime`](rustflow::Runtime) borrows that
-//! handle for as long as it is open, and the half refined on this worker
-//! opens a group of its own, so on that route the inline half runs *before*
-//! the group rather than inside it -- upstream's `FibonacciSwapped` ordering,
-//! which `benches/fibonacci.rs` records for the same reason and
-//! `tests/task_group.rs` ports. The two halves are independent `f64`s, so
-//! the tree, the arithmetic and the sum are unchanged to the last bit, which
-//! is what the sequential reference check below still holds this column to;
-//! what the ordering costs the column is that an interval submits its child
-//! only once the inline half is done, where the `rustflow` id exposes both
-//! halves at once.
+//! **Both columns refine the right half inline, inside the open group.** A
+//! group opened on a [`Runtime`](rustflow::Runtime) borrows that handle for
+//! as long as it is open and the half refined on this worker opens a group of
+//! its own, so until #395 the inline half had to run *before* the group on
+//! that route -- upstream's `FibonacciSwapped` ordering, which cost this
+//! column 20.7x to 26.8x at 24 workers because an interval submitted its
+//! child only once the inline half was done.
+//! [`TaskGroup::with_runtime`](rustflow::TaskGroup::with_runtime) lends the
+//! runtime back inside the group, so the two columns now differ in the queue
+//! alone; `BENCHMARKS.md`'s "The #380 measurement" has the ordering priced
+//! both ways. The two halves are independent `f64`s either way, so the tree,
+//! the arithmetic and the sum are unchanged to the last bit, which is what
+//! the sequential reference check below holds this column to.
 //!
 //! **What bounds the depth is the error bound; what bounds the size is the
 //! stack.** The recursion stops splitting an interval once two trapezoids
@@ -263,11 +264,12 @@ fn integrate_rustflow_on(value: f64, executor: &Arc<Executor>) -> f64 {
 /// [`Runtime`] refining it, so that the left half goes onto that worker's own
 /// queue.
 ///
-/// The right half is refined before the group is opened rather than inside
-/// it, for the reason the module docs give; the child is a runtime-shaped
-/// body because it opens a group of its own, which on this route is what
-/// replaces the `Arc<Executor>` the other column threads through the
-/// recursion.
+/// The right half is refined inside the open group, through
+/// [`with_runtime`](rustflow::TaskGroup::with_runtime), which is what keeps
+/// this column on [`integrate_rustflow`]'s ordering -- the module docs have
+/// what the ordering is worth. The child is a runtime-shaped body because it
+/// opens a group of its own, which on this route is what replaces the
+/// `Arc<Executor>` the other column threads through the recursion.
 fn integrate_runtime_group(
     x1: f64,
     y1: f64,
@@ -282,10 +284,9 @@ fn integrate_runtime_group(
     };
 
     let (x0, y0) = (split.x0, split.y0);
-    let right = integrate_runtime_group(x0, y0, x2, y2, split.right, runtime);
-
     let left_slot = Arc::new(AtomicU64::new(0));
-    let group = runtime.task_group();
+
+    let mut group = runtime.task_group();
     group.silent_async_runtime({
         let left_slot = Arc::clone(&left_slot);
         let left = split.left;
@@ -294,6 +295,10 @@ fn integrate_runtime_group(
             left_slot.store(area.to_bits(), Ordering::Relaxed);
         }
     });
+
+    let right = group
+        .with_runtime(|child| integrate_runtime_group(x0, y0, x2, y2, split.right, child))
+        .expect("a group opened on a runtime lends it back");
 
     group.corun();
 

@@ -59,14 +59,16 @@
 //!
 //!   The four recursive cases carry the route down the recursion as well, and
 //!   on the runtime route they take upstream's `FibonacciSwapped` ordering --
-//!   the group borrows the runtime it was opened from, so the branch this
-//!   worker computes itself runs *before* the group opens rather than across
-//!   its life. Upstream's tail-optimised ordering is the id route's alone,
-//!   which is why `fibonacci` and `fibonacci_swapped` are two recursions
-//!   there and one here. The two sorts hand their halves back through a slot
-//!   rather than a handle for a second consequence of the same shape: a body
-//!   that is handed a `Runtime` of its own has no value-returning spawning
-//!   form.
+//!   the branch this worker computes itself runs *before* the group opens
+//!   rather than across its life, which is why `fibonacci` and
+//!   `fibonacci_swapped` are two recursions on the id route and one here.
+//!   That was the only ordering the route had until #395 gave it
+//!   `TaskGroup::with_runtime`, and these cases keep it: it is upstream's own
+//!   line either way, and the tail-optimised ordering over the lent runtime
+//!   has its cases beside the method in `src/task_group.rs`. The two sorts
+//!   hand their halves back through a slot rather than a handle for a second
+//!   consequence of the same shape: a body that is handed a `Runtime` of its
+//!   own has no value-returning spawning form.
 //! - **The four recursive cases run at smaller inputs than upstream's**, and
 //!   that is the one deviation here which is about the port rather than about
 //!   Rust. Upstream asserts `fib(25)` and sorts up to ten thousand elements;

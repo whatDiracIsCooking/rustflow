@@ -1050,18 +1050,19 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   `src/task_group.rs` tells a caller which one the wait they are writing is
   against.
 
-  Holding the worker rather than its id costs two things, and both are in the
-  signature rather than in a second type. `TaskGroup::executor` answers an
+  Holding the worker rather than its id costs one thing, and it is in the
+  signature rather than in a second type: `TaskGroup::executor` answers an
   `Option`, `None` on the runtime route, for the reason the entry above on
-  handing an executor back gives: a runtime body cannot name the executor
-  running it, so neither can a group it opens. And the group borrows the
-  runtime for its whole life, so a body cannot schedule, spawn a sibling or
-  corun its own node while one is open — upstream's tail-optimised
-  `fibonacci`, which keeps a group open across an inline branch that opens
-  groups of its own, is written on this route with that branch first, which
-  is upstream's own `FibonacciSwapped` ordering. A second public type with
+  handing an executor back gives — a runtime body cannot name the executor
+  running it, so neither can a group it opens. A second public type with
   sixteen spawning forms of its own would have bought the accessor back and
-  neither of the other two, so the routes are one type and one enum.
+  nothing else, so the routes are one type and one enum. It cost a second
+  thing until #395: the group borrowed the runtime for its whole life, so a
+  body could not schedule, spawn a sibling or corun its own node while one was
+  open, and upstream's tail-optimised `fibonacci` — which keeps a group open
+  across an inline branch that opens groups of its own — had to be written on
+  this route with that branch first, upstream's own `FibonacciSwapped`
+  ordering. The entry below on lending the runtime back is what removed it.
 
 - **Both routes stay, and which one a body wants is decided by its own
   *ordering* rather than by the queue** (issue #380). The A/B of the two
@@ -1092,8 +1093,64 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   both cliffs measured. What would collapse the choice back to a single route
   is an API that lets a body on the runtime route submit *before* its inline
   branch runs -- a scoped form handing out a group and a reborrowed `Runtime`
-  together, say -- which is #395's question and is deliberately not decided
-  here.
+  together, say -- which was #395's question and which the entry below
+  answers: the choice did collapse, and the conclusion of this entry is
+  superseded by it.
+
+- **A group opened on a `Runtime` lends it back, in a scope, and that is the
+  only shape of it that is sound** (issue #395). Upstream's tail optimisation
+  — submit one branch, compute the other on this worker, then wait — is what
+  its `fibonacci`, `merge_sort` and `integrate` benchmarks all write, and the
+  entry above records that the runtime route could not write it and what the
+  forced ordering cost: at 24 workers and their larger size, 4.7x to 26.8x the
+  id route. `TaskGroup::with_runtime` is the fix, and it is the port's own —
+  upstream's group reaches the submitting worker through a thread-local
+  `this_worker()`, so a body there is never handed one back and the header has
+  no counterpart to translate. [`BENCHMARKS.md`](BENCHMARKS.md)'s "The #395
+  change" has the figures: those three cells go from 4.7x-26.8x against the id
+  route to 0.53x-0.87x for it.
+
+  **The shape the issue asked for first is the one Rust does not have.** A
+  `Runtime::with_task_group(|group, rt| ..)` handing a body both handles at
+  once wants a `&TaskGroup` and a `&mut Runtime` alive together, and both of
+  them are paths to the same `WorkerThread`: the group needs it to push a
+  child onto the worker's own deque and to re-enter that worker's scheduling
+  loop in `corun`, and the runtime needs it mutably for every scheduling
+  method it has. That is `&` and `&mut` to one place, which no
+  `RefCell` rescues either — a cell makes the *borrows* dynamic but a body
+  holding a live `Runtime` out of one would be holding the cell's mutable
+  borrow across an arbitrary stretch of its own code, so the group's next
+  submission panics instead of compiling. The shape that *is* sound is
+  nesting rather than simultaneity: the group owns the reborrowed handle and
+  lends it out for a scope. `with_runtime` takes `&mut self` for that reason
+  and reads the cell through `RefCell::get_mut` — the compiler then refuses a
+  body that tries to submit into the group whose runtime it is holding, and
+  there is no dynamic check left to fail. Nothing here is `unsafe`, and the
+  one-worker-per-node invariant that `is_entered` and `Work::invoke`'s
+  `try_lock` enforce is untouched: the lent handle is this thread's, names the
+  node its body is already running, and is a reborrow in a chain the compiler
+  checks rather than a second owner of it.
+
+  Two consequences are the signature's. The method answers `Option`, `None`
+  and nothing run on the id route, which is the mirror of `TaskGroup::executor`
+  rather than a failure — each route hands back the handle it holds, and a
+  group opened on the `Executor` borrows no runtime there is to lend. And the
+  group grew: it carries a whole reborrowed `Runtime` — worker, node, job and
+  worker thread — where it carried a worker, because the node and the job are
+  per-invocation and reach it no other way. That is 16 bytes a level of a
+  recursion of groups on the id route and 32 on the runtime one, measured
+  against both builds in one probe, which is a 1.5% and 2.7% shallower chain
+  of nested coruns and no shape's size in the suite. Holding a `&mut Runtime`
+  in the group instead would have cost one pointer rather than four, and is
+  not available: `Runtime<'r>` is invariant in `'r`, so `TaskGroup` would have
+  taken a second lifetime parameter and every signature naming `TaskGroup<'_>`
+  would have had to name it too.
+
+  So the two routes collapse to one choice, and it is not speed: **open the
+  group on a `Runtime` wherever a body has one**, and keep
+  `Executor::task_group` for a body that was handed none — a plain `spawn`, a
+  static task, any worker without the scheduler in its hand. `src/task_group.rs` is where a caller is
+  told which they are writing.
 
 ## The async family
 
