@@ -9,7 +9,7 @@
 //! because a group may only be opened by a worker. Both are translated as
 //! they stand.
 //!
-//! Two ids:
+//! Three ids:
 //!
 //! - **`rustflow-group`** is upstream's `nqueens/taskflow.cpp`: a
 //!   [`TaskGroup`](rustflow::TaskGroup) per level, one `silent_async` per
@@ -17,18 +17,26 @@
 //!   carries `group` rather than being plain `rustflow` because the
 //!   submission path is the thing this shape measures, and it is the same
 //!   path `fibonacci.rs`'s id of that name takes.
+//! - **`rustflow-runtime-group`** is the same recursion with the group opened
+//!   on the [`Runtime`](rustflow::Runtime) running a level rather than on the
+//!   executor, which is the route #372 added: a level's children go onto that
+//!   worker's own queue and the `corun` pops that same end, where the id
+//!   above leaves them in the shared buffers and coruns on a stealing view of
+//!   the queue. Same boards and the same pruning, so that a row of the table
+//!   is one column against the other in one process; #380 is where the pair
+//!   is measured.
 //! - **`rayon`** is `rayon::scope` plus one `spawn` per legal placement,
 //!   which is the form upstream's own non-Taskflow column has:
 //!   `nqueens/tbb.cpp` runs a `tbb::task_group`, `g.run` per placement, then
 //!   `g.wait`.
 //!
 //! There is no graph here, so the construction asymmetry `binary_tree.rs` and
-//! `embarrassing_parallelism.rs` warn about is absent: both ids measure "run
-//! the recursion" and nothing else. Unlike `skynet`, the tree is **ragged**
-//! -- a level spawns between zero and `N` children depending on what the
-//! pruning leaves -- so the per-level fan-out is data, not a constant, and a
-//! level near the bottom of the board typically spawns one or two children
-//! where the root spawns `N`.
+//! `embarrassing_parallelism.rs` warn about is absent: all three ids measure
+//! "run the recursion" and nothing else. Unlike `skynet`, the tree is
+//! **ragged** -- a level spawns between zero and `N` children depending on
+//! what the pruning leaves -- so the per-level fan-out is data, not a
+//! constant, and a level near the bottom of the board typically spawns one or
+//! two children where the root spawns `N`.
 //!
 //! # What this shape is here to measure
 //!
@@ -61,6 +69,13 @@
 //! can carry, which is the margin `fibonacci.rs`'s own sizes keep. **Neither
 //! size is chosen for speed**, and if the cliff moves these move with it.
 //!
+//! `rustflow-runtime-group` is not bound there -- its corun nests a frame per
+//! level of recursion, which here is a frame per column of the board, rather
+//! than one per outstanding task, the difference
+//! [`Runtime::task_group`](rustflow::Runtime::task_group) states -- but it is
+//! measured at these boards anyway, because a column that ran at other sizes
+//! would not be comparable with the one beside it.
+//!
 //! # Departures from upstream
 //!
 //! - **A child owns its board.** Upstream builds an `N`-by-`N` `buf` per
@@ -79,7 +94,9 @@
 //!   writes into it explicitly.
 //! - **The executor arrives as an `Arc`**, because a child opens a group of
 //!   its own and needs the executor to open it, from a `'static` closure.
-//!   Upstream captures `&executor`.
+//!   Upstream captures `&executor`. The runtime route carries no executor at
+//!   all: a child there is a runtime-shaped body, and the handle it is given
+//!   is what opens its own group.
 //! - **`queens_ok` counts in `i32`.** Upstream's board is `char` and its
 //!   diagonal test is `q == p - (j - i)`, which it is happy to let go
 //!   negative. A `u8` would wrap there, so the comparison is widened rather
@@ -95,7 +112,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use rustflow::Executor;
+use rustflow::{Executor, Runtime};
 
 #[path = "common/baseline.rs"]
 mod baseline;
@@ -194,6 +211,45 @@ fn nqueens_group(row: usize, board: &[u8], executor: &Arc<Executor>) -> u64 {
     parts.iter().map(|slot| slot.load(Ordering::Relaxed)).sum()
 }
 
+/// The same recursion with each level's group opened on the [`Runtime`]
+/// running it, so that a level's children go onto that worker's own queue.
+///
+/// [`nqueens_group`]'s body otherwise, down to the owned boards, the slots
+/// and the pruning; the children are runtime-shaped because each one opens a
+/// group of its own, which on this route is what replaces the `Arc<Executor>`
+/// the other id threads through the recursion.
+fn nqueens_runtime_group(row: usize, board: &[u8], runtime: &mut Runtime<'_>) -> u64 {
+    let side = board.len();
+    if row == side {
+        return 1;
+    }
+
+    let parts: Arc<Vec<AtomicU64>> = Arc::new((0..side).map(|_| AtomicU64::new(0)).collect());
+    let group = runtime.task_group();
+
+    for i in 0..side {
+        let mut next = board.to_vec();
+        next[row] = u8::try_from(i).expect("a board side below fifteen fits in a u8");
+
+        // Upstream's `else parts[i] = 0`, which the slot already holds.
+        if !queens_ok(row + 1, &next) {
+            continue;
+        }
+
+        group.silent_async_runtime({
+            let parts = Arc::clone(&parts);
+            move |child: &mut Runtime<'_>| {
+                let count = nqueens_runtime_group(row + 1, &next, child);
+                parts[i].store(count, Ordering::Relaxed);
+            }
+        });
+    }
+
+    group.corun();
+
+    parts.iter().map(|slot| slot.load(Ordering::Relaxed)).sum()
+}
+
 /// The same recursion as a `rayon::scope` of one `spawn` per legal placement,
 /// in the role upstream's `tbb::task_group` plays.
 ///
@@ -241,13 +297,33 @@ fn group_on(side: usize, executor: &Arc<Executor>) -> u64 {
         .expect("nothing under the recursion panicked")
 }
 
+/// [`group_on`] for the runtime route, which needs a runtime-shaped root
+/// body: `Executor::spawn_runtime` hands back a handle on `()`, so the count
+/// comes back through a slot rather than through the handle.
+fn runtime_group_on(side: usize, executor: &Executor) -> u64 {
+    let total = Arc::new(AtomicU64::new(0));
+
+    let task = executor.spawn_runtime({
+        let total = Arc::clone(&total);
+        move |runtime: &mut Runtime<'_>| {
+            total.store(
+                nqueens_runtime_group(0, &vec![0u8; side], runtime),
+                Ordering::Relaxed,
+            );
+        }
+    });
+    task.wait().expect("nothing under the recursion panicked");
+
+    total.load(Ordering::Relaxed)
+}
+
 /// The rayon wrapper. `install` is what holds the recursion to the worker
 /// count this row is measuring, as in every other shape here.
 fn rayon_on(side: usize, pool: &rayon::ThreadPool) -> u64 {
     pool.install(|| nqueens_rayon(0, &vec![0u8; side]))
 }
 
-/// Registers both ids at every board size and worker count.
+/// Registers all three ids at every board size and worker count.
 fn bench_nqueens(c: &mut Criterion) {
     let mut group = c.benchmark_group("nqueens");
     group
@@ -268,11 +344,16 @@ fn bench_nqueens(c: &mut Criterion) {
             // table before criterion times anything: a recursion that lost a
             // subtree then fails here rather than reporting a good number.
             assert_eq!(group_on(side, &executor), answer, "nqueens({side})");
+            assert_eq!(runtime_group_on(side, &executor), answer, "nqueens({side})");
             assert_eq!(rayon_on(side, &pool), answer, "nqueens({side})");
 
             group.bench_function(
                 BenchmarkId::new(format!("rustflow-group/{workers}w"), side),
                 |b| b.iter(|| black_box(group_on(black_box(side), &executor))),
+            );
+            group.bench_function(
+                BenchmarkId::new(format!("rustflow-runtime-group/{workers}w"), side),
+                |b| b.iter(|| black_box(runtime_group_on(black_box(side), &executor))),
             );
             group.bench_function(BenchmarkId::new(format!("rayon/{workers}w"), side), |b| {
                 b.iter(|| black_box(rayon_on(black_box(side), &pool)))

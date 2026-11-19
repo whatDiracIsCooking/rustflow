@@ -18,7 +18,7 @@ are these, by the issue that ported each: `linear_chain`, `binary_tree`,
 (#337); `wavefront` (#338); `graph_pipeline` and `data_pipeline` (#339, the
 second landing as a second criterion group in the file #188 had opened for the
 per-line slot measurement); `skynet` and `nqueens` (#340); and `merge_sort`
-and `integrate` (#341). That is 22 `[[bench]]` targets in `Cargo.toml` and 212
+and `integrate` (#341). That is 22 `[[bench]]` targets in `Cargo.toml` and 232
 criterion ids, which `cargo bench --all-features -- --list` counts.
 
 **Three are declined, and this is the whole of that list:**
@@ -64,7 +64,7 @@ Benchmarks are deliberately **not** part of the gate (`fmt`, `clippy`, `test`,
 `deny`, `doc`): a benchmark answers "how fast", which is not a pass or a fail.
 What CI holds the suite to is that it still compiles, which the gate's
 `cargo clippy --all-targets` already does, and that it still *runs*: the
-`examples` job of `.github/workflows/ci.yml` executes every one of the 212 ids
+`examples` job of `.github/workflows/ci.yml` executes every one of the 232 ids
 once in criterion's untimed `--test` mode, which is a smoke test and not a
 measurement -- nothing is timed, saved or compared against a baseline.
 

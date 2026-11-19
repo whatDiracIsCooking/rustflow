@@ -18,6 +18,16 @@
 //! level against **`rayon::join`** -- the baseline this shape asks for, as
 //! upstream's `tbb.cpp` writes the same recursion on a `tbb::task_group`.
 //!
+//! That column is `rustflow`, and beside it is **`rustflow-runtime-group`**:
+//! the same recursion with each level's group opened on the
+//! [`Runtime`](rustflow::Runtime) sorting it rather than on the executor,
+//! which is the route #372 added. The half it submits goes onto that worker's
+//! own queue and the `corun` pops that same end, where the `rustflow` id
+//! leaves it in the shared buffers and coruns on a stealing view of the
+//! queue. Same sizes, same cutoff and the same data, so a row of the table is
+//! one column against the other in one process; #380 is where the pair is
+//! measured.
+//!
 //! # Design
 //!
 //! **How the two halves reach the two branches.** A
@@ -49,7 +59,23 @@
 //! "Executor core" states costs a frame per outstanding task, about a
 //! kilobyte of a worker's two megabytes in a release build, so a thousand
 //! `msort` frames is inside it -- measured at both worker counts rather than
-//! assumed.
+//! assumed. `rustflow-runtime-group` nests a frame per *level* instead, ten
+//! of them at the larger size, which is the difference
+//! [`Runtime::task_group`](rustflow::Runtime::task_group) states; the sizes
+//! are shared so that a row compares the two columns rather than because
+//! that route needs them.
+//!
+//! **Which half the runtime route sorts inline, and why it is the other
+//! one.** A group opened on a [`Runtime`](rustflow::Runtime) borrows that
+//! handle for as long as it is open, and the half sorted on this worker opens
+//! a group of its own, so on that route the inline half runs *before* the
+//! group rather than inside it -- upstream's `FibonacciSwapped` ordering,
+//! which `benches/fibonacci.rs` records for the same reason and
+//! `tests/task_group.rs` ports. The two halves are disjoint ranges, so the
+//! merge and the output are unchanged, which is what the untimed comparison
+//! below still holds this column to; what the ordering costs the column is
+//! that a level submits its half only once the inline half is sorted, where
+//! the `rustflow` id exposes both at once.
 //!
 //! **Two departures from upstream beyond the array's type.** Upstream wraps
 //! the recursion in *two* nested `executor.async` calls --
@@ -69,7 +95,7 @@
 //! `std::vector<T> buffer(data.size())` is. `BENCHMARKS.md`'s "#366 change"
 //! section has the measurement behind the split.
 //!
-//! Correctness is checked before any id is timed: both columns sort one
+//! Correctness is checked before any id is timed: every column sorts one
 //! shuffle at each size and worker count outside every measured region, and
 //! each output is compared element by element against a copy sorted by
 //! `sort_unstable_by` on one thread. The comparison is exact rather than a
@@ -84,7 +110,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
-use rustflow::Executor;
+use rustflow::{Executor, Runtime};
 
 #[path = "common/baseline.rs"]
 mod baseline;
@@ -226,6 +252,49 @@ fn msort_rustflow(
     merge_cells(data, buffer, begin, mid, end);
 }
 
+/// [`msort_rustflow`] with this level's group opened on the [`Runtime`]
+/// sorting it, so that the half it submits goes onto that worker's own queue.
+///
+/// The left half is sorted before the group is opened rather than inside it,
+/// for the reason the module docs give; the child is a runtime-shaped body
+/// because it opens a group of its own, which on this route is what replaces
+/// the `Arc<Executor>` the other column threads through the recursion.
+fn msort_runtime_group(
+    runtime: &mut Runtime<'_>,
+    data: &Arc<Vec<AtomicU64>>,
+    buffer: &Arc<Vec<AtomicU64>>,
+    begin: usize,
+    end: usize,
+) {
+    let n = end - begin;
+
+    if n <= CUTOFF {
+        // `msort_rustflow`'s leaf, unchanged: the route is what differs
+        // between the two columns, not the sort below the cutoff.
+        let mut leaf: Vec<f64> = data[begin..end].iter().map(load).collect();
+        leaf.sort_unstable_by(f64::total_cmp);
+        for (cell, sorted) in data[begin..end].iter().zip(&leaf) {
+            cell.store(sorted.to_bits(), Ordering::Relaxed);
+        }
+        return;
+    }
+
+    let mid = begin + n / 2;
+
+    msort_runtime_group(runtime, data, buffer, begin, mid);
+
+    let group = runtime.task_group();
+    group.silent_async_runtime({
+        let data = Arc::clone(data);
+        let buffer = Arc::clone(buffer);
+        move |child: &mut Runtime<'_>| msort_runtime_group(child, &data, &buffer, mid, end)
+    });
+
+    group.corun();
+
+    merge_cells(data, buffer, begin, mid, end);
+}
+
 /// Upstream's `std::merge` into `buffer` followed by its `std::copy` back:
 /// `[begin, mid)` and `[mid, end)` are each sorted, and `[begin, end)` is
 /// their merge.
@@ -270,6 +339,23 @@ fn sort_rustflow(data: &Arc<Vec<AtomicU64>>, executor: &Arc<Executor>) {
             move || {
                 let buffer = buffer(n);
                 msort_rustflow(&executor, &data, &buffer, 0, n);
+            }
+        })
+        .wait()
+        .expect("no task under the recursion panicked");
+}
+
+/// [`sort_rustflow`] for the runtime route: the same root task, as a
+/// runtime-shaped body so that the recursion is handed a [`Runtime`], and the
+/// buffer allocated where upstream allocates it.
+fn sort_runtime_group(data: &Arc<Vec<AtomicU64>>, executor: &Executor) {
+    let n = data.len();
+    executor
+        .spawn_runtime({
+            let data = Arc::clone(data);
+            move |runtime: &mut Runtime<'_>| {
+                let buffer = buffer(n);
+                msort_runtime_group(runtime, &data, &buffer, 0, n);
             }
         })
         .wait()
@@ -341,8 +427,8 @@ fn sort_rayon(data: &mut [f64], pool: &rayon::ThreadPool) {
     pool.install(|| msort_rayon(data, &mut buffer));
 }
 
-/// Runs both variants once, outside any measured region, and checks each
-/// output against a sequentially sorted copy of its own input.
+/// Runs all three variants once, outside any measured region, and checks
+/// each output against a sequentially sorted copy of its own input.
 ///
 /// The untimed half of this target's acceptance: two branches that overlapped
 /// a range, or a merge that dropped one, fail here rather than producing a
@@ -352,13 +438,23 @@ fn verify(size: usize, workers: usize, executor: &Arc<Executor>, pool: &rayon::T
     let mut expected = input.clone();
     expected.sort_unstable_by(f64::total_cmp);
 
-    let cells = cells(&input);
-    sort_rustflow(&cells, executor);
-    let actual = read_back(&cells);
+    let rustflow_cells = cells(&input);
+    sort_rustflow(&rustflow_cells, executor);
+    let actual = read_back(&rustflow_cells);
     let mismatch = actual.iter().zip(&expected).position(|(a, b)| a != b);
     assert_eq!(
         mismatch, None,
         "rustflow/{workers}w at size {size}: first index whose element is not the sorted one"
+    );
+
+    let runtime_group_cells = cells(&input);
+    sort_runtime_group(&runtime_group_cells, executor);
+    let actual = read_back(&runtime_group_cells);
+    let mismatch = actual.iter().zip(&expected).position(|(a, b)| a != b);
+    assert_eq!(
+        mismatch, None,
+        "rustflow-runtime-group/{workers}w at size {size}: \
+         first index whose element is not the sorted one"
     );
 
     let mut data = input;
@@ -370,7 +466,7 @@ fn verify(size: usize, workers: usize, executor: &Arc<Executor>, pool: &rayon::T
     );
 }
 
-/// Registers both variants at every size and worker count.
+/// Registers all three variants at every size and worker count.
 fn bench_merge_sort(c: &mut Criterion) {
     let mut group = c.benchmark_group("merge_sort");
     group
@@ -395,13 +491,28 @@ fn bench_merge_sort(c: &mut Criterion) {
             // `BENCHMARKS.md`'s "#366 change" section measures. The merge
             // buffer is a different question and stays where upstream puts
             // it, inside.
-            let cells = cells(&shuffled(size));
+            let rustflow_cells = cells(&shuffled(size));
             group.bench_function(
                 BenchmarkId::new(format!("rustflow/{workers}w"), size),
                 |b| {
                     b.iter_batched_ref(
-                        || reshuffle_cells(&cells),
-                        |_: &mut ()| sort_rustflow(black_box(&cells), &executor),
+                        || reshuffle_cells(&rustflow_cells),
+                        |_: &mut ()| sort_rustflow(black_box(&rustflow_cells), &executor),
+                        BatchSize::PerIteration,
+                    );
+                },
+            );
+
+            // This id's own array, for the reason the one above has its own:
+            // the input is sorted in place, so an id that shared an array
+            // with its neighbour would be handed sorted data.
+            let runtime_group_cells = cells(&shuffled(size));
+            group.bench_function(
+                BenchmarkId::new(format!("rustflow-runtime-group/{workers}w"), size),
+                |b| {
+                    b.iter_batched_ref(
+                        || reshuffle_cells(&runtime_group_cells),
+                        |_: &mut ()| sort_runtime_group(black_box(&runtime_group_cells), &executor),
                         BatchSize::PerIteration,
                     );
                 },

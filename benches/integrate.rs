@@ -11,6 +11,16 @@
 //! the `f64` arithmetic are upstream's unchanged, down to `epsilon = 1.0e-9`
 //! and the two one-sided comparisons it is tested with.
 //!
+//! That column is `rustflow`. Beside it is **`rustflow-runtime-group`**, the
+//! same recursion with each interval's group opened on the
+//! [`Runtime`](rustflow::Runtime) refining it rather than on the executor,
+//! which is the route #372 added: the half it submits goes onto that worker's
+//! own queue and the `corun` pops that same end, where the `rustflow` id
+//! leaves it in the shared buffers and coruns on a stealing view of the
+//! queue. Same intervals, same `epsilon` and the same tree, so a row of the
+//! table is one column against the other in one process; #380 is where the
+//! pair is measured.
+//!
 //! The baseline is **`rayon::join`**, the same recursion with the fork
 //! replaced -- which is what upstream's `tbb.cpp` writes on a
 //! `tbb::task_group`, and what anyone would reach for here.
@@ -29,6 +39,19 @@
 //! orders the child's store against this frame's load is the `corun`. No
 //! `unsafe` and no shared mutable range anywhere in the shape.
 //!
+//! **Which half the runtime route refines inline, and why it is the other
+//! one.** A group opened on a [`Runtime`](rustflow::Runtime) borrows that
+//! handle for as long as it is open, and the half refined on this worker
+//! opens a group of its own, so on that route the inline half runs *before*
+//! the group rather than inside it -- upstream's `FibonacciSwapped` ordering,
+//! which `benches/fibonacci.rs` records for the same reason and
+//! `tests/task_group.rs` ports. The two halves are independent `f64`s, so
+//! the tree, the arithmetic and the sum are unchanged to the last bit, which
+//! is what the sequential reference check below still holds this column to;
+//! what the ordering costs the column is that an interval submits its child
+//! only once the inline half is done, where the `rustflow` id exposes both
+//! halves at once.
+//!
 //! **What bounds the depth is the error bound; what bounds the size is the
 //! stack.** The recursion stops splitting an interval once two trapezoids
 //! agree with one to within `epsilon`, which for this cubic happens at a
@@ -44,6 +67,11 @@
 //! rather than one task count, and `BENCHMARKS.md`'s "The #359 measurement"
 //! has this shape's own demand, 2.04 MiB of a worker's two at `V = 3`. #342
 //! is where the resume that would raise it is measured.
+//! `rustflow-runtime-group` is not bound there -- its corun nests a frame per
+//! level of the bisection rather than one per outstanding task, the
+//! difference [`Runtime::task_group`](rustflow::Runtime::task_group) states
+//! -- but it is measured at these intervals anyway, because a column that ran
+//! at other sizes would not be comparable with the one beside it.
 //!
 //! **So the sizes are not points on upstream's sweep at all, and that is the
 //! finding rather than a shrink.** Upstream's `main.cpp` walks
@@ -87,7 +115,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use rustflow::Executor;
+use rustflow::{Executor, Runtime};
 
 #[path = "common/baseline.rs"]
 mod baseline;
@@ -231,6 +259,66 @@ fn integrate_rustflow_on(value: f64, executor: &Arc<Executor>) -> f64 {
         .expect("no task under the recursion panicked")
 }
 
+/// [`integrate_rustflow`] with this interval's group opened on the
+/// [`Runtime`] refining it, so that the left half goes onto that worker's own
+/// queue.
+///
+/// The right half is refined before the group is opened rather than inside
+/// it, for the reason the module docs give; the child is a runtime-shaped
+/// body because it opens a group of its own, which on this route is what
+/// replaces the `Arc<Executor>` the other column threads through the
+/// recursion.
+fn integrate_runtime_group(
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    area: f64,
+    runtime: &mut Runtime<'_>,
+) -> f64 {
+    let split = match bisect(x1, y1, x2, y2, area) {
+        Ok(whole) => return whole,
+        Err(split) => split,
+    };
+
+    let (x0, y0) = (split.x0, split.y0);
+    let right = integrate_runtime_group(x0, y0, x2, y2, split.right, runtime);
+
+    let left_slot = Arc::new(AtomicU64::new(0));
+    let group = runtime.task_group();
+    group.silent_async_runtime({
+        let left_slot = Arc::clone(&left_slot);
+        let left = split.left;
+        move |child: &mut Runtime<'_>| {
+            let area = integrate_runtime_group(x1, y1, x0, y0, left, child);
+            left_slot.store(area.to_bits(), Ordering::Relaxed);
+        }
+    });
+
+    group.corun();
+
+    f64::from_bits(left_slot.load(Ordering::Relaxed)) + right
+}
+
+/// [`integrate_rustflow_on`] for the runtime route, which needs a
+/// runtime-shaped root body: `Executor::spawn_runtime` hands back a handle on
+/// `()`, so the area comes back through a slot rather than through the handle.
+fn integrate_runtime_group_on(value: f64, executor: &Executor) -> f64 {
+    let area = Arc::new(AtomicU64::new(0));
+
+    let task = executor.spawn_runtime({
+        let area = Arc::clone(&area);
+        move |runtime: &mut Runtime<'_>| {
+            let whole =
+                integrate_runtime_group(0.0, integrand(0.0), value, integrand(value), 0.0, runtime);
+            area.store(whole.to_bits(), Ordering::Relaxed);
+        }
+    });
+    task.wait().expect("no task under the recursion panicked");
+
+    f64::from_bits(area.load(Ordering::Relaxed))
+}
+
 /// The same recursion on `rayon::join`, in the role TBB's `task_group` plays
 /// upstream. The left half goes first because `join` runs its *second*
 /// closure on the forking thread when nobody steals it, which is where
@@ -290,8 +378,8 @@ fn assert_near_reference(area: f64, reference: f64, what: &str) {
     );
 }
 
-/// Runs both variants once, outside any measured region, and checks each
-/// against the closed form and against the sequential reference.
+/// Runs all three variants once, outside any measured region, and checks
+/// each against the closed form and against the sequential reference.
 ///
 /// The untimed half of this target's acceptance: a child whose area never
 /// reached its parent's slot fails here rather than producing a figure. The
@@ -313,6 +401,18 @@ fn verify(value: f64, workers: usize, executor: &Arc<Executor>, pool: &rayon::Th
         &format!("rustflow/{workers}w at V = {value}"),
     );
 
+    let on_worker = integrate_runtime_group_on(value, executor);
+    assert_near_exact(
+        on_worker,
+        exact,
+        &format!("rustflow-runtime-group/{workers}w at V = {value}"),
+    );
+    assert_near_reference(
+        on_worker,
+        reference,
+        &format!("rustflow-runtime-group/{workers}w at V = {value}"),
+    );
+
     let theirs = integrate_rayon_on(value, pool);
     assert_near_exact(theirs, exact, &format!("rayon/{workers}w at V = {value}"));
     assert_near_reference(
@@ -322,7 +422,7 @@ fn verify(value: f64, workers: usize, executor: &Arc<Executor>, pool: &rayon::Th
     );
 }
 
-/// Registers both variants at every size and worker count.
+/// Registers all three variants at every size and worker count.
 fn bench_integrate(c: &mut Criterion) {
     let mut group = c.benchmark_group("integrate");
     group
@@ -343,6 +443,10 @@ fn bench_integrate(c: &mut Criterion) {
             group.bench_function(
                 BenchmarkId::new(format!("rustflow/{workers}w"), value),
                 |b| b.iter(|| integrate_rustflow_on(black_box(value), &executor)),
+            );
+            group.bench_function(
+                BenchmarkId::new(format!("rustflow-runtime-group/{workers}w"), value),
+                |b| b.iter(|| integrate_runtime_group_on(black_box(value), &executor)),
             );
             group.bench_function(BenchmarkId::new(format!("rayon/{workers}w"), value), |b| {
                 b.iter(|| integrate_rayon_on(black_box(value), &pool));
