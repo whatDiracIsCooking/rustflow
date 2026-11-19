@@ -1884,9 +1884,28 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   **call shape** of that short-circuit: handing the standard library's sort a
   `&C` where the comparator is owned measures 37.8 ms against 21.9 ms for the
   same million `f64`s in one binary, and which regime a build lands in is a
-  property of the calling crate. #399 owns that line. The figures, the A/A
-  control that sets this shape's floor and the ablation are in
+  property of the calling crate. The figures, the A/A control that sets this
+  shape's floor and the ablation are in
   [`BENCHMARKS.md`](BENCHMARKS.md) under "The #381 measurement".
+
+- **No `&C` reaches `[T]::sort_unstable_by`, at any of the three places the
+  sort falls back to it** (issue #399). Upstream takes `Compare` by value and
+  its `std::sort(.., comp)` calls hand the sort a copy of the functor;
+  `Runtime::sort_by`'s short-circuit owns `cmp` and passes it, and
+  `sort_loop`'s two leaves, which hold the `&C` a whole scope shares and
+  cannot copy because `C` need not be `Clone`, pass `|a, b| cmp(a, b)`.
+  The reference form is the same program at a different cost -- `impl Fn for
+  &F` is a forwarding call some instantiations inline and others do not -- and
+  the cost is up to 1.8x on a million `f64`s. It is a property of the
+  *calling* crate, since that is where a generic instance is compiled, and it
+  is not stable under anything a caller would think of as unrelated: one
+  harness moved 20.06 ms to 32.06 ms on the same call when a second,
+  uncalled instantiation was added to the same file. Four caller binaries
+  that disagreed by 1.86x on this crate's own benchmark agree to 1.03x after
+  the change; what it does not buy is a faster sort on a build that was
+  already lucky, which the shape's own id shows by not moving outside its
+  spread. [`BENCHMARKS.md`](BENCHMARKS.md)'s "The #399 change" has the
+  four-way ablation and the before and after.
 
 ## Pipelines
 
