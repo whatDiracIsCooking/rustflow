@@ -1141,8 +1141,18 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   successors in a graph and no predecessors to call weak, so the `None` on
   those three paths is the answer an empty graph would have given. The
   allocation count is a test rather than a figure
-  (`src/executor/async_node.rs`), the price of the two blocks being
-  [`BENCHMARKS.md`](BENCHMARKS.md)'s to state.
+  (`src/executor/async_node.rs`); what taking the third block away was worth
+  is [`BENCHMARKS.md`](BENCHMARKS.md)'s "#382 measurement", which counted the
+  blocks either side of the change and A/B'd six shapes across it. A free
+  async task is **2.0159 blocks and 312 bytes** where it was 3.0159 and 344,
+  an externally submitted one is ~350 ns pinned where it was ~415, and the one
+  block is **7 to 16% of a task** at one worker on every shape that
+  allocates one — 12 to 14% at 24 workers on the shape that is nothing but
+  submissions, and nothing at 24 workers on a nested recursion, where #380's
+  handoff is what a task costs instead. The `Arc` grows from 88 bytes to 256
+  as it swallows the node, so what the change bought is the block's existence
+  and not its bytes, which is the proposition that run was built to
+  separate.
 - **A worker recycles the free node it finished, on a bounded list of its own**
   (issue #379). Upstream's `TF_ENABLE_TASK_POOL` build allocates every `Node`
   from a process-wide `ObjectPool`: `tf::animate` pops a block off one of its
@@ -1187,9 +1197,21 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   body's own box is deliberately not pooled: it is the type erasure, so its
   size is the body's and not the node's.
 
-  No figures here — the A/B of this against #376 is #382's — and the test
-  (`src/executor/async_node.rs`) asserts which block the second submission
-  landed in rather than what it saved.
+  What the list is worth was then measured
+  ([`BENCHMARKS.md`](BENCHMARKS.md)'s "#382 measurement"), and the answer is a
+  **footprint and not a time**: a child submitted through a `Runtime` costs 3
+  heap blocks and 144 bytes where it cost 4 and 400, its node drawn from the
+  list for all but one child in 121392 at one worker, while the two 24-worker
+  ids of that recursion read −0.6% and +0.3% against sides inside 2% of
+  themselves — a resolved no change. A block allocated and freed by the same
+  thread costs about what this list's own `RefCell` borrow, `Arc::get_mut` and
+  `Vec` push cost; the regime upstream's pool defends against is the
+  cross-thread one, which that file's "#125 attribution" priced at 691 to
+  737 ns a block. Off the route that draws, where nothing allocates
+  differently, the same change moves ids by −14% to +15% with no consistent
+  sign, and #397 is where that range is attributed and the change decided on.
+  The test (`src/executor/async_node.rs`) asserts which block the second
+  submission landed in rather than what it saved.
 - **`AsyncTask` is that `Arc`, so `use_count` counts the executor's shares
   too** (issues #86, #91). Upstream's handle is a `Node*` plus `_incref` and
   `_decref` on every copy, move and destruction; here it is an

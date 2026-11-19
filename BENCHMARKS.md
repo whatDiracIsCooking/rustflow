@@ -43,12 +43,12 @@ criterion ids, which `cargo bench --all-features -- --list` counts.
   measures is a comparison between two C++ libraries rather than a shape of
   the executor.
 
-**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 42
+**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 43
 headings, and they are three kinds: the three method sections that follow this
 preamble, "The machine" through "The upstream C++ column is empty"; 21 shape
 sections carrying the 22 shapes, since `async_task` and `fibonacci` share "The
 two shapes #96 added", which measured the two together in a run of their own;
-and 18 per-decision measurement sections, each named for the issue that took
+and 19 per-decision measurement sections, each named for the issue that took
 it. A shape's section is its table, its sizes and its departures from
 upstream. A measurement section is one question, with the machine, the load
 and the method of its own run in it, and it ends either in a change that
@@ -897,7 +897,9 @@ tightest:
   both `num_topologies` and `num_asyncs`, and the last decrement of each takes
   a mutex to meet a waiter), and `bulk_schedule` is called with **one** job,
   so the notifier is poked once per task where a run of 65536 sources pokes it
-  once for the batch.
+  once for the batch. **That ~440 ns is pre-#144 and pre-#376**: pinned on
+  today's `main` the same id reads 344 to 357 ns a task, and "The #382
+  measurement" at the end of this file has the two changes that moved it.
 - **Submitting from a worker saves 30%** -- 305 ns against 440 -- and the
   mechanism is *not* the one this bullet first gave: both ids push into the
   shared buffers, so the saving is not a worker's own queue against them. What
@@ -907,7 +909,10 @@ tightest:
   and the wait -- `wait_for_all` against a `corun` that also runs the tasks.
   This run separated none of those, so the figure stands and the cause is
   open; #119's section below confirms the figure does not move when a
-  *runtime* body's destination changes.
+  *runtime* body's destination changes. On today's `main` the pair is **150 ns
+  against 350**, the same 57% the "#144 change" section read, and #382's block
+  counts say what the gap is not: both ids allocate the same two blocks a
+  task, so what differs is which thread frees them.
 - **rayon's scope costs ~32 ns a task** at one worker, 14x less. A scope's
   spawn is a push onto the deque of the thread that is already running the
   scope, with no allocation beyond the closure and nothing to notify while the
@@ -1004,7 +1009,11 @@ What the table says:
 - **~340 ns per spawned child at one worker** (335 µs over 986 children), which
   is the `async_task` table's worker-submitted figure (305 ns) to within 12% --
   the same path measured from a recursion rather than a loop, and a useful
-  cross-check that this shape has no cost of its own at one worker.
+  cross-check that this shape has no cost of its own at one worker. On today's
+  `main` the group route's child is **327 to 334 ns** and the runtime route's
+  **178 to 183 ns**, and "The #382 measurement" at the end of this file prices
+  the two changes behind that: #376 took 12.5 to 16.5% off both routes at one
+  worker, and #379 gave 8.6% of it back on the group route alone.
 - **24 workers make it 7x slower**, 335 µs to 2.3 ms for the same 986 children,
   or ~2.4 µs each. This was the worst 1-to-24 scaling in the file and it is the
   same cause as the stack cliff above: every child crossed into the shared
@@ -1896,6 +1905,12 @@ not for the reason "one allocation per task" suggests: a free async task costs
 frees them, and two thirds of what they cost is that split rather than the
 allocating.
 
+**Three is two on today's `main`, and 848 bytes is 312.** #144 sized the
+middle block to the one node it held and #376 took that block away
+altogether; "The #382 measurement" at the end of this file counts what is left
+by this section's own method and prices both changes, and every "three blocks"
+below is this run's reading rather than the shipped one.
+
 **No shipped code changed**, and the decision at the end of this section says
 why. Everything below was measured with temporary counters and ablation
 harnesses inside `src/executor/async.rs`, `src/executor/mod.rs` and
@@ -1988,9 +2003,11 @@ emphatically not timings:
   allocation per async task, beyond its body", and the three are the
   `Arc<AsyncNode>` (88 B), the arena's `Vec<Option<Node>>` (**704 B**: one
   176-byte node in a `Vec` that grew to capacity 4) and the boxed body
-  (56 B). The middle figure is 176 B on today's `main` -- #144's section below
-  -- and that section also splits this bullet's 56-byte "boxed body" into the
-  two things a per-size histogram shows it to be.
+  (56 B). The middle figure became 176 B with #144 -- its section below -- and
+  then nothing at all with #376, which leaves the node's `Arc` at 256 B and
+  the task at two blocks ("The #382 measurement"); #144's section also splits
+  this bullet's 56-byte "boxed body" into the two things a per-size histogram
+  shows it to be.
 
 ### The ablations: what each candidate costs
 
@@ -2118,8 +2135,11 @@ could be changed from `executor::async` are each inside the noise:
 - The wait is 5%, and `wait_for_all` is already a condvar woken once.
 
 What is left is **the three heap blocks a free async task is**, 87% of the
-submission loop, and they are a property of how a node that belongs to no
-taskflow is represented here: `executor::async_node` gives such a task its own
+submission loop -- two of them on today's `main`, and "The #382 measurement"
+prices the one that went at 7 to 16% of the id at one worker, which over a
+344 to 440 ns task is the 69 to 75 ns the G ablation above priced a block at,
+measured this time as a shipped change rather than as an added block. They are
+a property of how a node that belongs to no taskflow is represented here: `executor::async_node` gives such a task its own
 one-node `Graph` inside an `Arc`, so that every piece of the scheduler which
 resolves a node by index into a graph resolves this one too, and the body is
 boxed because it is type-erased. That decision is #86's and its module docs
@@ -2139,7 +2159,10 @@ reachable without changing what a free node *is* in this port, so the
 reducible shape here is "fewer blocks per async task", which is a design
 change to #86 and a milestone rather than a patch -- the same place the end of
 the "#60 finding" section arrived at for the flat graph, and for the same kind
-of reason. **That is the recorded cost of the architecture, with the ablations
+of reason. That milestone is M12: #376 took the arena away and #379 gave a
+worker a free list of finished nodes, and "The #382 measurement" is where the
+two are priced -- the first worth 7 to 16% a task, the second worth nothing
+this box can see. **That is the recorded cost of the architecture, with the ablations
 above as the evidence.**
 
 ## The #144 change: a free node's arena is sized to its one node, and that is 6% of the submission path
@@ -2214,8 +2237,11 @@ block, and `DESIGN.md`'s entry on the `Arc`-owned free node now says why
 rather than leaving the next reader to re-derive it: a `Graph` holds its nodes
 in a `Vec`, so collapsing the two would take either a graph that can hold one
 node inline or an async path that does not resolve a job through a `&Graph` at
-all. What is reachable is the *size* of the second block, which is this
-change.
+all. What is reachable *here* is the size of the second block, which is this
+change; #376 then took the second of those two alternatives, and "The #382
+measurement" at the end of this file counts what a free async task costs after
+it -- **2.0159 blocks and 312.12 bytes** -- by the method this section's
+counters use.
 
 ### The headline id, both ways
 
@@ -3306,7 +3332,10 @@ number for doing less work.
 **The port loses this shape by between 8 and 21x, and what to take from the
 table is the per-task constant rather than any of those ratios.** At
 `MaxDepth = 4` and one worker, 11110 spawned tasks in 2.296 ms is 207 ns a
-task against the rayon scope's 22.9 ns. The body adds ten slots and returns, so
+task against the rayon scope's 22.9 ns. **That constant is pre-#376**: the
+same id reads 2.016 ms on today's `main`, **181 ns a task**, and "The #382
+measurement" at the end of this file puts the whole of that 13.7% on one heap
+block fewer per free node -- 14.4% for #376 alone against −0.4% for #379. The body adds ten slots and returns, so
 essentially the whole 184 ns of difference is the submission path: a
 `silent_async` into the shared buffers, an `Arc<[AtomicU64; 10]>` allocated and
 dropped per interior node, and a `corun` whose waiting frame the tenth child
@@ -3412,7 +3441,10 @@ nothing about any of them.
 
 **The ragged tree costs the port less than the regular one at one worker and
 more at 24.** At `q = 8` and one worker it is 2.2x behind -- 1.156 ms against
-535.8 µs, or 562 ns a task against 261 over 2056 tasks -- where `skynet` at one
+535.8 µs, or 562 ns a task against 261 over 2056 tasks, a figure the node
+changes leave where it was: #376 took 7.0% off it and #379 put 3.7% back, so
+"The #382 measurement" at the end of this file reads 556 to 564 ns there and
+calls the pair not resolved -- where `skynet` at one
 worker is 9.0x behind, because a `nqueens` body copies a board and prunes a
 column and so gives the submission path something to hide behind. At 24
 workers it goes the other way: 2.946 ms against 184.5 µs is 16x, with our
@@ -3718,7 +3750,13 @@ half is submitted after the left is sorted rather than before -- and that
 section's ablation puts the whole of the difference on the ordering. What the
 million-element rows add is the other half of it: this fork is expensive per
 task and the per task cost is all it is, so a shape with enough work per level
-buries it entirely.
+buries it entirely. **This is also the shape that resolves nothing about the
+node changes**, which is the same statement from the other side: "The #382
+measurement" at the end of this file A/B'd all four ids here across #376 and
+#379 as the regression check those changes needed, and every reading is inside
+one of the two sides' own spreads -- a block off a free node is not visible
+behind twenty million compares, or behind fifteen tasks whose leaves are
+1024-element sorts.
 
 ## integrate
 
@@ -3817,7 +3855,13 @@ at 24 -- and it is the per-task constant with nothing in front of it.** A node
 bisects an interval, evaluates two trapezoids and compares them: five or six
 `f64` operations, where `merge_sort`'s million-element rows hide the same fork
 behind twenty million of them. At `V = 2` and one worker, 1852 spawned tasks in
-636.6 µs is 344 ns a task against the `rayon::join` column's 22.6 ns.
+636.6 µs is 344 ns a task against the `rayon::join` column's 22.6 ns. **That
+constant is unchanged today, and not because nothing happened to it**: #376
+took 9.5% off it and #379 put 12.9% back, which is the largest regression "The
+#382 measurement" at the end of this file found and the reason #397 exists.
+The same id reads 625.7 µs there (338 ns a task) against the "#380
+measurement"'s 648.23 µs (350 ns), which is the few per cent this box moves
+between runs on it.
 
 The 24-worker rows then repeat `skynet`'s direction: ours goes from
 636.6 µs to 2.064 ms, 3.2x slower for 23 more workers, with each parent holding
@@ -5407,3 +5451,357 @@ and the `DESIGN.md` entry under "Dynamic tasking" is where the decision is.
   carrying a `rustflow-runtime-group` column of their own. And it does not
   revisit the small sizes' 24-worker regressions (`MaxDepth = 3`, `q = 6`),
   which are #343's and #367's arrival spread rather than either route's.
+
+## The #382 measurement: one block fewer is 7 to 16% a task, and recycling it is not
+
+**Taking the one-node arena out of a free async node (#376) is worth 7.0 to
+16.5% a task at one worker on every shape that allocates one, and parking the
+node a worker finished on that worker's own free list (#379) is worth nothing
+it can prove on the one route that draws from the list.** The two are the first
+and the second half of what the "#125 attribution" above called the
+irreducible shape of this design -- three heap blocks a free async task, 87%
+of the submission loop -- so this is where both are priced, apart and
+together, with the blocks counted the same way the "#144 change" counted them.
+A free async task is now **2.0159 blocks and 312.12 bytes**, against #125's
+3.016 blocks and 848 bytes and #144's 3.0159 and 320.12.
+
+The second finding is the one that needed the pricing. #379 takes the node's
+block out of the per-task count of a child submitted through a `Runtime` --
+counted below: 4.0000 blocks and 400 bytes a child down to 3.0000 and 144 --
+and moves **no time** there: −0.6% and +0.3% on `fibonacci`'s two 24-worker
+`rustflow-runtime` ids, against sides inside 1.3% and 1.9% of themselves. Off
+that route nothing allocates differently and the readings run from −14.2% to
++15.0% all the same, the two tightest of them pointing opposite ways:
+`integrate/rustflow/1w/2` **+12.9%** against sides inside 2.9%, and
+`skynet/rustflow-group/24w/3` **−14.2%** against sides inside 3.5%. That range
+is the hot path's code rather than its allocations, this run did not separate
+the three candidates inside it, and **#397** is where that attribution and the
+decision it carries are taken up.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id -- every id is each shape's own published one, unchanged |
+| `ulimit -s` | 8192 KiB |
+| Date | 2026-11-19 |
+| **Load average** | **0.53 to 14.8 before and after each measurement, 1 or 2 runnable threads at every reading, and all of it this run's own** |
+
+The box was this run's alone -- no sibling agent, nothing else building -- and
+the one-minute figure reaching 14 is the run's own: eighteen `bench-ab.sh`
+invocations, each of which builds two sides with `CARGO_BUILD_JOBS=4` and then
+runs six rounds of 24-worker criterion ids. `/proc/loadavg` was read either
+side of every measurement, and its **runnable-task** field -- the one that says
+whether anything else wanted a core -- read 1 or 2 at forty-one of the
+forty-two readings below, the forty-second reading 6 between two of the runs:
+
+| measurement | before | after |
+|---|---|---|
+| `async_task`, the span | 0.53 0.75 1.85 | 13.54 7.20 4.22 |
+| `fibonacci`, the span | 3.56 5.50 3.87 | 11.64 7.93 5.17 |
+| `skynet`, the span | 7.06 7.17 5.00 | 7.75 7.67 5.48 |
+| `nqueens`, the span | 6.55 7.42 5.42 | 11.13 8.69 6.13 |
+| `integrate`, the span | 10.24 8.55 6.10 | 12.25 9.35 6.66 |
+| `merge_sort`, the span | 10.44 9.06 6.60 | 6.76 7.92 6.50 |
+| `async_task`, #379 alone | 6.22 7.79 6.46 | 14.83 11.21 8.18 |
+| `fibonacci`, #379 alone | 11.55 10.66 8.04 | 12.74 10.77 8.59 |
+| `skynet`, #379 alone | 5.53 9.10 8.14 | 7.43 8.50 8.03 |
+| `nqueens`, #379 alone | 7.43 8.50 8.03 | 10.79 9.11 8.29 |
+| `integrate`, #379 alone | 9.92 8.96 8.25 | 11.90 9.67 8.57 |
+| `merge_sort`, #379 alone | 11.90 9.67 8.57 | 3.73 7.44 7.91 |
+| `async_task`, #376 alone | 1.62 6.29 7.49 | 12.14 9.28 8.42 |
+| `fibonacci`, #376 alone | 10.28 8.97 8.33 | 12.18 9.58 8.64 |
+| `skynet`, #376 alone | 11.21 9.42 8.59 | 8.93 9.07 8.56 |
+| `nqueens`, #376 alone | 8.93 9.07 8.56 | 10.00 9.31 8.70 |
+| `integrate`, #376 alone | 9.20 9.15 8.66 | 13.66 10.47 9.17 |
+| `merge_sort`, #376 alone | 13.66 10.47 9.17 | 6.57 8.88 8.78 |
+| the block counts, today's `main` | 1.07 0.86 1.97 | 0.77 0.81 1.90 |
+| the block counts, the two earlier refs | 1.36 4.23 6.83 | 1.36 4.23 6.83 |
+| the two pinned `async_task` absolutes | 2.12 7.05 8.15 | 1.94 6.69 8.00 |
+
+### Method: three spans, because the one the issue names is not two changes
+
+Every A/B below is one `devtools/bench-ab.sh <A> <B> --bench <shape> --rounds 3
+-- 'rustflow'` run: two worktrees, two target directories, three interleaved
+rounds a side, each side's spread over its own rounds printed before the
+B-over-A ratio of medians. Three spans, measured on each of the six shapes --
+eighteen runs, 96 matched ids, nothing unmatched:
+
+- **the whole span, `2e90fcb -> 2efc96b`**, which is what the issue asked for.
+  It is not #376 plus #379 alone: it also carries #375 (`sort_by`'s
+  pattern-defeating partition), #372 (a task group opened from a `Runtime`
+  getting its worker's queue) and #374 (the splitting partitioner). None of
+  those three is on the async submission path, and no id below reaches the two
+  partitioners at all, but #372 rewrites `TaskGroup::submit` into a two-armed
+  `Route` that every id below does reach.
+- **#376 alone, `2e90fcb -> 127e3b7`.**
+- **#379 alone, `da36b9d -> 2efc96b`.**
+
+The two changes are therefore priced apart twice over: once by the two
+single-commit spans, and once by whether the three-span row adds up. It
+mostly does -- `fibonacci/rustflow-group/1w/15` reads −12.5% for #376 and
++8.6% for #379 against +1.6% for the span, and `integrate/rustflow/1w/2`
+−9.5% and +12.9% against +3.0% -- which is the check that no third commit in
+the span is doing the work.
+
+A cell below is a **median of three rounds**, which is what `bench-ab`
+reports and not criterion's own interval; the ± figures in this section's prose
+are each side's spread over its own rounds, by the rule the "What is measured"
+section states. The two absolutes at the end are the exception and carry
+criterion's point estimate with half its 95% interval, because they are single
+criterion runs rather than an A/B. **Bold** marks a change outside both sides'
+own spreads by more than the 1.25x `bench-ab` calls resolved, *italic* a
+marginal one between 1.00x and 1.25x, and plain text a change inside one of
+the two spreads, which is not a result.
+
+### The blocks, counted on both sides of both changes
+
+#144's method, re-run: a counting global allocator in an example that is not
+part of this branch, one instrumented run per ref per route, 65536 external
+`silent_async`s (or 121392 spawned children for the recursion) after a warm-up
+run of the same shape, counted by block size. Three routes, because the
+changes do not reach them alike: **external**, which is `async_task`'s
+`rustflow` id; the **id route**, which is a `TaskGroup` from
+`Executor::task_group` inside a worker -- `async_task`'s `rustflow-group` id,
+and the route every one of the five nested shapes opens its groups through;
+and the **runtime route**, `benches/fibonacci.rs`'s `rustflow-runtime`
+recursion through `Runtime::silent_async_runtime`.
+
+| route | block | `2e90fcb` | after #376 | today's `main` |
+|---|---|---|---|---|
+| external | the body's box | 8 B x 1.0000 | 8 B x 1.0000 | 8 B x 1.0000 |
+| external | `Arc<AsyncNode>` | 88 B x 1.0000 | **256 B x 1.0000** | 256 B x 1.0000 |
+| external | the arena's `Vec<Option<Node>>` | **200 B x 1.0000** | -- | -- |
+| external | the spill buffers growing | 3032 B x 0.0159 | 3032 B x 0.0159 | 3032 B x 0.0159 |
+| external | **per task** | **3.0159 blocks, 344.12 B** | **2.0159 blocks, 312.12 B** | 2.0159 blocks, 312.12 B |
+| id route | **per task** | 3.0159 blocks, 344.12 B | 2.0159 blocks, 312.12 B | **2.0160 blocks, 312.13 B** |
+| runtime route | the body's box and the slot | 24 B x 2.0000 | 24 B x 2.0000 | 24 B x 2.0000 |
+| runtime route | the child's `Nested` | 96 B x 1.0000 | 96 B x 1.0000 | 96 B x 1.0000 |
+| runtime route | `Arc<AsyncNode>` | 88 B x 1.0000 | 256 B x 1.0000 | **256 B x 0.0000** |
+| runtime route | the arena's `Vec<Option<Node>>` | 200 B x 1.0000 | -- | -- |
+| runtime route | **per task** | **5.0000 blocks, 432.00 B** | **4.0000 blocks, 400.00 B** | **3.0000 blocks, 144.00 B** |
+
+- **The count reproduces #144's and corrects one of its figures.** 3.0159
+  blocks a task on the external route is that section's number exactly, down
+  to the 0.0159 of a spill buffer; the bytes read 344.12 where it read 320.12,
+  because the arena it sized to one node is **200 bytes** at the span's A side
+  against the 176 it measured the day before -- an `Option<Node>` 24 bytes
+  larger, from changes that are nobody's measurement here. Three blocks, in
+  other words, was still three blocks on the day #376 started.
+- **#376 is one block and 32 bytes a task**, and the second figure is the one
+  worth noticing: the `Arc<AsyncNode>` grows from 88 bytes to 256 as it
+  swallows the node, so what the change buys is almost entirely the *count*.
+  That is #125's "a block's size is worth less than its existence" measured
+  from the other end, and the per-task timings below are what it is worth.
+- **#379 is one more block, on the runtime route only.** A child there costs
+  3.0000 blocks where it cost 4.0000, and the node's 256-byte block is
+  allocated **once per run** rather than once per child at one worker (one
+  block in 121392) and 490 times in 121392 at 24 workers, where a child
+  finished on one worker is sometimes submitted from another. Two of the three
+  blocks left are the benchmark's own result slot and the body's box, so what
+  the scheduler still pays per child there is the body's box and the
+  **`Nested`** that parents it -- 96 bytes, allocated per child on the
+  routes that have a parent, and once per group on the route that does not.
+- **The id route never collects.** 256 B x 1.0000 on today's `main`: a
+  `TaskGroup` opened on an `Executor` submits through
+  `Submission::under_anchor`, which names no worker, so there is no list to
+  draw from and the node is allocated every task exactly as before. Five of
+  the six shapes below are that route, which is why #379's figures on them are
+  about something other than allocation.
+
+### The figures: 32 ids, three spans
+
+Before and after are the whole span's own two sides. The per-cent columns are
+B-over-A, so a negative number is the change making the id faster.
+
+| shape | id | before | after | the span | #376 | #379 |
+|---|---|---|---|---|---|---|
+| `async_task` | `rustflow/1w/4096` | 3.536 ms | 2.886 ms | **−18.4%** | −16.0% | −0.4% |
+| `async_task` | `rustflow/1w/65536` | 55.36 ms | 45.98 ms | **−17.0%** | **−13.6%** | −3.0% |
+| `async_task` | `rustflow/24w/4096` | 5.181 ms | 4.768 ms | *−8.0%* | −5.9% | +5.0% |
+| `async_task` | `rustflow/24w/65536` | 86.12 ms | 70.28 ms | **−18.4%** | *−9.8%* | −6.2% |
+| `async_task` | `rustflow-group/1w/4096` | 755.9 µs | 628.2 µs | **−16.9%** | **−15.5%** | **−3.9%** |
+| `async_task` | `rustflow-group/1w/65536` | 12.32 ms | 10.06 ms | **−18.3%** | **−14.1%** | *−5.1%* |
+| `async_task` | `rustflow-group/24w/4096` | 4.922 ms | 4.373 ms | **−11.2%** | **−12.2%** | **+2.1%** |
+| `async_task` | `rustflow-group/24w/65536` | 76.35 ms | 68.09 ms | **−10.8%** | **−13.8%** | **+2.5%** |
+| `fibonacci` | `rustflow-group/1w/12` | 84.30 µs | 88.06 µs | +4.5% | **−16.5%** | *+8.8%* |
+| `fibonacci` | `rustflow-group/1w/15` | 323.9 µs | 329.0 µs | +1.6% | **−12.5%** | **+8.6%** |
+| `fibonacci` | `rustflow-group/24w/12` | 1.086 ms | 1.072 ms | −1.3% | −1.6% | **−4.1%** |
+| `fibonacci` | `rustflow-group/24w/15` | 2.060 ms | 2.059 ms | −0.0% | +1.2% | −1.0% |
+| `fibonacci` | `rustflow-runtime/1w/12` | 50.12 µs | 46.82 µs | −6.6% | *−11.7%* | −0.7% |
+| `fibonacci` | `rustflow-runtime/1w/15` | 194.3 µs | 180.8 µs | −6.9% | **−13.6%** | −1.5% |
+| `fibonacci` | `rustflow-runtime/24w/12` | 843.9 µs | 831.6 µs | **−1.5%** | *+1.0%* | −0.6% |
+| `fibonacci` | `rustflow-runtime/24w/15` | 1.319 ms | 1.300 ms | −1.4% | +2.1% | +0.3% |
+| `skynet` | `rustflow-group/1w/3` | 243.1 µs | 212.6 µs | **−12.6%** | **−14.1%** | +0.2% |
+| `skynet` | `rustflow-group/1w/4` | 2.336 ms | 2.016 ms | **−13.7%** | **−14.4%** | −0.4% |
+| `skynet` | `rustflow-group/24w/3` | 525.6 µs | 442.7 µs | **−15.8%** | **−3.1%** | **−14.2%** |
+| `skynet` | `rustflow-group/24w/4` | 2.346 ms | 2.336 ms | −0.4% | *−3.4%* | +1.1% |
+| `nqueens` | `rustflow-group/1w/6` | 83.66 µs | 83.14 µs | −0.6% | −5.8% | +7.4% |
+| `nqueens` | `rustflow-group/1w/8` | 1.195 ms | 1.159 ms | −2.9% | **−7.0%** | +3.7% |
+| `nqueens` | `rustflow-group/24w/6` | 754.2 µs | 742.6 µs | −1.5% | −1.6% | −3.5% |
+| `nqueens` | `rustflow-group/24w/8` | 2.751 ms | 2.676 ms | −2.7% | +0.8% | +4.0% |
+| `integrate` | `rustflow/1w/1` | 277.2 µs | 292.4 µs | **+5.5%** | **−11.3%** | **+15.0%** |
+| `integrate` | `rustflow/1w/2` | 607.8 µs | 625.7 µs | **+3.0%** | **−9.5%** | **+12.9%** |
+| `integrate` | `rustflow/24w/1` | 1.235 ms | 1.253 ms | +1.4% | −1.0% | +2.2% |
+| `integrate` | `rustflow/24w/2` | 2.177 ms | 2.061 ms | **−5.3%** | −4.1% | −0.1% |
+| `merge_sort` | `rustflow/1w/10000` | 257.8 µs | 258.4 µs | +0.3% | −5.4% | −2.0% |
+| `merge_sort` | `rustflow/1w/1000000` | 54.85 ms | 55.60 ms | +1.4% | −3.5% | +1.1% |
+| `merge_sort` | `rustflow/24w/10000` | 838.4 µs | 710.0 µs | −15.3% | −1.5% | −5.5% |
+| `merge_sort` | `rustflow/24w/1000000` | 16.55 ms | 17.20 ms | +3.9% | −0.4% | −3.0% |
+
+The absolutes in the first two columns are **not** comparable with the shape
+tables above, and `async_task/rustflow/1w/65536`'s 55.36 ms against that
+section's 29 ms is the case the "#144 change" section already recorded:
+unpinned, that id's processes read 29 to 50 ms on this box depending on where
+the producer and its one worker land, so a figure from it is a ratio's
+denominator and nothing else. Within one row the two sides are measured
+minutes apart in alternating rounds under the same drift, which is the one
+thing the method does protect. The two pinned absolutes below are what the
+section quotes for that id instead.
+
+### #376: 7 to 16% a task wherever a submission is most of the shape
+
+At **one worker** the change is a result on every shape whose per-task cost is
+a submission, and the sizes agree with each other:
+
+| shape | id | #376 | each side's own spread |
+|---|---|---|---|
+| `fibonacci` | `rustflow-group/1w/12` | **−16.5%** | 6.4% / 10.8% |
+| `async_task` | `rustflow-group/1w/4096` | **−15.5%** | 3.3% / 4.7% |
+| `skynet` | `rustflow-group/1w/4` | **−14.4%** | 3.8% / 2.9% |
+| `async_task` | `rustflow-group/1w/65536` | **−14.1%** | 2.4% / 3.6% |
+| `fibonacci` | `rustflow-runtime/1w/15` | **−13.6%** | 2.5% / 5.4% |
+| `async_task` | `rustflow/1w/65536` | **−13.6%** | 1.3% / 1.7% |
+| `integrate` | `rustflow/1w/1` | **−11.3%** | 2.4% / 6.3% |
+| `integrate` | `rustflow/1w/2` | **−9.5%** | 5.4% / 7.0% |
+| `nqueens` | `rustflow-group/1w/8` | **−7.0%** | 2.3% / 3.5% |
+| `merge_sort` | `rustflow/1w/1000000` | −3.5% | 2.4% / 4.5% |
+
+**One block in three is worth between 7 and 16% of a free async task**, and
+the ordering of that column is the shape's own per-task
+arithmetic rather than anything about the change: `fibonacci` and `skynet`
+bodies hold nothing, `nqueens` copies a board and prunes a column, and
+`merge_sort`'s million-element id is twenty million compares with 1023
+submissions hidden behind them, which is why it is the one row that reads
+nothing. `integrate`'s two ids are the cross-check that the ordering is
+arithmetic and not route: they are the same id route as `skynet`'s and read
+two thirds of its figure, over a body of six `f64` operations.
+
+Read against the block counts, that is **−32 bytes and −1 block buying 7 to
+16%**, which closes #125's G-against-H question from the other side: that run
+measured one extra 64-byte block at 69 to 75 ns and one extra 704-byte block
+at 224, and could not tell a count from a size. Here the count falls by one
+while the size of what is left *rises* by 168 bytes, and the id gets 13%
+faster. A block's existence is the whole of it.
+
+At **24 workers** only the shape that is nothing but submissions keeps it:
+`async_task`'s group id reads −12.2% and −13.8%, its external id −5.9% and
+−9.8%, and every nested recursion reads between −4.1% and +2.1% with its
+sides disagreeing by as much. That is the "#380 measurement" above showing
+through -- at 24 workers a nested recursion's cost is the arrival of one
+outstanding child among 23 awake thieves, 59 µs a handoff, and a block saved
+in the submission disappears into it.
+
+### #379: nothing on the route that draws, and no sign off it
+
+The route the list was built for is `fibonacci`'s `rustflow-runtime` id, and
+the block counts above show the list doing exactly what it is for there: the
+node's block is drawn from it for all but one child in 121392 at one worker.
+The time does not move.
+
+| id | #379 | each side's own spread |
+|---|---|---|
+| `rustflow-runtime/24w/12` | −0.6% | 1.3% / 1.2% |
+| `rustflow-runtime/24w/15` | +0.3% | 1.8% / 1.9% |
+| `rustflow-runtime/1w/12` | −0.7% | 9.9% / 11.9% |
+| `rustflow-runtime/1w/15` | −1.5% | 14.4% / 3.2% |
+
+The two 24-worker rows are a **resolved no change**: sides inside 1 to 2% of
+themselves and a difference of half a percent. The two one-worker rows resolve
+nothing either way, their two sides disagreeing by 10 to 14% between their own
+rounds. So the honest statement of what recycling a block is worth, where it
+is drawn, is **half a percent of a child at 24 workers, and below what this
+box can see at one** -- that child being 183 ns at one worker and 1.3 µs at 24
+-- against a block count that falls by a quarter and a byte count that falls
+by 64%. Which is a statement about `glibc`'s allocator as much as
+about this port: a block allocated and freed by the same thread, 121392 times
+in a row at the same size, costs about what a `RefCell` borrow, an
+`Arc::get_mut` and a `Vec` push cost, so replacing one with the other is a
+wash. Upstream's `TF_ENABLE_TASK_POOL` defends against a different regime --
+its `ObjectPool` is a cross-thread recycler, and #125 priced *that* regime at
+691 to 737 ns a block.
+
+Off that route nothing allocates differently, and the readings still move:
+
+| shape | id | #379 | each side's own spread |
+|---|---|---|---|
+| `integrate` | `rustflow/1w/1` | **+15.0%** | 2.2% / 2.2% |
+| `integrate` | `rustflow/1w/2` | **+12.9%** | 1.6% / 2.9% |
+| `fibonacci` | `rustflow-group/1w/15` | **+8.6%** | 2.4% / 0.6% |
+| `nqueens` | `rustflow-group/1w/6` | +7.4% | 8.0% / 2.0% |
+| `skynet` | `rustflow-group/1w/4` | −0.4% | 5.4% / 4.1% |
+| `async_task` | `rustflow-group/1w/65536` | *−5.1%* | 4.7% / 3.3% |
+| `skynet` | `rustflow-group/24w/3` | **−14.2%** | 0.7% / 3.5% |
+
+Four of the twelve one-worker ids on routes that cannot draw are resolved, and
+three of those four are **regressions**: `integrate`'s two sizes agreeing at
++12.9 and +15.0% against sides inside 3%, and `fibonacci`'s group id at
++8.6%. The two resolved readings in the other direction are
+`async_task/rustflow-group/1w/65536` at −5.1% and
+`skynet/rustflow-group/24w/3` at −14.2%, and the second of those does not
+reproduce at the shape's other size (+1.1%, inside the spread). What the
+extra per-task work on these routes is, read off the code, is one `Arc` clone
+and drop of every finished free node in `WorkerThread::spend_job` plus a
+`RefCell` borrow and a length test in `FreeNodes::recycle` once the 32-block
+list is full -- which is a few nanoseconds and not 13% of `integrate`'s
+338-ns task, so most of that range has to be code layout and inlining on the
+one-worker corun path. **This run did not separate those**, and #397 is the issue that does:
+ablate the clone, the `recycle` call and the two together on
+`integrate/rustflow/1w/2`, then either stop charging a worker whose list is
+never drawn from, give the id route the draw, or revert a change whose measured
+win is a footprint and not a time.
+
+### The two absolutes, pinned, on today's `main`
+
+`async_task`'s two one-worker ids, each in its own criterion process, two
+rounds with the order reversed, under `taskset -c 4,5` -- two physical cores of
+one CCD for the producer and the one worker, which is #144's protocol for
+making this shape's absolute reproducible:
+
+| id | round 1 | round 2 | per task |
+|---|---|---|---|
+| `async_task/rustflow/1w/65536` | 22.565 ms ±0.22% | 23.424 ms ±0.68% | **344 / 357 ns** |
+| `async_task/rustflow-group/1w/65536` | 9.8517 ms ±0.12% | 9.9287 ms ±0.17% | **150 / 152 ns** |
+
+So **an externally submitted free async task is ~350 ns on today's `main`**,
+against #144's pinned 27.7 to 28.0 ms (423 to 427 ns) for the same id on the
+same protocol and #125's 438 to 478 ns before that change; and the same
+construction submitted from a worker through a task group is **~150 ns**,
+against #144's 182 and #125's 274. The two protocols agree: −16 to −19% from
+the pinned pair against the A/B's −13.6% and −14.1% for #376, with #379
+inside the noise on the external id.
+
+### The decision: #376 is settled, #379 is #397's
+
+- **#376 stays, and this is what it bought**: one block in three off every
+  free async task, 9.5 to 16.5% a task at one worker on four of the six shapes
+  and 7.0% on a fifth, 12 to 14% at 24 workers on the shape that is only
+  submissions, and nothing
+  at 24 workers on a nested recursion because #380's handoff is what costs
+  there instead. No shape regressed on it: the most positive reading in the
+  whole #376 column is `fibonacci/rustflow-runtime/24w/15` at +2.1%, inside
+  its sides' own 3.5%.
+- **#379's win is a footprint**: 400 bytes a child down to 144 on the runtime
+  route, with the node's block allocated once a run instead of once a child.
+  As a time it is unmeasurable where it applies and unresolved in sign where
+  it does not, and #397 carries the ablation plus the choice between fixing
+  the cost and reverting the change. Nothing in this section is an argument
+  for keeping it on the strength of the time it saves, because it saves none
+  that this box can see.
+- **What would reopen #376's half** is a third block to take out, and the
+  counts above name the candidates: the body's box, which is the type erasure
+  and cannot go, and the per-child `Nested` at 96 bytes, which is the one
+  block a *parented* child pays that the external route does not. That is a
+  design question about who owns a child's join counter rather than a tuning
+  one, and nothing here proposes it.
