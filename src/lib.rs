@@ -97,7 +97,8 @@
 //! primitive, for a submission with no builder behind it such as a
 //! dependent-async task. All of them carve `[0, n)` into chunks through a
 //! [`Partitioner`](algorithm::partitioner::Partitioner) -- static, guided,
-//! dynamic or random -- and spawn those chunks under a [`Scope`] rather than
+//! dynamic, random, or the port's own splitting one -- and spawn those
+//! chunks under a [`Scope`] rather than
 //! handing out aliasing indices into one `&mut`, which is where this port
 //! and upstream's raw iterators part company; an index-driven one walks an
 //! [`IndexRange`](algorithm::index_range::IndexRange) in place of a slice.

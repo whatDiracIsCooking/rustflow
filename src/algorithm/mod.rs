@@ -12,8 +12,9 @@
 //! - [`merge`] a parallel merge of two sorted slices into a third, by
 //!   co-rank chunking over [`Runtime::scope`](crate::Runtime::scope).
 //! - [`partitioner`] the strategies that split `[0, n)` into chunks for a
-//!   parallel loop -- static, guided, dynamic and random -- and the closure
-//!   wrapper a caller can run around every chunk's body.
+//!   parallel loop -- static, guided, dynamic, random, and the port's own
+//!   splitting one -- and the closure wrapper a caller can run around every
+//!   chunk's body.
 //! - [`for_each`] the first algorithm built on the two above plus
 //!   [`crate::Runtime::scope`]: a parallel loop over a mutable slice.
 //!
@@ -139,7 +140,9 @@ use crate::Scope;
 use crate::algorithm::find::FindPartitioner;
 use crate::algorithm::for_each_index::IndexDispatch;
 use crate::algorithm::index_range::IndexInt;
-use crate::algorithm::partitioner::{DynamicLoop, Partitioner, StaticLoop};
+use crate::algorithm::partitioner::{
+    DynamicLoop, Partitioner, StaticLoop, slice_shares, spawn_shares,
+};
 use crate::algorithm::reduce::ReducePartitioner;
 use crate::flow_builder::FlowBuilder;
 use crate::graph::Task;
@@ -172,7 +175,7 @@ pub use crate::algorithm::merge::{make_merge_task, make_merge_task_by};
 pub use crate::algorithm::module::make_module_task;
 pub use crate::algorithm::partitioner::{
     ClosureWrapper, DefaultClosureWrapper, DefaultPartitioner, DynamicPartitioner,
-    GuidedPartitioner, RandomPartitioner, StaticPartitioner,
+    GuidedPartitioner, RandomPartitioner, SplittingPartitioner, StaticPartitioner,
 };
 pub use crate::algorithm::reduce::{
     make_reduce_by_index_task, make_reduce_task, make_transform_reduce_task,
@@ -1117,6 +1120,7 @@ impl<C: ClosureWrapper> sealed::Sealed for StaticPartitioner<C> {}
 impl<C: ClosureWrapper> sealed::Sealed for GuidedPartitioner<C> {}
 impl<C: ClosureWrapper> sealed::Sealed for DynamicPartitioner<C> {}
 impl<C: ClosureWrapper> sealed::Sealed for RandomPartitioner<C> {}
+impl<C: ClosureWrapper> sealed::Sealed for SplittingPartitioner<C> {}
 
 impl<C: ClosureWrapper + Sync> SlicePartitioner for StaticPartitioner<C> {
     fn drive<'scope, T, Body>(
@@ -1198,6 +1202,50 @@ impl<C: ClosureWrapper + Sync> SlicePartitioner for RandomPartitioner<C> {
     {
         let pieces = partition_dynamic(self, data, n, w_total);
         drive_shared(scope, pieces, w_total, self.closure_wrapper(), body);
+    }
+}
+
+impl<C: ClosureWrapper + Sync> SlicePartitioner for SplittingPartitioner<C> {
+    /// One task per worker over a contiguous share of `data`, each handed a
+    /// [`Runtime`](crate::Runtime) so that a share which starts on a foreign
+    /// thread can hand half of itself on; `body` runs once per chunk of the
+    /// share a task is left with, under the closure wrapper, which therefore
+    /// wraps once per *task* rather than once per worker.
+    fn drive<'scope, T, Body>(
+        &'scope self,
+        scope: &Scope<'scope, '_, '_>,
+        data: &'scope mut [T],
+        _n: usize,
+        w_total: usize,
+        body: &'scope Body,
+    ) where
+        T: Send,
+        Body: Fn(&mut [T]) + Sync,
+    {
+        let chunk_size = self.chunk_size();
+        let wrapper = self.closure_wrapper();
+        let work = move |share: &'scope mut [T]| {
+            // `ClosureWrapper::invoke` takes `FnMut`, so the one share this
+            // task owns reaches the walk through a `take`, as every other
+            // chunk body in this crate does.
+            let mut share = Some(share);
+            wrapper.invoke(|| {
+                let mut rest = share
+                    .take()
+                    .expect("a closure wrapper runs a partitioned chunk body at most once");
+                while !rest.is_empty() {
+                    let take = if chunk_size == 0 {
+                        rest.len()
+                    } else {
+                        chunk_size.min(rest.len())
+                    };
+                    let (head, tail) = rest.split_at_mut(take);
+                    body(head);
+                    rest = tail;
+                }
+            });
+        };
+        spawn_shares(scope, slice_shares(data, w_total), self.split_floor(), work);
     }
 }
 

@@ -41,17 +41,19 @@
 //! [`Runtime::for_each_index`] / [`Runtime::for_each_by_index`] instead,
 //! computing it fresh each call.
 //!
-//! **One dispatch trait, four concrete impls, no blanket.** Upstream's
+//! **One dispatch trait, five concrete impls, no blanket.** Upstream's
 //! `make_*_task` branches `if constexpr(part.type() == PartitionerType::STATIC)`
 //! between [`StaticLoop`]'s strided walk and [`DynamicLoop`]'s shared-cursor
 //! race. A caller generic over an arbitrary `P: Partitioner` cannot make
 //! that choice in Rust -- neither loop trait is implemented by every
 //! partitioner, by design (`partitioner`'s own `# Design` section) -- so
 //! [`IndexDispatch`] is the per-concrete-type answer: one `dispatch` method,
-//! implemented once each for [`StaticPartitioner`] (over `spawn_static`)
-//! and for [`GuidedPartitioner`], [`DynamicPartitioner`] and
+//! implemented once each for [`StaticPartitioner`] (over `spawn_static`),
+//! for [`GuidedPartitioner`], [`DynamicPartitioner`] and
 //! [`RandomPartitioner`] (over `spawn_dynamic`, since all three are
-//! [`DynamicLoop`]s). Two blanket impls keyed on `P: StaticLoop` and
+//! [`DynamicLoop`]s), and for [`SplittingPartitioner`] (over
+//! `spawn_splitting`, since it is neither -- `partitioner`'s own `# Design`
+//! section says why). Two blanket impls keyed on `P: StaticLoop` and
 //! `P: DynamicLoop` were the first shape tried instead, and do not compile:
 //! nothing stops a future type from implementing both loop traits, so
 //! rustc's coherence check cannot rule out the overlap, unlike the four
@@ -77,12 +79,26 @@
 //! [`Scope::spawn`](crate::executor::scope::Scope::spawn), which needs only
 //! `&Scope`. A trait abstracting over "submit a task" would have
 //! to name one receiver mutability for both, which neither call site
-//! actually has in common. A plain `&mut dyn FnMut(bool, Box<dyn FnOnce() +
-//! Send + 'env>)` sidesteps the mismatch instead: each call site closes over
+//! actually has in common. A plain `&mut dyn FnMut(ChunkTask<'env>)`
+//! sidesteps the mismatch instead: each call site closes over
 //! whichever of `rt` or `s` it holds, in its own way, outside
-//! [`IndexDispatch`]'s own bounds entirely. The `bool` is upstream's own
-//! `(++w == W || ...) ? task() : rt.silent_async(task)` choice, carried
-//! across the callback rather than decided on either side of it.
+//! [`IndexDispatch`]'s own bounds entirely. [`ChunkTask`]'s two variants are
+//! upstream's own `(++w == W || ...) ? task() : rt.silent_async(task)`
+//! choice, carried across the callback rather than decided on either side of
+//! it -- a variant rather than the `bool` that stood here before, because
+//! the arms no longer carry the same body.
+//! [`ChunkTask::SpawnedRuntime`] is handed a [`Runtime`] of its own, which
+//! is what lets a [`SplittingPartitioner`] chunk hand its far half on, and
+//! it is a third variant rather than the second one widened so that the
+//! four ported partitioners keep submitting through
+//! [`Runtime::silent_async`] exactly as they did: a runtime-bodied async
+//! node is entered under the preemption protocol, three atomics a chunk
+//! task more than a plain one, which a chunk that cannot split should not
+//! be made to pay. An *inline* chunk needs no runtime at all, running on
+//! the thread that submitted it and so being the one chunk that never
+//! splits. The same asymmetry is why `make_body` is `Clone` here: a chunk
+//! that splits builds its far half's body from its own copy of the factory,
+//! where the ported four call it once per worker and never again.
 //!
 //! **A closure wrapper's body is `FnMut`, not `FnOnce`, on an honest
 //! assumption.** [`ClosureWrapper::invoke`] demands
@@ -129,15 +145,34 @@
 use std::boxed::Box;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::thread;
 
 use crate::algorithm::index_range::{
     IndexInt, IndexRange, IndexRanges, distance, is_index_range_invalid,
 };
 use crate::algorithm::partitioner::{
     ClosureWrapper, DynamicLoop, DynamicPartitioner, GuidedPartitioner, Partitioner,
-    RandomPartitioner, StaticLoop, StaticPartitioner,
+    RandomPartitioner, SplittingPartitioner, StaticLoop, StaticPartitioner, index_shares,
+    run_share, walk_chunks,
 };
 use crate::runtime::Runtime;
+
+/// One chunk task on its way to a worker, as [`IndexDispatch::dispatch`]
+/// hands it to its caller: upstream's `(++w == W || ...) ? task() :
+/// rt.silent_async(task)` choice, as a value rather than a `bool` beside a
+/// body. The module's `# Design` section says why there are three arms and
+/// not two.
+pub enum ChunkTask<'env> {
+    /// Run this chunk on the calling worker, before `dispatch` returns:
+    /// upstream's `task()`.
+    Inline(Box<dyn FnOnce() + 'env>),
+    /// Hand this chunk to the pool: upstream's `rt.silent_async(task)`, and
+    /// what the four ported partitioners ask for.
+    Spawned(Box<dyn FnOnce() + Send + 'env>),
+    /// Hand this chunk to the pool with a [`Runtime`] of its own, which only
+    /// a chunk that may split needs.
+    SpawnedRuntime(Box<dyn for<'a> FnOnce(&mut Runtime<'a>) + Send + 'env>),
+}
 
 /// Dispatches the chunked per-worker tasks for this partitioner's own
 /// scheduling family: upstream's `if constexpr(part.type() == ...)` branch
@@ -159,10 +194,10 @@ pub trait IndexDispatch: Partitioner {
         n: usize,
         w_total: usize,
         make_body: Make,
-        submit: &mut dyn FnMut(bool, Box<dyn FnOnce() + Send + 'env>),
+        submit: &mut dyn FnMut(ChunkTask<'env>),
     ) where
         B: FnMut(usize, usize) + Send + 'env,
-        Make: Fn() -> B;
+        Make: Fn() -> B + Clone + Send + 'env;
 }
 
 impl<CW> IndexDispatch for StaticPartitioner<CW>
@@ -174,10 +209,10 @@ where
         n: usize,
         w_total: usize,
         make_body: Make,
-        submit: &mut dyn FnMut(bool, Box<dyn FnOnce() + Send + 'env>),
+        submit: &mut dyn FnMut(ChunkTask<'env>),
     ) where
         B: FnMut(usize, usize) + Send + 'env,
-        Make: Fn() -> B,
+        Make: Fn() -> B + Clone + Send + 'env,
     {
         spawn_static(self, n, w_total, make_body, submit);
     }
@@ -192,10 +227,10 @@ where
         n: usize,
         w_total: usize,
         make_body: Make,
-        submit: &mut dyn FnMut(bool, Box<dyn FnOnce() + Send + 'env>),
+        submit: &mut dyn FnMut(ChunkTask<'env>),
     ) where
         B: FnMut(usize, usize) + Send + 'env,
-        Make: Fn() -> B,
+        Make: Fn() -> B + Clone + Send + 'env,
     {
         spawn_dynamic(self, n, w_total, make_body, submit);
     }
@@ -210,10 +245,10 @@ where
         n: usize,
         w_total: usize,
         make_body: Make,
-        submit: &mut dyn FnMut(bool, Box<dyn FnOnce() + Send + 'env>),
+        submit: &mut dyn FnMut(ChunkTask<'env>),
     ) where
         B: FnMut(usize, usize) + Send + 'env,
-        Make: Fn() -> B,
+        Make: Fn() -> B + Clone + Send + 'env,
     {
         spawn_dynamic(self, n, w_total, make_body, submit);
     }
@@ -228,12 +263,30 @@ where
         n: usize,
         w_total: usize,
         make_body: Make,
-        submit: &mut dyn FnMut(bool, Box<dyn FnOnce() + Send + 'env>),
+        submit: &mut dyn FnMut(ChunkTask<'env>),
     ) where
         B: FnMut(usize, usize) + Send + 'env,
-        Make: Fn() -> B,
+        Make: Fn() -> B + Clone + Send + 'env,
     {
         spawn_dynamic(self, n, w_total, make_body, submit);
+    }
+}
+
+impl<CW> IndexDispatch for SplittingPartitioner<CW>
+where
+    CW: ClosureWrapper + Clone + Send + 'static,
+{
+    fn dispatch<'env, B, Make>(
+        &self,
+        n: usize,
+        w_total: usize,
+        make_body: Make,
+        submit: &mut dyn FnMut(ChunkTask<'env>),
+    ) where
+        B: FnMut(usize, usize) + Send + 'env,
+        Make: Fn() -> B + Clone + Send + 'env,
+    {
+        spawn_splitting(self, n, w_total, make_body, submit);
     }
 }
 
@@ -249,11 +302,11 @@ fn spawn_static<'env, CW, B, Make>(
     n: usize,
     w_total: usize,
     make_body: Make,
-    submit: &mut dyn FnMut(bool, Box<dyn FnOnce() + Send + 'env>),
+    submit: &mut dyn FnMut(ChunkTask<'env>),
 ) where
     CW: ClosureWrapper + Clone + Send + 'static,
     B: FnMut(usize, usize) + Send + 'env,
-    Make: Fn() -> B,
+    Make: Fn() -> B + Clone + Send + 'env,
 {
     let mut w = 0_usize;
     let mut curr_b = 0_usize;
@@ -263,14 +316,14 @@ fn spawn_static<'env, CW, B, Make>(
         let p_call = part.clone();
         let p_loop = part.clone();
         let mut body = Some(make_body());
-        let task: Box<dyn FnOnce() + Send + 'env> = Box::new(move || {
+        let task = move || {
             p_call.call(move || {
                 let body = body
                     .take()
                     .expect("a closure wrapper runs a partitioned chunk body at most once");
                 p_loop.loop_static(n, w_total, task_curr_b, chunk_size, body);
             });
-        });
+        };
 
         w += 1;
         let run_inline = if w == w_total {
@@ -280,7 +333,7 @@ fn spawn_static<'env, CW, B, Make>(
             curr_b >= n
         };
 
-        submit(run_inline, task);
+        submit(wrap_chunk(run_inline, task));
     }
 }
 
@@ -293,11 +346,11 @@ fn spawn_dynamic<'env, P, B, Make>(
     n: usize,
     w_total: usize,
     make_body: Make,
-    submit: &mut dyn FnMut(bool, Box<dyn FnOnce() + Send + 'env>),
+    submit: &mut dyn FnMut(ChunkTask<'env>),
 ) where
     P: DynamicLoop + Clone + Send + 'static,
     B: FnMut(usize, usize) + Send + 'env,
-    Make: Fn() -> B,
+    Make: Fn() -> B + Clone + Send + 'env,
 {
     let next = Arc::new(AtomicUsize::new(0));
     for w in 0..w_total {
@@ -305,16 +358,76 @@ fn spawn_dynamic<'env, P, B, Make>(
         let p_loop = part.clone();
         let next_loop = Arc::clone(&next);
         let mut body = Some(make_body());
-        let task: Box<dyn FnOnce() + Send + 'env> = Box::new(move || {
+        let task = move || {
             p_call.call(move || {
                 let body = body
                     .take()
                     .expect("a closure wrapper runs a partitioned chunk body at most once");
                 p_loop.loop_dynamic(n, w_total, &next_loop, body);
             });
-        });
+        };
 
-        submit(w + 1 == w_total, task);
+        submit(wrap_chunk(w + 1 == w_total, task));
+    }
+}
+
+/// Wraps one ported partitioner's chunk task in the [`ChunkTask`] arm
+/// `run_inline` asks for: never the runtime-bodied one, which nothing but a
+/// splitting chunk has a use for.
+fn wrap_chunk<'env, F>(run_inline: bool, task: F) -> ChunkTask<'env>
+where
+    F: FnOnce() + Send + 'env,
+{
+    if run_inline {
+        ChunkTask::Inline(Box::new(task))
+    } else {
+        ChunkTask::Spawned(Box::new(task))
+    }
+}
+
+/// The splitting branch of [`IndexDispatch::dispatch`]: one task per worker
+/// over a contiguous share of `[0, n)`, each handed a [`Runtime`] so that a
+/// share which starts on a foreign thread can hand half of itself on --
+/// [`run_share`] is the walk, and `partitioner`'s `# Design` section the
+/// reason. The last share runs inline on the calling worker, as every other
+/// family's does.
+fn spawn_splitting<'env, CW, B, Make>(
+    part: &SplittingPartitioner<CW>,
+    n: usize,
+    w_total: usize,
+    make_body: Make,
+    submit: &mut dyn FnMut(ChunkTask<'env>),
+) where
+    CW: ClosureWrapper + Clone + Send + 'static,
+    B: FnMut(usize, usize) + Send + 'env,
+    Make: Fn() -> B + Clone + Send + 'env,
+{
+    let chunk_size = part.chunk_size();
+    let floor = part.split_floor();
+    let p_call = part.clone();
+    // One `B` per share, built where that share runs: a split hands its far
+    // half a task of its own, and two chunk bodies never overlap.
+    let work = move |(b, e): (usize, usize)| {
+        let mut body = make_body();
+        p_call.call(|| {
+            walk_chunks(b, e, chunk_size, |chunk_b, chunk_e| {
+                body(chunk_b, chunk_e);
+                false
+            });
+        });
+    };
+
+    let home = thread::current().id();
+    let mut shares = index_shares(n, w_total);
+    let last = shares.pop();
+    for share in shares {
+        let work = work.clone();
+        submit(ChunkTask::SpawnedRuntime(Box::new(
+            move |rt: &mut Runtime<'_>| run_share(rt, home, share, floor, work),
+        )));
+    }
+    if let Some(share) = last {
+        submit(ChunkTask::Inline(Box::new(move || work(share))));
     }
 }
 
@@ -392,7 +505,7 @@ where
         part.dispatch(
             n,
             w,
-            || {
+            move || {
                 let f = f.clone();
                 move |part_b: usize, part_e: usize| {
                     let mut idx = beg + step * T::from_position(part_b);
@@ -402,12 +515,10 @@ where
                     }
                 }
             },
-            &mut |run_inline, task| {
-                if run_inline {
-                    task();
-                } else {
-                    rt.silent_async(task);
-                }
+            &mut |task| match task {
+                ChunkTask::Inline(task) => task(),
+                ChunkTask::Spawned(task) => rt.silent_async(task),
+                ChunkTask::SpawnedRuntime(task) => rt.silent_async_runtime(task),
             },
         );
     }
@@ -478,18 +589,16 @@ where
         part.dispatch(
             n,
             w,
-            || {
+            move || {
                 let f = f.clone();
                 move |part_b: usize, part_e: usize| {
                     f(range.discrete_domain(part_b, part_e));
                 }
             },
-            &mut |run_inline, task| {
-                if run_inline {
-                    task();
-                } else {
-                    rt.silent_async(task);
-                }
+            &mut |task| match task {
+                ChunkTask::Inline(task) => task(),
+                ChunkTask::Spawned(task) => rt.silent_async(task),
+                ChunkTask::SpawnedRuntime(task) => rt.silent_async_runtime(task),
             },
         );
     }
@@ -565,18 +674,16 @@ where
         part.dispatch(
             n_outer,
             w,
-            || {
+            move || {
                 let f = f.clone();
                 move |part_b: usize, part_e: usize| {
                     f(range.discrete_domain(part_b * inner_volume, part_e * inner_volume));
                 }
             },
-            &mut |run_inline, task| {
-                if run_inline {
-                    task();
-                } else {
-                    rt.silent_async(task);
-                }
+            &mut |task| match task {
+                ChunkTask::Inline(task) => task(),
+                ChunkTask::Spawned(task) => rt.silent_async(task),
+                ChunkTask::SpawnedRuntime(task) => rt.silent_async_runtime(task),
             },
         );
     }
@@ -653,7 +760,7 @@ impl<'rt> Runtime<'rt> {
             part.dispatch(
                 n,
                 w,
-                || {
+                move || {
                     let f = f.clone();
                     move |part_b: usize, part_e: usize| {
                         let mut idx = beg + step * T::from_position(part_b);
@@ -663,12 +770,10 @@ impl<'rt> Runtime<'rt> {
                         }
                     }
                 },
-                &mut |run_inline, task| {
-                    if run_inline {
-                        task();
-                    } else {
-                        s.spawn(task);
-                    }
+                &mut |task| match task {
+                    ChunkTask::Inline(task) => task(),
+                    ChunkTask::Spawned(task) => s.spawn(task),
+                    ChunkTask::SpawnedRuntime(task) => s.spawn_runtime(task),
                 },
             );
         });
@@ -727,18 +832,16 @@ impl<'rt> Runtime<'rt> {
             part.dispatch(
                 n,
                 w,
-                || {
+                move || {
                     let f = f.clone();
                     move |part_b: usize, part_e: usize| {
                         f(range.discrete_domain(part_b, part_e));
                     }
                 },
-                &mut |run_inline, task| {
-                    if run_inline {
-                        task();
-                    } else {
-                        s.spawn(task);
-                    }
+                &mut |task| match task {
+                    ChunkTask::Inline(task) => task(),
+                    ChunkTask::Spawned(task) => s.spawn(task),
+                    ChunkTask::SpawnedRuntime(task) => s.spawn_runtime(task),
                 },
             );
         });
@@ -804,18 +907,16 @@ impl<'rt> Runtime<'rt> {
             part.dispatch(
                 n_outer,
                 w,
-                || {
+                move || {
                     let f = f.clone();
                     move |part_b: usize, part_e: usize| {
                         f(range.discrete_domain(part_b * inner_volume, part_e * inner_volume));
                     }
                 },
-                &mut |run_inline, task| {
-                    if run_inline {
-                        task();
-                    } else {
-                        s.spawn(task);
-                    }
+                &mut |task| match task {
+                    ChunkTask::Inline(task) => task(),
+                    ChunkTask::Spawned(task) => s.spawn(task),
+                    ChunkTask::SpawnedRuntime(task) => s.spawn_runtime(task),
                 },
             );
         });

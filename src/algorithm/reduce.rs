@@ -93,14 +93,15 @@ use crate::algorithm::SliceSource;
 use crate::algorithm::index_range::{IndexInt, IndexRange};
 use crate::algorithm::partitioner::{
     ClosureWrapper, DynamicLoop, DynamicPartitioner, GuidedPartitioner, Partitioner,
-    RandomPartitioner, StaticLoop, StaticPartitioner,
+    RandomPartitioner, SplittingPartitioner, StaticLoop, StaticPartitioner, index_shares,
+    spawn_shares, walk_chunks,
 };
 use crate::runtime::Runtime;
 
 /// Closes [`ReducePartitioner`] against implementations outside this crate,
 /// the same restriction [`crate::algorithm::SlicePartitioner`] and
 /// [`crate::algorithm::find::FindPartitioner`] carry, for the same reason:
-/// only the four concrete partitioners below can answer either loop shape.
+/// only the five concrete partitioners below can answer a loop shape.
 mod sealed {
     /// Marker a type must carry to implement [`super::ReducePartitioner`].
     pub trait Sealed {}
@@ -121,8 +122,11 @@ pub struct ReduceOps<'scope, Fold, Merge> {
 /// Drives the per-worker fold every method in this module builds on: splits
 /// `[0, n)` among `w_total` workers, runs `ops.fold` over each worker's own
 /// chunk(s) into a local accumulator, and merges every non-empty local into
-/// the shared `result` under its lock -- once per worker, never once per
-/// chunk or per element, which is the property this module's tests pin.
+/// the shared `result` under its lock -- once per chunk *task*, never once
+/// per chunk or per element, which is the property this module's tests pin.
+/// For the four ported partitioners that is once per worker; a
+/// [`SplittingPartitioner`] task that splits leaves two tasks, and so two
+/// locals, behind.
 ///
 /// Sealed against implementations outside this crate, like
 /// [`crate::algorithm::SlicePartitioner`] and
@@ -152,6 +156,7 @@ impl<C: ClosureWrapper> sealed::Sealed for StaticPartitioner<C> {}
 impl<C: ClosureWrapper> sealed::Sealed for GuidedPartitioner<C> {}
 impl<C: ClosureWrapper> sealed::Sealed for DynamicPartitioner<C> {}
 impl<C: ClosureWrapper> sealed::Sealed for RandomPartitioner<C> {}
+impl<C: ClosureWrapper> sealed::Sealed for SplittingPartitioner<C> {}
 
 impl<C: ClosureWrapper + Sync> ReducePartitioner for StaticPartitioner<C> {
     fn drive_fold<'scope, R, Fold, Merge>(
@@ -242,6 +247,40 @@ impl<C: ClosureWrapper + Sync> ReducePartitioner for RandomPartitioner<C> {
         Merge: Fn(&R, &R) -> R + Sync,
     {
         drive_fold_dynamic(self, scope, n, w_total, ops, result, cursor);
+    }
+}
+
+impl<C: ClosureWrapper + Sync> ReducePartitioner for SplittingPartitioner<C> {
+    /// One task per worker over a contiguous share of `[0, n)`, folding its
+    /// own local and merging it once; a share that splits takes a second
+    /// local with it. `cursor` is unused: nothing here is drawn from a
+    /// shared point.
+    fn drive_fold<'scope, R, Fold, Merge>(
+        &'scope self,
+        scope: &Scope<'scope, '_, '_>,
+        n: usize,
+        w_total: usize,
+        ops: &'scope ReduceOps<'scope, Fold, Merge>,
+        result: &'scope Mutex<Option<R>>,
+        _cursor: &'scope AtomicUsize,
+    ) where
+        R: Send,
+        Fold: Fn(usize, usize, &mut Option<R>) + Sync,
+        Merge: Fn(&R, &R) -> R + Sync,
+    {
+        let chunk_size = self.chunk_size();
+        let wrapper = self.closure_wrapper();
+        let work = move |(b, e): (usize, usize)| {
+            wrapper.invoke(|| {
+                let mut local: Option<R> = None;
+                walk_chunks(b, e, chunk_size, |part_b, part_e| {
+                    (ops.fold)(part_b, part_e, &mut local);
+                    false
+                });
+                merge_local(ops.merge, result, local);
+            });
+        };
+        spawn_shares(scope, index_shares(n, w_total), self.split_floor(), work);
     }
 }
 

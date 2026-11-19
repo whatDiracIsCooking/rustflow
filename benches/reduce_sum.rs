@@ -30,6 +30,13 @@
 //! timed, both variants run once at that size and worker count and are
 //! compared against a sequential sum, so a wrong answer fails the benchmark
 //! rather than being timed.
+//!
+//! A third column, `rustflow-split`, runs the identical task under
+//! `SplittingPartitioner` -- the port's own chunk scheme, whose share
+//! re-splits when another worker steals it -- so the two rustflow ids differ
+//! only in how a chunk reaches a worker, and the tolerance above covers it
+//! for the same reason. No figure for it is claimed here: the milestone's
+//! A/B issue is what measures the pair.
 
 use std::hint::black_box;
 use std::sync::{Arc, Mutex};
@@ -38,6 +45,8 @@ use std::time::Duration;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use rustflow::Executor;
+use rustflow::algorithm::partitioner::{DefaultClosureWrapper, SplittingPartitioner};
+use rustflow::algorithm::reduce::ReducePartitioner;
 use rustflow::algorithm::{DefaultPartitioner, IndexRange};
 use rustflow::prelude::*;
 
@@ -88,7 +97,10 @@ fn inputs(n: usize) -> Vec<f64> {
 /// upstream's `double result` captured by reference -- the shape
 /// `AlgorithmBuilder::reduce_by_index` takes. Both are built inside the
 /// measured region, as upstream's are.
-fn reduce_sum_rustflow(data: &Arc<Vec<f64>>, executor: &Executor) -> f64 {
+fn reduce_sum_rustflow<P>(data: &Arc<Vec<f64>>, executor: &Executor, part: P) -> f64
+where
+    P: ReducePartitioner + Clone + Send + 'static,
+{
     let mut taskflow = Taskflow::new();
     let total = Arc::new(Mutex::new(0.0_f64));
     let values = Arc::clone(data);
@@ -103,7 +115,7 @@ fn reduce_sum_rustflow(data: &Arc<Vec<f64>>, executor: &Executor) -> f64 {
             partial
         },
         |a: &f64, b: &f64| a + b,
-        DefaultPartitioner::default(),
+        part,
     );
     executor.run(&taskflow).wait().expect("no task panicked");
 
@@ -114,6 +126,14 @@ fn reduce_sum_rustflow(data: &Arc<Vec<f64>>, executor: &Executor) -> f64 {
 /// `parallel_reduce` plays upstream.
 fn reduce_sum_rayon(data: &[f64], pool: &rayon::ThreadPool) -> f64 {
     pool.install(|| data.par_iter().sum::<f64>())
+}
+
+/// The partitioner behind the `rustflow-split` ids: the port's own
+/// splitting scheme, with no configured chunk size, where the `rustflow` ids
+/// take the default guided one. No figure is claimed for either here -- the
+/// milestone's A/B issue measures them.
+fn splitting() -> SplittingPartitioner<DefaultClosureWrapper> {
+    SplittingPartitioner::default()
 }
 
 /// Asserts `actual` is within [`TOLERANCE`] of `expected`, relatively.
@@ -136,9 +156,14 @@ fn verify(data: &Arc<Vec<f64>>, workers: usize, executor: &Executor, pool: &rayo
     let expected: f64 = data.iter().sum();
 
     assert_close(
-        reduce_sum_rustflow(data, executor),
+        reduce_sum_rustflow(data, executor, DefaultPartitioner::default()),
         expected,
         &format!("rustflow/{workers}w at size {size}"),
+    );
+    assert_close(
+        reduce_sum_rustflow(data, executor, splitting()),
+        expected,
+        &format!("rustflow-split/{workers}w at size {size}"),
     );
     assert_close(
         reduce_sum_rayon(data, pool),
@@ -169,7 +194,19 @@ fn bench_reduce_sum(c: &mut Criterion) {
             group.bench_function(
                 BenchmarkId::new(format!("rustflow/{workers}w"), size),
                 |b| {
-                    b.iter(|| reduce_sum_rustflow(black_box(&data), &executor));
+                    b.iter(|| {
+                        reduce_sum_rustflow(
+                            black_box(&data),
+                            &executor,
+                            DefaultPartitioner::default(),
+                        )
+                    });
+                },
+            );
+            group.bench_function(
+                BenchmarkId::new(format!("rustflow-split/{workers}w"), size),
+                |b| {
+                    b.iter(|| reduce_sum_rustflow(black_box(&data), &executor, splitting()));
                 },
             );
             group.bench_function(BenchmarkId::new(format!("rayon/{workers}w"), size), |b| {
