@@ -34,12 +34,15 @@
 //! That one block is what [`FreeNodes`] recycles: a worker that finished a
 //! free node and holds the last share of it parks the allocation instead of
 //! returning it to the allocator, and the next submission that worker makes
-//! writes a new task into it. `DESIGN.md` has why the list is per worker and
-//! unshared where upstream's `NodePool` is one sharded pool per process, and
-//! why the hand-back is a *check* here and an obligation there.
+//! writes a new task into it. Only a worker some submission has already
+//! drawn from parks anything, a list nothing draws from being one whose
+//! blocks nobody can take out again. `DESIGN.md` has why the list is per
+//! worker and unshared where upstream's `NodePool` is one sharded pool per
+//! process, why the hand-back is a *check* here and an obligation there, and
+//! what the draw condition was measured to be worth.
 
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -203,6 +206,13 @@ pub(crate) struct FreeNodes {
     /// [`Handle::Placeholder`], so nothing a finished body captured stays
     /// alive by sitting here.
     parked: RefCell<Vec<Arc<AsyncNode>>>,
+    /// Whether a submission has ever drawn from this list, which is the
+    /// condition [`FreeNodes::recycle`] parks under: a list nothing draws
+    /// from would park blocks no submission can reach again. Set by
+    /// [`FreeNodes::animate`] whether or not the list had a block to give,
+    /// that call being what proves a submission names this list at all.
+    /// `DESIGN.md` has the measurement this condition came from.
+    drawn_from: Cell<bool>,
 }
 
 impl FreeNodes {
@@ -218,6 +228,7 @@ impl FreeNodes {
     pub(crate) fn new() -> Self {
         Self {
             parked: RefCell::new(Vec::new()),
+            drawn_from: Cell::new(false),
         }
     }
 
@@ -232,6 +243,7 @@ impl FreeNodes {
     pub(crate) fn animate(&self, name: String, handle: Handle) -> Arc<AsyncNode> {
         debug_assert_free_handle(&handle);
 
+        self.drawn_from.set(true);
         let recycled = self.parked.borrow_mut().pop();
         let Some(mut node) = recycled else {
             return AsyncNode::new(name, handle);
@@ -254,7 +266,15 @@ impl FreeNodes {
     /// block somebody can still reach is not this worker's to write a new
     /// task into. Upstream needs no such test, its own reference count
     /// having reached zero before `_tear_down_dependent_async` recycles.
+    ///
+    /// Nothing is parked either until [`FreeNodes::animate`] has drawn from
+    /// this list once, a list no submission names being one whose blocks
+    /// nothing can take out again.
     pub(crate) fn recycle(&self, mut node: Arc<AsyncNode>) {
+        if !self.drawn_from.get() {
+            return;
+        }
+
         let mut parked = self.parked.borrow_mut();
         if parked.len() >= Self::CAPACITY {
             return;
@@ -519,11 +539,33 @@ mod tests {
     #[test]
     fn the_list_parks_no_more_than_its_capacity() {
         let free = FreeNodes::new();
+        // The draw that opens the list, without which the loop below parks
+        // nothing: the case the test after this one is about.
+        drop(free.animate(String::new(), Handle::Async(body())));
+
         for _ in 0..FreeNodes::CAPACITY + 10 {
             free.recycle(AsyncNode::new(String::new(), Handle::Async(body())));
         }
 
         assert_eq!(free.len(), FreeNodes::CAPACITY);
+    }
+
+    /// The other bound, which #397 measured the want of: a list nothing has
+    /// drawn from parks nothing, so a worker running children that were
+    /// submitted through an `Executor` -- a route that names no worker and
+    /// so never draws -- holds no block it cannot hand out again.
+    #[test]
+    fn a_list_nothing_has_drawn_from_parks_nothing() {
+        let free = FreeNodes::new();
+
+        free.recycle(AsyncNode::new(String::new(), Handle::Async(body())));
+        assert_eq!(free.len(), 0, "nothing has drawn from this list");
+
+        // One draw opens it, whether or not the list had a block to give:
+        // this one had none, and the node below is parked all the same.
+        drop(free.animate(String::new(), Handle::Async(body())));
+        free.recycle(AsyncNode::new(String::new(), Handle::Async(body())));
+        assert_eq!(free.len(), 1, "and a list a submission names parks one");
     }
 
     /// The submission half, through the path a task body takes: a free node

@@ -1169,7 +1169,7 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   and not its bytes, which is the proposition that run was built to
   separate.
 - **A worker recycles the free node it finished, on a bounded list of its own**
-  (issue #379). Upstream's `TF_ENABLE_TASK_POOL` build allocates every `Node`
+  (issues #379, #397). Upstream's `TF_ENABLE_TASK_POOL` build allocates every `Node`
   from a process-wide `ObjectPool`: `tf::animate` pops a block off one of its
   shards' lock-free Treiber stacks and constructs into it, `tf::recycle`
   destroys the object and pushes the block back onto the shard its own header
@@ -1179,7 +1179,7 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   which [`BENCHMARKS.md`](BENCHMARKS.md)'s "#125 attribution" priced at ~700
   ns a block at 24 workers against ~70 ns on the thread that allocated it.
   This port gives the one node kind that is allocated per task the same
-  defence, and three things about it are its own.
+  defence, and four things about it are its own.
 
   **The list is one per worker and shared with nobody.** It lives in the
   `WorkerThread` frame behind a `RefCell`, not in a global behind a CAS:
@@ -1204,6 +1204,22 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   is tested is taken before the job is spent and tested after, which is the
   whole protocol (`WorkerThread::spend_job`).
 
+  **A list nothing has drawn from parks nothing**, which is what keeps the
+  recycling off the routes it cannot serve. `animate` records the draw
+  whether or not the list had a block to give, that call being what proves a
+  submission names this list at all, and until it has `recycle` hands every
+  node back to the allocator. Without that condition a worker whose children
+  came through `Executor::task_group` -- a route that names no worker, so
+  never draws -- parked blocks nothing could take out again, and the backing
+  `Vec` it parked them in cost a heap block per corun frame, which is a block
+  per *task* on a shape that coruns once per child.
+  [`BENCHMARKS.md`](BENCHMARKS.md)'s "#397 attribution" priced that at 9.6
+  and 13.7% of a task on `integrate`'s two one-worker ids and 11.5% on
+  `fibonacci`'s group recursion, against the `Arc` clone the protocol above
+  costs in `WorkerThread::spend_job`, which the same ablation priced at
+  nothing at all (+0.2% and +0.6% for removing it) and which therefore stays
+  as it is.
+
   **The list is bounded and dies with its worker**, where upstream's pool is
   unbounded until `release` and outlives every executor. 32 blocks is what
   stops a burst of submissions from parking memory for the life of the
@@ -1222,11 +1238,15 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   thread costs about what this list's own `RefCell` borrow, `Arc::get_mut` and
   `Vec` push cost; the regime upstream's pool defends against is the
   cross-thread one, which that file's "#125 attribution" priced at 691 to
-  737 ns a block. Off the route that draws, where nothing allocates
-  differently, the same change moves ids by −14% to +15% with no consistent
-  sign, and #397 is where that range is attributed and the change decided on.
-  The test (`src/executor/async_node.rs`) asserts which block the second
-  submission landed in rather than what it saved.
+  737 ns a block. Off the route that draws the same change moved ids by −14%
+  to +15% with no consistent sign until the condition above was added, which
+  is what that range was: the parking, on lists that could not be drawn from.
+  With it, `integrate`'s two one-worker ids are back inside the spread of the
+  side before #379 -- +2.0% and +3.2%, against sides disagreeing by 5.5% and
+  6.6% -- and the recursion that does draw is unmoved, its four ids reading
+  −1.7% to +0.7%. The tests (`src/executor/async_node.rs`) assert which block
+  the second submission landed in, and that a list nothing has drawn from
+  parks none, rather than what either saved.
 - **`AsyncTask` is that `Arc`, so `use_count` counts the executor's shares
   too** (issues #86, #91). Upstream's handle is a `Node*` plus `_incref` and
   `_decref` on every copy, move and destruction; here it is an

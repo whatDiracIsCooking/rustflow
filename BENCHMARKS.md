@@ -43,12 +43,12 @@ criterion ids, which `cargo bench --all-features -- --list` counts.
   measures is a comparison between two C++ libraries rather than a shape of
   the executor.
 
-**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 45
+**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 46
 headings, and they are three kinds: the three method sections that follow this
 preamble, "The machine" through "The upstream C++ column is empty"; 21 shape
 sections carrying the 22 shapes, since `async_task` and `fibonacci` share "The
 two shapes #96 added", which measured the two together in a run of their own;
-and 21 per-decision measurement sections, each named for the issue that took
+and 22 per-decision measurement sections, each named for the issue that took
 it. A shape's section is its table, its sizes and its departures from
 upstream. A measurement section is one question, with the machine, the load
 and the method of its own run in it, and it ends either in a change that
@@ -5540,10 +5540,12 @@ and moves **no time** there: −0.6% and +0.3% on `fibonacci`'s two 24-worker
 that route nothing allocates differently and the readings run from −14.2% to
 +15.0% all the same, the two tightest of them pointing opposite ways:
 `integrate/rustflow/1w/2` **+12.9%** against sides inside 2.9%, and
-`skynet/rustflow-group/24w/3` **−14.2%** against sides inside 3.5%. That range
-is the hot path's code rather than its allocations, this run did not separate
-the three candidates inside it, and **#397** is where that attribution and the
-decision it carries are taken up.
+`skynet/rustflow-group/24w/3` **−14.2%** against sides inside 3.5%. This run
+did not separate the three candidates inside that range and guessed at the
+hot path's code; the "#397 attribution" below separated them and found an
+allocation after all -- the `Vec` a corun frame's own list parks its blocks
+in, one a task on a shape that coruns per child -- which is also where the
+decision #379 was left needing is taken.
 
 | | |
 |---|---|
@@ -5822,12 +5824,13 @@ extra per-task work on these routes is, read off the code, is one `Arc` clone
 and drop of every finished free node in `WorkerThread::spend_job` plus a
 `RefCell` borrow and a length test in `FreeNodes::recycle` once the 32-block
 list is full -- which is a few nanoseconds and not 13% of `integrate`'s
-338-ns task, so most of that range has to be code layout and inlining on the
-one-worker corun path. **This run did not separate those**, and #397 is the issue that does:
-ablate the clone, the `recycle` call and the two together on
-`integrate/rustflow/1w/2`, then either stop charging a worker whose list is
-never drawn from, give the id route the draw, or revert a change whose measured
-win is a footprint and not a time.
+338-ns task, so most of that range looked like code layout and inlining on
+the one-worker corun path. **This run did not separate those**, and the "#397
+attribution" below is the run that did: the `recycle` call is the whole of
+the cost, the clone measures at nothing, and what the call pays on a route
+that cannot draw is a heap block a task rather than any of this paragraph's
+nanoseconds. #379 stays, parking nothing on a list no submission has drawn
+from.
 
 ### The two absolutes, pinned, on today's `main`
 
@@ -5862,8 +5865,9 @@ inside the noise on the external id.
 - **#379's win is a footprint**: 400 bytes a child down to 144 on the runtime
   route, with the node's block allocated once a run instead of once a child.
   As a time it is unmeasurable where it applies and unresolved in sign where
-  it does not, and #397 carries the ablation plus the choice between fixing
-  the cost and reverting the change. Nothing in this section is an argument
+  it does not, and the "#397 attribution" below is where the ablation and the
+  choice between fixing the cost and reverting the change were taken: the
+  cost came off, and the change stays. Nothing in this section is an argument
   for keeping it on the strength of the time it saves, because it saves none
   that this box can see.
 - **What would reopen #376's half** is a third block to take out, and the
@@ -6301,3 +6305,174 @@ above are the same code read id by id. Its one-worker million-element row
 moves 21.11 to 21.07 ms, which is nothing; the shape's own prose, which
 carried "within the noise that #399 is filed to remove", now carries the
 outcome instead.
+
+## The #397 attribution: the cost is the parking, and the list now waits to be drawn from
+
+**Of the three candidates the "#382 measurement" left, the one that costs is
+the `FreeNodes::recycle` call: taking it out alone moves
+`integrate/rustflow/1w/2` by −9.6% and `1w/1` by −13.7%, where taking the
+`Arc` clone and drop out of `WorkerThread::spend_job` alone moves neither
+(+0.2% and +0.6%, inside both sides' own spreads).** So #379 stays, with one
+condition added to it: a worker's list is parked into only once a submission
+has drawn from it. With that condition the two `integrate` ids read −10.8%
+and −12.8% against today's `main` and **+2.0% and +3.2% against `da36b9d`**,
+the side before #379, both inside the two sides' spreads -- the pre-#379 cost
+is back -- while the route the list was built for is unmoved: `fibonacci`'s
+four `rustflow-runtime` ids read −1.7% to +0.7%, every one of them inside a
+spread. What the recycling is worth is still the footprint #382 measured, and
+it now costs nothing where it cannot be collected.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id -- each shape's own published settings, unchanged |
+| Date | 2026-11-19 |
+| **Load average** | **each measurement's own, below; the runnable-task field read 1 at every reading but one, which read 2** |
+
+The box was this run's alone -- no sibling agent, nothing else building --
+and `/proc/loadavg` was read either side of every measurement:
+
+| measurement | before | after |
+|---|---|---|
+| `integrate`, the A/A control | 0.49 0.37 0.83 | 1.32 0.75 0.93 |
+| `integrate`, both candidates off | 1.12 0.72 0.92 | 1.69 1.09 1.04 |
+| `integrate`, the `recycle` call off | 1.43 1.05 1.03 | 1.47 1.21 1.09 |
+| `integrate`, the clone off | 0.58 1.00 1.02 | 1.32 1.21 1.10 |
+| `integrate`, `main` against the condition | 11.99 4.80 2.37 | 4.74 4.24 2.38 |
+| `integrate`, `da36b9d` against the condition | 3.12 3.90 2.31 | 2.21 3.52 2.32 |
+| `fibonacci`, `main` against the condition | 0.52 2.55 2.09 | 10.81 6.87 3.94 |
+
+Two of those figures are this run's own and not another workload: the 11.99
+one-minute average is the decay of the gate's own `cargo test --all-features`
+minutes earlier, with one runnable thread at the reading, and the 10.81 the
+`fibonacci` 24-worker ids that had just run. Every A/B below is one
+`devtools/bench-ab.sh` run of three interleaved rounds a side, each side's
+spread over its own rounds printed before the B-over-A ratio of medians, and
+a cell is that median. The ablations are three one-commit branches off
+`main`, measured against `main` itself, and the condition is measured as
+`WORKTREE`.
+
+### The ablation: three builds, and only one of them moves an id
+
+The per-cent columns are B-over-A, so a negative number is the *removal*
+making the id faster -- the cost of what was removed.
+
+| what the B side takes out of today's `main` | `1w/1` | `1w/2` | spreads on `1w/2` | verdict |
+|---|---|---|---|---|
+| nothing (`main` against `main`, an A/A control) | −0.7% | −1.4% | 6.7% / 2.2% | inside the spread |
+| the `FreeNodes::recycle` call, keeping the clone | **−13.7%** | **−9.6%** | 1.8% / 2.0% | a result |
+| the `Arc` clone and drop, keeping the `recycle` call | +0.6% | +0.2% | 2.3% / 0.7% | inside the spread |
+| both | **−11.9%** | **−7.4%** | 5.2% / 5.7% | a result |
+
+The clone was taken out by handing the node *out* of `Job::finish` -- the one
+place a job's share of its owner is dropped -- instead of cloning the share
+before the job is spent, which is the only way to keep the `recycle` call
+without the two atomics. It costs nothing either way, so the row below the
+A/A control is the whole of the finding: the two atomics of an `Arc` clone
+and drop are not what a worker pays on this route, and removing both
+candidates is no better than removing the call alone.
+
+**What the call costs on a route that cannot draw is a heap block a task**,
+which is read off the code rather than measured apart, and the arithmetic
+agrees with the figure:
+
+- `FreeNodes::new` leaves the backing `Vec` unallocated, so the first node a
+  list parks allocates it -- one block, four slots.
+- Every `TaskGroup::corun` runs on a `WorkerThread::corun_view`, which has a
+  list of its own and drops it with the frame, and `integrate`'s `rustflow`
+  id opens a group and coruns it **once per splitting interval**: one corun
+  frame per spawned child.
+- So before the condition, each of those frames allocated a `Vec` to park the
+  one node it finished in, parked a block nothing could take out again, and
+  freed both when the frame died -- one extra heap block a task, which the
+  "#125 attribution" priced at ~70 ns on the thread that allocates it. The
+  two ids moved 32 and 47 ns a task (9.6% of 622 µs over 1852 children, 13.7%
+  of 288 µs over 828), which is that block and no room for much else.
+- It is also why the figure followed the *shape* rather than the route.
+  #382's block count for the id route reads 2.0160 blocks a task against
+  #376's 2.0159 on `async_task/rustflow-group`, whose 65536 children share a
+  handful of corun frames: the same `Vec` per frame, amortised over 65536
+  tasks there and over one task here. That 0.0001 was this cost, counted,
+  before anything timed it.
+
+### The condition, on the two routes it has to tell apart
+
+`FreeNodes::animate` records that this list was drawn from -- whether or not
+it had a block to give, that call being what proves a submission names the
+list at all -- and `recycle` parks nothing until it has. The route that draws
+opens its list with its first child, which is submitted before any child of
+it finishes, so nothing about the collection changes there; the route that
+cannot draw never opens one.
+
+| shape | id | `main` -> the condition | spreads | verdict |
+|---|---|---|---|---|
+| `integrate` | `rustflow/1w/1` | **−12.8%** | 2.6% / 5.4% | a result |
+| `integrate` | `rustflow/1w/2` | **−10.8%** | 2.5% / 4.6% | a result |
+| `fibonacci` | `rustflow-group/1w/15` | **−11.5%** | 2.7% / 4.2% | a result |
+| `fibonacci` | `rustflow-group/1w/12` | *−11.9%* | 4.8% / 11.7% | marginal |
+| `fibonacci` | `rustflow-group/24w/12` | −3.3% | 7.5% / 1.6% | inside the spread |
+| `fibonacci` | `rustflow-group/24w/15` | +3.7% | 2.1% / 4.9% | inside the spread |
+| `fibonacci` | `rustflow-runtime/1w/12` | +0.7% | 10.7% / 4.6% | inside the spread |
+| `fibonacci` | `rustflow-runtime/1w/15` | −1.7% | 4.1% / 3.2% | inside the spread |
+| `fibonacci` | `rustflow-runtime/24w/12` | −0.0% | 1.6% / 0.6% | inside the spread |
+| `fibonacci` | `rustflow-runtime/24w/15` | +0.3% | 2.3% / 1.7% | inside the spread |
+
+The four `rustflow-group` rows are #382's regressions answered: that run read
+`fibonacci/rustflow-group/1w/15` at **+8.6%** for #379 and this one reads
+−11.5% for the condition, on sides inside 4.2%, and the two 24-worker ids say
+nothing either way in both runs -- which is the "#380 measurement" showing
+through, a nested recursion's cost at 24 workers being the handoff and not
+the submission. The four `rustflow-runtime` rows are the control: that is the
+one route that draws from the list, and the condition leaves it where #382
+left it.
+
+**Against the side before #379**, which is the comparison the acceptance
+named, one further run: `da36b9d` against the condition, interleaved, same
+three rounds.
+
+| id | `da36b9d` | the condition | ratio | spreads | verdict |
+|---|---|---|---|---|---|
+| `integrate/rustflow/1w/1` | 252.7 µs | 260.8 µs | +3.2% | 6.6% / 1.3% | inside the spread |
+| `integrate/rustflow/1w/2` | 562.0 µs | 573.5 µs | +2.0% | 5.5% / 1.7% | inside the spread |
+
+`da36b9d` reads 562.0 µs for `1w/2` here against the 558.2 µs it read in the
+#382 run, which is that absolute reproducing to 0.7% two days later. The
+**570 µs** bar the acceptance set -- that figure plus 2% -- sits inside this
+side's own spread today, its three rounds being 552.7, 562.0 and 583.2 µs, so
+it cannot be read as a pass or a fail at this box's resolution; the
+interleaved ratio above is what answers it, and +2.0% against sides that
+disagree by 5.5% is not a result. The condition's own median is 573.5 µs in
+this run and 575.2 µs in the run against `main`.
+
+One caveat on that span, which no id here reaches: `da36b9d` to today's
+`main` now also carries #399's sort fix (PR #403). Nothing in it touches the
+async submission path, and neither `integrate` nor `fibonacci` calls
+`sort_by` or a partitioner, so it is in the span and not in the figures.
+
+### The decision: #379 stays, with a condition on where it parks
+
+- **The ablation named the `recycle` call**, not the clone, and the call's
+  cost is a block a task on every route whose corun frames park blocks they
+  cannot draw out again. That is what the −14% to +15% range off the drawing
+  route was: not the hot path's code layout, as this section's predecessor
+  guessed at, but an allocation after all -- one the block counts had
+  already recorded as 0.0001 blocks a task on a shape that amortised it.
+- **The clone and drop stay where they are.** They are measurable at nothing
+  (+0.2% and +0.6% for removing them), and the alternative shape -- handing
+  the node out of `Job::finish` -- costs that method its one call site and
+  one return value for no figure, so it was measured and declined.
+- **Giving the id route the draw is not reachable**, which was the other
+  option #397 carried. A group opened by `Executor::task_group` holds its
+  worker's *id*: the owning `WorkerThread` frame is one no task body can
+  name, by the same argument that puts a corun on a stealing view of the
+  queue, and the list lives in that frame. Reaching it would mean moving the
+  list out of the frame -- a thread-local, or a shared per-worker slot behind
+  an atomic -- which is upstream's sharded pool and a different design than
+  the one #379 argued for.
+- **What #379 is worth is unchanged and is still a footprint**: a child
+  submitted through a `Runtime` costs 3 heap blocks and 144 bytes where it
+  cost 4 and 400, with its node drawn from the list for all but one child in
+  121392 at one worker. No time, where it is drawn; nothing, now, where it is
+  not.
