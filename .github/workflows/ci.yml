@@ -177,10 +177,16 @@ jobs:
       # with dev-dependencies available and under the same `release` profile a
       # bench build gives its dependencies, so criterion and rayon are already
       # compiled here and the marginal cost is the bench targets themselves.
-      # `cargo bench` runs every `[[bench]]` in Cargo.toml, so the fourteen
-      # targets #335-#341 add need no edit here -- but they are also what makes
-      # this step's cost worth watching, and #345 is where a decision to split
-      # it into a job of its own would be recorded.
+      # `cargo bench` runs every `[[bench]]` in Cargo.toml, so the thirteen
+      # targets #335-#341 add -- 22 in all, which `cargo bench -- --list`
+      # reports as 196 ids -- need no edit here. #345 took the decision this
+      # comment used to defer to it: the step stays here rather than becoming
+      # a job of its own. All four jobs run in parallel and this one finishes
+      # with them, so the split would shorten the workflow by nothing while
+      # paying the container setup again and rebuilding criterion and rayon
+      # that `run-examples.sh` has already compiled under this profile.
+      # DESIGN.md's "Benchmarks and performance" section has the timings it
+      # was decided on and the one thing that would reopen it.
       - name: Smoke-run the benchmarks
         run: cargo bench --all-features -- --test
 

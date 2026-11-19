@@ -42,7 +42,7 @@ in, and the port is at parity with upstream's user-facing surface at v4.1.0.
    `test_deferred_*.cpp` files exist, they are not in its own test
    `CMakeLists`.
 
-**Three milestones have no step number.** A **consolidation** ran between
+**Four milestones have no step number.** A **consolidation** ran between
 steps 5 and 6, on what five steps had left behind: five milestones' worth of
 rationale collected in doc comments, an async family written three times over
 its three receivers, and the run's machinery one 2,352-line file over a dozen
@@ -60,15 +60,32 @@ surface: it settled what the crate root re-exports and what
 `rustflow::prelude` is for, collapsed the algorithm family's eight extension
 traits into one and completed the `make_*_task` factories behind them, gave
 every async submission a `_named` twin, and fixed two scheduler defects its
-own panic matrix found. All three keep their decisions in
+own panic matrix found. **Benchmarks and performance** ran last and is the one
+of the four that changed no API at all: it took the suite from eight of
+upstream's shapes to twenty-two — thirteen new `[[bench]]` targets for 22 in
+`Cargo.toml` and 196 criterion ids — on `benches/common` for the fixtures a
+target may share, `devtools/bench-ab.sh` for an interleaved A/B between two
+refs, and a CI step that smoke-runs every id. Four of its measurements
+overturned something this repo had asserted: a nested `corun` costs about a
+kilobyte of stack a level, so what bounds those shapes' published sizes is the
+worker's stack rather than the clock (#359); the preempted-parent re-queue
+the port declines to optimise fires twelve times over a run of the whole
+suite, all twelve in `pipeline` and none in any nested shape, which is not
+what the stack entry had expected of it (#342); a chunk of the algorithms'
+chunk loop costs 15 ns and 1.3% of its run, leaving a fan-out that reaches 15
+to 19 of 24 workers as the open lead (#343); and 24 of the 196 ids were timing
+their own input setup (#366). All four keep their decisions in
 [`DESIGN.md`](../DESIGN.md), one entry per decision, in the subsystem
-section each belongs to rather than under the milestone that took it.
+section each belongs to rather than under the milestone that took it — the
+benchmarks milestone's own under "Benchmarks and performance", and the three
+it took about the port itself under "Executor core" and "Algorithms".
 
-So the step-to-milestone mapping is the seven steps with those three
-interleaved: step 6 is the sixth step and the seventh milestone, step 7 the
-eighth. A later step may do the same, and if one does it belongs in this list
-the same way, named here rather than renumbering the steps, since the numbers
-are what every issue and every `DESIGN.md` entry has been written against.
+So the step-to-milestone mapping is the seven steps with those four among
+them, which are milestones 6, 9, 10 and 11: step 6 is the sixth step and the
+seventh milestone, step 7 the eighth. A later step may do the same, and if one
+does it belongs in this list the same way, named here rather than renumbering
+the steps, since the numbers are what every issue and every `DESIGN.md` entry
+has been written against.
 
 ## The examples, by step
 
@@ -117,22 +134,27 @@ stayed inside it.
 
 ## Two performance results
 
-Every measured number is in [`BENCHMARKS.md`](../BENCHMARKS.md) — upstream's
-benchmarks ported to criterion with a rayon baseline in the role TBB's flow
-graph plays upstream, plus the pipeline (issue #187), which has no rayon
-equivalent and compares against an `mpsc` thread chain in the role TBB's own
-`parallel_pipeline` plays there — the machine and the load each ran under
-recorded beside them, and after the tables the per-decision measurements:
-#40 and #74 on what a job owns, the continuation #62 ported, the `Work`
+Every measured number is in [`BENCHMARKS.md`](../BENCHMARKS.md) — twenty-two
+of upstream's twenty-five benchmarks ported to criterion, sixteen of them
+against a rayon baseline in the role TBB's flow graph plays upstream and the
+other six against what rayon has no primitive to stand in for: an `mpsc`
+thread chain for the three pipeline shapes, in the role TBB's own
+`parallel_pipeline` plays there (#187, #339), a sequential program for `scan`
+and `wavefront`, and nothing at all for `linear_chain`, whose shape says of
+every pair of tasks the opposite of what a rayon primitive expresses — the
+machine and the load each ran under recorded beside them, and after the tables
+the per-decision measurements, each named for the issue that took it: among
+them #40 and #74 on what a job owns, the continuation #62 ported, the `Work`
 question, external submission (#60), a task body's own queue (#119), the
-spill-buffer count (#102), what a free async task costs (#125) and the boxed
+spill-buffer count (#102), what a free async task costs (#125), the boxed
 per-line slot a `DataPipeline` pays for over a `Pipeline` of the same shape
-(#186, measured in #188). They are kept there rather than repeated here, so
-each figure has one owner. Benchmarks are deliberately outside the gate: a
-benchmark answers "how fast", which is not a pass or a fail, so what CI holds
-the suite to is that it still compiles — and that it is still *run once*, the
-`examples` job executing every benchmark id a single untimed time in
-criterion's `--test` mode, which asks only whether it runs.
+(#186, measured in #188) and the benchmarks milestone's four (#359, #342,
+#343, #366). They are kept there rather than repeated here, so each figure has
+one owner. Benchmarks are deliberately outside the gate: a benchmark answers
+"how fast", which is not a pass or a fail, so what CI holds the suite to is
+that it still compiles — and that it is still *run once*, the `examples` job
+executing every benchmark id a single untimed time in criterion's `--test`
+mode, which asks only whether it runs.
 
 One of those results is bad, and tracked rather than filed away, because the
 honest state of play is more useful than a table of the shapes that happen to
