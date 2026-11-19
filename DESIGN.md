@@ -787,6 +787,38 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   queue, both upstream's -- and the figures are in
   [`BENCHMARKS.md`](BENCHMARKS.md) under "The #381 measurement".
 
+- **A corun learns its child is done one failed search late, and that search
+  is 211 attempts long** (issue #407). `WorkerThread::corun_until` reads its
+  predicate once a round and spends the round in `explore_task`, the scheduling
+  loop's search with the scheduling loop's give-up: `(num_queues() + 1) * 2`
+  attempts, then 150 more each after a `thread::yield_now`, 137 to 150 µs on
+  this box at 24 workers. A parent whose child was stolen therefore returns no
+  sooner than that round ends, however quickly the child finished -- which
+  makes this entry's own "a corun returns no sooner than the inner run
+  finishes and no later than the next job it picked up is done" false today,
+  by one search. Upstream's `_corun_until` at the pin reads `stop_predicate()`
+  after **every** failed steal, yields past `MAX_STEALS` and never gives up on
+  its own; the three differences `corun_until`'s docs list (one local job a
+  round, never sleeping, ignoring `done`) are upstream's too, and this fourth
+  one is not. Counters on `fibonacci(15)` at 24 workers put every failed corun
+  search at exactly 211 attempts and 151 yields, 100 to 178 of them a run, and
+  at **94 to 103% of the run's CPU** -- 13.5 to 27.8 ms of 17.9 to 32.5 for
+  169 µs of work -- while the scheduling loop's own thieves fail exactly one
+  search each, at the end, on their way to parking. A body-cost sweep says it
+  is a defect and not a granularity floor: at 1 µs bodies rayon gains 15x from
+  24 workers and the port 1.2x. An ablation that swaps in upstream's loop,
+  interleaved with today's in one binary, reads 137 µs against 1.848 ms on the
+  zero-work shape at 24 workers, 255 µs against 2.147 ms at 1 µs bodies and
+  1.131 ms against 2.733 ms at 10 µs, CPU at 0.22x, 0.25x and 0.50x, and it is
+  the first time 24 workers beat one on `fibonacci` or `integrate`.
+  **The fix is #412**, a port-fidelity correction rather than a scheduler
+  design, and it ships with a criterion A/B and a latency test rather than as
+  a measurement issue's diff; #407 closes with it. The sweep, the counters,
+  upstream's loop and the ablation are in [`BENCHMARKS.md`](BENCHMARKS.md)
+  under "The #407 measurement". What it does not reach is the per-child
+  constant (#382's territory) or the two-worker case, where a stolen child
+  still costs the parent a wait with nobody to hand it other work.
+
 ## Control flow and cancellation
 
 - **A failure inside a nested graph is delivered to whoever is waiting for

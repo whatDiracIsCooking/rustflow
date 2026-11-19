@@ -43,12 +43,12 @@ criterion ids, which `cargo bench --all-features -- --list` counts.
   measures is a comparison between two C++ libraries rather than a shape of
   the executor.
 
-**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 49
+**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 50
 headings, and they are three kinds: the three method sections that follow this
 preamble, "The machine" through "The upstream C++ column is empty"; 21 shape
 sections carrying the 22 shapes, since `async_task` and `fibonacci` share "The
 two shapes #96 added", which measured the two together in a run of their own;
-and 25 per-decision measurement sections, each named for the issue that took
+and 26 per-decision measurement sections, each named for the issue that took
 it. A shape's section is its table, its sizes and its departures from
 upstream. A measurement section is one question, with the machine, the load
 and the method of its own run in it, and it ends either in a change that
@@ -7230,3 +7230,473 @@ what #380's decision deferred to this issue, and the `DESIGN.md` entry under
   above point here. And it does not revisit the handoff counts or the width
   sweep #380 took: the ordering they were measuring is gone, so what they
   priced is no longer a cost of the route.
+
+## The #407 measurement: a corun re-checks its predicate once a search, and a search is 211 attempts
+
+**The nested shapes get slower with workers because a corun whose child was
+stolen cannot notice the child finishing until its current search has failed,
+and a failed search is `(num_queues() + 1) * 2 + 150` steal attempts -- 211 at
+24 workers -- with 150 `thread::yield_now` calls in it, 137 to 150 µs on this
+box.** `WorkerThread::corun_until` reads its predicate once per round and
+spends the round in `explore_task`, the scheduling loop's search with the
+scheduling loop's give-up; upstream's `_corun_until` reads `stop_predicate()`
+after **every** failed steal and never gives up on its own. That is a fourth
+difference from upstream, beside the three the function's docs list, and it
+is the whole of the cost: on `fibonacci(15)` at 24 workers every failed corun
+search is exactly 211 attempts and 151 yields, there are 100 to 178 of them a
+run, and they are **94 to 103% of the run's CPU** -- 13.5 to 27.8 ms of 17.9 to
+32.5 -- for 169 µs of actual work. An ablation that swaps in upstream's loop,
+selected at run time in the same binary, reads **137 µs against 1.848 ms** at
+24 workers on the zero-work shape, **255 µs against 2.147 ms** at 1 µs bodies
+and **1.131 ms against 2.733 ms** at 10 µs, with CPU at 0.22x, 0.25x and
+0.50x, and it is the first time 24 workers have beaten one on either shape.
+The fix is filed as #412; this section ships no code.
+
+This is the counter pass #407's acceptance asked for, widened from the
+splitting partitioner to the two recursions the suite coruns most, and
+preceded by the measurement the discussion that opened it asked for: a sweep of
+body cost against pool width, to separate a granularity floor from a defect.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| harness | a probe binary of its own, not criterion: a fresh executor per row, the pool confirmed fully parked (`Executor::num_waiters() == w`) before every run, 3 warm-up and 20 timed runs a cell for the sweep and the ablation, 3 and 6 for the counters, medians with the min and the max beside them |
+| body | a calibrated spin, `spin(100)` measuring 87 to 88 ns, `spin(1000)` 989 to 996, `spin(10000)` 9973 to 9993, run at the top of every recursive call -- leaves included |
+| CPU | `sum_exec_runtime` summed over `/proc/self/task/*/schedstat` either side of the timed region, as #400 read it |
+| Date | 2026-11-19 |
+| **Load average** | **0.24 to 1.14 either side of every pass, the runnable-task field 1 or 2 throughout, and all of it this run's own** |
+
+The box was this run's alone: no sibling agent, no other `cargo`, and the
+four passes ran one after another -- sweep (`0.79 0.33 0.28` before, `1.14
+0.41 0.31` after), counters (`0.75 0.38 0.30` both sides), ablation (`0.27
+0.36 0.31` before, `0.33 0.37 0.31` after) and a second counter pass with the
+ablation's cells (`0.24 0.33 0.30` both sides). The sweep and the ablation ran
+on a build with the counters compiled **out** -- a `const` gate folds every
+call site away, leaving one relaxed load a corun round for the ablation's
+switch -- so their figures carry no observer weight; the counter tables ran
+on the instrumented build, whose `Instant::now` around each search is the
+weight they carry, and they are quoted for their counts rather than their
+clocks. Nothing was committed: `src/probe.rs`, the call sites in
+`worker.rs` and the probe example were reverted before the gate ran, which is
+#343's, #367's and #400's method; the PR that landed this section carries
+the probe's source. Every run's answer was checked against the sequential
+recursion -- `fib(15) = 610`, and the integral to the bit -- before it was
+counted.
+
+The shapes are the two the published `rustflow-runtime-group` ids run:
+`fibonacci(15)`, 1973 bodies and 986 spawned children, and `integrate(V = 2)`,
+3705 bodies and 1852 children, each on `Runtime::task_group` with
+`TaskGroup::with_runtime` for the inline branch, exactly as `benches/` has
+them, with the spin added at the top of each call. rayon is the same recursion
+on `rayon::join` in a pool held to the same width.
+
+### The sweep: a defect, not a floor
+
+Body cost across pool width, the uninstrumented build. "vs 1w" is the row
+against the same column's one-worker row; the rayon column is medians of the
+same 20 runs in the same process.
+
+**`fibonacci(15)`, body 0 ns** -- sequential 1.8 µs:
+
+| workers | rustflow median | min | max | vs 1w | CPU median | rayon median | rayon vs 1w |
+|---|---|---|---|---|---|---|---|
+| 1 | 168.9 µs | 165.7 µs | 182.4 µs | 1.00x | 201.5 µs | 17.6 µs | 1.00x |
+| 2 | 603.5 µs | 401.6 µs | 704.9 µs | 3.57x | 1.252 ms | 11.3 µs | 0.64x |
+| 4 | 778.9 µs | 525.2 µs | 1.222 ms | 4.61x | 2.955 ms | 15.6 µs | 0.89x |
+| 8 | 801.0 µs | 500.6 µs | 1.303 ms | 4.74x | 5.773 ms | 15.8 µs | 0.90x |
+| 12 | 1.172 ms | 826.3 µs | 1.621 ms | 6.94x | 11.07 ms | 19.3 µs | 1.10x |
+| 24 | 1.436 ms | 984.3 µs | 1.939 ms | 8.50x | 22.70 ms | 25.7 µs | 1.46x |
+
+**`fibonacci(15)`, body 100 ns** -- sequential 204.1 µs:
+
+| workers | rustflow median | min | max | vs 1w | CPU median | rayon median | rayon vs 1w |
+|---|---|---|---|---|---|---|---|
+| 1 | 339.6 µs | 335.6 µs | 346.3 µs | 1.00x | 393.8 µs | 192.3 µs | 1.00x |
+| 2 | 712.7 µs | 525.1 µs | 991.2 µs | 2.10x | 1.505 ms | 102.0 µs | 0.53x |
+| 4 | 755.7 µs | 565.0 µs | 1.136 ms | 2.23x | 2.864 ms | 64.7 µs | 0.34x |
+| 8 | 1.200 ms | 801.1 µs | 1.484 ms | 3.53x | 7.969 ms | 39.7 µs | 0.21x |
+| 12 | 1.202 ms | 831.7 µs | 1.849 ms | 3.54x | 11.50 ms | 36.3 µs | 0.19x |
+| 24 | 1.540 ms | 1.195 ms | 2.111 ms | 4.53x | 28.86 ms | 37.4 µs | 0.19x |
+
+**`fibonacci(15)`, body 1000 ns** -- sequential 1.998 ms:
+
+| workers | rustflow median | min | max | vs 1w | CPU median | rayon median | rayon vs 1w |
+|---|---|---|---|---|---|---|---|
+| 1 | 2.060 ms | 2.057 ms | 2.158 ms | 1.00x | 2.129 ms | 1.936 ms | 1.00x |
+| 2 | 1.679 ms | 1.556 ms | 1.796 ms | 0.81x | 3.436 ms | 1.007 ms | 0.52x |
+| 4 | 1.310 ms | 1.009 ms | 1.789 ms | 0.64x | 5.182 ms | 520.3 µs | 0.27x |
+| 8 | 1.310 ms | 929.7 µs | 1.722 ms | 0.64x | 9.663 ms | 281.6 µs | 0.15x |
+| 12 | 1.449 ms | 981.5 µs | 2.049 ms | 0.70x | 14.79 ms | 197.7 µs | 0.10x |
+| 24 | 1.697 ms | 1.484 ms | 2.467 ms | 0.82x | 33.35 ms | 129.3 µs | 0.07x |
+
+**`fibonacci(15)`, body 10000 ns** -- sequential 19.50 ms:
+
+| workers | rustflow median | min | max | vs 1w | CPU median | rayon median | rayon vs 1w |
+|---|---|---|---|---|---|---|---|
+| 1 | 20.05 ms | 19.31 ms | 20.32 ms | 1.00x | 20.09 ms | 19.30 ms | 1.00x |
+| 2 | 11.00 ms | 10.84 ms | 11.28 ms | 0.55x | 21.97 ms | 10.00 ms | 0.52x |
+| 4 | 6.068 ms | 5.770 ms | 6.306 ms | 0.30x | 23.95 ms | 5.195 ms | 0.27x |
+| 8 | 3.574 ms | 3.285 ms | 3.844 ms | 0.18x | 27.37 ms | 2.687 ms | 0.14x |
+| 12 | 2.884 ms | 2.641 ms | 3.276 ms | 0.14x | 32.56 ms | 1.832 ms | 0.09x |
+| 24 | 2.835 ms | 2.019 ms | 3.511 ms | 0.14x | 55.79 ms | 1.072 ms | 0.06x |
+
+**`integrate(V = 2)`, body 0 ns** -- sequential 10.7 µs:
+
+| workers | rustflow median | min | max | vs 1w | CPU median | rayon median | rayon vs 1w |
+|---|---|---|---|---|---|---|---|
+| 1 | 306.1 µs | 285.2 µs | 501.4 µs | 1.00x | 340.4 µs | 52.2 µs | 1.00x |
+| 2 | 701.5 µs | 513.2 µs | 802.3 µs | 2.29x | 1.444 ms | 32.3 µs | 0.62x |
+| 4 | 641.1 µs | 455.5 µs | 1.000 ms | 2.09x | 2.425 ms | 25.7 µs | 0.49x |
+| 8 | 751.4 µs | 597.9 µs | 890.3 µs | 2.45x | 5.156 ms | 26.4 µs | 0.51x |
+| 12 | 904.3 µs | 698.6 µs | 1.417 ms | 2.95x | 8.863 ms | 30.1 µs | 0.58x |
+| 24 | 2.547 ms | 1.543 ms | 3.632 ms | 8.32x | 30.11 ms | 46.3 µs | 0.89x |
+
+**`integrate(V = 2)`, body 100 ns** -- sequential 370.4 µs:
+
+| workers | rustflow median | min | max | vs 1w | CPU median | rayon median | rayon vs 1w |
+|---|---|---|---|---|---|---|---|
+| 1 | 665.5 µs | 645.3 µs | 693.6 µs | 1.00x | 707.4 µs | 396.1 µs | 1.00x |
+| 2 | 666.5 µs | 473.4 µs | 769.6 µs | 1.00x | 1.378 ms | 204.1 µs | 0.52x |
+| 4 | 712.5 µs | 423.1 µs | 1.192 ms | 1.07x | 2.597 ms | 113.9 µs | 0.29x |
+| 8 | 841.1 µs | 554.1 µs | 1.528 ms | 1.26x | 5.720 ms | 75.3 µs | 0.19x |
+| 12 | 998.4 µs | 688.0 µs | 1.405 ms | 1.50x | 10.49 ms | 60.6 µs | 0.15x |
+| 24 | 1.188 ms | 951.0 µs | 1.809 ms | 1.79x | 20.87 ms | 68.5 µs | 0.17x |
+
+**`integrate(V = 2)`, body 1000 ns** -- sequential 3.705 ms:
+
+| workers | rustflow median | min | max | vs 1w | CPU median | rayon median | rayon vs 1w |
+|---|---|---|---|---|---|---|---|
+| 1 | 4.097 ms | 4.085 ms | 4.107 ms | 1.00x | 4.168 ms | 3.612 ms | 1.00x |
+| 2 | 2.411 ms | 2.385 ms | 2.512 ms | 0.59x | 4.896 ms | 1.936 ms | 0.54x |
+| 4 | 1.571 ms | 1.388 ms | 1.994 ms | 0.38x | 6.244 ms | 1.070 ms | 0.30x |
+| 8 | 1.212 ms | 1.049 ms | 1.688 ms | 0.30x | 9.158 ms | 525.8 µs | 0.15x |
+| 12 | 1.226 ms | 1.015 ms | 1.603 ms | 0.30x | 12.27 ms | 352.7 µs | 0.10x |
+| 24 | 1.488 ms | 1.153 ms | 1.714 ms | 0.36x | 26.19 ms | 269.9 µs | 0.07x |
+
+**`integrate(V = 2)`, body 10000 ns** -- sequential 36.81 ms:
+
+| workers | rustflow median | min | max | vs 1w | CPU median | rayon median | rayon vs 1w |
+|---|---|---|---|---|---|---|---|
+| 1 | 37.52 ms | 36.72 ms | 38.84 ms | 1.00x | 37.59 ms | 35.95 ms | 1.00x |
+| 2 | 19.21 ms | 19.05 ms | 19.56 ms | 0.51x | 38.43 ms | 18.93 ms | 0.53x |
+| 4 | 9.993 ms | 9.850 ms | 10.15 ms | 0.27x | 39.99 ms | 9.582 ms | 0.27x |
+| 8 | 5.445 ms | 5.262 ms | 5.651 ms | 0.15x | 42.90 ms | 4.913 ms | 0.14x |
+| 12 | 4.213 ms | 3.971 ms | 4.891 ms | 0.11x | 48.18 ms | 3.346 ms | 0.09x |
+| 24 | 2.922 ms | 2.688 ms | 3.341 ms | 0.08x | 61.04 ms | 1.803 ms | 0.05x |
+
+Four things to read off the sweep.
+
+- **One extra worker is the whole regression.** At zero body cost
+  `fibonacci(15)` is 3.57x slower at two workers than at one, and the second
+  through twenty-fourth worker add another 2.4x between them. rayon on the
+  same shape is 0.64x at two.
+- **It is not a granularity floor.** A floor is what every scheduler has at a
+  body cost below its own per-task constant, and rayon's shows at 100 ns and
+  below; at **1 µs bodies** rayon gains 15x from 24 workers and the port gains
+  **1.2x**, on 2 ms of work that 24 workers should finish in a tenth of a
+  millisecond. At 10 µs the port gains 7x against rayon's 18x and burns 55.8
+  ms of CPU for 2.8 ms of wall -- 20 of 24 threads busy for the whole run on
+  19.5 ms of work. A floor does not cost cores.
+- **The CPU column is the finding before the counters are.** At every body
+  cost the port's CPU grows roughly with the pool: 22.7 ms at 24 workers on a
+  shape whose work is 169 µs, 33.4 ms on 2 ms of work. Whatever the 23 other
+  workers are doing, they are doing it on a core, which rules out parked
+  workers (#373 showed those cost nothing) and points at awake ones.
+- **The variance is the mechanism's too.** `fibonacci(15)` at 8 workers and
+  zero body reads 500 µs to 1.3 ms over 20 runs of the same thing; a cost that
+  depends on *which* children happen to be stolen, and how many 140 µs waits
+  land on the critical path, looks exactly like that.
+
+### The counters: 211 attempts, 151 yields, 97% of the CPU
+
+The instrumented build, six runs a cell, every count a delta across one run
+summed over the workers' per-thread banks. "Search" is one call to
+`explore_task` from `corun_until` (a "corun search") or from `wait_for_task`
+(a "loop search"); a failed one returned `Stolen::Nothing`. "Spin" is the
+wall clock inside failed searches, and "share" is that spin against the run's
+CPU -- the two agree when the spinning threads were never descheduled, which
+under build A they were not.
+
+**`fibonacci(15)` at 24 workers, body 0, build A (today's loop):**
+
+| run | wall | CPU | corun calls / pops | corun searches ok / failed | per failed search | corun fail spin | loop searches ok / failed | loop fail spin | parks | share |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 1.178 ms | 17.90 ms | 986 / 895 | 62 / 100 | 211 attempts, 151 yields | 13.53 ms | 30 / 24 | 3.334 ms | 24 | 94% |
+| 2 | 1.940 ms | 32.49 ms | 986 / 840 | 113 / 178 | 211, 151 | 27.81 ms | 34 / 24 | 4.170 ms | 24 | 98% |
+| 3 | 1.357 ms | 20.77 ms | 986 / 890 | 67 / 105 | 211, 151 | 15.93 ms | 30 / 24 | 4.317 ms | 24 | 97% |
+| 4 | 1.578 ms | 27.45 ms | 986 / 840 | 114 / 143 | 211, 151 | 22.94 ms | 33 / 24 | 4.248 ms | 24 | 99% |
+| 5 | 1.680 ms | 26.67 ms | 986 / 853 | 99 / 163 | 211, 151 | 22.31 ms | 35 / 24 | 3.740 ms | 24 | 98% |
+| 6 | 1.270 ms | 21.34 ms | 986 / 884 | 73 / 110 | 211, 151 | 17.36 ms | 30 / 24 | 3.925 ms | 24 | 100% |
+
+**`integrate(V = 2)` at 24 workers, body 0, build A:**
+
+| run | wall | CPU | corun calls / pops | corun searches ok / failed | per failed search | corun fail spin | loop searches ok / failed | loop fail spin | parks | share |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 1.756 ms | 20.34 ms | 1852 / 1698 | 115 / 82 | 211, 151 | 19.08 ms | 40 / 24 | 8.020 ms | 24 | 133% |
+| 2 | 1.495 ms | 17.47 ms | 1852 / 1765 | 58 / 73 | 211, 151 | 12.94 ms | 30 / 24 | 6.939 ms | 24 | 114% |
+| 3 | 1.234 ms | 15.74 ms | 1852 / 1735 | 82 / 65 | 211, 151 | 10.29 ms | 36 / 24 | 8.199 ms | 24 | 117% |
+| 4 | 2.068 ms | 27.62 ms | 1852 / 1696 | 113 / 141 | 211, 151 | 27.20 ms | 44 / 24 | 6.703 ms | 24 | 123% |
+| 5 | 1.800 ms | 18.83 ms | 1852 / 1721 | 91 / 73 | 211, 151 | 16.74 ms | 41 / 24 | 6.838 ms | 24 | 125% |
+| 6 | 2.778 ms | 37.35 ms | 1852 / 1659 | 158 / 203 | 211, 151 | 39.58 ms | 36 / 24 | 6.875 ms | 24 | 124% |
+
+**`fibonacci(15)` at 24 workers, body 1000 ns, build A:**
+
+| run | wall | CPU | corun calls / pops | corun searches ok / failed | per failed search | corun fail spin | loop searches ok / failed | loop fail spin | parks | share |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 1.638 ms | 26.39 ms | 986 / 819 | 136 / 129 | 211, 151 | 20.90 ms | 32 / 24 | 4.955 ms | 24 | 98% |
+| 2 | 3.587 ms | 68.34 ms | 986 / 752 | 200 / 467 | 211, 151 | 64.36 ms | 35 / 24 | 5.784 ms | 24 | 103% |
+| 3 | 1.915 ms | 33.07 ms | 986 / 805 | 149 / 201 | 211, 151 | 28.38 ms | 33 / 24 | 4.403 ms | 24 | 99% |
+| 4 | 1.558 ms | 28.43 ms | 986 / 782 | 164 / 148 | 211, 151 | 23.48 ms | 41 / 24 | 4.132 ms | 24 | 97% |
+| 5 | 1.945 ms | 30.67 ms | 986 / 827 | 129 / 193 | 211, 151 | 24.98 ms | 36 / 24 | 4.532 ms | 24 | 96% |
+| 6 | 1.546 ms | 27.44 ms | 986 / 773 | 175 / 156 | 211, 151 | 21.47 ms | 39 / 24 | 3.680 ms | 24 | 92% |
+
+Two more cells of build A are summarised rather than tabled, because they say
+the same thing with different constants. At **12 workers** on the zero-work
+`fibonacci(15)`, a failed search is 185 attempts and 151 yields --
+`(17 + 1) * 2 + 150`, the twelve queues plus `bit_width(12) = 4` buffers --
+and the spin is 89 to 91% of 9.7 to 12.5 ms of CPU for a wall of 0.99 to 1.23
+ms. At **10 µs bodies** and 24 workers the spin is 54 to 72% of 52 to 65 ms
+of CPU, the rest being the 19.7 ms of work itself.
+
+What the counts say, in the order the cost was attributed.
+
+- **Every failed corun search is the full search, to the attempt.** 211
+  attempts and 151 yields in every one of 100 to 467 failed searches across
+  every build-A cell, which is `(29 + 1) * 2 = 60` attempts, then 150 more
+  each after a `yield_now`, then the one that returns. Nothing shortens it:
+  `corun_until` has no view of its predicate between the first attempt and
+  the 211th, and `explore_task` has no view of the predicate at all.
+- **The spin is the CPU.** 94 to 103% on `fibonacci` at 0 and 1 µs, 114 to
+  133% on `integrate` where the wall-clock spin overshoots the CPU because
+  3705 bodies on 24 threads deschedule a yielding searcher more often. The
+  actual work -- 169 µs of recursion at one worker -- is 1% of what the pool
+  spends.
+- **It is not the scheduling loop's thieves.** The loop fails exactly 24
+  searches a run at 24 workers and 12 at 12, and parks exactly 24 and 12
+  times: every worker runs one failed search at the *end* of the run, on its
+  way to parking, and none in the middle. The 3.3 to 8.2 ms of "loop fail
+  spin" is that tail -- 24 workers each spending one 211-attempt round after
+  the last job -- and it is upstream's tail too. During the run the loop
+  steals 30 to 44 jobs and the coruns steal 58 to 200; the work moves through
+  coruning parents, not through the loop.
+- **What a search finds, it finds early.** Of the searches that succeed, 31 to
+  59% succeed on attempt 0 (the sticky victim) and most of the rest within 60
+  attempts; at 0 and 1 µs bodies 0 to 13 of them land in attempts 61 to 110
+  and 0 to 2 in the 100 after that, and only at 10 µs bodies -- where a
+  stolen child's own children arrive later -- do those two buckets reach 29
+  and 12. The 150 yielding attempts find almost nothing a corun can use,
+  which is why a shorter give-up -- the first of #407's candidates -- would
+  help and is still the wrong fix: the search's length is not what the parent
+  is waiting for.
+- **The parent is waiting for its child, and the child is already done.** A
+  `fibonacci` child stolen at depth `k` is a subtree of a few microseconds; its
+  parent's corun enters a 211-attempt search when the child was taken, and
+  the predicate it would satisfy turns true a few microseconds in. Build B's
+  counters below put a number on that: the same searches end after 45
+  attempts on average, because that is where the predicate is first read
+  true.
+
+### Upstream's loop, and the ablation
+
+Upstream's `_corun_until` at the pin (`executor.hpp`, the live definition
+below the commented-out one):
+
+```cpp
+exploit:
+  while(!stop_predicate()) {
+    if(auto t = w._wsq.pop(); t) { _invoke(w, t); }
+    else {
+      size_t num_steals = 0;
+      size_t vtm = w._sticky_victim;
+      explore:
+      t = (vtm < _workers.size()) ? _workers[vtm]._wsq.steal()
+                                  : _buffers[vtm-_workers.size()].queue.steal();
+      if(t) { _invoke(w, t); w._sticky_victim = vtm; goto exploit; }
+      else if(!stop_predicate()) {
+        if(++num_steals > MAX_STEALS) { std::this_thread::yield(); }
+        vtm = w._rdgen() % MAX_VICTIM;
+        goto explore;
+      }
+      else { break; }
+    }
+  }
+```
+
+The predicate is read after every failed steal, the search yields past
+`MAX_STEALS` and never returns on its own, and `_explore_task`'s 150-attempt
+give-up is nowhere in it: that give-up exists so that `_wait_for_task` can
+park, which a corun never does. `WorkerThread::corun_until`'s docs name three
+differences from this -- one local job a round, never sleeping, ignoring
+`done` -- and all three are in upstream's loop too. The fourth is not: the
+port's round is `explore_task()`, and the predicate waits for it.
+
+**Build B** is the loop above in Rust, line for line, as a second method
+beside `corun_until` and selected by a relaxed `AtomicU8` the probe sets
+before each run, so A and B are the same binary, the same executor and the
+same pool, interleaved run by run -- A, B, A, B -- on the uninstrumented
+build. Medians of 20 runs after 3 warm-ups, with the min and max of each side.
+
+**`fibonacci(15)`, body 0 ns:**
+
+| workers | A: today | min | max | A CPU | B: upstream's loop | min | max | B CPU | B/A wall | B/A CPU |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 168.5 µs | 165.0 µs | 290.1 µs | 193.6 µs | 167.8 µs | 164.3 µs | 284.7 µs | 193.7 µs | 1.00x | 1.00x |
+| 2 | 958.0 µs | 548.6 µs | 1.533 ms | 1.973 ms | 297.0 µs | 287.0 µs | 321.7 µs | 656.1 µs | **0.31x** | 0.33x |
+| 4 | 1.059 ms | 622.2 µs | 1.463 ms | 4.192 ms | 220.7 µs | 211.1 µs | 251.9 µs | 1.038 ms | **0.21x** | 0.25x |
+| 8 | 1.405 ms | 747.5 µs | 1.831 ms | 8.080 ms | 160.1 µs | 122.5 µs | 176.3 µs | 1.741 ms | **0.11x** | 0.22x |
+| 12 | 2.444 ms | 1.554 ms | 3.201 ms | 23.18 ms | 177.6 µs | 160.0 µs | 210.7 µs | 3.740 ms | **0.07x** | 0.16x |
+| 24 | 1.848 ms | 1.180 ms | 2.508 ms | 30.54 ms | 137.2 µs | 103.4 µs | 229.7 µs | 6.713 ms | **0.07x** | 0.22x |
+
+**`fibonacci(15)`, body 1000 ns:**
+
+| workers | A: today | min | max | A CPU | B: upstream's loop | min | max | B CPU | B/A wall | B/A CPU |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 2.192 ms | 2.185 ms | 2.291 ms | 2.242 ms | 2.193 ms | 2.182 ms | 2.207 ms | 2.243 ms | 1.00x | 1.00x |
+| 2 | 1.742 ms | 1.544 ms | 2.237 ms | 3.519 ms | 1.334 ms | 1.172 ms | 1.430 ms | 2.736 ms | **0.77x** | 0.78x |
+| 4 | 1.394 ms | 1.012 ms | 1.870 ms | 5.520 ms | 638.2 µs | 607.6 µs | 678.7 µs | 2.722 ms | **0.46x** | 0.49x |
+| 8 | 1.291 ms | 1.071 ms | 1.714 ms | 8.727 ms | 359.5 µs | 343.7 µs | 401.5 µs | 3.308 ms | **0.28x** | 0.38x |
+| 12 | 1.767 ms | 1.165 ms | 2.390 ms | 15.90 ms | 302.8 µs | 279.2 µs | 331.4 µs | 4.603 ms | **0.17x** | 0.29x |
+| 24 | 2.147 ms | 1.513 ms | 2.979 ms | 34.60 ms | 255.4 µs | 192.2 µs | 310.0 µs | 8.580 ms | **0.12x** | 0.25x |
+
+**`fibonacci(15)`, body 10000 ns:**
+
+| workers | A: today | min | max | A CPU | B: upstream's loop | min | max | B CPU | B/A wall | B/A CPU |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 19.85 ms | 19.39 ms | 20.30 ms | 19.88 ms | 19.87 ms | 19.36 ms | 20.85 ms | 19.90 ms | 1.00x | 1.00x |
+| 2 | 10.67 ms | 10.57 ms | 11.20 ms | 21.32 ms | 10.16 ms | 10.10 ms | 10.59 ms | 20.36 ms | 0.95x | 0.96x |
+| 4 | 5.874 ms | 5.666 ms | 6.230 ms | 23.32 ms | 5.187 ms | 5.154 ms | 5.216 ms | 20.87 ms | **0.88x** | 0.89x |
+| 8 | 3.624 ms | 3.323 ms | 4.743 ms | 28.51 ms | 2.659 ms | 2.638 ms | 3.393 ms | 21.60 ms | **0.73x** | 0.76x |
+| 12 | 3.210 ms | 2.879 ms | 3.792 ms | 34.18 ms | 2.050 ms | 1.886 ms | 2.220 ms | 25.31 ms | **0.64x** | 0.74x |
+| 24 | 2.733 ms | 2.108 ms | 3.535 ms | 55.35 ms | 1.131 ms | 1.034 ms | 1.615 ms | 27.72 ms | **0.41x** | 0.50x |
+
+**`integrate(V = 2)`, body 0 ns:**
+
+| workers | A: today | min | max | A CPU | B: upstream's loop | min | max | B CPU | B/A wall | B/A CPU |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 488.5 µs | 483.3 µs | 539.5 µs | 521.1 µs | 492.0 µs | 485.5 µs | 504.5 µs | 524.6 µs | 1.01x | 1.01x |
+| 2 | 796.9 µs | 610.5 µs | 817.9 µs | 1.651 ms | 444.7 µs | 437.6 µs | 461.8 µs | 954.5 µs | **0.56x** | 0.58x |
+| 4 | 636.1 µs | 467.8 µs | 944.7 µs | 2.523 ms | 275.7 µs | 269.8 µs | 281.0 µs | 1.266 ms | **0.43x** | 0.50x |
+| 8 | 1.085 ms | 793.2 µs | 1.478 ms | 6.916 ms | 249.9 µs | 198.8 µs | 276.5 µs | 2.426 ms | **0.23x** | 0.35x |
+| 12 | 1.410 ms | 854.4 µs | 2.038 ms | 12.88 ms | 249.9 µs | 179.4 µs | 286.9 µs | 4.734 ms | **0.18x** | 0.37x |
+| 24 | 1.621 ms | 746.7 µs | 2.240 ms | 27.82 ms | 154.6 µs | 131.7 µs | 256.9 µs | 6.307 ms | **0.10x** | 0.23x |
+
+**`integrate(V = 2)`, body 1000 ns:**
+
+| workers | A: today | min | max | A CPU | B: upstream's loop | min | max | B CPU | B/A wall | B/A CPU |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 3.859 ms | 3.855 ms | 3.894 ms | 3.898 ms | 3.859 ms | 3.856 ms | 3.888 ms | 3.900 ms | 1.00x | 1.00x |
+| 2 | 2.886 ms | 2.269 ms | 3.599 ms | 5.831 ms | 2.690 ms | 2.164 ms | 2.954 ms | 5.446 ms | 0.93x | 0.93x |
+| 4 | 1.628 ms | 1.420 ms | 1.921 ms | 6.418 ms | 1.138 ms | 1.125 ms | 1.171 ms | 4.748 ms | **0.70x** | 0.74x |
+| 8 | 1.255 ms | 1.004 ms | 1.660 ms | 9.042 ms | 644.0 µs | 600.6 µs | 690.8 µs | 5.567 ms | **0.51x** | 0.62x |
+| 12 | 2.023 ms | 1.785 ms | 3.233 ms | 21.11 ms | 778.1 µs | 757.9 µs | 797.1 µs | 11.04 ms | **0.38x** | 0.52x |
+| 24 | 1.764 ms | 1.509 ms | 2.204 ms | 30.31 ms | 392.5 µs | 303.6 µs | 811.3 µs | 12.18 ms | **0.22x** | 0.40x |
+
+**`integrate(V = 2)`, body 10000 ns:**
+
+| workers | A: today | min | max | A CPU | B: upstream's loop | min | max | B CPU | B/A wall | B/A CPU |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 37.27 ms | 36.17 ms | 37.77 ms | 37.31 ms | 37.32 ms | 36.18 ms | 37.62 ms | 37.35 ms | 1.00x | 1.00x |
+| 2 | 19.62 ms | 19.37 ms | 19.91 ms | 39.20 ms | 19.36 ms | 19.07 ms | 19.77 ms | 38.74 ms | 0.99x | 0.99x |
+| 4 | 10.26 ms | 9.958 ms | 10.36 ms | 40.92 ms | 9.873 ms | 9.838 ms | 9.898 ms | 39.66 ms | **0.96x** | 0.97x |
+| 8 | 5.526 ms | 5.367 ms | 6.045 ms | 43.29 ms | 4.931 ms | 4.904 ms | 5.001 ms | 39.78 ms | **0.89x** | 0.92x |
+| 12 | 4.104 ms | 3.890 ms | 4.471 ms | 46.93 ms | 3.327 ms | 3.298 ms | 3.501 ms | 40.43 ms | **0.81x** | 0.86x |
+| 24 | 2.776 ms | 2.443 ms | 3.270 ms | 56.85 ms | 1.836 ms | 1.763 ms | 2.148 ms | 44.70 ms | **0.66x** | 0.79x |
+
+A B/A in bold is one where B's max is below A's min -- the two spreads do not
+touch. Every 24-worker cell is one; every 1-worker cell is a tie to within
+1%, as it must be, since at one worker no corun ever reaches a steal and the
+two loops are the same code path. The cells at 2 workers and 10 µs bodies on
+both shapes, and at 2 workers and 1 µs on `integrate`, overlap and are
+reported as the band.
+
+And the counters under B, same cells as above, same instrumented build:
+
+**`fibonacci(15)` at 24 workers, body 0, build B:**
+
+| run | wall | CPU | corun calls / pops | corun searches ok / failed | per failed search | corun fail spin | loop searches ok / failed | loop fail spin | parks |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 134.8 µs | 3.863 ms | 986 / 878 | 85 / 44 | 56 attempts, 4 yields | 369.7 µs | 24 / 24 | 12.49 ms | 24 |
+| 2 | 116.5 µs | 3.416 ms | 986 / 898 | 70 / 44 | 47, 2 | 182.4 µs | 19 / 24 | 13.88 ms | 24 |
+| 3 | 153.6 µs | 3.683 ms | 986 / 907 | 61 / 38 | 47, 1 | 150.7 µs | 19 / 24 | 11.45 ms | 24 |
+| 4 | 110.3 µs | 3.477 ms | 986 / 865 | 98 / 53 | 45, 2 | 287.0 µs | 24 / 24 | 11.24 ms | 24 |
+| 5 | 118.4 µs | 3.603 ms | 986 / 896 | 69 / 42 | 45, 2 | 206.9 µs | 22 / 24 | 11.46 ms | 24 |
+| 6 | 117.3 µs | 3.789 ms | 986 / 858 | 99 / 47 | 51, 4 | 324.4 µs | 30 / 24 | 13.72 ms | 24 |
+
+**`integrate(V = 2)` at 24 workers, body 0, build B:**
+
+| run | wall | CPU | corun calls / pops | corun searches ok / failed | per failed search | corun fail spin | loop searches ok / failed | loop fail spin | parks |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 158.4 µs | 4.503 ms | 1852 / 1713 | 91 / 42 | 32, 1 | 99.1 µs | 49 / 24 | 10.61 ms | 24 |
+| 2 | 148.0 µs | 4.200 ms | 1852 / 1764 | 56 / 22 | 40, 1 | 67.3 µs | 33 / 24 | 9.503 ms | 24 |
+| 3 | 170.9 µs | 5.103 ms | 1852 / 1699 | 113 / 48 | 36, 1 | 141.8 µs | 41 / 24 | 10.61 ms | 24 |
+| 4 | 175.4 µs | 5.005 ms | 1852 / 1696 | 114 / 44 | 26, 1 | 136.4 µs | 43 / 24 | 10.61 ms | 24 |
+| 5 | 160.4 µs | 4.298 ms | 1852 / 1731 | 91 / 38 | 29, 1 | 69.9 µs | 31 / 24 | 8.898 ms | 24 |
+| 6 | 154.0 µs | 4.367 ms | 1852 / 1689 | 130 / 35 | 38, 1 | 100.1 µs | 34 / 24 | 9.337 ms | 24 |
+
+**`fibonacci(15)` at 24 workers, body 1000 ns, build B:**
+
+| run | wall | CPU | corun calls / pops | corun searches ok / failed | per failed search | corun fail spin | loop searches ok / failed | loop fail spin | parks |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 176.6 µs | 6.150 ms | 986 / 790 | 158 / 76 | 46, 2 | 280.7 µs | 39 / 24 | 4.299 ms | 24 |
+| 2 | 194.0 µs | 6.900 ms | 986 / 803 | 150 / 84 | 44, 2 | 301.9 µs | 34 / 24 | 4.884 ms | 24 |
+| 3 | 189.2 µs | 6.485 ms | 986 / 768 | 188 / 90 | 46, 3 | 419.3 µs | 31 / 24 | 3.952 ms | 24 |
+| 4 | 179.1 µs | 6.559 ms | 986 / 771 | 173 / 84 | 46, 2 | 282.9 µs | 34 / 24 | 4.902 ms | 24 |
+| 5 | 174.1 µs | 6.088 ms | 986 / 833 | 114 / 73 | 43, 1 | 184.1 µs | 40 / 24 | 3.767 ms | 24 |
+| 6 | 193.4 µs | 6.455 ms | 986 / 764 | 187 / 91 | 42, 2 | 310.4 µs | 36 / 24 | 4.592 ms | 24 |
+
+Under B a failed corun search ends after **26 to 56 attempts and 1 to 4
+yields**, which is where the predicate first reads true, and the corun spin
+falls from 10 to 40 ms a run to 0.07 to 0.42 ms. What is left of the CPU --
+3.4 to 6.9 ms against a wall of 110 to 194 µs -- is now mostly the loop's
+tail: 24 workers each running their one 211-attempt search before parking,
+whose 9 to 14 ms of wall is more than the CPU because, with the run over and
+24 threads yielding on 24 hardware threads, most of it is spent descheduled.
+That tail is upstream's as well, it costs the run's wall nothing (the
+submitter's `wait` has returned), and it is the subject of no issue.
+
+### The decision: #412 ships the loop, and #407 closes with it
+
+**No code ships here; the fix is #412.** The bar #407 set was a counter run
+naming which candidate the cost is, then an A/B outside both spreads or a
+reason the search cannot be shortened. The counters name it, and it is none
+of the four candidates as written.
+
+- **The cost is the predicate's granularity, not the search's length.** A
+  shorter give-up (candidate one) would cut a failed round from 211 attempts
+  to fewer and change nothing about *when* the parent learns its child is
+  done; the parent would re-check once a round, with a shorter round. A
+  bounded park on the join counter (candidate two) would solve a problem the
+  counters do not show -- CPU burned while *genuinely* waiting -- when what
+  they show is CPU burned after the wait is over. Backing off (three) is the
+  wrong direction. Leaving it (four) is answered by the sweep.
+- **What the fix is, is upstream's loop**: re-read the predicate after every
+  failed steal, yield past `MAX_STEALS`, never give up on your own. It is a
+  port-fidelity correction rather than a scheduler design, which is why it is
+  not a decision this section is entitled to take as a measurement issue's
+  diff: it touches `WorkerThread::corun_until`, every blocking wait in the
+  crate runs through it (`Subflow::join`, `Runtime::corun`,
+  `TaskGroup::corun`, `Executor::corun`, the algorithms' scopes), and its
+  acceptance is a criterion A/B on the published ids plus a test on the
+  latency it changes. #412 has the figures above as its bar and #407 closes
+  with it.
+- **What it would and would not fix.** The `fibonacci`, `integrate`,
+  `merge_sort`, `skynet` and `nqueens` tables' 24-worker rows, and the
+  `SplittingPartitioner`'s 14 µs a re-split that #400 priced -- that join is
+  this wait, so #406's handoff-seam change may no longer be needed and #409's
+  floor question moves with it. It would not touch the fan-out ceiling (#367),
+  the per-task constants (#382), the 1000-element algorithm floor (#343) or
+  external submission (#60), none of which corun.
+
+**What this does not say.** It does not say the shapes reach rayon: under B
+`fibonacci(15)` at 24 workers and 1 µs bodies reads 255 µs against rayon's
+129, the per-child constant of ~170 ns against rayon's 13 ns a level being
+what remains, and that is #382's territory. It does not re-publish any
+shape's table -- the A column here is this probe's own harness, not
+criterion's, and the published `rustflow-runtime-group/24w/15` of 1.2855 ms
+is the figure #412's A/B reads against. And it does not say the two-worker
+case is solved: under B, two workers on the zero-work `fibonacci` are still
+1.77x slower than one, which is what a stolen child costs when there is no
+third worker to hand the parent anything else to do, and rayon's 0.64x there
+is its inline-first `join` rather than a search it runs better.
