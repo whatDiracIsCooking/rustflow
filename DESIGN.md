@@ -942,7 +942,9 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   handle that *does* have an `executor()`, and for the reason this entry
   gives rather than against it: a group is opened by a call on the `Executor`
   value itself, so the borrow it keeps is the caller's own and no
-  back-pointer is involved.
+  back-pointer is involved. A group opened on a `Runtime` instead answers
+  `None` there, which is this entry applied a second time rather than an
+  exception to it; the entry below on the two routes has it.
 - **A task group has no implicit join on drop** (issue #93). Upstream's
   `TaskGroup` has no destructor, so a group that goes out of scope with work
   outstanding dangles the `NodeBase` its children are still counting down —
@@ -958,15 +960,39 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   second panic and an abort. `TaskGroup::corun` is where the join and the
   failure both live.
 
-  A group's children are also queued in the shared buffers where a runtime
-  body's go onto the submitting worker's own queue, and that stays true even
-  for a group that could name its worker: `corun` on a group runs without the
-  owning end of that queue, so its pops are steals from the first-in end, and
-  pushing LIFO against a FIFO waiter would hand the corun the oldest
-  outstanding subtree rather than the child it just spawned. What that leaves
-  is a **stack-depth** ceiling, not a correctness one — every child still runs
-  — and `src/task_group.rs` has where the cliff is, with the test inputs kept a
-  factor of two inside it.
+  Where a group's children are queued is a property of the **route** it was
+  opened through and not of groups (issue #372). `Executor::task_group` is a
+  call on the executor value, which can name the opening worker only by id —
+  the owning end of that worker's queue lives in the `WorkerThread` frame
+  below the task body, where no method on the `Executor` can reach it — so
+  such a group pushes into the shared buffers and coruns on a `corun_view`
+  whose pops are steals from the first-in end. Pushing LIFO against that FIFO
+  waiter would hand the corun the oldest outstanding subtree rather than the
+  child it just spawned, so the buffers are the consistent destination for
+  that route. `Runtime::task_group` is the route that *does* hold the frame:
+  the group borrows the `&mut WorkerThread` the runtime has, its children go
+  onto the worker's own LIFO queue and its corun pops that same end, which is
+  what upstream does for every group through the thread-local `this_worker()`
+  its `_schedule_async_task` consults. What the route decides is a
+  **stack-depth** ceiling rather than correctness — every child runs either
+  way: the id route nests one frame per outstanding *task*, which for a
+  recursion is most of the task tree, where the runtime route nests one per
+  level of *recursion*. `BENCHMARKS.md` has both cliffs, and
+  `src/task_group.rs` tells a caller which one the wait they are writing is
+  against.
+
+  Holding the worker rather than its id costs two things, and both are in the
+  signature rather than in a second type. `TaskGroup::executor` answers an
+  `Option`, `None` on the runtime route, for the reason the entry above on
+  handing an executor back gives: a runtime body cannot name the executor
+  running it, so neither can a group it opens. And the group borrows the
+  runtime for its whole life, so a body cannot schedule, spawn a sibling or
+  corun its own node while one is open — upstream's tail-optimised
+  `fibonacci`, which keeps a group open across an inline branch that opens
+  groups of its own, is written on this route with that branch first, which
+  is upstream's own `FibonacciSwapped` ordering. A second public type with
+  sixteen spawning forms of its own would have bought the accessor back and
+  neither of the other two, so the routes are one type and one enum.
 
 ## The async family
 

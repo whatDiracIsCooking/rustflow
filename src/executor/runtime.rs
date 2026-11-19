@@ -3,8 +3,13 @@
 //! The executor's half of runtime tasking: upstream's `_invoke_runtime_task`
 //! and **both** overloads of `_invoke_runtime_task_impl`, which that header
 //! defines out of line, plus the scheduling methods of `tf::Runtime` --
-//! `schedule`, `corun`, `corun_all` and `is_cancelled`. The `RUNTIME` arm of
-//! `_invoke` in `taskflow/core/executor.hpp` is one line into [`invoke`]
+//! `schedule`, `corun`, `corun_all` and `is_cancelled`. [`Runtime::task_group`]
+//! is here as well and is **not** one of them: upstream opens a group on its
+//! executor, which reaches the submitting worker through a thread-local
+//! `this_worker()` where this port cannot, so the branch that pushes onto
+//! that worker's own queue is reachable only from the handle holding its
+//! scheduling loop. `src/task_group.rs` has the two routes. The `RUNTIME`
+//! arm of `_invoke` in `taskflow/core/executor.hpp` is one line into [`invoke`]
 //! below. The shell of [`Runtime`] is `src/runtime.rs`, which says what the
 //! handle holds and why it cannot hand back an executor.
 //!
@@ -109,6 +114,7 @@ use crate::executor::run_handle::RunError;
 use crate::executor::topology::{Cancellable, Job};
 use crate::executor::worker::{Release, Worker, WorkerThread, is_entered};
 use crate::graph::{AsyncWork, Node, NonpreemptiveRuntimeWork, OnceWork, RuntimeWork, Task};
+use crate::task_group::TaskGroup;
 
 /// The two bits a runtime task holds while its own work is outstanding:
 /// upstream's `NSTATE::PREEMPTED | NSTATE::IMPLICITLY_ANCHORED`, which it
@@ -450,7 +456,8 @@ impl Runtime<'_> {
     /// nests one such frame per level of *recursion*, a child submitted here
     /// going onto this worker's own queue for the wait to pop straight back.
     /// `DESIGN.md`'s "Executor core" has the bound, and what makes
-    /// [`TaskGroup::corun`](crate::TaskGroup::corun)'s a much lower one.
+    /// [`TaskGroup::corun`](crate::TaskGroup::corun)'s a much lower one on
+    /// the route that holds a worker id rather than the worker.
     ///
     /// # Errors
     ///
@@ -575,6 +582,71 @@ impl Runtime<'_> {
     /// ```
     pub fn corun_until(&mut self, predicate: impl FnMut() -> bool) {
         self.thread.corun_until(predicate);
+    }
+
+    /// Opens a task group that holds this worker's queue: a scope to spawn
+    /// asynchronous work into and wait for with
+    /// [`TaskGroup::corun`](crate::TaskGroup::corun), whose children go onto
+    /// the queue of the worker running this body and whose corun pops that
+    /// same end.
+    ///
+    /// Upstream has one group constructor and this is its mechanism: its
+    /// `_schedule_async_task` finds the submitting worker through
+    /// `this_worker()` and pushes onto `w._wsq`, which a method on
+    /// [`Executor`] cannot do here, the owning end of that queue living in
+    /// the frame below the body. A [`Runtime`] is what holds that frame, so
+    /// it is the surface the branch is reachable from;
+    /// [`Executor::task_group`] stays the route for a body that was handed no
+    /// `Runtime`, and `DESIGN.md`'s "Dynamic tasking" has what separates the
+    /// two -- a recursion of groups through this one nests a stack frame per
+    /// level of recursion rather than per outstanding task.
+    ///
+    /// The group borrows this handle for as long as it lives, which is the
+    /// one thing a caller has to arrange around: the body cannot spawn
+    /// siblings, [`schedule`](Runtime::schedule) or corun its own node while
+    /// a group of its own is open. There is no error to handle, where
+    /// [`Executor::task_group`] has one: holding a `Runtime` is already proof
+    /// of a worker. [`TaskGroup::executor`](crate::TaskGroup::executor)
+    /// answers `None` on a group opened here.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    ///
+    /// use rustflow::prelude::*;
+    /// use rustflow::{Executor, Runtime};
+    ///
+    /// let counter = Arc::new(AtomicUsize::new(0));
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// taskflow.emplace_runtime({
+    ///     let counter = Arc::clone(&counter);
+    ///     move |runtime: &mut Runtime<'_>| {
+    ///         let group = runtime.task_group();
+    ///
+    ///         for _ in 0..100 {
+    ///             let counter = Arc::clone(&counter);
+    ///             group.silent_async(move || {
+    ///                 counter.fetch_add(1, Ordering::Relaxed);
+    ///             });
+    ///         }
+    ///
+    ///         // The one thing that waits for a group's children, here on
+    ///         // the very worker whose queue they were pushed onto.
+    ///         group.corun();
+    ///         assert_eq!(group.size(), 0);
+    ///     }
+    /// });
+    ///
+    /// Executor::new(4).run(&taskflow).wait().expect("no task panicked");
+    /// assert_eq!(counter.load(Ordering::Relaxed), 100);
+    /// ```
+    #[must_use]
+    pub fn task_group(&mut self) -> TaskGroup<'_> {
+        // Upstream's `TaskGroup(*this, *w)` with its `this_worker()` lookup
+        // answered by the handle: this *is* worker `w`, and the loop the
+        // group needs to push onto and pop is the one below this body.
+        TaskGroup::on_worker(self.thread)
     }
 }
 
