@@ -16,10 +16,12 @@
 //! which is the `Route` below and the one thing that differs between two
 //! groups: a group opened on the executor holds its worker's *id* and queues
 //! its children in the shared buffers, where a group opened on a `Runtime`
-//! holds the worker's own scheduling loop -- upstream's `Worker&` itself --
-//! so its children go onto that worker's LIFO queue and its `corun` pops the
-//! same end. `DESIGN.md`'s "Dynamic tasking" has why the id route cannot do
-//! that and what the difference costs a recursion.
+//! holds a reborrow of that handle -- upstream's `Worker&` itself, plus the
+//! node and the job -- so its children go onto that worker's LIFO queue, its
+//! `corun` pops the same end, and [`TaskGroup::with_runtime`] lends the
+//! handle back for the length of a scope. `DESIGN.md`'s "Dynamic tasking" has
+//! why the id route cannot do the first, why the lend is a scope rather than
+//! two live handles, and what each costs a recursion.
 //!
 //! The sixteen spawning forms below are one delegation each onto the
 //! submission core in `executor::async`, through the two private `submit`
@@ -63,12 +65,14 @@ impl Executor {
     /// counted in [`Executor::wait_for_all`]'s work.
     ///
     /// This is the route for a body that has no [`Runtime`] of its own, and
-    /// the group it opens holds the opening worker's *id*:
-    /// [`Runtime::task_group`] is the route that holds the worker itself, and
-    /// `DESIGN.md` has what that buys a recursion of groups. What this route
-    /// keeps in exchange is the runtime it does not borrow: a body may spawn
-    /// siblings, corun its own node or run a branch of its own -- including
-    /// one that opens groups -- while a group opened here is still open.
+    /// that is the one thing it is for: the group it opens holds the opening
+    /// worker's *id* where [`Runtime::task_group`] holds the worker itself,
+    /// and `DESIGN.md` has what that buys a recursion of groups and why a
+    /// body holding a `Runtime` wants the other route. A
+    /// group opened here borrows no runtime, so a body may spawn siblings,
+    /// corun its own node or run a branch of its own -- including one that
+    /// opens groups -- with one still open; on the other route that is
+    /// [`TaskGroup::with_runtime`].
     ///
     /// ```
     /// use std::sync::Arc;
@@ -141,15 +145,19 @@ enum Route<'a> {
         /// a call on the `Executor` value can see of it.
         worker: usize,
     },
-    /// A group opened by [`Runtime::task_group`], which holds the opening
-    /// worker's own scheduling loop: upstream's `Worker&` itself, so the
-    /// children go onto that worker's queue and the corun pops the same end.
+    /// A group opened by [`Runtime::task_group`], which owns a reborrow of
+    /// the handle it was opened from: upstream's `Worker&` itself, so the
+    /// children go onto that worker's queue and the corun pops the same end,
+    /// plus the node and the job [`TaskGroup::with_runtime`] lends back.
     ///
-    /// The cell is borrowed mutably for the length of a `corun` and at no
-    /// other time, and that borrow can never be contended: a [`TaskGroup`] is
-    /// not [`Send`] and no task body can name one, so the only frame that can
-    /// reach this group is the one blocked inside the corun.
-    OnWorker(RefCell<&'a mut WorkerThread>),
+    /// The cell is borrowed mutably for the length of a `corun` and immutably
+    /// for the length of a submission, and neither borrow can ever be
+    /// contended: a [`TaskGroup`] is not [`Send`] and no task body can name
+    /// one, so the only frame that can reach this group is the one inside the
+    /// call. `with_runtime` hands the reborrow out through
+    /// [`RefCell::get_mut`] instead, having `&mut self` to prove the same
+    /// thing statically.
+    OnWorker(RefCell<Runtime<'a>>),
 }
 
 /// A scope one worker spawns asynchronous tasks into and waits for:
@@ -161,7 +169,8 @@ enum Route<'a> {
 /// eight spawning forms put a task under the group's anchor;
 /// [`TaskGroup::corun`] waits for all of them on the opening worker without
 /// taking that worker out of the pool; [`TaskGroup::cancel`] stops the ones
-/// that have not started.
+/// that have not started; [`TaskGroup::with_runtime`] lends the second
+/// route's handle back for a scope, so that a body can submit and then work.
 ///
 /// **Dropping a group does not join it.** Children outstanding at that point
 /// keep running, with nothing waiting for them and a failure of one of them
@@ -198,11 +207,11 @@ impl<'a> TaskGroup<'a> {
         Self::opened(Route::ById { executor, worker })
     }
 
-    /// Opens a group that holds `thread`, the scheduling loop of the worker
-    /// running the body asking for it: the same constructor over the route
+    /// Opens a group that owns `runtime`, a reborrow of the handle the body
+    /// asking for it was given: the same constructor over the route
     /// [`Runtime::task_group`] takes.
-    pub(crate) fn on_worker(thread: &'a mut WorkerThread) -> Self {
-        Self::opened(Route::OnWorker(RefCell::new(thread)))
+    pub(crate) fn on_worker(runtime: Runtime<'a>) -> Self {
+        Self::opened(Route::OnWorker(RefCell::new(runtime)))
     }
 
     /// A group of `route` with nothing outstanding: the half of upstream's
@@ -244,6 +253,95 @@ impl<'a> TaskGroup<'a> {
         }
     }
 
+    /// Runs `body` with the [`Runtime`] this group was opened from, so that a
+    /// body can submit a child, do work of its own, and only then
+    /// [`corun`](TaskGroup::corun) -- or `None`, having run nothing, for a
+    /// group opened by [`Executor::task_group`], which borrows no runtime to
+    /// lend back. The port's own, with no upstream counterpart, and the
+    /// mirror of [`TaskGroup::executor`]: each route hands back the handle it
+    /// holds and `None` on the other one. `DESIGN.md`'s "Dynamic tasking" has
+    /// what it is for and why it is a scope rather than a second handle.
+    ///
+    /// The handle `body` is given names the same worker, node and job as the
+    /// opening one, so everything a runtime body can do it can do. What it is
+    /// **not** given is this group, which is what the `&mut self` here
+    /// refuses: a body cannot submit into the group whose runtime it holds.
+    /// Children outstanding under the group while `body` runs count down the
+    /// group's anchor rather than the node, so a `corun` of the node inside
+    /// `body` neither waits for them nor finishes without them.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicU64, Ordering};
+    ///
+    /// use rustflow::{Executor, Runtime};
+    ///
+    /// /// Upstream's tail-optimised `fibonacci`, on the route that holds the
+    /// /// worker: one branch spawned, the other computed here, then the wait.
+    /// fn fibonacci(n: u64, runtime: &mut Runtime<'_>) -> u64 {
+    ///     if n < 2 {
+    ///         return n;
+    ///     }
+    ///
+    ///     let spawned = Arc::new(AtomicU64::new(0));
+    ///     let mut group = runtime.task_group();
+    ///     group.silent_async_runtime({
+    ///         let spawned = Arc::clone(&spawned);
+    ///         move |child: &mut Runtime<'_>| {
+    ///             spawned.store(fibonacci(n - 1, child), Ordering::Relaxed);
+    ///         }
+    ///     });
+    ///
+    ///     // The child is already outstanding for anybody to steal while
+    ///     // this branch runs on the worker that spawned it.
+    ///     let inline = group
+    ///         .with_runtime(|runtime| fibonacci(n - 2, runtime))
+    ///         .expect("a group opened on a runtime lends it back");
+    ///
+    ///     group.corun();
+    ///
+    ///     spawned.load(Ordering::Relaxed) + inline
+    /// }
+    ///
+    /// let executor = Arc::new(Executor::new(4));
+    /// let answer = Arc::new(AtomicU64::new(0));
+    /// executor
+    ///     .spawn_runtime({
+    ///         let answer = Arc::clone(&answer);
+    ///         move |runtime: &mut Runtime<'_>| {
+    ///             answer.store(fibonacci(15, runtime), Ordering::Relaxed);
+    ///         }
+    ///     })
+    ///     .wait()
+    ///     .expect("no task panicked");
+    ///
+    /// assert_eq!(answer.load(Ordering::Relaxed), 610);
+    ///
+    /// // The other route has no runtime to lend, and says so rather than
+    /// // panicking: the body is never called.
+    /// executor
+    ///     .spawn({
+    ///         let executor = Arc::clone(&executor);
+    ///         move || {
+    ///             let mut group = executor.task_group().expect("a worker opens a group");
+    ///             assert!(group.with_runtime(|_| unreachable!()).is_none());
+    ///         }
+    ///     })
+    ///     .wait()
+    ///     .expect("no task panicked");
+    /// ```
+    pub fn with_runtime<R, F>(&mut self, body: F) -> Option<R>
+    where
+        F: FnOnce(&mut Runtime<'_>) -> R,
+    {
+        match &mut self.route {
+            Route::ById { .. } => None,
+            // `get_mut` rather than `borrow_mut`: the `&mut self` above has
+            // already proved there is no other borrow to check for.
+            Route::OnWorker(runtime) => Some(body(runtime.get_mut())),
+        }
+    }
+
     /// Submits one free-standing child under this group's anchor, through
     /// whichever route opened the group: the one place the sixteen forms
     /// below differ between the two.
@@ -252,9 +350,9 @@ impl<'a> TaskGroup<'a> {
             Route::ById { executor, .. } => executor
                 .shared
                 .schedule_async_task(spawn, &Submission::under_anchor(&self.anchor)),
-            Route::OnWorker(thread) => {
-                let thread = thread.borrow();
-                let worker: &WorkerThread = &thread;
+            Route::OnWorker(runtime) => {
+                let runtime = runtime.borrow();
+                let worker: &WorkerThread = runtime.thread;
                 worker
                     .shared
                     .schedule_async_task(spawn, &Submission::under_anchor_on(&self.anchor, worker))
@@ -275,9 +373,9 @@ impl<'a> TaskGroup<'a> {
                 &Submission::under_anchor(&self.anchor),
                 dependencies,
             ),
-            Route::OnWorker(thread) => {
-                let thread = thread.borrow();
-                let worker: &WorkerThread = &thread;
+            Route::OnWorker(runtime) => {
+                let runtime = runtime.borrow();
+                let worker: &WorkerThread = runtime.thread;
                 worker.shared.schedule_dependent_async_task(
                     spawn,
                     &Submission::under_anchor_on(&self.anchor, worker),
@@ -720,12 +818,12 @@ impl<'a> TaskGroup<'a> {
     /// worker picks up while waiting runs on the waiting frame, so what
     /// decides the nesting is which job it is handed. Opened from a
     /// [`Runtime`], this wait pops the children it queued itself, newest
-    /// first, and nests one frame per level of *recursion*: 1104 bytes a
-    /// level in a release build, so a chain of them is 1893 levels deep on
+    /// first, and nests one frame per level of *recursion*: 1136 bytes a
+    /// level in a release build, so a chain of them is 1842 levels deep on
     /// std's default 2 MiB worker stack. Opened from the [`Executor`], it is
     /// handed the oldest job in the pool instead and nests one frame per task
-    /// still outstanding, which at one worker is the whole subtree: 1040
-    /// bytes a level and 2010 levels of a chain, but a *tree* meets that
+    /// still outstanding, which at one worker is the whole subtree: 1056
+    /// bytes a level and 1980 levels of a chain, but a *tree* meets that
     /// ceiling at its task count rather than at its depth, which is the
     /// difference that matters -- upstream's ten-way `skynet` completes at
     /// `MaxDepth = 8` through a `Runtime` on one worker and overflows at 5
@@ -795,7 +893,7 @@ impl<'a> TaskGroup<'a> {
                 // The real loop, which is upstream's `_worker`: its `pop` is
                 // the owning end of the queue this group's children were
                 // pushed onto, so the wait takes the newest of them first.
-                Route::OnWorker(thread) => thread.borrow_mut().corun_until(outstanding),
+                Route::OnWorker(runtime) => runtime.borrow_mut().corun_until(outstanding),
             }
         }
 
@@ -807,7 +905,7 @@ impl<'a> TaskGroup<'a> {
     fn worker_id(&self) -> usize {
         match &self.route {
             Route::ById { worker, .. } => *worker,
-            Route::OnWorker(thread) => thread.borrow().id,
+            Route::OnWorker(runtime) => runtime.borrow().worker_id(),
         }
     }
 
@@ -1400,6 +1498,83 @@ mod tests {
             .expect("no task panicked");
 
         assert_eq!(ran.load(Ordering::Relaxed), 2);
+    }
+
+    /// The runtime a group lends back is handed out with the group's child
+    /// already outstanding, which is the ordering a tail-optimised recursion
+    /// needs, and it is a runtime in full: it opens a group of its own on the
+    /// same worker while the first one is still waiting.
+    ///
+    /// One worker, so that "the child has not run yet" is a fact rather than
+    /// a race: the only thread that could have run it is the one inside the
+    /// lent body. The id route has no runtime to lend and is checked here for
+    /// the same assertion's sake -- it answers `None` without calling the
+    /// body at all.
+    #[test]
+    fn a_group_lends_its_runtime_back_with_the_child_already_queued() {
+        let executor = Arc::new(Executor::new(1));
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let inline = Arc::new(AtomicUsize::new(0));
+
+        executor
+            .spawn_runtime({
+                let executor = Arc::clone(&executor);
+                let spawned = Arc::clone(&spawned);
+                let inline = Arc::clone(&inline);
+                move |runtime: &mut Runtime<'_>| {
+                    let mut group = runtime.task_group();
+                    group.silent_async({
+                        let spawned = Arc::clone(&spawned);
+                        move || {
+                            spawned.fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+
+                    let worker = group.with_runtime(|lent| {
+                        assert_eq!(
+                            executor.shared.workers[0].queue_size(),
+                            1,
+                            "the group's child is outstanding while the branch runs"
+                        );
+                        assert_eq!(
+                            spawned.load(Ordering::Relaxed),
+                            0,
+                            "and on one worker nothing can have run it yet"
+                        );
+
+                        let nested = lent.task_group();
+                        nested.silent_async(move || {
+                            inline.fetch_add(1, Ordering::Relaxed);
+                        });
+                        nested.corun();
+
+                        lent.worker_id()
+                    });
+
+                    assert_eq!(worker, Some(0));
+                    group.corun();
+                }
+            })
+            .wait()
+            .expect("no task panicked");
+
+        assert_eq!(spawned.load(Ordering::Relaxed), 1);
+        assert_eq!(inline.load(Ordering::Relaxed), 1);
+
+        executor
+            .spawn({
+                let executor = Arc::clone(&executor);
+                move || {
+                    let mut group = executor.task_group().expect("a worker may open a group");
+                    assert!(
+                        group
+                            .with_runtime(|_| unreachable!("the id route lends nothing"))
+                            .is_none()
+                    );
+                }
+            })
+            .wait()
+            .expect("no task panicked");
     }
 
     /// A cancelled group runs none of the children it had not started, and

@@ -602,9 +602,13 @@ impl Runtime<'_> {
     /// level of recursion rather than per outstanding task.
     ///
     /// The group borrows this handle for as long as it lives, which is the
-    /// one thing a caller has to arrange around: the body cannot spawn
-    /// siblings, [`schedule`](Runtime::schedule) or corun its own node while
-    /// a group of its own is open. There is no error to handle, where
+    /// one thing a caller has to arrange around: while one is open, the way
+    /// to this handle is
+    /// [`TaskGroup::with_runtime`](crate::TaskGroup::with_runtime), which
+    /// lends it back for a scope, and that is where a body spawns siblings,
+    /// [`schedule`](Runtime::schedule)s, coruns its own node or runs the
+    /// inline branch of a recursion. There is no error to
+    /// handle, where
     /// [`Executor::task_group`] has one: holding a `Runtime` is already proof
     /// of a worker. [`TaskGroup::executor`](crate::TaskGroup::executor)
     /// answers `None` on a group opened here.
@@ -645,8 +649,15 @@ impl Runtime<'_> {
     pub fn task_group(&mut self) -> TaskGroup<'_> {
         // Upstream's `TaskGroup(*this, *w)` with its `this_worker()` lookup
         // answered by the handle: this *is* worker `w`, and the loop the
-        // group needs to push onto and pop is the one below this body.
-        TaskGroup::on_worker(self.thread)
+        // group needs to push onto and pop is the one below this body. A
+        // reborrow of the whole handle rather than of its worker alone,
+        // because the group lends it back to `TaskGroup::with_runtime`.
+        TaskGroup::on_worker(Runtime::new(
+            self.worker,
+            self.node,
+            self.job,
+            &mut *self.thread,
+        ))
     }
 }
 

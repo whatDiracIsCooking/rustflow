@@ -65,17 +65,18 @@
 //! are shared so that a row compares the two columns rather than because
 //! that route needs them.
 //!
-//! **Which half the runtime route sorts inline, and why it is the other
-//! one.** A group opened on a [`Runtime`](rustflow::Runtime) borrows that
-//! handle for as long as it is open, and the half sorted on this worker opens
-//! a group of its own, so on that route the inline half runs *before* the
-//! group rather than inside it -- upstream's `FibonacciSwapped` ordering,
-//! which `benches/fibonacci.rs` records for the same reason and
-//! `tests/task_group.rs` ports. The two halves are disjoint ranges, so the
-//! merge and the output are unchanged, which is what the untimed comparison
-//! below still holds this column to; what the ordering costs the column is
-//! that a level submits its half only once the inline half is sorted, where
-//! the `rustflow` id exposes both at once.
+//! **Both columns sort the left half inline, inside the open group.** A
+//! group opened on a [`Runtime`](rustflow::Runtime) borrows that handle for
+//! as long as it is open and the half sorted on this worker opens a group of
+//! its own, so until #395 the inline half had to run *before* the group on
+//! that route -- upstream's `FibonacciSwapped` ordering, which cost this
+//! column 4.7x at 24 workers because a level submitted its half only once
+//! the inline half was sorted.
+//! [`TaskGroup::with_runtime`](rustflow::TaskGroup::with_runtime) lends the
+//! runtime back inside the group, so the two columns now differ in the queue
+//! alone; `BENCHMARKS.md`'s "The #380 measurement" has the ordering priced
+//! both ways. The two halves are disjoint ranges either way, which is what
+//! the untimed comparison below holds this column to.
 //!
 //! **Two departures from upstream beyond the array's type.** Upstream wraps
 //! the recursion in *two* nested `executor.async` calls --
@@ -255,10 +256,12 @@ fn msort_rustflow(
 /// [`msort_rustflow`] with this level's group opened on the [`Runtime`]
 /// sorting it, so that the half it submits goes onto that worker's own queue.
 ///
-/// The left half is sorted before the group is opened rather than inside it,
-/// for the reason the module docs give; the child is a runtime-shaped body
-/// because it opens a group of its own, which on this route is what replaces
-/// the `Arc<Executor>` the other column threads through the recursion.
+/// The left half is sorted inside the open group, through
+/// [`with_runtime`](rustflow::TaskGroup::with_runtime), which is what keeps
+/// this column on [`msort_rustflow`]'s ordering -- the module docs have what
+/// the ordering is worth. The child is a runtime-shaped body because it opens
+/// a group of its own, which on this route is what replaces the
+/// `Arc<Executor>` the other column threads through the recursion.
 fn msort_runtime_group(
     runtime: &mut Runtime<'_>,
     data: &Arc<Vec<AtomicU64>>,
@@ -281,14 +284,16 @@ fn msort_runtime_group(
 
     let mid = begin + n / 2;
 
-    msort_runtime_group(runtime, data, buffer, begin, mid);
-
-    let group = runtime.task_group();
+    let mut group = runtime.task_group();
     group.silent_async_runtime({
         let data = Arc::clone(data);
         let buffer = Arc::clone(buffer);
         move |child: &mut Runtime<'_>| msort_runtime_group(child, &data, &buffer, mid, end)
     });
+
+    group
+        .with_runtime(|child| msort_runtime_group(child, data, buffer, begin, mid))
+        .expect("a group opened on a runtime lends it back");
 
     group.corun();
 

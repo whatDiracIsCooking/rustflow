@@ -26,21 +26,21 @@
 //!   executor, which is the route #372 added. The child goes onto that
 //!   worker's own queue and the `corun` pops that same end, where
 //!   `rustflow-group` leaves it in the shared buffers and coruns on a
-//!   stealing view of the queue -- and that, bar the ordering below, is the
-//!   only difference between the two bodies. #380 measures the pair.
+//!   stealing view of the queue -- and that is the only difference between
+//!   the two bodies. #380 measures the pair.
 //! - **`rayon`** is `rayon::join`, which is the shape rayon has for exactly
 //!   this and is what anyone would write: a fork of two closures, the second
 //!   of which usually runs on the forking thread.
 //!
-//! **`rustflow-runtime-group` takes upstream's `FibonacciSwapped` ordering**,
-//! which is the one thing the route forces: the group borrows the runtime for
-//! as long as it is open, so the `n - 2` branch -- which opens a group of its
-//! own -- is the one that runs *before* it rather than inside it. Upstream
-//! writes both orderings -- `unittests/test_task_group.cpp` has `Fibonacci`
-//! and `FibonacciSwapped`, and `tests/task_group.rs` ports both -- so this is
-//! upstream's own line rather than a liberty; what it costs the column is
-//! that a level submits its child only once the inline branch is done, where
-//! the other three expose both branches at once.
+//! **All four ids submit before the inline branch runs.** Until #395 the
+//! runtime route could not: the group borrows the runtime for as long as it
+//! is open and the `n - 2` branch opens a group of its own, so that branch
+//! had to run *before* the group -- upstream's `FibonacciSwapped` ordering,
+//! which left one child outstanding at a time and cost this column 16.6x at
+//! 24 workers. `TaskGroup::with_runtime` lends the runtime back inside the
+//! open group, which is what puts this body back on upstream's own
+//! `fibonacci/taskflow.cpp` line; `BENCHMARKS.md`'s "The #380 measurement"
+//! has the ordering priced both ways.
 //!
 //! Unlike every other shape in this suite there is **no graph to build**, so
 //! the asymmetry `binary_tree.rs` and `embarrassing_parallelism.rs` have to
@@ -196,27 +196,32 @@ fn fibonacci_runtime(n: u64, runtime: &mut Runtime<'_>) -> u64 {
 /// [`Runtime`] running this level, so that the child goes onto this worker's
 /// own queue and the `corun` pops it straight back.
 ///
-/// Upstream's `fibonacci_swapped` ordering, for the reason the module header
-/// gives: the group borrows the runtime for as long as it is open, so the
-/// branch computed on this worker is the one that runs before it. The child
-/// is a runtime-shaped body because it opens a group of its own, which is
-/// also what replaces the `Arc<Executor>` [`fibonacci_group`] threads through
-/// the recursion.
+/// Upstream's tail-optimised ordering, as [`fibonacci_group`] has: the group
+/// lends its runtime back through
+/// [`with_runtime`](rustflow::TaskGroup::with_runtime), so the branch this
+/// worker computes itself runs *between* the submission and the wait rather
+/// than before the group opens -- which is #395, and the module header has
+/// what the ordering is worth. The child is a runtime-shaped body because it
+/// opens a group of its own, which is also what replaces the `Arc<Executor>`
+/// [`fibonacci_group`] threads through the recursion.
 fn fibonacci_runtime_group(n: u64, runtime: &mut Runtime<'_>) -> u64 {
     if n < 2 {
         return n;
     }
 
-    let second = fibonacci_runtime_group(n - 2, runtime);
     let first = Arc::new(AtomicU64::new(0));
 
-    let group = runtime.task_group();
+    let mut group = runtime.task_group();
     group.silent_async_runtime({
         let first = Arc::clone(&first);
         move |child: &mut Runtime<'_>| {
             first.store(fibonacci_runtime_group(n - 1, child), Ordering::Relaxed);
         }
     });
+
+    let second = group
+        .with_runtime(|child| fibonacci_runtime_group(n - 2, child))
+        .expect("a group opened on a runtime lends it back");
 
     group.corun();
 
