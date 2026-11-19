@@ -43,12 +43,12 @@ criterion ids, which `cargo bench --all-features -- --list` counts.
   measures is a comparison between two C++ libraries rather than a shape of
   the executor.
 
-**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 43
+**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 44
 headings, and they are three kinds: the three method sections that follow this
 preamble, "The machine" through "The upstream C++ column is empty"; 21 shape
 sections carrying the 22 shapes, since `async_task` and `fibonacci` share "The
 two shapes #96 added", which measured the two together in a run of their own;
-and 19 per-decision measurement sections, each named for the issue that took
+and 20 per-decision measurement sections, each named for the issue that took
 it. A shape's section is its table, its sizes and its departures from
 upstream. A measurement section is one question, with the machine, the load
 and the method of its own run in it, and it ends either in a change that
@@ -2384,7 +2384,7 @@ own module docs say so, and it is why this table carries no
 untimed setup already isolates the one cost this shape has that rayon's does
 not. That buffer is allocated before anything is timed, where upstream's
 file-level global lives; the "#366 change" section at the end of this file is
-why, and is where these figures come from.
+why.
 
 | | |
 |---|---|
@@ -2393,28 +2393,27 @@ why, and is where these figures come from.
 | OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
 | criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id |
 | Date | 2026-11-19 |
-| **Load average** | **6.6 falling to 4.8 over the run, all of it this run's own decay** |
+| **Load average** | **0.34 rising to 2.80 over the run, all of it this run's own** |
 
-The figures below are the #366 pass's, on a quiet box: no sibling agent and
-nothing else building, with the load average above being the tail of the
-shape measured before this one. They replace a set taken at a load of 11.3
-with three other agents building, which is why the two differ by more than
-this change does -- the controlled before-and-after of the change itself is
-tabulated in the "#366 change" section and moved no id of this shape by more
-than 5.6%.
+The figures below were re-taken in the "#381 measurement" pass at the end of
+this file, on a quiet box: no sibling agent and nothing else building. They
+replace the #366 pass's set, which read 19.51 µs, 23.00 µs, 36.26 ms and
+15.51 ms on the same four ids and predates #375's change to the partition --
+the two sets differ by more than that change does, and that section says why.
 
 | size | workers | rustflow | rayon | upstream C++ |
 |---|---|---|---|---|
-| 1000 | 1 | 19.51 µs ±0.3% | 12.38 µs ±1.3% | not published |
-| 1000 | 24 | 23.00 µs ±0.7% | 16.12 µs ±1.3% | not published |
-| 1000000 | 1 | 36.26 ms ±0.2% | 24.84 ms ±0.1% | not published |
-| 1000000 | 24 | 15.51 ms ±7.8% | 3.370 ms ±0.5% | not published |
+| 1000 | 1 | 15.69 µs ±0.2% | 12.00 µs ±0.2% | not published |
+| 1000 | 24 | 17.34 µs ±0.5% | 15.74 µs ±0.7% | not published |
+| 1000000 | 1 | 21.11 ms ±0.6% | 23.94 ms ±0.1% | not published |
+| 1000000 | 24 | 15.01 ms ±6.9% | 3.362 ms ±0.7% | not published |
 
 **`rustflow/24w/1000000` is the one id of this shape too wide to read as a
-point**: ±7.8%, where its baseline beside it is ±0.5%. It is quoted rather
-than dropped and rather than re-run -- one run per id is the rule this pass
-is measured under -- but it means "about 15 ms" and nothing finer, and the
-before-and-after of this change could not resolve it either (p = 0.76).
+point**: ±6.9%, where its baseline beside it is ±0.7%. It is quoted rather
+than dropped and rather than re-run -- one run per id is the rule every pass
+here is measured under -- but it means "about 15 ms" and nothing finer, and
+the "#381 measurement"'s own three interleaved rounds put its round-to-round
+spread at 15.3%, which is wider than any change #375 made to it.
 
 At 1000 elements -- below this type's parallel cutoff on every worker count --
 both columns take their serial path, so the gap is construction and dispatch
@@ -2424,18 +2423,30 @@ and tears both down, where rayon's `install` has no graph to build at all.
 `linear_chain`'s own table gives -- there is nothing here for the other 23 to
 do.
 
-At 1000000 elements the parallel path runs on both sides, and the gap widens
-rather than closes: rayon is 1.5x faster at one worker and 4.6x at 24, the
-second figure as wide as the id it comes from. Two differences compound
-rather than one. `Runtime::sort_by`'s own partition is a single-pivot,
-three-way split per level against `par_sort_unstable`'s own
-pattern-defeating quicksort, so this crate does strictly more comparisons and
-swaps for the same input; and every spawned half goes through this crate's
-own node machinery -- `Scope::spawn_runtime`, a fresh arena, a join -- where
-rayon's split is a `join` of two closures with one atomic. Both gaps are the
-ones `binary_tree`'s own table already found for a plain increment; sorting
-does not change which one dominates, only how much larger the constant is
-that it is multiplying.
+**The one-worker million-element row is the port ahead of its baseline, and
+neither column's sort is this crate's**: `Runtime::sort_by` short-circuits to
+`[T]::sort_unstable_by` whenever the pool has one worker or the range is at or
+under `parallel_sort_cutoff::<T>()`, which for `f64` is 4096, so three of this
+table's four `rustflow` ids measure the standard library's pdqsort with a
+taskflow built around it. 21.11 ms against `par_sort_unstable_by`'s 23.94 ms
+on one thread is those two sorts, and the "#381 measurement" below found that
+this id swings by 1.7x on the *call shape* of that short-circuit -- the
+comparator reaches the sort as a `&C`, whose instantiation optimises in some
+calling crates and not others -- so read the row as "the two libraries' serial
+sorts, within the noise that #399 is filed to remove" rather than as a win.
+
+At 1000000 elements and 24 workers the parallel path runs on both sides and
+rayon is 4.5x ahead, the figure as wide as the id it comes from. **What that
+row is about is scaling and not the partition**: this column goes 21.11 ms to
+15.01 ms over 24 workers, 1.41x, where rayon goes 23.94 ms to 3.362 ms, 7.1x.
+Every spawned half here goes through this crate's own node machinery --
+`Scope::spawn_runtime`, a fresh arena, a join -- where rayon's split is a
+`join` of two closures with one atomic, which is the gap `binary_tree`'s own
+table already found for a plain increment. The partition itself is no longer a
+candidate: #375 replaced the single-pivot three-way split this section used to
+blame with upstream's live `parallel_pdqsort` core, and the A/B in the "#381
+measurement" reads this id at 1.035x across that change, inside its own
+15.3% round-to-round spread.
 
 ## pipeline
 
@@ -2812,6 +2823,20 @@ What is above is what was underneath. The one mechanism those counters did
 name -- the fan-out reaching only 15 to 19 of the 24 workers -- is filed
 outside this milestone and is unaffected either way.
 
+**A third column, `rustflow-split`, is priced in the "#381 measurement" below
+rather than here.** It runs the identical task under `SplittingPartitioner`,
+whose share re-splits when another worker steals it, so the pair differ only
+in how a chunk reaches a worker. It is 1.00x this column at a thousand
+elements and one worker and 0.95x at a million and one -- nothing splits
+without a steal, which makes a pool of one that pair's control -- and
+**3.40x** at a million and 24 workers, **33.8x** at a thousand and 24. That
+pass re-measured this table's own `rustflow` and `rayon` ids in passing and
+reproduced seven of the eight within 7%; the exception is `rustflow/24w/1000`,
+which read 31.52 µs against the 45.12 µs above, and it is the id this section
+already flags as ±3.3% with 4 of 20 outliers and whose between-run spread
+#343 put at 1.6x. The "1.58x behind" below is that id's bad day as much as
+this shape's cost.
+
 **The cross-table comparison this section was added for.** At 24 workers
 `for_each` spends 0.62 ns an element end to end (622.4 µs over a million),
 where `embarrassing_parallelism` above spends 176 ns a task (11.54 ms over
@@ -2882,6 +2907,15 @@ local and its one `gop` merge cannot be the difference -- there are 24 of them
 in a run of a quarter of a millisecond -- so what is left is the per-chunk
 dispatch `for_each` isolates, now spread over a fold cheap enough an element
 that it hides none of it.
+
+**The `rustflow-split` column of this shape's twelve ids is priced in the
+"#381 measurement" below**, where the same `reduce_by_index` runs under
+`SplittingPartitioner` at the same chunk size: a tie at one worker, 0.98x at a
+million, and **4.95x** this column at a million and 24 workers, the widest
+24-worker ratio of the four shapes that carry a split id. A fold of one `f64`
+addition an element is the least body in the suite to amortise an extra task
+over, which is the same reason this table's own 24-worker rows read the way
+they do.
 
 The 1000-element rows say the same thing from the other side. At 24 workers a
 thousand-element sum costs us 135.4 µs against 10.2 µs at one worker: a factor
@@ -2954,6 +2988,17 @@ clock, so the baseline is a dependency chain running at the hardware's limit
 and the two-pass algorithm has to do twice the multiplies before any of its
 workers helps.
 
+**This shape carries no `rustflow-split` id, where `for_each`, `reduce_sum`,
+`primes` and `mandelbrot` each gained one with #374.** The scan family takes
+no partitioner anywhere in the port, because it takes none upstream:
+`src/algorithm/scan.rs`'s provenance names its six entry points as
+`make_inclusive_scan_task`, `make_exclusive_scan_task` and the four
+`make_transform_*_scan_task` overloads at v4.1.0, and not one of them has a
+`part` parameter -- a two-pass scan divides its range by worker count rather
+than by a chunk policy. Giving it one would be a departure from upstream's
+user-facing surface and is nobody's decision yet; the "#381 measurement"
+below records it where the other four shapes' split figures are.
+
 At a thousand elements the parallel scan loses by 17x at one worker and by
 383x at 24. A 630 ns sequential scan is shorter than building the one-node
 taskflow and handing out its chunks, and at 24 workers it is shorter than
@@ -3012,6 +3057,15 @@ workers the gap is 11% -- 2.925 ms against 2.636 ms -- with both columns
 reaching 10.1x and 11.0x of their own one worker, which is the range twelve
 physical cores with SMT give an ALU-bound body and not a scheduling ceiling
 either side is hitting.
+
+**The `rustflow-split` column, priced in the "#381 measurement" below, holds
+upstream's chunk of ten and changes only the dispatch**:
+`SplittingPartitioner::new(10)` against the `DynamicPartitioner::new(10)` this
+table's `rustflow` ids use. It ties at one worker and costs **1.27x** at a
+million and 24 workers -- the *smallest* 24-worker penalty of the four shapes
+that carry a split id, because trial division is the heaviest body in the
+suite to amortise an extra task over -- and **7.02x** at 10000, where the
+whole job is under 70 µs of division.
 
 **The 10000-element 24-worker row is the one the two sides' chunk sizes
 decide, and it costs us 3.1x**: 160.9 µs against 52.20 µs, and 2.4x our own one
@@ -3082,6 +3136,15 @@ tie by construction -- one thread renders every line whatever order it picks
 them in -- and that is what makes them the control: the two columns' buffers,
 locks and kernels cost the same to within a percent or two, so the 24-worker
 rows can be read as scheduling and nothing else.
+
+**The `rustflow-split` column is this shape's most interesting number and it
+is in the "#381 measurement" below**: `SplittingPartitioner::new(1)` against
+the `DynamicPartitioner::new(1)` above, same chunk of one, same body. A
+partitioner whose share re-splits when it is stolen should have its best case
+on the suite's load-imbalance shape, and it does not -- **1.48x** at 100 lines
+and **1.70x** at 500, against a column that is itself ahead of rayon at both.
+Where the dynamic chunk of one costs one cursor acquisition a line, the split
+costs a task.
 
 There the chunk of one earns its keep. 100 unequal lines over 24 workers is
 four lines a worker if the deal is even and a visible imbalance if it is
@@ -5805,3 +5868,303 @@ inside the noise on the external id.
   block a *parented* child pays that the external route does not. That is a
   design question about who owns a child's join counter rather than a tuning
   one, and nothing here proposes it.
+
+## The #381 measurement: the share reaches the pool, not the tree, and the sort's gain is a call shape
+
+**Three A/Bs on the fan-out changes, and none of the three ships a line.** The
+bulk wake was answered without code before this run began; the splitting
+partitioner reaches 21 to 24 of 24 workers where the guided one reaches 21 to
+22, for a wall of 1.9 to 2.9 ms against 0.5 to 0.6 ms, so it stays the option
+#374 made it and does not become a default; and the pattern-defeating
+partition #375 shipped is *not* what moved the `sort` figures -- three of that
+shape's four ids never reach a partition of this crate's at all, and the one
+that does moves 3.5% against a side that disagrees with itself by 15%.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id, as every target declares |
+| Date | 2026-11-19 |
+| **Load average** | **each measurement's own, below; 0.2 to 11.4 before a shape and 0.2 to 12.0 after it, with nothing else on the box** |
+
+The box was this run's alone: no sibling agent, no other `cargo`, and
+`/proc/loadavg` read either side of every measurement below --
+`for_each` 0.70 to 8.82, `reduce_sum` 7.01 to 10.60, `primes` 9.75 to 11.37,
+`mandelbrot` 9.63 to 11.99, the counter sweep 0.29 to 0.29, the `sort` A/B
+8.02 through 3.99 round by round, the re-taken `sort` table 0.34 to 2.80 and
+the call-shape ablation 0.22 to 0.22 with `/proc/pressure/cpu`'s `some avg10`
+at 0.00. A shape's "before" is its predecessor's decay rather than zero,
+which is the condition "What is measured" describes; the PR records every
+pair. Every criterion figure is **one** run of one id, quoted as the point
+estimate of the mean with half the width of the 95% confidence interval as a
+plus-or-minus percentage.
+
+### Part 1: the bulk wake, already answered and not re-measured
+
+**#378 closed with no code, so this part is a citation rather than a
+measurement.** "The #367 measurement" above is the gate it closed on: 24
+`notify_one` calls produce 24 or 25 `unpark` calls and 23 to 25 returned
+parks, **zero** parks are taken while a job is queued in any deque or buffer,
+and the batched `notify_n` form #378 proposed was implemented, counted and
+reverted -- the push loop costs the same 45-60 µs for 23 tasks either way,
+the distinct-worker count stays inside the unbatched path's own range at 20,
+100 and 500 µs bodies, and at the longest bodies two runs of three recorded a
+submitter stall of 0.8 to 1.1 ms. There is no before-and-after to run, so
+there is no `bench-ab` table here and no observer count: the mechanism this
+part was filed to price does not exist in the tree on either side.
+
+### Part 2: the splitting partitioner against the shipped ids, in one process
+
+Four bench files carry the `rustflow-split` ids #374 added -- `for_each`,
+`reduce_sum`, `primes` and `mandelbrot` -- and each runs the *same* task as
+its `rustflow` id under `SplittingPartitioner` instead of the partitioner the
+shape ships with, **at the same chunk size**: guided floor 1 against
+splitting floor 1 on `for_each` and `reduce_sum`, `DynamicPartitioner::new(10)`
+against `SplittingPartitioner::new(10)` on `primes`, and `new(1)` against
+`new(1)` on `mandelbrot`. So a row below changes how a chunk reaches a worker
+and nothing else. Each file's twelve ids were measured in one `cargo bench`
+per shape, the three columns of a row seconds apart in the same process,
+which is the one thing this environment protects.
+
+**`benches/scan.rs` has no such id, and that is a finding rather than an
+omission**: the scan family takes no partitioner anywhere in the port because
+it takes none upstream. `src/algorithm/scan.rs`'s provenance names its six
+entry points as `make_inclusive_scan_task`, `make_exclusive_scan_task` and
+the four `make_transform_*_scan_task` overloads at v4.1.0, and not one of
+them has a `part` parameter. Giving scan one would be a departure from
+upstream's user-facing surface, which is its own decision and not this
+measurement's to take.
+
+| shape | size | workers | `rustflow` | `rustflow-split` | split ÷ shipped | `rayon` |
+|---|---|---|---|---|---|---|
+| `for_each` | 1000 | 1 | 14.95 µs ±0.6% | 14.94 µs ±0.6% | **1.00x** | 9.858 µs ±1.9% |
+| `for_each` | 1000 | 24 | 31.52 µs ±0.2% | 1.065 ms ±0.9% | **33.8x** | 30.45 µs ±2.5% |
+| `for_each` | 1000000 | 1 | 8.526 ms ±0.2% | 8.108 ms ±0.6% | **0.95x** | 7.601 ms ±0.2% |
+| `for_each` | 1000000 | 24 | 652.8 µs ±1.6% | 2.222 ms ±1.1% | **3.40x** | 754.7 µs ±2.4% |
+| `reduce_sum` | 1000 | 1 | 8.874 µs ±12.9% | 7.318 µs ±0.3% | 0.82x | 4.664 µs ±0.2% |
+| `reduce_sum` | 1000 | 24 | 113.5 µs ±2.0% | 446.7 µs ±1.4% | **3.94x** | 28.13 µs ±2.3% |
+| `reduce_sum` | 1000000 | 1 | 654.8 µs ±0.2% | 643.2 µs ±0.2% | **0.98x** | 618.7 µs ±0.1% |
+| `reduce_sum` | 1000000 | 24 | 276.4 µs ±0.8% | 1.369 ms ±1.4% | **4.95x** | 109.2 µs ±0.6% |
+| `primes` | 10000 | 1 | 67.73 µs ±0.6% | 67.90 µs ±0.5% | **1.00x** | 60.77 µs ±0.2% |
+| `primes` | 10000 | 24 | 138.2 µs ±1.1% | 970.1 µs ±1.2% | **7.02x** | 51.12 µs ±1.0% |
+| `primes` | 1000000 | 1 | 30.36 ms ±0.1% | 30.37 ms ±0.1% | **1.00x** | 28.99 ms ±0.1% |
+| `primes` | 1000000 | 24 | 2.937 ms ±2.3% | 3.719 ms ±1.2% | **1.27x** | 2.595 ms ±0.5% |
+| `mandelbrot` | 100 | 1 | 17.08 ms ±0.1% | 17.09 ms ±0.1% | **1.00x** | 16.10 ms ±0.1% |
+| `mandelbrot` | 100 | 24 | 1.012 ms ±0.5% | 1.501 ms ±0.1% | **1.48x** | 1.211 ms ±0.4% |
+| `mandelbrot` | 500 | 1 | 424.0 ms ±0.1% | 423.2 ms ±0.0% | **1.00x** | 399.3 ms ±0.0% |
+| `mandelbrot` | 500 | 24 | 21.46 ms ±0.3% | 36.42 ms ±0.4% | **1.70x** | 22.33 ms ±0.3% |
+
+Three readings, in the order they decide the question.
+
+- **At one worker the two columns are the same program, and the figures say
+  so.** Seven of the eight one-worker rows are inside a percent of each other;
+  the two exceptions are `for_each/1w/1000000` at 0.95x, where the split id's
+  one unstolen share is a single body call while the guided cursor still walks
+  its geometric sequence of chunks, and `reduce_sum/1w/1000`, whose shipped id
+  carries a ±12.9% interval and 8 of 20 outliers and so resolves nothing.
+  That tie is the mechanism confirming itself: **nothing splits without a
+  steal**, so a pool of one is this partitioner's control rather than a row of
+  its own.
+- **At 24 workers it costs between 1.27x and 33.8x, and the ordering is by how
+  much body there is to amortise it over.** `primes` at a million, 2.9 ms of
+  trial division over 100000 chunks of ten, pays 1.27x; `mandelbrot` at 500
+  lines pays 1.70x; `for_each` and `reduce_sum` at a million, where the body
+  is one `tan` or one addition an element, pay 3.40x and 4.95x; and the two
+  small sizes, where the whole job is 10 to 60 µs of work, pay 3.94x to 33.8x
+  because the dispatch *is* the row.
+- **The shape it was built for is the one where it loses most clearly.**
+  `mandelbrot` is this suite's load-imbalance benchmark -- 100 to 500 lines
+  whose cost varies by two orders of magnitude, handed out one at a time -- so
+  a scheme that re-splits on a steal should have its best case here. It is
+  1.48x and 1.70x behind the dynamic chunk of one it replaces, and 1.24x and
+  1.63x behind rayon, on a shape where the shipped id is *ahead* of rayon at
+  both sizes.
+
+### What the split buys, counted: a share per task, and not the tree
+
+The #343 observer, registered on the executor and counting which worker enters
+each dispatched task, over the same `for_each_by_index` the `for_each` table
+builds: `n = 1000000` at 24 workers, six runs per partitioner with the pool
+confirmed fully parked before each window (`Executor::num_waiters() == 24`),
+a fresh executor per row so that run 0 is a cold pool. "Tasks" is the
+observer's own entry count, which for a splitting row counts the re-splits.
+
+| partitioner | tasks | distinct workers, six runs | wall |
+|---|---|---|---|
+| guided, floor 1 (`DefaultPartitioner`) | 25 | **21-22** / 24 | 0.48-0.63 ms |
+| splitting, floor 1 (`default()`) | **121-157** | **21-24** / 24 | **1.90-2.86 ms** |
+| guided, 4096 | 25 | 21-23 / 24 | 0.48-0.71 ms |
+| splitting, 4096 | 88-94 | 22-23 / 24 | 1.03-1.28 ms |
+| guided, 65536 | 25 | **17** / 24 | 0.73-0.96 ms |
+| splitting, 65536 | 25 | 22 / 24 | 0.72-0.85 ms |
+| guided, 262144 | 25 | **11-15** / 24 | 2.15-2.38 ms |
+| splitting, 262144 | 25 | 21-23 / 24 | 0.72-0.77 ms |
+
+And the same sweep at `n = 1000`, where the whole job is 10 to 12 µs of work:
+
+| partitioner | tasks | distinct workers, six runs | wall |
+|---|---|---|---|
+| guided, floor 1 | 24 | **13-16** / 24 | 0.05-0.08 ms |
+| splitting, floor 1 | 66-82 | **17-21** / 24 | 0.33-0.90 ms |
+| guided or splitting, 4096 | **1** | 1 / 24 | 0.02-0.03 ms |
+
+- **The re-split is not what reaches the workers.** The two bottom rows of the
+  first table are the splitting partitioner with its re-splits turned off by a
+  floor above `n / w`: 25 tasks, no splits, and still **21 to 23** of 24
+  workers, which is the count the splitting default reaches *with* 121 to 157
+  tasks. What reaches those workers is the share the dispatch hands each task
+  -- `n / w` of the range, walked in one body call -- against the guided
+  cursor, whose chunk floor decides how much of the range is left by the time
+  a late worker arrives. At a floor of 65536 the guided cursor has 16 chunks
+  for 24 tasks and reaches 17 workers, and at 262144 it has 4 and reaches 11
+  to 15; the splitting walk at those same floors reaches 22 either way.
+  #367's reading that `SplittingPartitioner` "is the one knob that moves the
+  count where it is low" survives, but the knob turns out to be the static
+  share and not the tree.
+- **A re-split costs 12 to 16 µs, which is 7x what a fan-out task costs.**
+  The splitting default's 1.90-2.86 ms against the same partitioner's
+  non-splitting 0.72-0.77 ms is +111 tasks for +1.49 ms at the medians --
+  **13 µs a split**, and 12 to 16 µs taken run by run -- where "The #367
+  measurement" priced a plain fan-out push, node and two boxed closures and
+  deque push and `notify_one`, at about **2 µs**. A split is one
+  `Scope::spawn_runtime` of a half share, so the gap is not accounted for by
+  the submission, and **#400** is the counter run that attributes it.
+- **The default floor is the type's worst setting.** 1.90-2.86 ms at floor 1,
+  1.03-1.28 at 4096, 0.72-0.85 at 65536, with the distinct-worker count flat
+  at 21 to 24 across all three: the floor buys nothing the type exists for and
+  costs 2.5 to 3.5x. `SplittingPartitioner` is the port's own, so unlike
+  `GuidedPartitioner`'s floor of 1 -- upstream's, which #343 declined to
+  change for that reason -- this default is ours to pick, and **#401** is that
+  decision with its figures.
+- **The cold-pool advantage #367 read off run 0 does not reproduce here.**
+  That section's partitioner table has guided at 13 of 24 on the first fan-out
+  an executor ever ran against the splitting rows' 16 to 19, and called the
+  splitting dispatch "the one knob that moves the count where it is low". In
+  this sweep run 0 reads 21 of 24 for guided and 21 or 22 for splitting, and
+  no row's run 0 is its lowest. The two sweeps differ in their harness rather
+  than in the code they call, so what this one adds is that the cold run is
+  not reliably the low one and the cold-pool margin is not a figure to lean
+  on; the static-share mechanism above is, and it is visible warm.
+- **At a thousand elements a chunk size still beats both.** The
+  `n <= chunk_size` early-out takes the whole job sequentially in
+  0.02-0.03 ms, against 0.05-0.08 for the guided default and 0.33-0.90 for the
+  splitting one, which is #343's own finding reproduced on both partitioners.
+
+### Part 3: the sort partition, before and after #375
+
+`devtools/bench-ab.sh 127e3b7 a03d9dd --bench sort --rounds 3`: interleaved
+rounds over both sizes and both worker counts, each side built into its own
+worktree and its own target directory. Medians of three rounds, with each
+side's spread against its own rounds -- the rule a difference is read against.
+
+| id | before #375 | after #375 | B/A | A spread | B spread | verdict |
+|---|---|---|---|---|---|---|
+| `rustflow/1w/1000` | 19.28 µs | 15.11 µs | 0.784x | 1.010x | **1.365x** | inside B's own spread |
+| `rustflow/1w/1000000` | 36.62 ms | **20.97 ms** | **0.573x** | 1.006x | 1.049x | a result, 15.3x the spread |
+| `rustflow/24w/1000` | 21.99 µs | 18.12 µs | **0.824x** | 1.061x | 1.084x | a result, 2.6x the spread |
+| `rustflow/24w/1000000` | 15.41 ms | 15.95 ms | 1.035x | **1.153x** | 1.052x | inside A's own spread |
+| `rayon/1w/1000` | 13.03 µs | 13.35 µs | 1.025x | 1.308x | 1.283x | control: inside |
+| `rayon/1w/1000000` | 25.25 ms | 23.99 ms | 0.950x | 1.048x | 1.042x | control: marginal |
+| `rayon/24w/1000` | 16.43 µs | 15.99 µs | 0.974x | 1.011x | 1.010x | control: "a result" |
+| `rayon/24w/1000000` | 3.417 ms | 3.437 ms | 1.006x | 1.042x | 1.051x | control: inside |
+
+**The four `rayon` rows are an A/A control and they set this shape's floor.**
+#375 touched `src/algorithm/sort.rs`, `tests/sort.rs` and
+`tests/properties.rs` and nothing else -- `git diff --stat` says so -- so the
+baseline column runs identical code on both sides, and whatever it reports is
+noise. It reports up to 5.0%, and on `rayon/24w/1000` the script's own rule
+calls a 2.6% difference "a result" because that id's within-side spread is
+1.0%. So read a `rustflow` row's 3.5% as nothing and its 42.7% as something,
+and treat anything between 3% and 6% on this shape as unresolved.
+
+### Three of the four sort ids never reach the new partition
+
+`Runtime::sort_by` short-circuits before any partition of this crate's runs:
+
+```rust
+let cutoff = parallel_sort_cutoff::<T>();
+if self.num_workers() <= 1 || data.len() <= cutoff {
+    data.sort_unstable_by(&cmp);
+    return;
+}
+```
+
+`parallel_sort_cutoff::<f64>()` is 4096, so **`1w/1000`, `1w/1000000` and
+`24w/1000` all take that line** -- one worker, or a thousand elements -- and
+the only id of this shape that reaches `parallel_pdqsort` is
+`24w/1000000`, which the table above reads at 1.035x inside a 1.153x spread.
+That line is character for character the same in `127e3b7` and `a03d9dd`.
+
+What moved, then, is the codegen of that one call, and three sorts of the same
+million `f64`s in one binary isolate it:
+
+| call shape | wall, two runs each |
+|---|---|
+| `data.sort_unstable_by(&cmp)` -- what the short-circuit writes | **37.76, 39.37 ms** |
+| `data.sort_unstable_by(cmp)` | **21.90, 21.88 ms** |
+| `data.sort_unstable_by(\|a, b\| cmp(a, b))` | 21.80, 21.81 ms |
+| `buffer.sort_unstable_by(f64::total_cmp)`, no generic in the way | 21.88, 21.91 ms |
+
+**Handing the standard library's sort a `&C` costs 1.7x when that
+instantiation does not optimise, and whether it does is a property of the
+calling crate.** With today's library the bench crate reads
+`sort/rustflow/1w/1000000` at 21.67 ms while an example crate in the same
+tree, calling `taskflow.sort_by` on the same buffer with the same comparator,
+reads 35.4 to 36.1 ms; with `127e3b7`'s library the same two harnesses read
+36.62 ms and 19.9 ms. Both versions have both regimes, the regimes are 1.7x
+apart, and #375's diff shuffled which crate lands in which. The A/B's
+headline figure is that lottery. **#399** is the fix -- pass the comparator by
+value or through a closure, both of which read 21.8 ms above -- and the same
+`&C` reaches `[T]::sort_unstable_by` from `sort_loop`'s own leaves, which the
+parallel path runs once per leaf.
+
+The re-taken `sort` table in that shape's section above is today's regime, and
+the one row that is about #375 at all is the 24-worker million-element one,
+unchanged at about 15 ms.
+
+### The decision: nothing new ships, two defaults stand, three leads filed
+
+The bar is #342's and #343's -- a mechanism the counters name, then an A/B
+outside both sides' spread -- and the three parts land in three different
+places.
+
+- **Part 1 is closed and this run added nothing to it.** #378 shipped no code
+  and "The #367 measurement" is the answer; there was no second build to
+  measure.
+- **Part 2: `SplittingPartitioner` stays an option and does not become a
+  default, at a cost this section now states.** It reaches 21 to 24 of 24
+  workers against the guided default's 21 to 22, and the counters say the
+  static share rather than the re-split is what does that; the re-splits
+  themselves cost 12 to 16 µs each, and the whole scheme 1.27x to 33.8x of the
+  shipped ids' wall at 24 workers, including 1.48x and 1.70x on `mandelbrot`,
+  the shape whose imbalance it was built for.
+  `DefaultPartitioner = GuidedPartitioner<>` therefore stays what #343 left
+  it. The declined change is "make the
+  splitting dispatch the default", and its price is the 24-worker column
+  above.
+- **Part 3: #375 stays, on the grounds it was taken on rather than on a
+  figure.** It replaced a call upstream itself does not make -- the pinned
+  header's `make_sort_task` calls `parallel_pdqsort` and its
+  `parallel_3wqsort` call is commented out, with a `sort3` its pivot picker
+  needs missing from the tree -- so the port now runs upstream's live core.
+  What this measurement adds is that the change is **not visible** on this
+  shape: the one id that reaches it moves 3.5% inside a 15.3% spread, and the
+  42.7% and 17.6% the A/B shows elsewhere belong to a comparator call shape on
+  a path neither partition touches.
+- **The three leads are filed.** #399 (the `&cmp` call shape, 1.7x on a
+  one-worker sort), #400 (what 13 µs a re-split is made of), #401
+  (`SplittingPartitioner::default()`'s floor). Each names a bar and none of
+  them is this section's to take.
+
+**What this does not say.** It does not say `SplittingPartitioner` is useless:
+a box wider than its pool, a body longer than the arrival spread, or a cursor
+whose chunk floor starves late workers -- the guided 262144 row, 11 to 15
+workers at 2.2 ms against the splitting walk's 22 at 0.74 -- are all cases
+where the static share wins, and the type exists for a caller who has one. It
+does not say #375 made the sort slower or faster: on the one id that measures
+it, it did neither. And it does not resolve `sort/rustflow/24w/1000000`, whose
+±6.9% interval and 15.3% round-to-round spread are wider than any change #375
+could plausibly have made; what would resolve it is an id with a tighter
+spread, which is a harness question and not this one's.
