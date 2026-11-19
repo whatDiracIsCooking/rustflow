@@ -289,7 +289,7 @@ what became of each item.
 
 Every measured number this port has is in [`BENCHMARKS.md`](BENCHMARKS.md):
 **twenty-two of upstream's twenty-five benchmarks**, ported to criterion with
-a rayon baseline in the role TBB plays upstream, 212 ids in all, each table
+a rayon baseline in the role TBB plays upstream, 232 ids in all, each table
 beside the machine and the load it ran under, plus the per-decision
 measurements behind [`DESIGN.md`](DESIGN.md). Thirteen of the shapes are the
 benchmarks milestone's own -- `for_each`, `reduce_sum`, `scan`, `primes`,

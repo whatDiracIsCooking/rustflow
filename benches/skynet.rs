@@ -7,7 +7,7 @@
 //! one `executor.async(...)` whose handle is waited, because a group may only
 //! be opened by a worker. Both are translated as they stand.
 //!
-//! Two ids:
+//! Three ids:
 //!
 //! - **`rustflow-group`** is upstream's `skynet/taskflow.cpp`: a
 //!   [`TaskGroup`](rustflow::TaskGroup) per level, ten `silent_async`
@@ -15,13 +15,21 @@
 //!   The id carries `group` rather than being plain `rustflow` because the
 //!   submission path is the thing this shape measures, and it is the same
 //!   path `fibonacci.rs`'s id of that name takes.
+//! - **`rustflow-runtime-group`** is the same recursion with the group opened
+//!   on the [`Runtime`](rustflow::Runtime) running a level rather than on the
+//!   executor, which is the route #372 added: the ten children go onto that
+//!   worker's own queue and the `corun` pops that same end, where the id
+//!   above leaves them in the shared buffers and coruns on a stealing view of
+//!   the queue. Same depths and the same ten children per level, so that a
+//!   row of the table is one column against the other in one process; #380
+//!   is where the pair is measured.
 //! - **`rayon`** is `rayon::scope` plus ten `spawn`s per level, which is the
 //!   form upstream's own non-Taskflow column has: `skynet/tbb.cpp` runs a
 //!   `tbb::task_group`, `tg.run` ten times, then `tg.wait`.
 //!
 //! There is no graph here, so the construction asymmetry
 //! `binary_tree.rs` and `embarrassing_parallelism.rs` warn about is absent:
-//! both ids measure "run the recursion" and nothing else.
+//! all three ids measure "run the recursion" and nothing else.
 //!
 //! # What this shape is here to measure
 //!
@@ -52,6 +60,12 @@
 //! it, is what this id can carry. **Neither size is chosen for speed**, and
 //! if the cliff moves these move with it.
 //!
+//! `rustflow-runtime-group` is not bound there -- its corun nests a frame per
+//! level of recursion rather than one per outstanding task, which is the
+//! difference [`Runtime::task_group`](rustflow::Runtime::task_group) states
+//! -- but it is measured at these depths anyway, because a column that ran at
+//! other sizes would not be comparable with the one beside it.
+//!
 //! # Departures from upstream
 //!
 //! - **The ten slots are an `Arc<[AtomicU64; 10]>`**, where upstream's child
@@ -65,7 +79,9 @@
 //!   against the parent's load is the `corun` between them.
 //! - **The executor arrives as an `Arc`**, because a child opens a group of
 //!   its own and needs the executor to open it, from a `'static` closure.
-//!   Upstream captures `&exe`.
+//!   Upstream captures `&exe`. The runtime route carries no executor at all:
+//!   a child there is a runtime-shaped body, and the handle it is given is
+//!   what opens its own group.
 //! - **The sum is checked outside the measured region**, against
 //!   `n * (n - 1) / 2` for `n = 10^MaxDepth`: the leaves are exactly the
 //!   integers below `n`, each counted once, so the shape has a closed-form
@@ -79,7 +95,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use rustflow::Executor;
+use rustflow::{Executor, Runtime};
 
 #[path = "common/baseline.rs"]
 mod baseline;
@@ -155,6 +171,41 @@ fn skynet_group(base: u64, depth: u32, max_depth: u32, executor: &Arc<Executor>)
         .sum()
 }
 
+/// The same recursion with each level's group opened on the [`Runtime`]
+/// running it, so that the ten children go onto that worker's own queue.
+///
+/// [`skynet_group`]'s body otherwise, down to the slots and the sum; the
+/// children are runtime-shaped because each one opens a group of its own,
+/// which on this route is what replaces the `Arc<Executor>` the other id
+/// threads through the recursion.
+fn skynet_runtime_group(base: u64, depth: u32, max_depth: u32, runtime: &mut Runtime<'_>) -> u64 {
+    if depth == max_depth {
+        return base;
+    }
+
+    let offset = 10u64.pow(max_depth - depth - 1);
+    let results: Arc<[AtomicU64; CHILDREN]> = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
+    let group = runtime.task_group();
+
+    for i in 0..CHILDREN {
+        let index = u64::try_from(i).expect("a child index below ten fits in a u64");
+        group.silent_async_runtime({
+            let results = Arc::clone(&results);
+            move |child: &mut Runtime<'_>| {
+                let sum = skynet_runtime_group(base + offset * index, depth + 1, max_depth, child);
+                results[i].store(sum, Ordering::Relaxed);
+            }
+        });
+    }
+
+    group.corun();
+
+    results
+        .iter()
+        .map(|slot| slot.load(Ordering::Relaxed))
+        .sum()
+}
+
 /// The same recursion as a `rayon::scope` of ten `spawn`s, in the role
 /// upstream's `tbb::task_group` plays.
 ///
@@ -193,13 +244,33 @@ fn group_on(max_depth: u32, executor: &Arc<Executor>) -> u64 {
         .expect("nothing under the recursion panicked")
 }
 
+/// [`group_on`] for the runtime route, which needs a runtime-shaped root
+/// body: `Executor::spawn_runtime` hands back a handle on `()`, so the sum
+/// comes back through a slot rather than through the handle.
+fn runtime_group_on(max_depth: u32, executor: &Executor) -> u64 {
+    let total = Arc::new(AtomicU64::new(0));
+
+    let task = executor.spawn_runtime({
+        let total = Arc::clone(&total);
+        move |runtime: &mut Runtime<'_>| {
+            total.store(
+                skynet_runtime_group(0, 0, max_depth, runtime),
+                Ordering::Relaxed,
+            );
+        }
+    });
+    task.wait().expect("nothing under the recursion panicked");
+
+    total.load(Ordering::Relaxed)
+}
+
 /// The rayon wrapper. `install` is what holds the recursion to the worker
 /// count this row is measuring, as in every other shape here.
 fn rayon_on(max_depth: u32, pool: &rayon::ThreadPool) -> u64 {
     pool.install(|| skynet_rayon(0, 0, max_depth))
 }
 
-/// Registers both ids at every depth and worker count.
+/// Registers all three ids at every depth and worker count.
 fn bench_skynet(c: &mut Criterion) {
     let mut group = c.benchmark_group("skynet");
     group
@@ -224,11 +295,20 @@ fn bench_skynet(c: &mut Criterion) {
                 answer,
                 "skynet({max_depth})"
             );
+            assert_eq!(
+                runtime_group_on(max_depth, &executor),
+                answer,
+                "skynet({max_depth})"
+            );
             assert_eq!(rayon_on(max_depth, &pool), answer, "skynet({max_depth})");
 
             group.bench_function(
                 BenchmarkId::new(format!("rustflow-group/{workers}w"), max_depth),
                 |b| b.iter(|| black_box(group_on(black_box(max_depth), &executor))),
+            );
+            group.bench_function(
+                BenchmarkId::new(format!("rustflow-runtime-group/{workers}w"), max_depth),
+                |b| b.iter(|| black_box(runtime_group_on(black_box(max_depth), &executor))),
             );
             group.bench_function(
                 BenchmarkId::new(format!("rayon/{workers}w"), max_depth),
