@@ -598,9 +598,9 @@ impl WorkerThread {
             }
             // The two async handles, the one pair of arms a graph is not
             // supposed to reach: an async task's node is free-standing and
-            // dispatched through a job of its own arena, so what gets here is
-            // a handle somebody put in a taskflow. Both refuse. Both also tear
-            // themselves down inside their own dispatch function --
+            // dispatched through a job that owns it outright, so what gets
+            // here is a handle somebody put in a taskflow. Both refuse. Both
+            // also tear themselves down inside their own dispatch function --
             // `Shared::finish_async`, a dependent task's successor release --
             // which can signal a waiter (`Executor::wait_for_all`,
             // `Executor::drop`) before this match produces a value at all, so
@@ -676,70 +676,80 @@ impl WorkerThread {
         // keeps for itself rather than queueing.
         let mut cache = None;
 
-        // Upstream's second switch over the handle, which `Release` has already
-        // answered. Either arm counts a successor against this node's parent
-        // before queueing it, or the run could look finished with a job in
-        // flight.
-        match release.selected() {
-            // Upstream's `default` arm: every successor, each the moment its
-            // last strong dependency is spent. The decrement floors at zero,
-            // which is this port's one departure here: a successor's counter
-            // can *already* be zero, something having bypassed its dependencies
-            // -- `Runtime::schedule` stores a zero, as does the arm below -- and
-            // upstream's bare `fetch_sub` on a `size_t` wraps it to `SIZE_MAX`,
-            // which no waiter matches, so a bypassed node that later coruns
-            // hangs. The floor loses no release upstream delivers.
-            None => {
-                for &successor in node.successors() {
-                    let next = graph.node(successor);
-                    // The other half of the bypass, and the one the floor
-                    // cannot reach: an *entered* successor is a node something
-                    // bypassed the dependencies of, and the count it holds is
-                    // its own outstanding work's. Spending one would resume the
-                    // node before that work is done, so the release is reported
-                    // through the path a panicking body takes, which leaves the
-                    // node's references intact. The read is before the
-                    // decrement, as `finish_job`'s is.
-                    if is_entered(next) {
-                        job.record_panic(Box::new(REENTERED));
-                        continue;
+        // A free async node is the one job with no graph to release into, and
+        // it has nothing to release: its successors are jobs on the
+        // `AsyncNode`, handed out by the dependent-async tear-down rather than
+        // found through an edge. So this whole block belongs to a job of a
+        // graph, and the `None` skips it instead of resolving an index against
+        // a graph that is not there.
+        if let Some(graph) = graph {
+            // Upstream's second switch over the handle, which `Release` has
+            // already answered. Either arm counts a successor against this
+            // node's parent before queueing it, or the run could look finished
+            // with a job in flight.
+            match release.selected() {
+                // Upstream's `default` arm: every successor, each the moment its
+                // last strong dependency is spent. The decrement floors at zero,
+                // which is this port's one departure here: a successor's
+                // counter can *already* be zero, something having bypassed its
+                // dependencies -- `Runtime::schedule` stores a zero, as does
+                // the arm below -- and upstream's bare `fetch_sub` on a
+                // `size_t` wraps it to `SIZE_MAX`, which no waiter matches, so
+                // a bypassed node that later coruns hangs. The floor loses no
+                // release upstream delivers.
+                None => {
+                    for &successor in node.successors() {
+                        let next = graph.node(successor);
+                        // The other half of the bypass, and the one the floor
+                        // cannot reach: an *entered* successor is a node
+                        // something bypassed the dependencies of, and the count
+                        // it holds is its own outstanding work's. Spending one
+                        // would resume the node before that work is done, so
+                        // the release is reported through the path a panicking
+                        // body takes, which leaves the node's references
+                        // intact. The read is before the decrement, as
+                        // `finish_job`'s is.
+                        if is_entered(next) {
+                            job.record_panic(Box::new(REENTERED));
+                            continue;
+                        }
+                        // `update` is a compare-exchange loop where upstream has
+                        // one `fetch_sub`, and that cost is deliberate: the cheaper
+                        // shape -- subtract, then add the one back on a zero -- is
+                        // not sound, two predecessors of one bypassed node being
+                        // able to sit in that window at once.
+                        let outstanding = next.join_counter().update(
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                            |outstanding| outstanding.saturating_sub(1),
+                        );
+                        if outstanding == 1 {
+                            job.parent().count_queued(topology, 1);
+                            self.update_cache(&mut cache, job.successor(successor));
+                        }
                     }
-                    // `update` is a compare-exchange loop where upstream has
-                    // one `fetch_sub`, and that cost is deliberate: the cheaper
-                    // shape -- subtract, then add the one back on a zero -- is
-                    // not sound, two predecessors of one bypassed node being
-                    // able to sit in that window at once.
-                    let outstanding = next.join_counter().update(
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                        |outstanding| outstanding.saturating_sub(1),
-                    );
-                    if outstanding == 1 {
+                }
+                // Upstream's `CONDITION`/`MULTI_CONDITION` arm: only the
+                // successors the body named, each scheduled outright. An index
+                // naming no successor is how a branch ends.
+                Some(conditions) => {
+                    let num_successors = node.num_successors();
+                    for &condition in conditions {
+                        let Some(index) = selected_successor(condition, num_successors) else {
+                            continue;
+                        };
+                        let successor = node.successors()[index];
+                        // Upstream's "zeroing the join counter for invariant": a
+                        // weak successor may be re-entered on a cycle before its
+                        // strong predecessors run again, so nothing else would
+                        // decrement its counter to the zero that means ready.
+                        graph
+                            .node(successor)
+                            .join_counter()
+                            .store(0, Ordering::Relaxed);
                         job.parent().count_queued(topology, 1);
                         self.update_cache(&mut cache, job.successor(successor));
                     }
-                }
-            }
-            // Upstream's `CONDITION`/`MULTI_CONDITION` arm: only the
-            // successors the body named, each scheduled outright. An index
-            // naming no successor is how a branch ends.
-            Some(conditions) => {
-                let num_successors = node.num_successors();
-                for &condition in conditions {
-                    let Some(index) = selected_successor(condition, num_successors) else {
-                        continue;
-                    };
-                    let successor = node.successors()[index];
-                    // Upstream's "zeroing the join counter for invariant": a
-                    // weak successor may be re-entered on a cycle before its
-                    // strong predecessors run again, so nothing else would
-                    // decrement its counter to the zero that means ready.
-                    graph
-                        .node(successor)
-                        .join_counter()
-                        .store(0, Ordering::Relaxed);
-                    job.parent().count_queued(topology, 1);
-                    self.update_cache(&mut cache, job.successor(successor));
                 }
             }
         }

@@ -31,7 +31,7 @@ consolidation ran 17 issues against the 11 it opened with, and the rest of its
 decisions extended an entry rather than adding one. Where each is: the anchor
 window and the companion walk in `enter` (#157) under "A failure inside a
 nested graph is delivered to whoever is waiting for that graph"; the one-node
-arena and why three heap blocks cannot be two (#144) under "An async task is
+arena and the heap-block bill it was part of (#144) under "An async task is
 one `Arc`-owned free-standing node"; the debug assertion and the loom model
 that replaced a paragraph (#138, #141) under "A run's waiter is released by the
 last share of its storage hold"; and a task body's own queue (#119) and naming
@@ -981,14 +981,15 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   overloads collapse onto the unnamed forms: they differ only in the name they
   give the node, and the observers that would read one are step 6.
 - **An async task is one `Arc`-owned free-standing node, and its job names a
-  sentinel run** (issues #86, #105). Upstream's async node is an ordinary
+  sentinel run** (issues #86, #105, #376). Upstream's async node is an ordinary
   `Node` out of its object pool with `_topology == nullptr`, held alive by a
   reference count packed into the low 24 bits of the node's state word. A
-  `Node` here is a slot in a `Graph`'s arena and has no way to exist outside
-  one, so an async task owns a one-node arena and the `Arc` around it *is*
-  upstream's count: handles share it, every queued job of the node shares it,
-  and the node goes when the last share goes — no second counter to keep in
-  step and no recycle call to get right. That leaves the null topology, which
+  `Node` of a taskflow here is a slot in a `Graph`'s arena, so an async task
+  holds its one node *inline* instead — `AsyncNode` owns a `Node` and no
+  arena — and the `Arc` around it *is* upstream's count: handles share it,
+  every queued job of the node shares it, and the node goes when the last
+  share goes — no second counter to keep in step and no recycle call to get
+  right. That leaves the null topology, which
   every job in the scheduler reaches through without asking whether it is
   there. Making the field an `Option` would have put a `None` case into the
   worker's dispatch, into every arm that schedules a nested graph, into the
@@ -1003,18 +1004,32 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   never returned.
 
   What the shape costs was measured rather than argued: an externally
-  submitted async task is ~415 ns, of which 87% is the three heap blocks the
-  node is -- the `Arc`, the arena inside it and the body's box.
+  submitted async task was ~415 ns, of which 87% was the three heap blocks the
+  node then was — the `Arc`, the arena inside it and the body's box.
   [`BENCHMARKS.md`](BENCHMARKS.md) has the ablations under "The #125
-  attribution" and, in the section after it, the one change they named: the
-  arena is sized to the single node it holds (issue #144), which is 528 of
-  the 848 bytes a task and 6% of the submission path. That it is three blocks
-  and not two is `Graph`'s doing rather than this entry's — nodes live in a
-  `Vec`, so folding the arena into the `Arc` would take either a graph that
-  can hold one node inline, which is a discriminant and a branch on every
-  resolution by index in every graph in the crate for the one case that needs
-  it, or an async path that does not resolve a job through a `&Graph` at all.
-  The three are therefore the bill, for the reason this entry gives.
+  attribution", which priced a block at ~70 ns on the thread that allocates it
+  and ~700 ns when a worker frees what a producer allocated, and the section
+  after them has the first change they named: the arena was sized to the
+  single node it held (issue #144), 528 of the 848 bytes a task and 6% of the
+  submission path. #376 is the second and takes the arena away altogether, so
+  a free node is **two blocks, the `Arc` and the body's box** — the body stays
+  because it is type erasure — and the two were measured to be one too many
+  rather than argued down. Of the two ways to fold the arena into the `Arc`,
+  the one taken is the second: **a free node's job resolves its node through a
+  field rather than by index into a graph**, where the rejected alternative
+  was a `Graph` that can hold one node inline, which is a discriminant and a
+  branch on every resolution by index in every graph in the crate for the one
+  case that needs it. What that choice costs is paid by `GraphOwner`: its
+  async arm answers `node()` from the field and has no graph to answer with at
+  all, so `graph()` is an `Option` on the three paths every job reaches — the
+  node's own dispatch, the observer views, and `runs_inside` — and panics on
+  the paths that are a graph's alone, which are `set_up_graph`, a successor
+  release and `Runtime::schedule`'s bypass target. A free node has no
+  successors in a graph and no predecessors to call weak, so the `None` on
+  those three paths is the answer an empty graph would have given. The
+  allocation count is a test rather than a figure
+  (`src/executor/async_node.rs`), the price of the two blocks being
+  [`BENCHMARKS.md`](BENCHMARKS.md)'s to state.
 - **`AsyncTask` is that `Arc`, so `use_count` counts the executor's shares
   too** (issues #86, #91). Upstream's handle is a `Node*` plus `_incref` and
   `_decref` on every copy, move and destruction; here it is an
@@ -1193,9 +1208,8 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
 
   The default is deliberately unchanged: an unnamed submission names its node
   the empty string, which is what `DefaultTaskParams` leaves `Node::_name`
-  as upstream, and `Graph::add_named_node` already took the name a free
-  node's one-node arena is built with -- nothing in `src/graph/` moved for
-  this.
+  as upstream, and the node constructors in `src/graph/` already took a name
+  — nothing there moved for this.
 
 - **A scoped spawn, and the crate's second `unsafe` module** (issue #164).
   `Runtime::scope` is this port's own addition -- upstream has nothing to

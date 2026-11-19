@@ -61,7 +61,8 @@
 //! predecessor here is a [`Task`](crate::Task) index, so answering "is this
 //! predecessor a conditioner" -- what [`TaskView::num_weak_dependencies`]
 //! needs -- means resolving that index back into a node, which takes the
-//! graph too.
+//! graph too. The graph is an `Option` for the one task that lives in none,
+//! a free async task's, which has no predecessor to resolve either.
 //!
 pub mod chrome;
 pub mod tfprof;
@@ -201,13 +202,14 @@ impl<'a> WorkerView<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct TaskView<'a> {
     node: &'a Node,
-    graph: &'a Graph,
+    graph: Option<&'a Graph>,
 }
 
 impl<'a> TaskView<'a> {
-    /// Borrows `node` out of `graph`. Crate-private, as upstream's
-    /// constructor is `private` with `Executor` the one `friend`.
-    pub(crate) fn new(node: &'a Node, graph: &'a Graph) -> Self {
+    /// Borrows `node` out of `graph`, which is `None` for a node no graph
+    /// holds -- a free async task's. Crate-private, as upstream's constructor
+    /// is `private` with `Executor` the one `friend`.
+    pub(crate) fn new(node: &'a Node, graph: Option<&'a Graph>) -> Self {
         Self { node, graph }
     }
 
@@ -251,11 +253,16 @@ impl<'a> TaskView<'a> {
     /// `TaskView::num_weak_dependencies`.
     #[must_use]
     pub fn num_weak_dependencies(&self) -> usize {
-        self.node
-            .predecessors()
-            .iter()
-            .filter(|&&predecessor| self.graph.node(predecessor).handle().is_conditioner())
-            .count()
+        // A task with no graph is a free async task, which has no predecessor
+        // of either kind: the `map_or` answers the count it would reach by
+        // iterating an empty list.
+        self.graph.map_or(0, |graph| {
+            self.node
+                .predecessors()
+                .iter()
+                .filter(|&&predecessor| graph.node(predecessor).handle().is_conditioner())
+                .count()
+        })
     }
 
     /// A hash of this task's identity, distinct from every other live
@@ -356,6 +363,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::executor::async_node::AsyncNode;
+    use crate::graph::{AsyncWork, Handle};
 
     struct Counting {
         entries: AtomicUsize,
@@ -402,6 +411,25 @@ mod tests {
         list.remove(&registered);
         assert!(list.is_empty());
         assert_eq!(list.len(), 0);
+    }
+
+    /// The view of the one task that lives in no graph: a free async task,
+    /// whose node the executor hands over with `None` where a graph task's
+    /// view carries the arena its predecessors index. Every question a hook
+    /// may ask is answered without one, the two dependency counts being the
+    /// zero an empty predecessor list gives.
+    #[test]
+    fn a_task_view_of_a_free_node_needs_no_graph() {
+        let node = AsyncNode::new("free", Handle::Async(AsyncWork::plain(|| {})));
+        let view = TaskView::new(node.node(), None);
+
+        assert_eq!(view.name(), "free");
+        assert_eq!(view.task_type(), TaskType::Async);
+        assert_eq!(view.num_predecessors(), 0);
+        assert_eq!(view.num_successors(), 0);
+        assert_eq!(view.num_weak_dependencies(), 0);
+        assert_eq!(view.num_strong_dependencies(), 0);
+        assert_ne!(view.hash_value(), 0);
     }
 
     /// Removing an `Arc` that was never registered is a no-op, not a panic.

@@ -14,9 +14,10 @@
 //! around; `ownership` has the shapes those handles are.
 //!
 //! Two consequences are this module's own. A job addresses its node by
-//! [`Task`] index rather than by pointer, so the node comes out of its graph
-//! through safe code and a graph nobody can edit while a job names it cannot
-//! invalidate an index either; and [`Job::finish`] *consumes* the job, which
+//! [`Task`] index rather than by pointer -- resolved through the owner, which
+//! for the one owner that is no graph is a field rather than an index -- so
+//! the node comes out of safe code either way, and a graph nobody can edit
+//! while a job names it cannot invalidate an index either; and [`Job::finish`] *consumes* the job, which
 //! is how the compiler enforces that a worker gives up its share of the graph
 //! before the decrement that may end the run.
 
@@ -75,7 +76,7 @@ impl Job {
     }
 
     /// The job that runs the free-standing node of `node`, which belongs to no run
-    /// and to no graph the caller built: upstream's `_schedule(Worker&, Node*)`
+    /// and to no graph at all: upstream's `_schedule(Worker&, Node*)`
     /// over an async node. `parent` is whatever scheduled this task --
     /// [`Parent::Run`] over the sentinel for a task submitted to the executor,
     /// which is upstream's null parent, or a [`Parent::Nested`] for one spawned by
@@ -105,16 +106,32 @@ impl Job {
         topology: &'a Arc<Topology>,
         parent: &'a Parent,
     ) -> impl Iterator<Item = Self> + 'a {
+        // A free async node is the one owner that is no graph, and it is no
+        // caller of this either: its one job is `Job::free`, which names the
+        // node rather than searching for a source.
         owner
-            .graph()
-            .iter()
+            .try_graph()
+            .into_iter()
+            .flat_map(Graph::iter)
             .filter(|(_, node)| node.num_predecessors() == 0)
             .map(move |(task, _)| Self::new(task, owner, topology, parent))
     }
 
-    /// The graph this job's node lives in, whichever of the five kinds it is.
+    /// The graph this job's node lives in, whichever of the four kinds of
+    /// owner that is a graph it belongs to.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this job is a free async node's, which lives in no graph:
+    /// [`Job::try_graph`] is the accessor for a path every job reaches. Also
+    /// panics as [`Job::node`] does.
     pub(crate) fn graph(&self) -> &Graph {
         self.owner.graph()
+    }
+
+    /// The same, as the `None` a free async node is.
+    pub(crate) fn try_graph(&self) -> Option<&Graph> {
+        self.owner.try_graph()
     }
 
     /// The owner of a graph this job's *own* node owns: this job's owner plus
@@ -137,7 +154,7 @@ impl Job {
     /// storage -- this job's own, for one -- is outstanding. The same holds of
     /// every node on the path to a nested graph.
     pub(crate) fn node(&self) -> &Node {
-        self.graph().node(self.task)
+        self.owner.node(self.task)
     }
 
     /// The free-standing node this job runs, or `None` for a job of a graph
@@ -287,12 +304,13 @@ impl Job {
         }
     }
 
-    /// Resolves this job into the node to run, the graph holding it and the run it
-    /// is part of. Safe, and that is the point of the type: the job owns a share of
-    /// the storage and of the run, so neither can have gone away, and the node
-    /// comes out of the graph by index. Panics as [`Job::node`] does.
-    pub(crate) fn parts(&self) -> (&Node, &Graph, &Topology) {
-        (self.node(), self.graph(), &self.topology)
+    /// Resolves this job into the node to run, the graph holding it -- `None`
+    /// for a free async node, which no graph holds -- and the run it is part
+    /// of. Safe, and that is the point of the type: the job owns a share of
+    /// whatever owns the node and a share of the run, so neither can have
+    /// gone away. Panics as [`Job::node`] does.
+    pub(crate) fn parts(&self) -> (&Node, Option<&Graph>, &Topology) {
+        (self.node(), self.try_graph(), &self.topology)
     }
 
     /// Whether this job may be skipped because its run or some parent above it has
@@ -323,7 +341,13 @@ impl Job {
     pub(crate) fn runs_inside(&self, graph: &Graph) -> bool {
         let mut job = self;
         loop {
-            if std::ptr::eq(job.graph(), graph) {
+            // A free async node is inside no graph, so the job of one answers
+            // the question for whatever is above it on the chain and for
+            // nothing of its own.
+            if job
+                .try_graph()
+                .is_some_and(|inside| std::ptr::eq(inside, graph))
+            {
                 return true;
             }
 

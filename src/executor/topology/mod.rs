@@ -1261,10 +1261,9 @@ mod tests {
         AsyncNode::new("free", Handle::Async(AsyncWork::plain(|| {})))
     }
 
-    /// A job of a free node resolves like a job of any other graph: the one
-    /// node of the task's own arena, the arena itself, and the sentinel run.
-    /// That is the whole point of giving an async task a one-node graph --
-    /// the dispatch learns nothing new.
+    /// A job of a free node resolves to the node the task owns inline, to no
+    /// graph at all, and to the sentinel run: the three a dispatch arm asks
+    /// for, and the one owner of the five whose middle answer is `None`.
     #[test]
     fn a_job_of_a_free_node_resolves_to_that_node() {
         let node = free_node();
@@ -1276,8 +1275,8 @@ mod tests {
             "the job names the task's one node"
         );
         assert!(
-            std::ptr::eq(graph, node.graph()),
-            "and resolves it against the task's own arena"
+            graph.is_none(),
+            "which lives in no graph, so there is no index to resolve"
         );
         assert!(
             std::ptr::eq(topology, &**Topology::free_standing()),
@@ -1285,6 +1284,18 @@ mod tests {
         );
         assert_eq!(resolved.name(), "free");
         assert!(resolved.handle().is_async());
+    }
+
+    /// And the accessor a dispatch arm of a *graph* uses, which a free node
+    /// has no answer for: `Runtime::schedule`'s bypass resolves a second
+    /// task of the job's own graph through it, so the one job that names no
+    /// graph fails there rather than resolving an index against the node it
+    /// is.
+    #[test]
+    #[should_panic(expected = "a free async node lives in no graph")]
+    fn a_free_nodes_job_has_no_graph_to_name_another_task_in() {
+        let node = free_node();
+        let _ = Job::free(&node, &Parent::Run).graph();
     }
 
     /// Both halves of what the sentinel has to make true. A free node with
