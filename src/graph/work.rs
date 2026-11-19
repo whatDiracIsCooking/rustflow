@@ -380,4 +380,28 @@ impl AsyncWork {
             complete: OnceWork::new(Box::new(complete)),
         }
     }
+
+    /// Drops the body of a task that is never going to run, out of every
+    /// slot this shape has, leaving them as the one worker that ran the task
+    /// would have left them: empty. A no-op on a slot already taken, so a
+    /// caller that reaches a body twice drops it once.
+    ///
+    /// Upstream has no equivalent, its cancelled node's `std::function` dying
+    /// with the node. Here the node outlives the point at which the task is
+    /// counted off -- the `Arc` it sits in may be parked for reuse, or still
+    /// named by a handle -- so a skipped body has to be dropped *on purpose*,
+    /// before the count, which is what the cancellation early-out in
+    /// `WorkerThread::invoke_one` calls this for (issue #416). Through the
+    /// shared reference every job of a node has, the slots being behind
+    /// [`OnceWork`]'s own lock.
+    pub(crate) fn discard(&self) {
+        match self {
+            Self::Plain(body) => drop(body.take()),
+            Self::Runtime(body) => drop(body.take()),
+            Self::Reentrant { body, complete } => {
+                drop(body.take());
+                drop(complete.take());
+            }
+        }
+    }
 }

@@ -142,6 +142,30 @@ impl AsyncNode {
         self.node().base().take_panic()
     }
 
+    /// Drops the body of a task that will never run, leaving the handle's
+    /// slots as a run would have left them: [`AsyncWork::discard`], on
+    /// whichever of the two free-node handles this node carries.
+    ///
+    /// What the cancellation early-out in `WorkerThread::invoke_one` calls
+    /// **before** it counts the skipped job off. The body is the one thing a
+    /// task owns that a caller can observe being dropped -- a `Runtime::scope`
+    /// child's captures a borrow of the frame that opened the scope, and a
+    /// guard in it may write through that borrow from its `Drop` -- and the
+    /// node it sits in outlives the count: it is parked by
+    /// [`FreeNodes::recycle`] or kept by whatever else still names it, and
+    /// either way the body would be dropped after `Runtime::scope` had been
+    /// told every child was joined. Issue #416 is where that order was found;
+    /// `WorkerThread::spend_job`'s docs state the order every path keeps now.
+    pub(crate) fn discard_body(&self) {
+        match self.node().handle() {
+            Handle::Async(work) | Handle::DependentAsync(work) => work.discard(),
+            // Not a free node's handle: `debug_assert_free_handle` has why
+            // only the two above are, and a parked node's `Placeholder` is
+            // never dispatched.
+            _ => {}
+        }
+    }
+
     /// Leaves `job` to be released when this task finishes, reporting `false`
     /// if it has finished already and the caller must release it itself:
     /// upstream's `_process_dependent_async`, which takes the lock, tests

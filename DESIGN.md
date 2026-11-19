@@ -1567,6 +1567,35 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   model, checked against the mutation of skipping the join `scope` performs
   on every path out of it.
 
+  **"Joined" means dropped, not counted** (issue #416). The guarantee the
+  erasure rests on is that `Runtime::scope` does not return until every
+  child's body -- and whatever it captured from the scope's frame -- is gone,
+  and `scope` learns that from one number: the join counter its `try_corun`
+  watches. So the count a job releases in `WorkerThread::finish_job` has to be
+  released *after* the body is dropped, on every path a job takes to it. The
+  completed path always was: the body is taken out of the node and consumed
+  by the arm that runs it. The cancelled path was not. A child skipped by the
+  early-out at the top of `WorkerThread::invoke_one` kept its never-called
+  closure in the node's handle, and `spend_job` counted the job off first and
+  let `FreeNodes::recycle`'s reset drop the body afterwards -- so a `scope`
+  could return, and its caller reclaim the frame, while a boxed closure
+  holding a `&'scope mut` or a guard whose `Drop` writes through one was
+  still about to be dropped on another worker. The window was one `recycle`
+  wide, which is why #412's faster corun return exposed it and nothing
+  before did. The fix is one call: the early-out drops the body on purpose
+  (`AsyncNode::discard_body`, under the `catch_unwind` the body itself would
+  have run under) before anything releases a count, and `spend_job`'s docs
+  now state that the node reaches it holding no body. The loom model models
+  the drop as the cancelled child's one touch of its borrow, and carries the
+  old order as a mutation it has to find with the join in place; its earlier
+  cancelled arm touched nothing, which encoded the belief that a never-called
+  closure cannot reach its borrow -- it can, through `Drop`. The other
+  skipped-job paths were asked the same question: `release_skipped` and a
+  task group's children run through the same early-out, so one drop covers
+  them; a semaphore-parked job is a graph node's, whose body is the graph's
+  and not the job's to drop, and it is not counted off until it is woken and
+  dispatched through the same early-out.
+
 ## Observers
 
 - **The observer list is one atomic check on the path with no observers, and a

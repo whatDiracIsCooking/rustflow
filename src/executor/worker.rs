@@ -510,12 +510,48 @@ impl WorkerThread {
     /// which is what [`FreeNodes::recycle`]'s decision rests on; `DESIGN.md`
     /// has why that decision is taken at all. Nothing else is deferred past
     /// [`Job::finish`], whose counters may end the run.
+    ///
+    /// **The node reaches this method holding no body**, on either path a job
+    /// takes to it, and that is load-bearing: `finish_job` is what releases
+    /// the counts a `Runtime::scope` -- or a task group's `corun`, or the run
+    /// itself -- waits on, and the waiter reads a released count as every
+    /// child *joined*, which has to mean dropped and not merely counted. A
+    /// child's body may hold a borrow of the waiter's own frame (`Scope`'s
+    /// erasure is sound only while the join is before the frame moves on),
+    /// or a guard whose `Drop` a caller can observe. On the completed path
+    /// the body was taken out of the slot and consumed by the arm that ran
+    /// it; on the cancelled path the early-out in
+    /// [`WorkerThread::invoke_one`] drops it on purpose, through
+    /// [`WorkerThread::discard_skipped_body`], before calling here. What
+    /// [`FreeNodes::recycle`]'s reset tears down after the count is
+    /// therefore a name and an empty successor list, nothing a caller can
+    /// see. Issue #416 found the cancelled path dropping the body *here*,
+    /// after the count, a window one `recycle` wide that #412's faster
+    /// corun return was the first to open.
     fn spend_job(&self, job: Job) {
         let finished = job.async_node().cloned();
         self.finish_job(job.finish());
 
         if let Some(node) = finished {
             self.free_nodes.recycle(node);
+        }
+    }
+
+    /// Drops the body of a free node whose job the cancellation early-out is
+    /// about to count off, so that nothing the body captured outlives the
+    /// count: [`AsyncNode::discard_body`], under the same `catch_unwind` the
+    /// body would have run under. A `Drop` that panics is recorded against
+    /// the job's anchor chain exactly as a panicking body is, rather than
+    /// unwinding the worker with a job it never counted off -- which would
+    /// leave the parent's join counter one short for ever. Nothing to do for
+    /// a job of a graph node, whose body is the graph's and outlives every
+    /// job of it.
+    fn discard_skipped_body(&self, job: &Job) {
+        let Some(node) = job.async_node() else {
+            return;
+        };
+        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| node.discard_body())) {
+            job.record_panic(payload);
         }
     }
 
@@ -598,6 +634,11 @@ impl WorkerThread {
                 if node.dispatch_claim().release() {
                     self.schedule(job.clone());
                 }
+
+                // The body first, before either release below moves a count
+                // anybody waits on: "joined" means *dropped*, not counted, and
+                // `spend_job`'s docs have the order and what it protects.
+                self.discard_skipped_body(&job);
 
                 // Upstream's cancelled branch goes to `_tear_down_invoke`,
                 // which dispatches on the handle: a skipped dependent-async
@@ -1267,9 +1308,77 @@ fn seed_from_current_thread() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
+    use crate::executor::r#async::{Spawn, Submission};
+    use crate::executor::topology::{Cancellable, Nested};
     use crate::graph::Graph;
     use crate::{Executor, FlowBuilder, RunError, Semaphore, Taskflow};
+
+    /// A value a skipped child's closure captured, whose `Drop` reads how
+    /// many jobs its parent still counts outstanding at the instant it runs:
+    /// the observation issue #416 is about, made from inside the drop
+    /// rather than raced against from another thread.
+    struct CountWitness {
+        parent: Arc<Nested>,
+        seen: Arc<AtomicUsize>,
+    }
+
+    impl Drop for CountWitness {
+        fn drop(&mut self) {
+            self.seen
+                .store(self.parent.outstanding(), Ordering::Release);
+        }
+    }
+
+    /// Issue #416, pinned deterministically: a child the cancellation
+    /// early-out skips has its body dropped **while its parent still counts
+    /// it**, so a waiter released by that count can never find the body
+    /// alive. The worker is driven on this thread, as the hand-stepped cases
+    /// in `executor::async_node` are; the parent is a cancelled anchor, which
+    /// is what makes the child's one job take the early-out by construction.
+    ///
+    /// How the old order fails this: the body was dropped by
+    /// `FreeNodes::recycle` after `finish_job`, so the witness read zero.
+    #[test]
+    fn a_skipped_childs_body_is_dropped_while_its_parent_still_counts_it() {
+        let executor = Executor::new(1);
+        let mut worker = WorkerThread::new(Arc::clone(&executor.shared), 0, WorkerQueue::new());
+
+        let parent = Nested::new(None);
+        parent
+            .base()
+            .estate()
+            .fetch_or(Cancellable::CANCELLED, Ordering::Relaxed);
+
+        let seen = Arc::new(AtomicUsize::new(usize::MAX));
+        let witness = CountWitness {
+            parent: Arc::clone(&parent),
+            seen: Arc::clone(&seen),
+        };
+        let to = Submission::under_anchor_on(&parent, &worker);
+        executor
+            .shared
+            .schedule_async_task(Spawn::silent(move || drop(witness)), &to);
+        assert_eq!(
+            parent.outstanding(),
+            1,
+            "the child is counted at submission"
+        );
+
+        let job = worker
+            .pop()
+            .expect("the child went onto this worker's own queue");
+        worker.invoke(job);
+
+        assert_eq!(
+            seen.load(Ordering::Acquire),
+            1,
+            "the body was dropped before the parent's count was released"
+        );
+        assert_eq!(parent.outstanding(), 0, "and the count was released after");
+    }
 
     /// Upstream's `TF_THROW("can't release the semaphore more than its
     /// maximum value: ", _max_value)`, which escapes its worker loop: here

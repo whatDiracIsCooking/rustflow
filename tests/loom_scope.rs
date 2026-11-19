@@ -37,12 +37,20 @@
 //! [`run_child`] carries the three paths `src/executor/scope.rs`'s module
 //! docs name, as one function whose [`Outcome`] picks the ending: a child
 //! that completes normally, one that panics after it has already touched the
-//! borrow, and one that is "cancelled" -- dropped before its body ever runs,
-//! so it never touches the borrow at all but still has to be *counted*, the
-//! same `done` flag a real job's early-out still sets. The one thing that
-//! must hold across all three is [`one_scope`]'s `join` knob: when it waits
-//! for `done` before flipping `alive`, no child -- on any of the three paths
-//! -- can ever observe `false`.
+//! borrow, and one that is "cancelled" -- dropped before its body ever runs.
+//! That third child never *calls* anything that touches the borrow, but its
+//! **drop does**: a closure that captured a guard runs that guard's `Drop`
+//! when the never-called closure is dropped, and a `Drop` may write through
+//! the borrow as freely as the body would have. So the cancelled arm's one
+//! [`access`] stands for the drop, and it has to come *before* the arm sets
+//! `done` -- the same `done` flag a real job's early-out still sets, and the
+//! order issue #416 found the real early-out getting wrong: it counted the
+//! job off first and let the node's recycling drop the body afterwards, one
+//! `recycle` after `Runtime::scope` had already been told every child was
+//! joined. The one thing that must hold across all three paths is
+//! [`one_scope`]'s `join` knob: when it waits for `done` before flipping
+//! `alive`, no child -- on any of the three paths -- can ever observe
+//! `false`.
 //!
 //! The model earns its keep by **mutation**, as `tests/loom_storage.rs` and
 //! `tests/loom_anchor.rs` do: alongside the join the crate ships, it carries
@@ -50,7 +58,14 @@
 //! returning as soon as `f` does, upstream's own `spawn`/`silent_async`
 //! detaching rather than joining -- and asserts that loom *finds* it, on
 //! every one of the three paths that could hide a mutation that only broke
-//! one of them.
+//! one of them. It carries a second mutation as well, #416's own:
+//! [`Outcome::CancelledCountedFirst`] is the cancelled path with the drop
+//! moved after the count, and loom has to find that one *with the join in
+//! place*, since the join is exactly what that order defeats. Before #416 the
+//! cancelled arm made no access at all, which encoded the belief that a
+//! never-called closure cannot touch its borrow; a model built on that
+//! belief passed against the broken order and would have passed against any
+//! order, which is why it had no cancelled-path mutation to fail.
 //!
 //! What the model does not say anything about: the accounting that makes
 //! `done` get set at all (that is the join counter and the preemption
@@ -112,10 +127,19 @@ enum Outcome {
     Panics,
     /// The child is dropped before its body is ever called: the
     /// cancellation early-out in `executor::worker`'s dispatch, which never
-    /// reaches the closure at all -- so it never touches the borrow -- but
-    /// still counts the job off, which is the only reason `done` is set on
-    /// this path too.
+    /// reaches the closure's body -- but drops the closure, and a guard it
+    /// captured runs its `Drop` through the borrow then -- and still counts
+    /// the job off, which is the only reason `done` is set on this path too.
+    /// The drop comes first, as `WorkerThread::discard_skipped_body` makes
+    /// it in the real early-out.
     Cancelled,
+    /// **A mutation**, issue #416's: the cancelled path with its two steps
+    /// in the order the real early-out had before that issue -- the job
+    /// counted off, and the body dropped only afterwards, by the node's
+    /// recycling. Not a path the crate ships; what `mutation_a_cancelled_
+    /// childs_drop_after_the_count_is_found_with_the_join` asserts loom can
+    /// tell apart from `Cancelled`.
+    CancelledCountedFirst,
 }
 
 /// Runs one child against `borrow` under `outcome`, then marks `done` --
@@ -139,8 +163,17 @@ fn run_child(outcome: Outcome, borrow: &Borrow, done: &AtomicBool) {
             done.store(true, Ordering::Release);
         }
         Outcome::Cancelled => {
-            // No `access()`: the early-out never calls this closure's body.
+            // The one touch a never-called closure makes: the `Drop` of what
+            // it captured, which the early-out runs by dropping the body --
+            // before it counts the job off.
+            borrow.access();
             done.store(true, Ordering::Release);
+        }
+        Outcome::CancelledCountedFirst => {
+            // #416's order: counted off first, so a frame waiting on `done`
+            // may already have moved on when the drop touches the borrow.
+            done.store(true, Ordering::Release);
+            borrow.access();
         }
     }
 }
@@ -205,9 +238,11 @@ fn a_panicking_child_is_joined_before_its_borrow_is_reclaimed() {
     bounded_model(|| one_scope(Outcome::Panics, true));
 }
 
-/// A cancelled child never touches its borrow at all, so there is nothing
-/// for the reclaim to race -- this is the liveness half: the join still has
-/// to *terminate*, which it can only do if the early-out still sets `done`.
+/// A cancelled child touches its borrow exactly once, from the drop of what
+/// its never-called closure captured, and the join waits for that drop
+/// because the early-out makes it before it counts the job off. The
+/// liveness half rides along: the join still has to *terminate*, which it
+/// can only do if the early-out still sets `done`.
 #[test]
 fn a_cancelled_child_is_joined_before_its_borrow_is_reclaimed() {
     bounded_model(|| one_scope(Outcome::Cancelled, true));
@@ -233,4 +268,29 @@ fn mutation_a_completing_child_is_found_without_the_join() {
 #[should_panic(expected = "a child used its borrow after the frame that owned it took it back")]
 fn mutation_a_panicking_child_is_found_without_the_join() {
     bounded_model(|| one_scope(Outcome::Panics, false));
+}
+
+/// The identical mutation, on the cancelled path, which it could not reach
+/// before issue #416 gave that path an access to race: a dropped closure's
+/// guard is as exposed to a `scope` that does not wait as a body that ran.
+#[test]
+#[should_panic(expected = "a child used its borrow after the frame that owned it took it back")]
+fn mutation_a_cancelled_child_is_found_without_the_join() {
+    bounded_model(|| one_scope(Outcome::Cancelled, false));
+}
+
+// --- The second mutation, #416's: the join is in place, and the cancelled
+// --- path counts the job off before it drops the body -----------------------
+
+/// Issue #416's order, under the join the crate ships: `scope` waits for
+/// `done` as it should, and the early-out sets `done` *before* the drop
+/// touches the borrow, so the wait is satisfied while the drop is still to
+/// come. Loom has to find the interleaving where the frame reclaims first --
+/// it is the one `recycle` of a window the box took ~22 full-suite runs to
+/// hit once -- which is what makes this model a check on the order rather
+/// than only on the join.
+#[test]
+#[should_panic(expected = "a child used its borrow after the frame that owned it took it back")]
+fn mutation_a_cancelled_childs_drop_after_the_count_is_found_with_the_join() {
+    bounded_model(|| one_scope(Outcome::CancelledCountedFirst, true));
 }
