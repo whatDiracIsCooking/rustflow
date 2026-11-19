@@ -40,6 +40,30 @@ deliberately left none: #128 and #151 are the weekly loom workflow, whose own
 file and the README say what it runs, and #146 was two module docs still
 calling the async family a later milestone.
 
+**Decisions taken in M12**, the scheduler-performance milestone, are spread
+the same way, and most of them extended an entry rather than adding one. Where
+each is: in "Dynamic tasking", the queue a group's children are pushed onto
+(#372) under "A task group has no implicit join on drop", which route a body
+wants (#380) and the runtime a group lends back (#395); in "Executor core",
+the fan-out's `w - 1` pushes and pokes (#367, with #378 declined inside it),
+the partitioner's share against its tree (#381), the corun that read its
+predicate once a search (#407, #412) and upstream's own column on whose
+regression that was (#384), plus the two declined below; in "The async
+family", the free node in one block fewer (#376), the worker's recycling list
+(#379, #397) and what "joined" means for a scoped child (#416) under "A scoped
+spawn"; and in "Algorithms", `SplittingPartitioner` as an option rather than a
+default (#381), its floor (#401, re-decided as #409 with #406 declined), the
+live sort partition (#375) and the comparator reaching the sort by value
+(#399). Two of its issues left no entry: #373, whose answer is that 23 idle
+workers cost a serial chain nothing, and #393, the one `if` that answer found
+missing from the semaphore release hook -- a guard upstream has and this port
+had dropped, so neither of them changes a decision this file records. Both are
+in [`BENCHMARKS.md`](BENCHMARKS.md) under "The #373 measurement". The two the
+milestone **declined** never became issues, so they are the only two entries
+in this file that name a milestone where every other names an issue; they are
+the last two of "Executor core", and they are stack-allocated jobs for scoped
+children and a splittable source range for external submission.
+
 The entries are grouped by the part of the port they decide rather than by the
 milestone that decided them; each still names its issue, which is where the
 order they were taken in is recorded.
@@ -861,6 +885,42 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   is nine calls of one build of one compiler; the figures, the caveats and the
   one shape where this port's column is ahead are in
   [`BENCHMARKS.md`](BENCHMARKS.md) under "The #384 measurement".
+- **A child spawned into a scope is still an owned job, not a borrowed frame**
+  (M12, **declined**). A `rayon::scope` child is a job allocated on the
+  spawning frame and borrowing it, which is why rayon's per-child constant on
+  the nested shapes is tens of nanoseconds -- 22.9 ns a task on `skynet` at one
+  worker -- where this port's free async task is ~150 ns submitted from inside
+  a worker and ~350 ns from outside ([`BENCHMARKS.md`](BENCHMARKS.md), "The
+  #382 measurement"), and upstream's is one `Node` out of an object pool. Doing
+  the same here is the only route to a constant of that class, and the reason
+  it is declined is not its cost but its reach: it changes what a `Job` **is**.
+  The unit of work this executor is built around -- the first entry of this
+  section is where its ownership was settled (#40), and
+  [`BENCHMARKS.md`](BENCHMARKS.md)'s "#74 decision" is where its width was --
+  is an owned value a queue holds after the frame
+  that made it has moved on, which is what lets it be stolen, re-queued and
+  dropped by a thread that never saw that frame -- and a job living in a
+  caller's frame can be none of those things without a second, parallel
+  dispatch path for scoped work. That is a different executor rather than a
+  tuning of this one. What *is* reachable, and was taken, is fewer blocks per
+  owned job: #376 took one of three off a free async node, and "A worker
+  recycles the free node it finished" is where the rest of that went.
+- **An external submission gets no splittable source range, and #60 stays the
+  documented cost** (M12, **declined**). A graph submitted from outside the
+  pool reaches the pool only by being stolen, at about 100 ns a task with most
+  of it on the producer -- [`BENCHMARKS.md`](BENCHMARKS.md)'s "The #60 finding",
+  whose own last subsection calls what is left architectural. The change that
+  would answer it is a submission the workers split between them rather than
+  draw one task at a time. For a *loop* that already exists and is
+  `for_each_by_index` with a partitioner, which "The partitioned chunk loop
+  stays as upstream wrote it" under "Algorithms" measures as the first shape
+  where this port's column runs the same program as rayon's. For a graph of
+  independent source nodes there is no range: the sources are distinct nodes
+  with distinct bodies, and a splittable range over them is a different thing
+  from a graph -- `tf::Taskflow` has no such thing either, and inventing one
+  here would mean a second submission path whose unit is not a node. So the
+  cost stays recorded rather than fixed, and `for_each_index` stays the answer
+  a caller writes for the shape that has one.
 
 ## Control flow and cancellation
 
@@ -2963,3 +3023,21 @@ lives.
   criterion and rayon already compiled under the profile a bench build gives
   them. What would reopen this is `examples` becoming the longest job of the
   four, which is a number the workflow's own run history answers.
+
+  **That condition has since been met, and the step still stays** (issue
+  #385). The scheduler-performance milestone took the suite from 196 ids to
+  232, and on the five `ci` runs that closed its last five issues the smoke
+  step reads **43 to 47 s** against #345's 42, inside an `examples` job of
+  1m39 to 1m45: on the last of the five, 17 s of container setup and checkout,
+  33 s of `run-examples.sh`, 47 s of smoke run and 3 s of teardown. Over those
+  five runs `examples` was the **sole**
+  longest job once (1m40 against `ci`'s 1m27 and `two-core`'s 1m21), tied for
+  longest once, and third or fourth the other three times, where `ci` ranged
+  1m18 to 2m26 and `two-core` 1m21 to 2m08. So the arithmetic that decided it
+  the first time has not changed sign: splitting the smoke run into a job of
+  its own would have shortened the workflow in **one** of those five runs, by
+  13 s, and in the other four by nothing at all, while paying the 17 s of
+  setup a second time on every run. What would reopen it now is a smoke step
+  that costs more than that setup it would pay twice -- `examples` the sole
+  longest job, by more than ~20 s, on a majority of runs -- which is still the
+  run history's number and not an estimate.

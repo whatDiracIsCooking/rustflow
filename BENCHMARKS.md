@@ -18,8 +18,16 @@ are these, by the issue that ported each: `linear_chain`, `binary_tree`,
 (#337); `wavefront` (#338); `graph_pipeline` and `data_pipeline` (#339, the
 second landing as a second criterion group in the file #188 had opened for the
 per-line slot measurement); `skynet` and `nqueens` (#340); and `merge_sort`
-and `integrate` (#341). That is 22 `[[bench]]` targets in `Cargo.toml` and 232
-criterion ids, which `cargo bench --all-features -- --list` counts.
+and `integrate` (#341). That is **22** `[[bench]]` targets in `Cargo.toml`,
+which `grep -c '^\[\[bench\]\]' Cargo.toml` counts, and **232** criterion ids,
+which `cargo bench --all-features -- --list | grep -c ': benchmark$'` counts --
+the grep because that listing carries the lib target's unit tests beside the
+ids. The target count has not moved since the benchmarks milestone built the
+suite; the id count has, from 196 to 232 over the scheduler-performance
+milestone -- 16 `rustflow-split` ids across `for_each`, `reduce_sum`, `primes`
+and `mandelbrot` (#374) and 20 `rustflow-runtime-group` ids on the five nested
+shapes (#377) -- all of them inside targets and criterion groups that already
+existed.
 
 **Three are declined, and this is the whole of that list:**
 
@@ -49,7 +57,8 @@ preamble, "The machine" through "The upstream C++ column"; 21 shape
 sections carrying the 22 shapes, since `async_task` and `fibonacci` share "The
 two shapes #96 added", which measured the two together in a run of their own;
 and 29 per-decision measurement sections, each named for the issue that took
-it. A shape's section is its table, its sizes and its departures from
+it, **fourteen of them the scheduler-performance milestone's**. A shape's
+section is its table, its sizes and its departures from
 upstream. A measurement section is one question, with the machine, the load
 and the method of its own run in it, and it ends either in a change that
 shipped or in a change declined with what it would have cost.
@@ -93,7 +102,8 @@ noise is between runs rather than within one.
 
 ## What is measured
 
-**The fourteen sections this milestone added were measured in one pass on a
+**The fourteen shape sections the benchmarks milestone added were measured in
+one pass on a
 quiet box**, a condition only the #359 measurement below has had before: no
 sibling agent, no other `cargo` anywhere, and `/proc/loadavg`'s runnable-task
 field at 1 or 2 throughout, so the load each shape ran under is its own 24
@@ -124,6 +134,29 @@ that has one rather than smoothed away. The one group this pass deliberately
 did *not* re-measure is `data_pipeline_slot`: those figures belong to the
 #186 decision below and re-taking them was not this pass's job, so
 `benches/data_pipeline.rs`'s two groups carry figures from two different runs.
+
+**The scheduler-performance milestone's pass is fourteen runs rather than one,
+and each is its own section.** #367, #373, #380, #381, #382, #384, #395, #397,
+#399, #400, #401, #407, #409 and #412 each carry a machine table, a date and
+the load readings of their own run, because a measurement that answers one
+question is taken when the question is asked rather than in a sweep of the
+suite. What the fourteen have in common is the condition above and the
+**same day, 2026-11-19**: no sibling agent and no other `cargo` in any of
+them, `/proc/loadavg` read before and after every measurement and quoted in
+the section that took it, and the runnable-task field at 1 to 3 wherever a
+section records it. Three things that pass shares beyond the box. Every A/B in
+it ran through `devtools/bench-ab.sh` in interleaved rounds, by the rule the
+last bullet below states, and reads a difference against each side's own
+spread rather than against a threshold. Every criterion figure in it is the
+convention above -- one run of one id, twenty samples, half the 95% interval
+as a ± -- while the hand-rolled harnesses several of them also carry, for a
+counter or an ablation criterion cannot hold, state their own method in the
+section that uses them. And **#384 is the one section in this file whose
+figures come out of another project's harness**: upstream's own, one call a
+row, under the caveats "The upstream C++ column" above states. What that pass
+re-published in the shape sections is five tables: `skynet`, `nqueens`, `merge_sort` and
+`integrate` from #412's A/B, and `sort` from #399's change. `fibonacci`'s
+stays the benchmarks milestone's, for the reason its own section gives.
 
 - **Ours includes building the graph.** Upstream's `measure_time_taskflow`
   wraps constructing the `tf::Taskflow` as well as running it, so the ported
