@@ -1268,6 +1268,297 @@ one-worker end is what every size in this file is chosen inside, so no size
 changes on account of this: #352 is where the figures and any resizing are
 taken.
 
+## The #342 decision: the resumed parent stays on a queue, and no shape here resumes one
+
+The #62 section above ends on the half of upstream's locality optimisation
+this port did not take: a preempted parent, resumed when its last child
+finishes, goes back on a queue rather than being run on the spot
+(`WorkerThread::finish_job`), and "the shapes that would [move] are the nested
+ones, and nothing here measures those yet". There are five of those shapes in
+this file now, so this is that measurement. **The change is declined, and what
+declines it is a counter rather than the clock: over one run of every id of
+the eleven shapes the suite A/Bs, the re-queue it would replace happens twelve
+times, all twelve of them in `pipeline`, and in the five nested shapes it
+happens never.**
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id |
+| Instrument | `devtools/bench-ab.sh`, 3 interleaved rounds, A then B in each |
+| Date | 2026-11-19 |
+| **Load average** | **2.8 to 14.2 over the pass, all of it this pass's own** |
+
+That last row is the one the method depends on. No sibling agent was on the
+box: every load figure the eleven reports recorded -- start, after each build,
+after each round -- is the benchmark itself, which is why it rises with the
+24-worker ids and falls back between runs. The whole pass ran 00:45Z to
+01:17Z.
+
+### The path, from the last child's tear-down to the parent's next dispatch
+
+`WorkerThread::finish_job` is the whole of it. The last job of a nested
+graph reads the parent's state word **before** spending its count, as upstream
+reads it, and exactly one child -- the one whose `fetch_sub` returns 1 -- finds
+`PREEMPTED` set and calls `Nested::resume`, which hands back the job the
+parent node was dequeued as. That job then goes through
+`WorkerThread::schedule`: onto **this worker's own LIFO queue** when the worker
+holds an owning queue end, into the **shared spill buffers** when it is a corun
+view (`LocalQueue::Corun`), and `notify_one` either way. So what a re-queue
+costs is a push, a notify, and a pop that may be another worker's steal --
+which is the hand-off #62 priced on a chain link: 22 to 34 ns at one worker
+and 128 to 137 ns at 24.
+
+The continuation slot #62 added is **not eligible** for the resumed parent as
+`main` stands, and not by oversight: `update_cache` is reached only from
+`invoke_one`'s two successor loops, and `finish_job` returns `()` to a caller
+that has already produced its `cache`.
+
+**Upstream v4.1.0 resumes on the spot**, so the "B" side here is upstream's
+behaviour rather than a hypothesis of ours. `taskflow/core/executor.hpp`'s
+`_tear_down_nonasync` ends in `_update_cache(worker, cache, parent)` under
+exactly this condition -- "this task is spawned from a preempted parent, so we
+need to resume it" -- and every caller of it closes with
+`TF_INVOKE_CONTINUATION()`, including the cancelled early-out at the top of
+`_invoke`. The same `_update_cache(worker, cache, parent)` appears a second
+time, in the tear-down of a taskflow module's topology, with the `PREEMPTED`
+test commented out around it.
+
+B is that behaviour, in a two-file patch of 28 added lines and 11 removed:
+`finish_job` returns `Option<Job>` instead of calling `schedule`, and
+`invoke_one`'s two calls to it put what comes back into the slot through
+`update_cache` -- which queues a successor already there, as upstream's
+`_update_cache` queues it. Nothing else in the scheduler changes.
+
+### What the suite resumes: twelve events in eleven shapes
+
+Before timing a change, count the events it is for. A build of `main`
+carrying four counters at that tear-down -- nested tear-downs, those that
+drove the parent's counter to zero, those that then found `PREEMPTED`, and
+those that re-queued a job -- read at every `Executor::drop`, with each bench
+binary run in criterion's `--test` mode over the ids the A/B below uses:
+
+| bench | ids counted | nested tear-downs | drove the counter to zero | found `PREEMPTED` | re-queued |
+|---|---|---|---|---|---|
+| `fibonacci` | `rustflow-group`, `rustflow-runtime` | 4872 | 2436 | 0 | **0** |
+| `skynet` | `rustflow-group` | 48880 | 4915 | 0 | **0** |
+| `nqueens` | `rustflow-group` | 8832 | 5703 | 0 | **0** |
+| `merge_sort` | `rustflow` | 4152 | 4152 | 0 | **0** |
+| `integrate` | `rustflow` | 10720 | 10720 | 0 | **0** |
+| `linear_chain` | `rustflow` | 0 | 0 | 0 | **0** |
+| `binary_tree` | `rustflow` | 0 | 0 | 0 | **0** |
+| `graph_traversal` | `rustflow` | 0 | 0 | 0 | **0** |
+| `embarrassing_parallelism` | `rustflow` | 0 | 0 | 0 | **0** |
+| `sort` | `rustflow` | 383 | 0 | 0 | **0** |
+| `pipeline` | `rustflow` | 80007 | 12 | 12 | **12** |
+
+Cumulative over both worker counts, one run of each id's routine. The counter
+is not broken, which the two cases that do fire establish: `pipeline`
+re-queues a parent once per pipeline run, twelve ids being twelve events, and
+the unit test the issue names --
+`executor::runtime::tests::a_body_that_leaves_work_outstanding_is_preempted_and_resumed`
+-- reports `nested=1 last=1 preempted=1 resumed=1` under the same build.
+
+**Why the five nested shapes never reach it is the shape of their join, not
+their size.** All five wait with a `corun`, and a `corun` leaves nothing
+preempted.
+
+- Four of them, and `fibonacci`'s `rustflow-group` id, wait on a
+  **`TaskGroup`**, whose children are parented to the group's own anchor:
+  `Nested::new(None)`, which carries `IMPLICITLY_ANCHORED`, never carries
+  `PREEMPTED`, and has no job to resume. What the last child's decrement
+  releases is the *frame* watching that counter inside `TaskGroup::corun`, so
+  there is no job to keep out of a queue in the first place. That is the same
+  fact the #359 section measures from the other end: the parent is a live frame
+  on a worker's stack, which is why the group route costs about a kilobyte of
+  stack a level.
+- `fibonacci`'s `rustflow-runtime` id does parent its children to the node
+  (`Submission::under_node`), and that node *is* `PREEMPTED` for the length of
+  its body -- `executor::runtime`'s `enter` sets the bit before the body runs
+  and holds a reference of its own on the join counter while it does. But
+  `Runtime::corun` waits for that counter to come back to one, so when the body
+  returns nothing is outstanding, the body's own `fetch_sub` returns 1, and the
+  node finishes on its **first** entry. A node that never leaves the dispatch
+  preempted is never resumed.
+
+**This supersedes four sentences in the sections below**, two in `skynet`'s
+and two in `nqueens`'s: "every one of the ... interior nodes is a **preempted
+parent**", "every parent goes back on a queue instead of being resumed where
+it stopped", and the pair that make the re-queue "a larger share of a node's
+cost" in the ragged tree than in the regular one. The interior nodes of those
+shapes *are* parents, and they are why the shapes cost what they do, but the
+mechanism is an anchored frame rather than a preempted node, so none of
+`skynet`'s 184 ns a task and none of the `nqueens` figures those sentences
+divide is a re-queue a resumed parent could give back. The pair is still
+worth measuring together; what distinguishes them is the fan-out, not the
+tear-down. It also answers the two forward references this section was
+promised to: `merge_sort`'s, which called that shape one of the five #342
+could A/B, and `integrate`'s, which expected the resume to raise its own
+stack cliff. It raises nothing -- the frames that make the cliff are a
+`corun`'s, not a preempted node's -- so **no size in this file moves on
+account of #342**.
+
+What does leave a parent preempted is a body that returns with work still
+outstanding -- a `silent_async` or a `scope` with no join, a subflow, a module
+task -- and `pipeline`'s twelve are the only such events in the file.
+
+### The A/B anyway: 56 ids, and what they can see
+
+The counters say B's branch is never taken in ten of the eleven shapes and
+once per run in the eleventh, so what the sweep below can see is code layout
+and this box's own noise. It was run all the same, because that is what the
+issue asked for and because a sweep of 56 ids is a useful reading of the
+resolution this instrument has today. Each row is one `bench-ab.sh` run of
+three interleaved rounds; the ratio is of the two sides' medians and the
+verdict is the script's own, which divides the change by the wider of the two
+within-side spreads.
+
+The five nested shapes, at both worker counts and both sizes:
+
+| id | A spread | B spread | A median | B median | B/A | verdict |
+|---|---|---|---|---|---|---|
+| `fibonacci/rustflow-group/1w/12` | 1.012x | 1.035x | 84.91 µs | 84.44 µs | 0.994x (-0.6%) | inside |
+| `fibonacci/rustflow-group/1w/15` | 1.036x | 1.012x | 335.7 µs | 322.4 µs | 0.960x (-4.0%) | marginal |
+| `fibonacci/rustflow-group/24w/12` | 1.153x | 1.106x | 1.172 ms | 1.102 ms | 0.940x (-6.0%) | inside |
+| `fibonacci/rustflow-group/24w/15` | 1.106x | 1.144x | 2.296 ms | 2.18 ms | 0.950x (-5.0%) | inside |
+| `fibonacci/rustflow-runtime/1w/12` | 1.071x | 1.094x | 54.13 µs | 52.29 µs | 0.966x (-3.4%) | inside |
+| `fibonacci/rustflow-runtime/1w/15` | 1.038x | 1.045x | 195.6 µs | 196.4 µs | 1.004x (+0.4%) | inside |
+| `fibonacci/rustflow-runtime/24w/12` | 1.048x | 1.042x | 864.9 µs | 872.5 µs | 1.009x (+0.9%) | inside |
+| `fibonacci/rustflow-runtime/24w/15` | 1.052x | 1.028x | 1.368 ms | 1.418 ms | 1.037x (+3.7%) | inside |
+| `skynet/rustflow-group/1w/3` | 1.037x | 1.018x | 245.8 µs | 242 µs | 0.984x (-1.6%) | inside |
+| `skynet/rustflow-group/1w/4` | 1.035x | 1.017x | 2.433 ms | 2.391 ms | 0.983x (-1.7%) | inside |
+| `skynet/rustflow-group/24w/3` | 1.036x | 1.030x | 563.3 µs | 558.6 µs | 0.992x (-0.8%) | inside |
+| `skynet/rustflow-group/24w/4` | 1.078x | 1.108x | 2.553 ms | 2.674 ms | 1.048x (+4.8%) | inside |
+| `nqueens/rustflow-group/1w/6` | 1.123x | 1.011x | 83.3 µs | 86.13 µs | 1.034x (+3.4%) | inside |
+| `nqueens/rustflow-group/1w/8` | 1.044x | 1.007x | 1.154 ms | 1.145 ms | 0.993x (-0.7%) | inside |
+| `nqueens/rustflow-group/24w/6` | 1.044x | 1.148x | 813.2 µs | 791.3 µs | 0.973x (-2.7%) | inside |
+| `nqueens/rustflow-group/24w/8` | 1.066x | 1.039x | 3.023 ms | 2.884 ms | 0.954x (-4.6%) | inside |
+| `merge_sort/rustflow/1w/10000` | 1.018x | 1.051x | 278 µs | 277.3 µs | 0.998x (-0.2%) | inside |
+| `merge_sort/rustflow/1w/1000000` | 1.026x | 1.012x | 59.62 ms | 56.94 ms | 0.955x (-4.5%) | **a result** |
+| `merge_sort/rustflow/24w/10000` | 1.067x | 1.092x | 834.8 µs | 823.4 µs | 0.986x (-1.4%) | inside |
+| `merge_sort/rustflow/24w/1000000` | 1.142x | 1.120x | 18.74 ms | 19 ms | 1.014x (+1.4%) | inside |
+| `integrate/rustflow/1w/1` | 1.026x | 1.077x | 287.2 µs | 289.1 µs | 1.007x (+0.7%) | inside |
+| `integrate/rustflow/1w/2` | 1.029x | 1.018x | 633 µs | 637.4 µs | 1.007x (+0.7%) | inside |
+| `integrate/rustflow/24w/1` | 1.068x | 1.159x | 1.31 ms | 1.235 ms | 0.943x (-5.7%) | inside |
+| `integrate/rustflow/24w/2` | 1.063x | 1.020x | 2.099 ms | 2.086 ms | 0.994x (-0.6%) | inside |
+
+**Twenty-two of the twenty-four are inside one side's own spread, and the two
+that are not have no mechanism behind them.** `merge_sort/rustflow/1w/1000000`
+reads -4.5% against sides inside 2.6% and 1.2% of themselves, which the script
+calls a result at 1.8x the wider spread -- and the counters above say B's
+branch is taken zero times in that shape, so what it can be is code layout or
+a spread three rounds underestimated. One id in 56 at 1.8x is also what a
+sweep this wide produces on its own. `fibonacci/rustflow-group/1w/15` at -4.0%
+and 1.15x is the script's "marginal", which is the same reading with less of
+it. No id in the table is the gain the change was proposed for, and none could
+have been.
+
+The six graph shapes, which is the regression check #144's section ran:
+
+| id | A spread | B spread | A median | B median | B/A | verdict |
+|---|---|---|---|---|---|---|
+| `linear_chain/rustflow/1w/1024` | 1.337x | 1.011x | 154.8 µs | 154.3 µs | 0.997x (-0.3%) | inside |
+| `linear_chain/rustflow/1w/16384` | 1.178x | 1.038x | 2.161 ms | 2.124 ms | 0.983x (-1.7%) | inside |
+| `linear_chain/rustflow/24w/1024` | 1.033x | 1.286x | 162 µs | 148.1 µs | 0.914x (-8.6%) | inside |
+| `linear_chain/rustflow/24w/16384` | 1.037x | 1.031x | 2.053 ms | 2.081 ms | 1.014x (+1.4%) | inside |
+| `binary_tree/rustflow/1w/4096` | 1.202x | 1.010x | 683.7 µs | 679.9 µs | 0.994x (-0.6%) | inside |
+| `binary_tree/rustflow/1w/65536` | 1.369x | 2.332x | 11.31 ms | 10.34 ms | 0.914x (-8.6%) | inside |
+| `binary_tree/rustflow/24w/4096` | 1.030x | 1.023x | 1.046 ms | 1.026 ms | 0.981x (-1.9%) | inside |
+| `binary_tree/rustflow/24w/65536` | 1.024x | 1.166x | 16.31 ms | 15.72 ms | 0.964x (-3.6%) | inside |
+| `graph_traversal/rustflow/1w/3476` | 1.181x | 1.059x | 807.3 µs | 774.2 µs | 0.959x (-4.1%) | inside |
+| `graph_traversal/rustflow/1w/56759` | 1.009x | 1.562x | 13.21 ms | 13.12 ms | 0.993x (-0.7%) | inside |
+| `graph_traversal/rustflow/24w/3476` | 1.007x | 1.015x | 431.6 µs | 429.6 µs | 0.995x (-0.5%) | inside |
+| `graph_traversal/rustflow/24w/56759` | 1.034x | 1.046x | 6.592 ms | 6.609 ms | 1.003x (+0.3%) | inside |
+| `embarrassing_parallelism/rustflow/1w/4096` | 1.451x | 1.262x | 3.084 ms | 2.882 ms | 0.934x (-6.6%) | inside |
+| `embarrassing_parallelism/rustflow/1w/65536` | 1.323x | 1.290x | 58.73 ms | 48 ms | 0.817x (-18.3%) | inside |
+| `embarrassing_parallelism/rustflow/24w/4096` | 1.044x | 1.076x | 961.7 µs | 1.005 ms | 1.045x (+4.5%) | inside |
+| `embarrassing_parallelism/rustflow/24w/65536` | 1.007x | 1.040x | 13.78 ms | 13.8 ms | 1.001x (+0.1%) | inside |
+| `sort/rustflow/1w/1000` | 1.026x | 1.054x | 20.23 µs | 19.79 µs | 0.979x (-2.1%) | inside |
+| `sort/rustflow/1w/1000000` | 1.041x | 1.052x | 37.16 ms | 37.07 ms | 0.997x (-0.3%) | inside |
+| `sort/rustflow/24w/1000` | 1.314x | 1.048x | 22.78 µs | 21.87 µs | 0.960x (-4.0%) | inside |
+| `sort/rustflow/24w/1000000` | 1.027x | 1.172x | 14.04 ms | 15.18 ms | 1.081x (+8.1%) | inside |
+| `pipeline/rustflow/1l_1w/1024` | 1.019x | 1.011x | 2.253 ms | 2.231 ms | 0.990x (-1.0%) | inside |
+| `pipeline/rustflow/1l_1w/16384` | 1.023x | 1.022x | 35.25 ms | 35.5 ms | 1.007x (+0.7%) | inside |
+| `pipeline/rustflow/1l_24w/1024` | 1.188x | 1.029x | 4.597 ms | 2.321 ms | 0.505x (-49.5%) | **a result** |
+| `pipeline/rustflow/1l_24w/16384` | 1.020x | 1.030x | 35.81 ms | 35.54 ms | 0.992x (-0.8%) | inside |
+| `pipeline/rustflow/4l_1w/1024` | 1.039x | 1.012x | 2.34 ms | 2.344 ms | 1.001x (+0.1%) | inside |
+| `pipeline/rustflow/4l_1w/16384` | 1.029x | 1.012x | 36.87 ms | 37.34 ms | 1.013x (+1.3%) | inside |
+| `pipeline/rustflow/4l_24w/1024` | 1.001x | 1.008x | 1.764 ms | 1.785 ms | 1.012x (+1.2%) | **a result** |
+| `pipeline/rustflow/4l_24w/16384` | 1.005x | 1.010x | 27.79 ms | 27.95 ms | 1.006x (+0.6%) | inside |
+| `pipeline/rustflow/8l_1w/1024` | 1.030x | 1.016x | 2.364 ms | 2.382 ms | 1.008x (+0.8%) | inside |
+| `pipeline/rustflow/8l_1w/16384` | 1.037x | 1.006x | 36.5 ms | 37.37 ms | 1.024x (+2.4%) | inside |
+| `pipeline/rustflow/8l_24w/1024` | 1.007x | 1.011x | 1.772 ms | 1.792 ms | 1.012x (+1.2%) | marginal |
+| `pipeline/rustflow/8l_24w/16384` | 1.005x | 1.008x | 27.93 ms | 28.24 ms | 1.011x (+1.1%) | **a result** |
+
+**Twenty-eight of the thirty-two are inside a spread; all four that are not
+are `pipeline`, and they point in both directions at once.** Three of them are
+the 24-worker ids whose sides are inside 1% of themselves -- `4l_24w/1024`,
+`8l_24w/1024` and `8l_24w/16384`, at +1.2%, +1.2% and +1.1% -- which is the
+only consistent signal anywhere in the sweep, and at one re-queue per
+pipeline run it cannot be the mechanism either -- a mechanism that fires once
+per 1.8 ms cannot cost 1% of 1.8 ms: it is 1% of three ids of the one shape
+whose sides are tight enough for 1% to clear them. The fourth,
+`1l_24w/1024`, reads -49.5% with both sides' own rounds tight around their
+medians, and it is the useful row rather than the striking one: its A side
+*is* `origin/main`, the same source the #352 pass measured at 2.524 ms, and it
+came out at 3.90, 4.63 and 4.60 ms here. A same-source disagreement of 1.8x is
+larger than every A-to-B ratio in these two tables put together, so what that
+id resolves is nothing, and B's 2.32 ms agreeing with #352's figure is the
+coincidence rather than the finding. A one-line pipeline at 24 workers is the
+degenerate id the `pipeline` section already calls out; this run adds that it
+is bistable across builds.
+
+### The decision: declined
+
+#342's bar was that the five nested shapes gain outside their spread **and**
+the six graph shapes do not lose. Neither half is met, and the first could not
+have been: the branch B changes is taken zero times in all five nested shapes
+and in four of the six graph shapes, so there was no gain available to measure
+there. What is left is three `pipeline` ids reading 1% the wrong way and a
+mechanism change to the hottest path in the scheduler, which is not a trade to
+take for a branch no benchmarked shape takes more than once a run.
+
+What the change is worth is bounded by the same two measurements rather than
+guessed at. In the five nested shapes it is exactly nothing: the branch is
+never taken. In `pipeline` it is one hand-off per pipeline run, which at
+#62's price -- 128 to 137 ns at 24 workers, 22 to 34 at one -- is 137 ns off
+an id that costs 1.76 ms, six thousandths of one percent, and the three
+`pipeline` ids that moved at all moved 1% the other way. The port therefore
+keeps the queue, and `DESIGN.md`'s "Executor core" carries the decision.
+
+**What would reopen it is a shape, not a better box.** A benchmark that leaves
+parents preempted -- a recursion through module tasks, a subflow per level, or
+a `silent_async` tree joined once at the root instead of at every level --
+would put the path under load for the first time, and the A/B is 28 lines and
+half an hour once such a shape exists. The one place this file already touches
+it is `pipeline`, at one event per run.
+
+### The invariant this cannot weaken
+
+The port promises **one worker per node at a time**, enforced rather than
+assumed, by three things: `graph::work`'s `lock_callable`, a `try_lock` that
+panics naming the invariant rather than blocking; `executor::worker`'s
+`is_entered`, which reads the `PREEMPTED` bit of the four handle kinds that
+can carry it, so that a release landing on a node something has already
+entered is reported instead of resuming it; and the `DispatchClaim`
+`invoke_one` takes and gives back once per job dispatch (#320). The B side
+touches none of the three, and the argument it rests on is the counting rather
+than the locks. Exactly one child of a preempted parent sees its
+`fetch_sub` return 1, so exactly one resume job exists however it travels;
+`invoke_one` takes the claim on entry whether that job arrived from a queue or
+from the continuation slot; and the count the resumed job holds against *its
+own* parent was taken when it was first queued and is spent only when the
+resumed dispatch finishes, which is what makes holding it across the
+tear-down of its last child sound -- `update_cache`'s own docs make that
+argument for a successor. What B does remove is the `notify_one` that re-queue
+performs, which is why a test asserting the wake rather than the resumption
+would have to be rewritten against it: five unit tests pop the worker's queue
+to prove the re-queue happened, and under B the resumed job never goes there.
+They were the only things in the suite that failed against it; the other 2644
+tests passed unchanged.
+
 ## The #102 decision: 5 spill buffers stay, and here is what 48 costs
 
 `Buffers::new` makes `bit_width(num_workers)` spill buffers -- 5 at 24 workers

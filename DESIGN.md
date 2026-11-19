@@ -671,6 +671,48 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   the shape allows, or raise `RUST_MIN_STACK`. Nothing here changes how `corun`
   nests.
 
+- **A preempted parent is resumed through a queue, not the continuation slot**
+  (issue #342). Upstream's `_tear_down_nonasync` ends in
+  `_update_cache(worker, cache, parent)`: the child that drives a preempted
+  parent's join counter to zero keeps that parent out of the queues and
+  `TF_INVOKE_CONTINUATION()`s straight into it, on the thread that has just
+  finished the last child. `WorkerThread::finish_job` schedules it instead --
+  the worker's own LIFO queue, or the shared buffers when the worker is a
+  corun view, with a `notify_one` either way. #62 took half of upstream's
+  locality optimisation, the one successor a node keeps out of its queue, and
+  this entry is why the other half stays untaken.
+
+  What decided it was counting the events rather than timing them. Across the
+  eleven shapes the suite A/Bs, that re-queue happens **twelve times**, all
+  twelve of them in `pipeline` at one per pipeline run, and in the five nested
+  shapes -- `fibonacci`, `skynet`, `nqueens`, `merge_sort`, `integrate` -- it
+  happens never. The reason is the shape of a `corun`, and it corrects what
+  the #359 entry above expected of this issue. A `TaskGroup`'s children are
+  parented to the group's own anchor, `Nested::new(None)`, which carries
+  `IMPLICITLY_ANCHORED`, never carries `PREEMPTED` and has no job to resume,
+  so what the last child's decrement releases is the waiting *frame* -- the
+  very frame whose nesting is that entry's stack bound. Resuming a preempted
+  parent on the spot therefore cannot lower the group route's stack demand. A
+  `Runtime`'s children do hang off the node, and that node is `PREEMPTED` for
+  as long as its body runs, but `Runtime::corun` waits for the join counter to
+  come back to one, so the body's own reference is the last one spent and the
+  node finishes on its first entry. What leaves a parent preempted is a body
+  that returns with work still outstanding: an unjoined `silent_async` or
+  `scope`, a subflow, a module task.
+
+  The divergence from upstream is therefore deliberate rather than an
+  omission, and it is cheap to revisit: the patch is 28 lines over
+  `src/executor/run_handle.rs` and `src/executor/worker.rs`; every test but
+  the five that pop a worker's queue to assert the re-queue itself passes
+  against it; and the one-worker-per-node invariant is untouched either way,
+  since exactly one child sees the counter reach zero, so exactly one resume
+  job exists however it travels, and `invoke_one` takes the dispatch claim on
+  entry whether that job came from a queue or from the slot. The figures, the
+  counters and the 56-id A/B behind all of this are in
+  [`BENCHMARKS.md`](BENCHMARKS.md) under "The #342 decision"; what would
+  reopen the question is a benchmark shape that leaves parents preempted,
+  rather than a quieter box.
+
 ## Control flow and cancellation
 
 - **A failure inside a nested graph is delivered to whoever is waiting for
