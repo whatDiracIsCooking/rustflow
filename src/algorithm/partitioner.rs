@@ -98,32 +98,39 @@
 //! `n` and `w`, asks this one for one call per share instead, since the
 //! balance it offers comes from re-splitting rather than from small chunks.
 //!
-//! **The default floor of one index is this type's most expensive setting,
-//! and it stays.** `BENCHMARKS.md`'s splitting measurement runs a
+//! **The default floor of one index stays, and what it used to cost has
+//! gone.** `BENCHMARKS.md`'s splitting measurements all run a
 //! `for_each_by_index` over a million indices at 24 workers, body one `tan`
-//! an index, at three floors:
+//! an index. #381 and #401 read the default there at **1.90-2.86 ms** against
+//! 0.72-0.85 for the same partitioner with its splits off -- 9 to 13 µs of
+//! wall a re-split, 2.0x to 2.5x of the guided default -- and #400 attributed
+//! the whole of that to the join a split opens rather than to the split: the
+//! far half goes to a [`Runtime`] scope, and the scope's corun could not
+//! notice the half finishing until its own 211-attempt search had failed.
+//! Issue #412 gave a corun upstream's loop, which re-reads what it waits for
+//! after every failed steal, and #409 re-took both measurements on that tree:
 //!
-//! | floor | chunk tasks | distinct workers | wall |
+//! | row, one process | chunk tasks | distinct workers | wall |
 //! |---|---|---|---|
-//! | one index -- [`SplittingPartitioner::default()`] | 121-157 | 21-24 / 24 | 1.90-2.86 ms |
-//! | 4096 | 88-94 | 22-23 / 24 | 1.03-1.28 ms |
-//! | 65536 | 25 | 22 / 24 | 0.72-0.85 ms |
+//! | floor of one -- [`SplittingPartitioner::default()`] | 113-132 | 21-24 / 24 | 0.893-1.275 ms |
+//! | a floor above `n / w`, so nothing splits | 23 | 22-23 / 24 | 0.914-1.219 ms |
+//! | [`GuidedPartitioner`], this crate's [`DefaultPartitioner`] | 23 | 14-18 / 24 | 1.211-1.399 ms |
 //!
-//! The distinct-worker count -- the property this type exists for -- is flat
-//! across all three, so on that shape the default costs 2.5 to 3.5x and buys
-//! none of it. The floor sweep that followed, which moves the floor alone
-//! where those two rows move the chunk walk with it, is why it stays anyway:
-//! a floor worked out from `n` and `w` lands anywhere from 1.35x to 1.75x of
-//! the guided default against 2.0x to 2.5x for this one, but so does a floor
-//! high enough to split nothing, and no derived floor separates from another
-//! or from that control. What the sweep does separate is the *uncapped* chain
-//! a floor of one allows, at 9 to 13 µs of wall a split -- and that cost is
-//! the join a split opens rather than the split, which the same file bounds
-//! at 1 to 2 µs once the far half is joined by its own node. So raising the
-//! floor would tune a shipped default against a cost another change removes,
-//! while giving up what the depth buys: a worker arriving late to a share
-//! that was already stolen. A caller who wants the cheaper setting asks for
-//! it with [`SplittingPartitioner::new`].
+//! A re-split prices between **−1.9 and +1.2 µs** over the four processes
+//! #409 measured -- a quantity whose sign the harness cannot fix -- so the
+//! default is level with its own non-splitting control on wall and on CPU,
+//! where it used to be 2 to 4x it. Against the *guided* default the same row
+//! reads 0.88x in the process above and 1.19x and 1.18x in the two sweep
+//! processes, this box's processes differing by up to 1.4x about any one row;
+//! what is stable across all four is the comparison with the non-splitting
+//! control, and that the floor of one is the only row of the sweep's seven
+//! that ever reaches 24 of 24 workers. The floor stays at one for the reason
+//! #401 kept it: a seven-row sweep taken in both row orders separates no
+//! floor from another, or from splitting nothing, by more than either side's
+//! own spread, and what the uncapped chain buys -- depth, so that a worker
+//! arriving late to an already-stolen share still finds half of it to take --
+//! is permanent where the cost was not. A caller who wants a coarser setting
+//! asks for it with [`SplittingPartitioner::new`].
 //!
 //! **It implements neither [`StaticLoop`] nor [`DynamicLoop`].** Both
 //! describe a walk a worker performs alone, over a `curr_b` or a shared
