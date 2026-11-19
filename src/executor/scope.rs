@@ -37,11 +37,12 @@
 //!   `panic!`, which keeps the original payload.
 //! - **A cancelled run.** A child queued but never picked up takes the
 //!   cancellation early-out `executor::worker`'s dispatch already has for
-//!   every async task: its body is never called, and the job -- holding the
-//!   only share of whatever that body captured -- is dropped instead, still
-//!   counted off the very join counter the wait above reads. "Dropped, not
-//!   leaked into a queue" is that drop, not a second mechanism built for
-//!   this module.
+//!   every async task: its body is never called, and is dropped instead --
+//!   *first*, and only then is the job counted off the very join counter the
+//!   wait above reads (issue #416: a `Drop` in what the body captured can
+//!   write through the borrow as freely as the body could, so the count
+//!   that releases the wait has to come after it). "Dropped, not leaked into
+//!   a queue" is that drop, not a second mechanism built for this module.
 //!
 //! The `unsafe` is the two [`core::mem::transmute`] calls in
 //! [`Scope::spawn`] and [`Scope::spawn_runtime`], each erasing a boxed

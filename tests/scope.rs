@@ -39,6 +39,20 @@ impl Drop for DropGuard {
     }
 }
 
+/// A value whose [`Drop`] **writes through a borrow of the scope's own
+/// frame**, standing in for the kind of capture `Scope` exists for: no `Arc`,
+/// one `&mut` into a local the runtime task owns. Issue #416's instrument: a
+/// child skipped by cancellation never calls its body, but dropping the body
+/// drops this, and that write has to land before `Runtime::scope` lets the
+/// frame it points into move on.
+struct FrameGuard<'a>(&'a mut usize);
+
+impl Drop for FrameGuard<'_> {
+    fn drop(&mut self) {
+        *self.0 += 1;
+    }
+}
+
 /// A scope whose two children write disjoint halves of a slice borrowed from
 /// the runtime task's own frame, which is the whole point of `Scope` over
 /// [`Runtime::silent_async`](rustflow::Runtime::silent_async): the array
@@ -308,6 +322,84 @@ fn a_cancelled_run_drops_every_unstarted_child_before_scope_returns() {
             dropped.load(Ordering::Relaxed),
             CHILDREN,
             "{workers} worker(s): every child was dropped all the same"
+        );
+    }
+}
+
+/// Issue #416: the case above, with the drop made *observable through the
+/// frame* rather than through an `Arc`. Each skipped child's closure captured
+/// a [`FrameGuard`] holding a `&mut` into an array on the runtime task's own
+/// stack, and that guard's `Drop` writes through it. `Runtime::scope` must
+/// not return until every one of those writes has landed -- "joined" means
+/// dropped, not counted -- so the body reads the array on the very next line,
+/// with the scope frame still on the stack, and expects every slot written
+/// exactly once.
+///
+/// The order this pins is the one `WorkerThread::spend_job`'s docs state: the
+/// early-out drops the skipped body *before* it releases the count the scope
+/// waits on. With the old order the drop came one `recycle` after the count,
+/// a window this case could only ever hit as a flake -- and the deterministic
+/// pin is `executor::worker`'s own unit test, which reads the count from
+/// inside the drop. Any flake of this case is a failure to investigate, not
+/// to rerun: a late write here is a write through a borrow of a frame that
+/// has moved on.
+#[test]
+fn a_cancelled_run_drops_every_childs_frame_guard_before_scope_returns() {
+    const CHILDREN: usize = 64;
+
+    for workers in 1..=4 {
+        let reached = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let checked = Arc::new(AtomicBool::new(false));
+
+        let mut taskflow = Taskflow::new();
+        taskflow.emplace_runtime({
+            let reached = Arc::clone(&reached);
+            let cancelled = Arc::clone(&cancelled);
+            let checked = Arc::clone(&checked);
+            move |runtime: &mut Runtime<'_>| {
+                reached.store(true, Ordering::Release);
+                spin_until_cancelled(&cancelled, || runtime.is_cancelled());
+
+                // The frame: one slot per child, on this task's own stack,
+                // and borrowed -- never shared -- by the children below.
+                let mut written = [0usize; CHILDREN];
+
+                runtime.scope(|s| {
+                    for slot in written.iter_mut() {
+                        let guard = FrameGuard(slot);
+                        s.spawn(move || {
+                            // Never reached: the run is cancelled, so the
+                            // job takes the early-out and drops this closure
+                            // -- and `guard` with it -- instead of calling it.
+                            drop(guard);
+                        });
+                    }
+                });
+
+                // `scope` has returned and `written` is readable again: every
+                // guard has written its slot, with the scope frame still
+                // on the stack.
+                assert!(
+                    written.iter().all(|&writes| writes == 1),
+                    "{workers} worker(s): every skipped child's guard wrote \
+                     through the frame before scope returned: {written:?}"
+                );
+                checked.store(true, Ordering::Release);
+            }
+        });
+
+        let executor = Executor::new(workers);
+        let run = executor.run(&taskflow);
+        spin_until("the runtime body to start", || {
+            reached.load(Ordering::Acquire)
+        });
+        assert!(run.cancel(), "the run had not finished");
+
+        run.wait().expect("a cancelled run is not a failed one");
+        assert!(
+            checked.load(Ordering::Acquire),
+            "{workers} worker(s): the body read the frame back after scope"
         );
     }
 }
