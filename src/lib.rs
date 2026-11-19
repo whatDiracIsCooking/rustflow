@@ -176,6 +176,31 @@
 //! `DESIGN.md`'s "Benchmarks and performance" section has the decisions the
 //! suite itself took.
 //!
+//! A **scheduler performance** milestone ran after that one, on what those
+//! tables found: five nested shapes were slower at 24 workers than at one.
+//! Three of its changes are ones a caller writes.
+//! [`Runtime::task_group`] is a second way to open a
+//! [`TaskGroup`]: the group borrows the runtime's own worker, so its children
+//! go onto that worker's queue and its `corun` waits on the owning end of it,
+//! where [`Executor::task_group`]'s children go to the shared buffers and its
+//! `corun` waits on a stealing view. Both routes stay and the choice is a
+//! caller's -- the queue is the difference, and four of the five nested shapes
+//! read 2.0x to 2.5x faster on the runtime one at 24 workers, with
+//! `merge_sort` inside 1.1x of the other route because its bodies, not its
+//! submissions, are the run.
+//! [`SplittingPartitioner`](algorithm::partitioner::SplittingPartitioner) is a
+//! fifth partitioner beside the four ported ones, and the port's own: a chunk
+//! that runs on a worker other than the one that was given the share re-splits
+//! it, which is how a fan-out reaches more workers than the one queue it was
+//! pushed onto. It is not a default -- `DefaultPartitioner` is still
+//! [`GuidedPartitioner`](algorithm::partitioner::GuidedPartitioner) -- and the
+//! price of a split is in its own `# Design` section. And the sort behind
+//! [`AlgorithmBuilder::sort_by`](algorithm::AlgorithmBuilder::sort_by) and
+//! [`Runtime::sort_by`] runs upstream's live partition rather than the dead
+//! one beside it in the pinned header, and hands the comparator on by value
+//! where a reference had cost a one-worker sort up to 1.8x depending on
+//! nothing the caller could see.
+//!
 //! The crate's `unsafe` blocks live in two modules and nowhere else:
 //! [`notifier`](executor::notifier), in the lock-free waiter stack, and
 //! [`scope`](executor::scope), where [`Runtime::scope`] erases a borrowed

@@ -42,7 +42,7 @@ in, and the port is at parity with upstream's user-facing surface at v4.1.0.
    `test_deferred_*.cpp` files exist, they are not in its own test
    `CMakeLists`.
 
-**Four milestones have no step number.** A **consolidation** ran between
+**Five milestones have no step number.** A **consolidation** ran between
 steps 5 and 6, on what five steps had left behind: five milestones' worth of
 rationale collected in doc comments, an async family written three times over
 its three receivers, and the run's machinery one 2,352-line file over a dozen
@@ -60,10 +60,10 @@ surface: it settled what the crate root re-exports and what
 `rustflow::prelude` is for, collapsed the algorithm family's eight extension
 traits into one and completed the `make_*_task` factories behind them, gave
 every async submission a `_named` twin, and fixed two scheduler defects its
-own panic matrix found. **Benchmarks and performance** ran last and is the one
-of the four that changed no API at all: it took the suite from eight of
-upstream's shapes to twenty-two — thirteen new `[[bench]]` targets for 22 in
-`Cargo.toml` and the 232 criterion ids the suite has today — on
+own panic matrix found. **Benchmarks and performance** ran fourth and is the one
+of the five that changed no API at all: it took the suite from eight of
+upstream's shapes to twenty-two — thirteen new `[[bench]]` targets for the 22
+in `Cargo.toml` and 196 criterion ids, 232 today — on
 `benches/common` for the fixtures a target may share,
 `devtools/bench-ab.sh` for an interleaved A/B between two refs, and a CI step
 that smoke-runs every id. Four of its measurements
@@ -75,18 +75,50 @@ suite, all twelve in `pipeline` and none in any nested shape, which is not
 what the stack entry had expected of it (#342); a chunk of the algorithms'
 chunk loop costs 15 ns and 1.3% of its run, leaving a fan-out that reaches 15
 to 19 of 24 workers as the open lead (#343); and 24 of the 196 ids were timing
-their own input setup (#366). All four keep their decisions in
+their own input setup (#366). **Scheduler performance** ran last, on the worst
+thing those tables said: five nested shapes — `skynet`, `nqueens`,
+`integrate`, `fibonacci` and `merge_sort` — were *slower* at 24 workers than
+at one. Twenty-six issues later they are not, and the two changes that did
+it are both places this port had diverged from the design it translates: a
+task group opened on a `Runtime` holds the submitting worker's own queue and
+coruns on that end (#372), where every group child used to go to the shared
+buffers; and `corun_until` re-reads its predicate after every failed steal
+(#412), where it used to read it once a 211-attempt search — upstream's
+`_schedule_async_task` and `_corun_until` already did both. Each of the five is now faster
+at 24 workers than at one, where the worst of them was 6.9x slower. The
+milestone's own last act is what makes that a finding rather than a hope: it
+put a C++ toolchain in the image and built **upstream's own benchmark
+binaries** (#383), so the `upstream C++` column of those five tables is
+upstream's executor measured on the same CPU (#384) — and since upstream gains
+from the width on every shape and size it can be asked for, the regression was
+this port's and not Taskflow's. Three measurements in it ship nothing and are
+kept for what they rule out: the fan-out's ceiling is one queue and one
+producer rather than a wake-up policy (#367), a chain at 24 workers costs what
+a chain at one worker costs and the 40% was the continuation's (#373 — whose
+one by-product, a guard upstream has on the semaphore release hook, shipped as
+#393 and is worth 16% of a chain's run region), and
+`SplittingPartitioner`'s default floor is the one the sweep cannot separate
+from any other (#401, re-taken as #409 once #412 had removed the search its
+price was mostly made of, which also closed #406 as declined). It also declined two changes outright,
+both recorded in [`DESIGN.md`](../DESIGN.md) with their reasons: stack-allocated
+jobs for scoped children, and a splittable source range for external
+submission.
+
+All five keep their decisions in
 [`DESIGN.md`](../DESIGN.md), one entry per decision, in the subsystem
 section each belongs to rather than under the milestone that took it — the
 benchmarks milestone's own under "Benchmarks and performance", and the three
-it took about the port itself under "Executor core" and "Algorithms".
+it took about the port itself under "Executor core" and "Algorithms"; the
+scheduler milestone's are spread over "Executor core", "Dynamic tasking",
+"The async family" and "Algorithms", and that file's preamble lists where each
+of them is.
 
-So the step-to-milestone mapping is the seven steps with those four among
-them, which are milestones 6, 9, 10 and 11: step 6 is the sixth step and the
-seventh milestone, step 7 the eighth. A later step may do the same, and if one
-does it belongs in this list the same way, named here rather than renumbering
-the steps, since the numbers are what every issue and every `DESIGN.md` entry
-has been written against.
+So the step-to-milestone mapping is the seven steps with those five among
+them, which are milestones 6, 9, 10, 11 and 12: step 6 is the sixth step and
+the seventh milestone, step 7 the eighth. A later step may do the same, and if
+one does it belongs in this list the same way, named here rather than
+renumbering the steps, since the numbers are what every issue and every
+`DESIGN.md` entry has been written against.
 
 ## The examples, by step
 

@@ -309,12 +309,37 @@ any nested shape, so no size and no gap here turns on it. "The #343
 attribution" took the `for_each` gap apart and found the per-chunk cost to be
 15 ns and 1.3% of the run, this port's chunk loop rayon's equal, and what is
 left a fan-out that reaches only 15 to 19 of 24 workers -- which is the open
-lead, filed as an issue of its own rather than answered there. One older
-result is bad and tracked rather than filed away: a graph submitted from
-outside the pool reaches it only by stealing, so a graph of nothing but
-independent sources runs several times slower than rayon on the same box. The
+lead, filed as an issue of its own rather than answered there. The
 continuation optimisation that halved a chain's cost is measured there too,
 and [`docs/porting.md`](docs/porting.md) has the summary of both.
+
+A **scheduler performance** milestone ran after that one, on the worst thing
+those tables said: five nested shapes -- `skynet`, `nqueens`, `integrate`,
+`fibonacci` and `merge_sort` -- were *slower* at 24 workers than at one.
+**They are not any more.** A task group opened on a `Runtime` now puts its
+children on the submitting worker's own queue and waits on that end, and a
+`corun` re-reads what it waits for after every failed steal rather than once a
+211-attempt search, which is what upstream's own loop does. Each of the five is
+now faster at 24 workers than at one -- 1.7x to 3.4x on the executor-opened
+route and 2.2x to 4.9x on the runtime one -- and three of them pass rayon at 24
+workers where none did. The milestone also built **upstream's own benchmark
+binaries** and ran them on this box, which is what settles whose regression it
+was: upstream's executor gains from the width on every shape and size it can be
+asked for, so the fault was this port's and not Taskflow's design. The
+per-task constant moved too, with one of the three heap blocks a free async
+node used to be: an externally submitted free async task is **~350 ns** against
+the 438 to 478 first attributed to it, and the same task submitted from inside a
+worker through a group **~150 ns** against 274.
+
+**The one result still tracked as bad is external submission.** A graph
+submitted from outside the pool reaches it only by stealing, so a graph of
+nothing but independent sources runs several times slower than rayon on the
+same box -- about 100 ns a task, most of it the producer's. The scheduler
+milestone looked at it again and left it: what would fix it is a splittable
+source range, which for a loop is `for_each_index` with a partitioner and which
+a caller already has, and for a graph of independent sources is a different
+design for what a submission is. It is the documented cost of this one, not an
+open defect.
 
 Benchmarks are deliberately outside the gate, since "how fast" is not a pass
 or a fail; what CI holds the suite to is that it still compiles and still
@@ -333,7 +358,10 @@ had asserted, and finding 24 of its 196 ids timing their own input setup. Its
 tables are in [`BENCHMARKS.md`](BENCHMARKS.md), and the decisions it took
 about the suite itself are in [`DESIGN.md`](DESIGN.md)'s "Benchmarks and
 performance" section -- the two it took about the scheduler being filed under
-the part of the port they decide, as every entry there is. The three rules
+the part of the port they decide, as every entry there is. A **scheduler
+performance** milestone ran after it, on what those tables found, and is the
+fifth with no step number; "Performance" above is what it changed and
+`docs/porting.md` has its paragraph. The three rules
 below are the ones a contributor needs before touching anything.
 
 ### Upstream pin
