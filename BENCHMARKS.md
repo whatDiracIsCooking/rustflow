@@ -43,12 +43,12 @@ criterion ids, which `cargo bench --all-features -- --list` counts.
   measures is a comparison between two C++ libraries rather than a shape of
   the executor.
 
-**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 52
+**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 53
 headings, and they are three kinds: the three method sections that follow this
-preamble, "The machine" through "The upstream C++ column is empty"; 21 shape
+preamble, "The machine" through "The upstream C++ column"; 21 shape
 sections carrying the 22 shapes, since `async_task` and `fibonacci` share "The
 two shapes #96 added", which measured the two together in a run of their own;
-and 28 per-decision measurement sections, each named for the issue that took
+and 29 per-decision measurement sections, each named for the issue that took
 it. A shape's section is its table, its sizes and its departures from
 upstream. A measurement section is one question, with the machine, the load
 and the method of its own run in it, and it ends either in a change that
@@ -163,16 +163,59 @@ did *not* re-measure is `data_pipeline_slot`: those figures belong to the
   the end, together with `nproc`, so that a table built from it can carry the
   load it ran under the way the ones below do.
 
-## The upstream C++ column is empty, and that is the finding
+## The upstream C++ column: five shapes measured here, seventeen still empty
 
 Upstream's `benchmarks/benchmarks.md` publishes **no figures**. It documents how
 to build the suite and how to drive it with `benchmarks.py`, and then shows one
 plot (`image/benchmarks.svg`) with no tabulated numbers behind it. There is
-therefore nothing to quote for any of the twenty-two shapes, and the
-`upstream C++` column each of their twenty-two tables carries says so rather
-than a number from somewhere else. Had there been one,
-it would still not have been comparable: it would be a different CPU, a
-different compiler and a TBB baseline rather than a rayon one.
+therefore nothing to *quote* for any of the twenty-two shapes, and for
+**seventeen** of them the `upstream C++` column still says `not published`,
+which is what this section said about all twenty-two before.
+
+**Five of them now carry a figure measured here instead** (issue #384): the
+five nested shapes — `skynet`, `nqueens`, `integrate`, `fibonacci` and
+`merge_sort` — because the question the scheduler-performance milestone exists
+to answer is a question a rayon baseline cannot answer. Whether these shapes
+are slower at 24 workers than at one is a property of Taskflow's design or of
+this port of it, and only upstream's own executor on this box separates the
+two. `devtools/upstream-bench.sh` (issue #383, documented in
+[`docs/development.md`](docs/development.md)) builds upstream's own
+`bench_skynet`, `bench_nqueens`, `bench_integrate`, `bench_fibonacci` and
+`bench_merge_sort` from a clone at this repo's pin and runs each at one worker
+and at 24 under `-m tf`, upstream's own model. The run those five columns are
+drawn from — its toolchain, its clone commit, its load average and its whole
+output — is "The #384 measurement" at the end of this file, together with the
+1-to-24 comparison it was taken for.
+
+**The caveats, stated here once and not repeated under the five tables:**
+
+- **The same CPU, a different compiler.** The Ryzen 9 5900X and the container
+  of "The machine" above, with g++ 12.2.0 at `-O3 -DNDEBUG -std=c++20
+  -fpermissive -fopenmp` (cmake's `Release` plus what that script adds) against
+  rustc 1.100.0 at `--release`. A factor between two of these columns is two
+  compilers' work as well as two schedulers'.
+- **Upstream's harness measures what upstream measures.** One call, timed
+  whole, `std::chrono` divided down to milliseconds and printed — no warm-up,
+  no sample distribution, no outlier handling — against criterion's twenty
+  samples and a 95% interval. **One run per cell, with no repeat count**:
+  upstream's `-r` stays at 1, so a cell is a single call and carries no ± of
+  any kind, and the figure is quoted as upstream prints it, in milliseconds,
+  with the conversion in parentheses wherever it is below one, since the
+  columns beside it are then in microseconds. Nothing in that column is
+  comparable with a criterion
+  interval; what it is for is the factor between two columns at one size,
+  which is how every ratio in this file is read in any case.
+- **TBB is absent from the comparison.** The script runs upstream's `tf` model
+  only. Upstream's `tbb` and `omp` models are *its* baselines, where the
+  second column of every table here is rayon — running them would add a fourth
+  library rather than a second reading of the first.
+- **Six of these twenty cells cannot be had this way at all.** `integrate`'s
+  `V = 1` and `V = 2` are not on upstream's grid, which steps `v` by 100 and
+  whose first non-degenerate point spawns two orders of magnitude more tasks
+  than our two sizes do; and `bench_merge_sort` deadlocks at one worker inside
+  upstream's own
+  harness, which leaves that shape's one-worker rows with no counterpart. Both
+  say so in place, and the measurement section explains each.
 
 ## linear_chain
 
@@ -981,10 +1024,10 @@ done here, because a row of the table above compares the two variants at one
 
 | `n` | workers | rustflow-group | rustflow-runtime | rayon | upstream C++ |
 |---|---|---|---|---|---|
-| 12 | 1 | 111.2 / 84.93 µs | 108.8 / 82.13 µs | 6.219 / 6.707 µs | not published |
-| 12 | 24 | 1.289 / 1.231 ms | 1.262 / 1.302 ms | 16.49 / 16.71 µs | not published |
-| 15 | 1 | 454.4 / 331.9 µs | 336.3 / 338.2 µs | 12.73 / 12.95 µs | not published |
-| 15 | 24 | 2.880 / 3.664 ms | 2.308 / 2.399 ms | 23.06 / 23.17 µs | not published |
+| 12 | 1 | 111.2 / 84.93 µs | 108.8 / 82.13 µs | 6.219 / 6.707 µs | 0.03 ms (30 µs) |
+| 12 | 24 | 1.289 / 1.231 ms | 1.262 / 1.302 ms | 16.49 / 16.71 µs | 0.026 ms (26 µs) |
+| 15 | 1 | 454.4 / 331.9 µs | 336.3 / 338.2 µs | 12.73 / 12.95 µs | 0.093 ms (93 µs) |
+| 15 | 24 | 2.880 / 3.664 ms | 2.308 / 2.399 ms | 23.06 / 23.17 µs | 0.064 ms (64 µs) |
 
 The one-worker rows of the two `rustflow` variants are the pair the load moved:
 round 1 ran at a load average above 20 and round 2 below 15, and the `n = 12`
@@ -997,7 +1040,11 @@ measurement the four bullets below are written against, two of which the file
 has since corrected in place; what the three `rustflow` ids read today is in
 "The #412 change" at the end of this file, re-taken at 1 and 24 workers --
 and there every one of them is *faster* at 24 workers than at one, where every
-row above is slower.
+row above is slower. The one column that is **not** superseded is
+`upstream C++`, which is #384's run on this box and is this file's only
+figure for upstream's own `bench_fibonacci`; read it against the #412 table
+rather than against the `rustflow` columns beside it, which predate every
+change this milestone made to the submission path.
 
 What the table says:
 
@@ -3410,15 +3457,25 @@ number for doing less work.
 
 | size | workers | rustflow-group | rayon | upstream C++ |
 |---|---|---|---|---|
-| `MaxDepth = 3` | 1 | 200.95 µs ±0.23% | 29.45 µs ±0.19% | not published |
-| `MaxDepth = 3` | 24 | **130.61 µs ±0.44%** | 30.88 µs ±0.35% | not published |
-| `MaxDepth = 4` | 1 | 1.9252 ms ±0.37% | 254.94 µs ±0.17% | not published |
-| `MaxDepth = 4` | 24 | **1.1325 ms ±1.39%** | 120.38 µs ±0.27% | not published |
+| `MaxDepth = 3` | 1 | 200.95 µs ±0.23% | 29.45 µs ±0.19% | 0.083 ms (83 µs) |
+| `MaxDepth = 3` | 24 | **130.61 µs ±0.44%** | 30.88 µs ±0.35% | 0.056 ms (56 µs) |
+| `MaxDepth = 4` | 1 | 1.9252 ms ±0.37% | 254.94 µs ±0.17% | 0.755 ms (755 µs) |
+| `MaxDepth = 4` | 24 | **1.1325 ms ±1.39%** | 120.38 µs ±0.27% | 0.176 ms (176 µs) |
 
 Re-taken in "The #412 change" pass at the end of this file; the rows it
 replaces are 237.1 µs, 539.9 µs, 2.296 ms and 2.465 ms. Two to five of 20
 measurements were flagged as outliers on the 24-worker ids, which is where the
 widest interval is (±1.39%).
+
+The `upstream C++` column is #384's run of upstream's own `bench_skynet` on
+this box, under the caveats "The upstream C++ column" above states once:
+upstream takes `MaxDepth = 4` from 0.755 ms at one worker to 0.176 at 24,
+**4.3x**, where the id route gains 1.7x and the runtime route 2.4x. So the
+port's remaining gap here is the per-task constant below and not the scaling.
+Upstream's own 0.176 ms is itself 1.5x behind the rayon column's 120.38 µs,
+and 2.9x behind it at one worker, which is the direction thirteen of the
+fourteen filled cells in these five shapes take; "The #384 measurement" says
+what that is and is not evidence of.
 
 **The port loses this shape by between 4 and 9x, and what to take from the
 table is the per-task constant rather than any of those ratios.** At
@@ -3528,16 +3585,28 @@ hundred times.
 
 | size | workers | rustflow-group | rayon | upstream C++ |
 |---|---|---|---|---|
-| `q = 6` | 1 | 79.17 µs ±2.08% | 32.60 µs ±0.80% | not published |
-| `q = 6` | 24 | **41.12 µs ±0.72%** | 25.39 µs ±0.44% | not published |
-| `q = 8` | 1 | 1.0650 ms ±0.16% | 535.08 µs ±0.30% | not published |
-| `q = 8` | 24 | **374.89 µs ±2.91%** | 176.94 µs ±0.29% | not published |
+| `q = 6` | 1 | 79.17 µs ±2.08% | 32.60 µs ±0.80% | 0.09 ms (90 µs) |
+| `q = 6` | 24 | **41.12 µs ±0.72%** | 25.39 µs ±0.44% | 0.12 ms (120 µs) |
+| `q = 8` | 1 | 1.0650 ms ±0.16% | 535.08 µs ±0.30% | 0.936 ms (936 µs) |
+| `q = 8` | 24 | **374.89 µs ±2.91%** | 176.94 µs ±0.29% | 0.175 ms (175 µs) |
 
 Re-taken in "The #412 change" pass at the end of this file; the rows it
 replaces are 84.09 µs, 829.7 µs, 1.156 ms and 2.946 ms, whose two 24-worker
 cells carried ±6.5% and ±4.6%. The loosest cell now is `rustflow-group/24w/8`
 at ±2.91%, with 5 of 20 measurements flagged on it. The gaps below are factors
 rather than percentages, so those widths change nothing about any of them.
+
+The `upstream C++` column is #384's run of upstream's own `bench_nqueens`,
+under the caveats "The upstream C++ column" above states once, and this is the
+shape where it is closest: upstream takes `q = 8` from 0.936 ms at one worker
+to 0.175 at 24, **5.4x**, and the runtime route's 152.93 µs in the #412 pass
+is ahead of that 175 µs -- the only one of these five shapes where a
+`rustflow` id passes upstream's own binary at 24 workers, and the one cell in
+all five where upstream in turn passes the rayon column (176.94 µs). Its
+`q = 6` row goes the other way, 0.09 ms to 0.12, and that pair is inside the
+noise of a single untimed call rather than a regression: upstream's own
+24-thread sweep moves between 0.046 and 0.184 ms across the eight neighbouring
+sizes it prints in that one process, which is the whole of this difference.
 
 **The ragged tree costs the port less than the regular one at one worker, and
 since #412 it costs less at 24 too.** At `q = 8` and one worker it is 2.0x
@@ -3803,10 +3872,10 @@ The eight ids are `merge_sort/{rustflow,rayon}/{1w,24w}/{10000,1000000}`.
 
 | size | workers | rustflow | rayon | upstream C++ |
 |---|---|---|---|---|
-| 10000 | 1 | 252.82 µs ±0.20% | 249.43 µs ±0.24% | not published |
-| 10000 | 24 | **132.39 µs ±0.16%** | 140.32 µs ±1.34% | not published |
-| 1000000 | 1 | 54.26 ms ±0.60% | 56.43 ms ±0.08% | not published |
-| 1000000 | 24 | **15.82 ms ±1.19%** | 18.16 ms ±3.02% | not published |
+| 10000 | 1 | 252.82 µs ±0.20% | 249.43 µs ±0.24% | deadlocks (see below) |
+| 10000 | 24 | **132.39 µs ±0.16%** | 140.32 µs ±1.34% | 0.3 ms (300 µs) |
+| 1000000 | 1 | 54.26 ms ±0.60% | 56.43 ms ±0.08% | deadlocks (see below) |
+| 1000000 | 24 | **15.82 ms ±1.19%** | 18.16 ms ±3.02% | 23.231 ms |
 
 Re-taken in "The #412 change" pass at the end of this file, on the quiet box
 and under the conditions "What is measured" names; the rows this replaces --
@@ -3814,6 +3883,22 @@ and under the conditions "What is measured" names; the rows this replaces --
 what the paragraphs below were written against, and the one they contradict
 says so. `rayon/24w/1000000` is the widest of the eight at ±3.02%, and every
 id was flagged with one or two outliers of 20.
+
+The `upstream C++` column is #384's run of upstream's own `bench_merge_sort`,
+under the caveats "The upstream C++ column" above states once, and it is the
+one shape of the five where this port's column is **ahead of upstream's own**:
+0.3 ms and 23.231 ms at 24 workers against 132.39 µs and 15.82 ms, 2.3x and
+1.5x. It is also the fairest of the five to compare, being the same recursion
+at the same 1024-element cutoff over the same `f64` data -- through a slice of
+`AtomicU64` on this side, for the reason `benches/merge_sort.rs`'s module docs
+give -- so most of each row is the merge itself rather than either scheduler.
+The one-worker rows have no upstream figure at all, and the reason is
+upstream's harness rather than its executor: `msort(executor, data)` waits on
+`executor.async(...)` from inside a worker, so with one worker that worker
+blocks on a task only it could run -- measured at the 420-second mark with not
+one row of the sweep printed, where `-t 2` completes all eight in about twelve
+seconds. That is a finding about upstream's harness and not about either
+executor.
 
 **The 24-worker rows are #412's**, which is the change that moved this shape
 most: a corun now reads what it waits for after every failed steal rather than
@@ -3970,15 +4055,26 @@ The eight ids are `integrate/{rustflow,rayon}/{1w,24w}/{1,2}`.
 
 | size | workers | rustflow | rayon | upstream C++ |
 |---|---|---|---|---|
-| `V = 1` | 1 | 257.13 µs ±0.37% | 19.09 µs ±0.08% | not published |
-| `V = 1` | 24 | **139.08 µs ±0.61%** | 28.00 µs ±0.57% | not published |
-| `V = 2` | 1 | 529.87 µs ±0.35% | 37.85 µs ±0.15% | not published |
-| `V = 2` | 24 | **286.45 µs ±0.49%** | 36.49 µs ±2.40% | not published |
+| `V = 1` | 1 | 257.13 µs ±0.37% | 19.09 µs ±0.08% | not on its grid |
+| `V = 1` | 24 | **139.08 µs ±0.61%** | 28.00 µs ±0.57% | not on its grid |
+| `V = 2` | 1 | 529.87 µs ±0.35% | 37.85 µs ±0.15% | not on its grid |
+| `V = 2` | 24 | **286.45 µs ±0.49%** | 36.49 µs ±2.40% | not on its grid |
 
 Re-taken in "The #412 change" pass at the end of this file; the rows it
 replaces are 277.4 µs, 1.287 ms, 636.6 µs and 2.064 ms. One or two of 20
 measurements were flagged as outliers on every id, and no interval in the
 table exceeds ±2.40%, which is nothing against the ratios in it.
+
+The `upstream C++` column says `not on its grid` for all four rows, and that
+is this shape's own doing rather than a gap in #384's run: upstream's
+`bench_integrate` walks `v = 0, 100, ..., V`, so `V = 1` and `V = 2` -- the
+two sizes the paragraph above explains, two orders of magnitude below
+upstream's sweep because `V = 3` overflows a one-worker stack here -- are not
+points it can be asked for. Its first non-degenerate point, `v = 100`, is
+about 390,000 spawned tasks against our 828 and 1852, and #384 ran it anyway
+as the nearest thing there is: 26.43 ms at one worker and 3.822 at 24, **6.9x**,
+which is the scaling reading this shape contributes and is reported in "The
+#384 measurement" rather than in this table, since it is not a row of it.
 
 **This was the widest gap in the file -- 14x and 15x at one worker, 42x and
 53x at 24 -- and the 24-worker end of that was the corun's predicate: #412
@@ -8421,3 +8517,210 @@ ids. And it does not re-test the four bounded floors at other shapes or
 widths: `for_each_by_index` at `n = 1e6` and 24 workers is the one shape
 #381, #400, #401 and this section share, which is what makes the four passes
 comparable and is also the whole of their reach.
+
+## The #384 measurement: upstream's own executor speeds up at 24 workers, so the regression was the port's
+
+The one question in this milestone that no column of this file could answer
+until now. Five shapes here were *slower* at 24 workers than at one --
+`skynet`, `nqueens`, `integrate`, `merge_sort` at 10000 and `fibonacci`'s group
+route -- and #372 was opened on the premise that the cause was the port rather
+than Taskflow: the port submitted every group child into the shared buffers
+where upstream routes them to the submitting worker's own queue. A rayon
+baseline cannot test that premise, because rayon is not an implementation of
+this design. Upstream's own binaries on this box can, and
+`devtools/upstream-bench.sh` (#383) is the build that runs them.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `nproc` | 24 |
+| Upstream | `taskflow/taskflow` at tag `v4.1.0` -- this repo's pin -- commit `45366fe` |
+| C++ toolchain | g++ 12.2.0, cmake 3.25.1, make 4.3, in the same Debian 12 container |
+| Flags | cmake `Release` (`-O3 -DNDEBUG`) plus `-std=c++20 -fpermissive -fopenmp`, upstream's own `benchmarks/CMakeLists.txt` adding the rest |
+| Harness | upstream's `-m tf -r 1`: **one call a row**, timed whole, no warm-up, printed in milliseconds |
+| Date | 2026-11-19 |
+| **Load average** | **1.77 before the first run, 1.71 after each of the next eight, 3.09 after `merge_sort`'s, whose sweep ends at 1e8 elements** |
+
+Nothing else was on the box: no sibling agent, no `cargo` anywhere, which is
+the condition every figure here is quoted under and the reason this issue runs
+alone and changes no code.
+
+### The output, every figure as upstream printed it
+
+Nine runs -- five shapes at one worker and at 24, less the one that deadlocks.
+Each binary sweeps a range in one process and prints a row per point, so the
+cells the five tables above carry are **rows of these sweeps** rather than
+separate runs, and the rows either side of ours are the noise floor of a
+single untimed call at that size. Each shape's two widths are two separate
+processes, set side by side here for reading; no figure is rounded,
+re-ordered or combined:
+
+```
+=== skynet, 1 thread(s) / 24 thread(s) -- our rows: MaxDepth = 3 and 4
+   size      1 thread     24 threads
+      1         0.029          0.069
+      2         0.022          0.085
+      3         0.083          0.056
+      4         0.755          0.176
+      5         6.075          1.028
+      6        59.404          9.176
+      7       591.431         66.798
+      8        5765.9        520.798
+
+=== nqueens, -q 8 -- our rows: q = 6 and 8
+   size      1 thread     24 threads
+      1         0.041          0.051
+      2         0.018          0.046
+      3         0.022          0.081
+      4         0.025          0.156
+      5         0.031          0.104
+      6          0.09           0.12
+      7         0.271          0.184
+      8         0.936          0.175
+
+=== integrate, -v 100 -- our V = 1 and 2 are NOT on this grid
+   size      1 thread     24 threads
+      0         0.018          0.027
+    100         26.43          3.822
+
+=== fibonacci, -f 15 -- our rows: n = 12 and 15
+   size      1 thread     24 threads
+      1         0.023          0.023
+      2         0.026          0.029
+      3         0.012          0.027
+      4         0.012           0.03
+      5         0.012          0.037
+      6         0.014          0.111
+      7         0.011          0.047
+      8         0.012          0.035
+      9         0.014          0.026
+     10         0.018          0.083
+     11         0.022          0.052
+     12          0.03          0.026
+     13         0.045          0.053
+     14          0.06          0.052
+     15         0.093          0.064
+
+=== merge_sort -- our rows: 10000 and 1000000; 1 thread deadlocks and is skipped
+       size      1 thread     24 threads
+         10             -          0.063
+        100             -          0.028
+       1000             -          0.082
+      10000             -            0.3
+     100000             -          2.004
+    1000000             -         23.231
+   10000000             -        236.182
+  100000000             -        2071.29
+```
+
+Every figure is in milliseconds. `bench_merge_sort -t 1` printed not one row
+in 420 seconds, because upstream's `msort` waits on `executor.async(...)` from inside
+a worker: with one worker that worker blocks on a task only it could run. The
+whole sweep completes in about twelve seconds at `-t 2`, so the deadlock is
+upstream's harness meeting a one-worker pool and not a property of either
+executor.
+
+### The scaling, upstream beside the port's two routes
+
+The comparison the milestone exists for: the factor by which 24 workers beat
+one, on the same shape at the same size, in each of four columns. The port's
+two routes and rayon are the published figures from "The #412 change" above --
+`rustflow`/`rustflow-group` as the **id route** and `rustflow-runtime-group`
+as the **runtime route**.
+
+| shape | size | upstream C++ | id route | runtime route | rayon |
+|---|---|---|---|---|---|
+| `skynet` | `MaxDepth = 3` | 1.5x | 1.5x | 1.8x | 1.0x |
+| `skynet` | `MaxDepth = 4` | **4.3x** | 1.7x | 2.4x | 2.1x |
+| `nqueens` | `q = 6` | 0.8x | 1.9x | 1.7x | 1.3x |
+| `nqueens` | `q = 8` | **5.4x** | 2.8x | 4.9x | 3.0x |
+| `fibonacci` | `n = 12` | 1.2x | 1.5x | 1.3x | 0.4x |
+| `fibonacci` | `n = 15` | **1.5x** | 1.7x | 2.2x | 0.7x |
+| `integrate` | `V = 1` | not on its grid | 1.8x | 2.1x | 0.7x |
+| `integrate` | `V = 2` | not on its grid | 1.8x | 2.4x | 1.0x |
+| `integrate` | `v = 100` | **6.9x** | not a size of ours | -- | -- |
+| `merge_sort` | 10000 | 1w deadlocks | 1.9x | 1.9x | 1.8x |
+| `merge_sort` | 1000000 | 1w deadlocks | 3.4x | 3.8x | 3.1x |
+
+**Upstream's executor speeds up at 24 workers on every size it can be asked
+for, and never slows down outside the noise of one call.** Seven of the
+eleven rows are sizes upstream has: 4.3x, 5.4x and 6.9x at the three large
+enough to carry 24 workers at all, and 1.2 to 1.5x at three of the four
+smaller ones. The fourth is `nqueens` at `q = 6`, 0.09 ms to 0.12, and that
+pair is inside the spread of a single untimed call -- upstream's own 24-thread
+sweep moves between 0.046 and 0.184 ms over the eight neighbouring sizes of
+that one process, which is twice the difference being read. Upstream's factor
+also *grows* with the size, which is what a scheduler whose cost is per task
+rather than per level should do: 11.1x at `MaxDepth = 8`, a size this port
+cannot run at either width, its cliffs being `MaxDepth = 5` at one worker and
+6 at 24 for the reason "The #359 measurement" above gives.
+
+**So the regression was the port's.** Nothing in the design makes these shapes
+slower at 24 workers: upstream's own translation of each of them, on this CPU,
+gains from the width every time. And the two places the port had to change to
+gain it too are both places it had diverged from the design rather than
+places the design was wrong -- #372's queue (every group child pushed into the
+shared buffers, where upstream routes it to the submitting worker's own deque)
+and #412's corun predicate (re-read once a 211-attempt search, where
+upstream's `_corun_until` re-reads it after every failed steal).
+
+What the premise read against is the pre-#412 rows each shape section above
+names as the ones it replaces. At the larger size of each shape, 24 workers
+were *slower* than one by 1.1x on `skynet`, 2.5x on `nqueens`, 3.2x on
+`integrate` and 6.9x on `fibonacci`'s group route, with only `merge_sort`'s
+million-element row faster (3.2x) because twenty million compares bury the
+wait. Those same five cells now read 1.7x, 2.8x, 1.8x, 1.7x and 3.4x
+*faster* on the id route and 2.4x, 4.9x, 2.4x, 2.2x and 3.8x on the runtime
+route -- the same direction as upstream's own column in every one of them,
+which is what the premise predicted would happen if the cause was the port.
+
+### The absolute figures, which is a different question
+
+What the factors above do not say is where the two columns actually sit. At 24
+workers and the larger size of each shape:
+
+| shape | size | id route | runtime route | upstream C++ |
+|---|---|---|---|---|
+| `skynet` | `MaxDepth = 4` | 1.1325 ms (6.4x behind) | 573.17 µs (3.3x behind) | 0.176 ms |
+| `nqueens` | `q = 8` | 374.89 µs (2.1x behind) | **152.93 µs (1.1x ahead)** | 0.175 ms |
+| `fibonacci` | `n = 15` | 174.55 µs (2.7x behind) | 77.225 µs (1.2x behind) | 0.064 ms |
+| `merge_sort` | 1000000 | **15.82 ms (1.5x ahead)** | **14.304 ms (1.6x ahead)** | 23.231 ms |
+| `merge_sort` | 10000 | **132.39 µs (2.3x ahead)** | **132.10 µs (2.3x ahead)** | 0.3 ms |
+
+At one worker, where upstream has three of the five: `skynet` at
+`MaxDepth = 4` is 2.5x behind on the id route and 1.8x on the runtime route,
+`fibonacci` at `n = 15` 3.2x and 1.8x, and `nqueens` at `q = 8` 1.1x behind on
+the id route and **1.3x ahead** on the runtime route. The pattern across both
+widths is the one the shape sections give separately: the port is behind
+wherever a cheap body leaves the submission path exposed -- `skynet`'s bodies
+hold no work at all -- and level or ahead wherever the body is the run, which
+is `merge_sort`'s twenty million compares and, at one worker, `nqueens`'s
+board copy and column prune.
+
+The column that does not fit any of this is **rayon**, which is ahead of
+upstream's own binary in thirteen of the fourteen filled cells, by 2.9x on
+`skynet` at `MaxDepth = 4` and one worker and 6.1x on `fibonacci` at `n = 15`.
+That is not a finding about Taskflow, and this run does not isolate it: a
+`rayon::scope` child is a job on the parent's own frame borrowing the frame it
+was spawned from, where both this port and upstream allocate a node per child
+and copy what it captures. That is the asymmetry "What is measured" names, and
+"The #125 attribution" above is where its price on this side is recorded --
+one allocation at 69 to 75 ns a task at one worker, three blocks a free node
+then and two now -- as the cost of the architecture rather than as something a
+patch reaches. What this run adds is that upstream pays a version of it too,
+and pays less: one `tf::Node` out of `animate` per child where this port
+allocates two blocks, three before #376.
+
+**What this does not say.** It is nine processes and one call a row, from one
+build of one compiler: a cell is good for the factor against its own other
+cell, which is what both tables above are made of, and good for nothing finer.
+It is not a library comparison -- g++ 12.2.0 against rustc 1.100.0, upstream's
+`std::chrono` against criterion's twenty samples, and in four of the five
+shapes a different representation for a child's result, a slot of `AtomicU64`
+where upstream's child writes into the parent's frame, each module's docs
+giving the reason it has to be. It does not reach the seventeen shapes whose
+`upstream C++` column still says `not published`; none of them is nested, so
+none of them asks this question. It does not reach widths between 1 and 24,
+where "The #412 change" already says the two-worker case is the one a stolen
+child still costs a parent. And it re-opens nothing: it measures upstream, not
+this port, so every decision above stands on the figures it was taken with.

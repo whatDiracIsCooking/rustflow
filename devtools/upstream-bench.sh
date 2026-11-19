@@ -12,8 +12,8 @@
 #   devtools/upstream-bench.sh --rounds 3         # upstream's -r (default 1)
 #   devtools/upstream-bench.sh --dir /var/tmp/ub  # where the clone goes
 #
-# WHY THIS EXISTS. "The upstream C++ column is empty, and that is the finding"
-# in BENCHMARKS.md records that upstream publishes no figures at all -- its
+# WHY THIS EXISTS. "The upstream C++ column" in BENCHMARKS.md records that
+# upstream publishes no figures at all -- its
 # `benchmarks/benchmarks.md` documents how to build and drive the suite and
 # then shows one plot with no table behind it. So the only way to get a number
 # for upstream's own executor is to run it, and the one comparison that settles
@@ -21,7 +21,9 @@
 # upstream's binary on the same CPU. This script is that build, and it exists
 # as a script rather than a paragraph for the reason the coverage and
 # documentation instruments do: a figure from a build nobody recorded is not
-# comparable with the next one.
+# comparable with the next one. #384 is the run that filled the five nested
+# shapes' column with it; "The #384 measurement" at the end of that file is
+# where its output and its reading are.
 #
 # THE IMAGE MUST BE REBUILT FIRST. The toolchain this needs -- g++, cmake,
 # make -- was added to the Dockerfile by the same issue that added this file.
