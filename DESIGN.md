@@ -1600,6 +1600,38 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   that each argued for their own trait are one paragraph in
   `src/algorithm/mod.rs`, where the trait now is.
 
+- **The partitioned chunk loop stays as upstream wrote it, including the chunk
+  floor of 1** (issue #343). `for_each_by_index` with a partitioner is the
+  splittable source range the "#60 finding" in
+  [`BENCHMARKS.md`](BENCHMARKS.md) said this port lacked, so it is the first
+  shape where the rayon baseline runs the same program; the question was what
+  its per-chunk cost is worth. Counted rather than timed, the answer is that
+  there is nothing there: a chunk allocates nothing -- `dispatch` builds one
+  free node per *worker*, never per chunk, so 547 chunks cost 23 of them --
+  and a chunk is about 15 ns, 1.3% of the run it belongs to. The same chunk
+  loop driven by rayon's fan-out instead of this executor's is *faster* than
+  rayon's own range split on the same body, which is the measurement that
+  retires the question.
+
+  So `GuidedPartitioner`'s `chunk_size == 0 ? 1 : chunk_size` and
+  `DefaultPartitioner = GuidedPartitioner<>` keep upstream's values, even
+  though the floor of 1 is what makes the default partitioner hand out the
+  last 1% of a range a few elements at a time, and even though a chunk size
+  large enough to take `make_for_each_by_index_task`'s own
+  `n <= part.chunk_size()` early-out beats the parallel path outright below
+  about ten thousand elements. A caller who wants either already has the API
+  to ask for it; changing a ported default to flatter one benchmark row is the
+  trade this declines.
+
+  What the measurement did find is not in this subsystem at all: the `w` tasks
+  `dispatch` submits all land on one worker's queue, and 15 to 19 of 24
+  workers ever run a chunk body, the rest entering their task after the shared
+  cursor is exhausted. That is the steal loop and the notifier, so the next
+  measurement belongs to #60's and #102's territory rather than to
+  `src/algorithm/`. The counters, the ablations and the harness term that
+  turns out to be most of the published gap are in
+  [`BENCHMARKS.md`](BENCHMARKS.md) under "The #343 attribution".
+
 ## Pipelines
 
 - **A pipeline's lines need the eleventh `Handle` variant after all**
