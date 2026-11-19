@@ -764,13 +764,28 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   stolen, so a late thief has many non-empty deques to find instead of one.
   `SplittingPartitioner` (#374) is that mechanism ported, and the measurement
   shows it reaching more workers on a cold pool at three to four times the
-  dispatch cost -- a trade #381 owns, not this entry. The counters, the
+  dispatch cost -- a trade #381 priced and declined as a default, in the
+  entry under "Algorithms" below. The counters, the
   partitioner sweep, the worker-count sweep and the background-spinner control
   are in [`BENCHMARKS.md`](BENCHMARKS.md) under "The #367 measurement"; what
   would reopen the question is a box with more hardware threads than the pool
   has workers, which would separate the arrival race from the machine's own
   width -- at 24 workers on 24 threads they are confounded, and at every width
   up to 20 the fan-out reaches every worker it has.
+
+  **What the partitioner A/B added to this is that the share, not the tree, is
+  what reaches a late worker** (issue #381). Turning the re-splits off by
+  giving `SplittingPartitioner` a floor above `n / w` leaves 25 tasks -- the
+  same count the flat dispatch submits -- and still reaches 21 to 23 of 24
+  workers, where the same partitioner with its floor at 1 reaches 21 to 24 for
+  121 to 157 tasks. What differs from the guided cursor at those floors is
+  only what each task is handed: `n / w` of the range outright, against
+  whatever the cursor has left by the time that task is entered. So the
+  tree-versus-flat distinction this entry drew from rayon is not the one that
+  matters on the arrival race; how much work a task still holds when it is
+  finally stolen is. The ceiling itself is unchanged -- one producer, one
+  queue, both upstream's -- and the figures are in
+  [`BENCHMARKS.md`](BENCHMARKS.md) under "The #381 measurement".
 
 ## Control flow and cancellation
 
@@ -1832,6 +1847,46 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   `src/algorithm/`. The counters, the ablations and the harness term that
   turns out to be most of the published gap are in
   [`BENCHMARKS.md`](BENCHMARKS.md) under "The #343 attribution".
+
+- **`SplittingPartitioner` stays an option and `GuidedPartitioner` stays the
+  default, at a price now measured** (issue #381). #374 added the port's own
+  partitioner -- a chunk task that finds itself on a foreign thread hands half
+  its remaining share to a task of its own -- against the fan-out the entry
+  under "Executor core" describes, and the question this leaves is whether it
+  should be what `DefaultPartitioner` names. It should not. On the four shapes
+  that carry a `rustflow-split` id it costs **1.27x to 33.8x** of the shipped
+  dispatch at 24 workers, including 1.48x and 1.70x on `mandelbrot`, the
+  suite's load-imbalance shape and so the one its mechanism was built for; it
+  ties on every one-worker row, which is the mechanism confirming itself,
+  since nothing splits without a steal. What it buys is 21 to 24 of 24 workers
+  against the guided default's 21 to 22, and the counters attribute even that
+  to the static share each task is handed rather than to the re-split: with
+  the splits turned off by a high floor the count is unchanged and the wall is
+  a third of it. A re-split costs 12 to 16 µs where a fan-out task costs
+  2 µs, which is #400's to attribute, and the floor of 1 that `default()`
+  sets is the type's worst setting on every shape measured, which is #401's
+  to decide.
+
+- **`sort_by` keeps upstream's live partition, and the sort's own figures do
+  not show it** (issues #375, #381). The pinned header defines two sort cores
+  and `make_sort_task` calls only `parallel_pdqsort`; the `parallel_3wqsort`
+  call beside it is commented out and its pivot picker needs a `sort3` the
+  tree does not define, so running the three-way split was the port following
+  dead code. #375 replaced it with the live core -- ninther pivot, Hoare
+  `partition_right`, `partition_left` on a repeated pivot, insertion sort below
+  24 elements, `break_patterns` on a bad split -- and that stands on those
+  grounds rather than on a measurement: the A/B across it reads the one `sort`
+  id that reaches a partition at all (24 workers, a million elements) at
+  1.035x, inside its own 15.3% round-to-round spread. The other three ids of
+  that shape never reach either partition, because `sort_by` short-circuits to
+  `[T]::sort_unstable_by` at one worker or at or under
+  `parallel_sort_cutoff::<T>()`, and the 1.7x the A/B shows on them is the
+  **call shape** of that short-circuit: handing the standard library's sort a
+  `&C` where the comparator is owned measures 37.8 ms against 21.9 ms for the
+  same million `f64`s in one binary, and which regime a build lands in is a
+  property of the calling crate. #399 owns that line. The figures, the A/A
+  control that sets this shape's floor and the ablation are in
+  [`BENCHMARKS.md`](BENCHMARKS.md) under "The #381 measurement".
 
 ## Pipelines
 
