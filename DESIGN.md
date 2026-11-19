@@ -1014,8 +1014,9 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   holds its one node *inline* instead — `AsyncNode` owns a `Node` and no
   arena — and the `Arc` around it *is* upstream's count: handles share it,
   every queued job of the node shares it, and the node goes when the last
-  share goes — no second counter to keep in step and no recycle call to get
-  right. That leaves the null topology, which
+  share goes — no second counter to keep in step, and the recycle call upstream
+  has to get right is a *check* here rather than an obligation (the entry
+  below). That leaves the null topology, which
   every job in the scheduler reaches through without asking whether it is
   there. Making the field an `Option` would have put a `None` case into the
   worker's dispatch, into every arm that schedules a nested graph, into the
@@ -1056,6 +1057,53 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   allocation count is a test rather than a figure
   (`src/executor/async_node.rs`), the price of the two blocks being
   [`BENCHMARKS.md`](BENCHMARKS.md)'s to state.
+- **A worker recycles the free node it finished, on a bounded list of its own**
+  (issue #379). Upstream's `TF_ENABLE_TASK_POOL` build allocates every `Node`
+  from a process-wide `ObjectPool`: `tf::animate` pops a block off one of its
+  shards' lock-free Treiber stacks and constructs into it, `tf::recycle`
+  destroys the object and pushes the block back onto the shard its own header
+  names, and nothing goes back to the system allocator until the pool is
+  released. What that defends against is exactly the regime the async family
+  is in — the thread that submits allocates the node and a *worker* frees it —
+  which [`BENCHMARKS.md`](BENCHMARKS.md)'s "#125 attribution" priced at ~700
+  ns a block at 24 workers against ~70 ns on the thread that allocated it.
+  This port gives the one node kind that is allocated per task the same
+  defence, and three things about it are its own.
+
+  **The list is one per worker and shared with nobody.** It lives in the
+  `WorkerThread` frame behind a `RefCell`, not in a global behind a CAS:
+  upstream shards *because* its pool is global and every thread animates out
+  of it, where a list only the owning worker's thread can reach needs no
+  atomic at all. The submission path that draws from it is the one that
+  already names a worker — a body spawning on the worker running it — so
+  nothing new had to be threaded through to find the list. The price is that a
+  node finished on worker 3 is only ever reused by worker 3, where upstream's
+  blocks circulate between threads, and that an external submission
+  (`Executor::silent_async`, a task group's) names no worker and allocates as
+  it always did.
+
+  **A block is parked only when the `Arc` says the last share has gone**,
+  which is the `Arc::get_mut` in `FreeNodes::recycle`. Upstream's
+  `recycle(Node*)` is an unchecked promise — the caller swears the node is
+  dead, and its `AsyncTask` reference count having reached zero is what makes
+  that true. The same node here may still be named by an `AsyncTask` handle or
+  by the parent chain of something still queued, so the test is what lets the
+  recycling add no `unsafe` and no invariant a reader has to learn: a node
+  somebody can still reach is dropped exactly as it was before. The clone that
+  is tested is taken before the job is spent and tested after, which is the
+  whole protocol (`WorkerThread::spend_job`).
+
+  **The list is bounded and dies with its worker**, where upstream's pool is
+  unbounded until `release` and outlives every executor. 32 blocks is what
+  stops a burst of submissions from parking memory for the life of the
+  executor, and a node is reset at the moment it is parked rather than at
+  reuse, so it holds no body, no name and no successor job while it waits. The
+  body's own box is deliberately not pooled: it is the type erasure, so its
+  size is the body's and not the node's.
+
+  No figures here — the A/B of this against #376 is #382's — and the test
+  (`src/executor/async_node.rs`) asserts which block the second submission
+  landed in rather than what it saved.
 - **`AsyncTask` is that `Arc`, so `use_count` counts the executor's shares
   too** (issues #86, #91). Upstream's handle is a `Node*` plus `_incref` and
   `_decref` on every copy, move and destruction; here it is an

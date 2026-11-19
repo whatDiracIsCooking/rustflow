@@ -30,8 +30,16 @@
 //! paid by every caller that used to resolve this node by index into a
 //! graph, [`AsyncNode::node`] being where the index goes instead;
 //! `DESIGN.md` has the bill for both shapes.
+//!
+//! That one block is what [`FreeNodes`] recycles: a worker that finished a
+//! free node and holds the last share of it parks the allocation instead of
+//! returning it to the allocator, and the next submission that worker makes
+//! writes a new task into it. `DESIGN.md` has why the list is per worker and
+//! unshared where upstream's `NodePool` is one sharded pool per process, and
+//! why the hand-back is a *check* here and an obligation there.
 
 use std::any::Any;
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -74,19 +82,37 @@ impl AsyncNode {
     /// from the start as upstream's `AsyncTask(Node*)` takes the first
     /// reference count in its constructor: a dependency may be handed out
     /// before the task is queued. Panics in a debug build if `handle` is
-    /// neither async handle -- a free node with (say) a subflow handle is one
-    /// whose arm preempts it with nothing above it to resume it.
+    /// neither async handle, for [`debug_assert_free_handle`]'s reason.
+    ///
+    /// Allocates: [`FreeNodes::animate`] is the same node out of a block the
+    /// calling worker recycled, and the two are interchangeable.
     pub(crate) fn new(name: impl Into<String>, handle: Handle) -> Arc<Self> {
-        debug_assert!(
-            handle.is_async() || handle.is_dependent_async(),
-            "a free-standing node carries an async handle, not {handle:?}"
-        );
+        debug_assert_free_handle(&handle);
 
         Arc::new(Self {
             node: Node::new(name.into(), handle),
             finished: AtomicBool::new(false),
             successors: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Writes this node's whole state afresh, as the free node of the task
+    /// `handle` is the body of: upstream's `ObjectPool::animate`, which
+    /// constructs a `Node` into a block it recycled earlier. Everything the
+    /// previous task left -- its body, its name, its finished flag and
+    /// anything still on its successor list -- is dropped here, so a reused
+    /// block carries nothing of it.
+    ///
+    /// Takes `&mut self`, which is the whole of what makes it sound to call
+    /// on a shared node: only [`FreeNodes`] has one, and only through
+    /// `Arc::get_mut`.
+    fn reset(&mut self, name: String, handle: Handle) {
+        self.node = Node::new(name, handle);
+        *self.finished.get_mut() = false;
+        self.successors
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 
     /// The node itself: what `GraphOwner::Async` resolves a job's
@@ -149,6 +175,105 @@ impl AsyncNode {
     }
 }
 
+/// Debug-asserts that `handle` is one a free-standing node may carry: a free
+/// node with (say) a subflow handle is one whose arm preempts it with nothing
+/// above it to resume it. Shared by the two ways such a node is built, the
+/// allocation and the recycled block.
+fn debug_assert_free_handle(handle: &Handle) {
+    debug_assert!(
+        handle.is_async() || handle.is_dependent_async(),
+        "a free-standing node carries an async handle, not {handle:?}"
+    );
+}
+
+/// The free [`AsyncNode`] blocks one worker has finished with and may write
+/// its next submission into: upstream's `NodePool`, the sharded `ObjectPool`
+/// every `Node` of a `TF_ENABLE_TASK_POOL` build is animated from and
+/// recycled to, as one unshared stack per worker.
+///
+/// Reached only from the thread of the worker whose frame holds it -- the
+/// submission that draws from it names that worker, and the tear-down that
+/// parks a block runs on it -- which is what the [`RefCell`] rests on.
+/// `DESIGN.md` has why the list is per worker rather than sharded, and why
+/// nothing recycled here is pooled beyond the one block.
+pub(crate) struct FreeNodes {
+    /// The parked blocks, most recently freed first. Each is the only share
+    /// of itself, which [`FreeNodes::recycle`] is what establishes, and each
+    /// holds no task: a parked node was reset to an empty name and
+    /// [`Handle::Placeholder`], so nothing a finished body captured stays
+    /// alive by sitting here.
+    parked: RefCell<Vec<Arc<AsyncNode>>>,
+}
+
+impl FreeNodes {
+    /// How many blocks one worker parks before it starts handing them back to
+    /// the allocator. A bound on the memory a burst of async submissions can
+    /// leave parked for the life of the executor, per worker; upstream's pool
+    /// is unbounded until its `release`.
+    const CAPACITY: usize = 32;
+
+    /// An empty list. The backing `Vec` is left unallocated, a worker that
+    /// finishes no free node -- and a corun view, which gets its own list for
+    /// the frame it lives in -- paying nothing for having one.
+    pub(crate) fn new() -> Self {
+        Self {
+            parked: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The free-standing node of an async task whose body is `handle`, in a
+    /// recycled block if this list has one: upstream's
+    /// `ObjectPool::animate`, which is what its `animate(ArgsT&&...)` calls
+    /// in a pooled build and `new Node` in every other.
+    ///
+    /// The node comes out indistinguishable from [`AsyncNode::new`]'s, which
+    /// is [`AsyncNode::reset`]'s job, and the caller cannot tell which it
+    /// got.
+    pub(crate) fn animate(&self, name: String, handle: Handle) -> Arc<AsyncNode> {
+        debug_assert_free_handle(&handle);
+
+        let recycled = self.parked.borrow_mut().pop();
+        let Some(mut node) = recycled else {
+            return AsyncNode::new(name, handle);
+        };
+
+        Arc::get_mut(&mut node)
+            .expect("a parked node is the only share of itself, and the list is this worker's")
+            .reset(name, handle);
+        node
+    }
+
+    /// Parks the block `node` sits in for this worker's next submission, or
+    /// drops the share and lets the allocator have it: upstream's
+    /// `ObjectPool::recycle`, called where it calls its own, as the node of a
+    /// finished task is given up.
+    ///
+    /// Nothing is parked unless `node` is the **last** share of that node,
+    /// which `Arc::get_mut` is what decides: an `AsyncTask` handle or the
+    /// parent chain of something still queued may name the same node, and a
+    /// block somebody can still reach is not this worker's to write a new
+    /// task into. Upstream needs no such test, its own reference count
+    /// having reached zero before `_tear_down_dependent_async` recycles.
+    pub(crate) fn recycle(&self, mut node: Arc<AsyncNode>) {
+        let mut parked = self.parked.borrow_mut();
+        if parked.len() >= Self::CAPACITY {
+            return;
+        }
+
+        let Some(unique) = Arc::get_mut(&mut node) else {
+            return;
+        };
+        unique.reset(String::new(), Handle::Placeholder);
+        parked.push(node);
+    }
+
+    /// How many blocks are parked.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.parked.borrow().len()
+    }
+}
+
 impl core::fmt::Debug for AsyncNode {
     /// Hand-written: the derived one would print every job in the list.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -169,7 +294,11 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+    use crate::Executor;
+    use crate::executor::r#async::{Spawn, Submission};
+    use crate::executor::queue::WorkerQueue;
     use crate::executor::topology::{Parent, Topology};
+    use crate::executor::worker::WorkerThread;
     use crate::graph::AsyncWork;
 
     /// The system allocator plus a count of the allocations the calling
@@ -304,6 +433,167 @@ mod tests {
             "and the job that queues it is two clones of two shares"
         );
         drop(job);
+    }
+
+    /// A silent body with a capture of its own, so that the box it goes in
+    /// is an allocation and the two blocks a free task costs can be told
+    /// apart: the node's, and this one's.
+    fn silent_body() -> impl FnOnce() + Send + 'static {
+        let captured = 7_usize;
+        move || assert_eq!(captured, 7, "the body is its own block")
+    }
+
+    /// That body as the node's handle holds it.
+    fn body() -> AsyncWork {
+        AsyncWork::plain(silent_body())
+    }
+
+    /// The list's whole point, counted: a node recycled to it and then
+    /// animated out of it again is the *same allocation*, and the second
+    /// task costs one block where the first cost two.
+    #[test]
+    fn an_animated_node_reuses_the_block_a_recycled_one_parked() {
+        let free = FreeNodes::new();
+
+        let (first_blocks, first) =
+            allocations_of(|| free.animate(String::new(), Handle::Async(body())));
+        assert_eq!(
+            first_blocks, 2,
+            "an empty list allocates: the `Arc` and the body's box"
+        );
+
+        let address = Arc::as_ptr(&first);
+        free.recycle(first);
+        assert_eq!(free.len(), 1, "the last share of a finished node is parked");
+
+        let (second_blocks, second) =
+            allocations_of(|| free.animate(String::new(), Handle::Async(body())));
+        assert_eq!(
+            second_blocks, 1,
+            "the body's box alone: the node's block was the parked one"
+        );
+        assert!(
+            std::ptr::eq(address, Arc::as_ptr(&second)),
+            "and it is that block"
+        );
+        assert_eq!(free.len(), 0, "which the list no longer holds");
+
+        // The task written into it is a task like any other, carrying
+        // nothing of the one before it.
+        assert_eq!(second.node().name(), "");
+        assert!(second.node().handle().is_async());
+        assert!(!second.is_finished());
+        assert!(second.take_panic().is_none());
+    }
+
+    /// The rule that makes recycling safe without `unsafe`: a node somebody
+    /// else still names -- an `AsyncTask` handle, a job of it still queued --
+    /// is not parked, so no second task is ever written over a node a caller
+    /// can still read.
+    #[test]
+    fn a_node_somebody_still_names_is_not_parked() {
+        let free = FreeNodes::new();
+        let node = free.animate("task".to_string(), Handle::DependentAsync(body()));
+        let handle = Arc::clone(&node);
+
+        free.recycle(node);
+        assert_eq!(free.len(), 0, "a shared node is dropped, not reused");
+        assert_eq!(
+            handle.node().name(),
+            "task",
+            "and the holder's node is untouched"
+        );
+
+        free.recycle(handle);
+        assert_eq!(
+            free.len(),
+            1,
+            "the last share of it is the one that parks it"
+        );
+    }
+
+    /// The bound: a burst of finished tasks parks blocks up to the list's
+    /// capacity and hands every one after that back to the allocator, so a
+    /// worker cannot hold an unbounded number of nodes for the life of the
+    /// executor.
+    #[test]
+    fn the_list_parks_no_more_than_its_capacity() {
+        let free = FreeNodes::new();
+        for _ in 0..FreeNodes::CAPACITY + 10 {
+            free.recycle(AsyncNode::new(String::new(), Handle::Async(body())));
+        }
+
+        assert_eq!(free.len(), FreeNodes::CAPACITY);
+    }
+
+    /// The submission half, through the path a task body takes: a free node
+    /// finished by a worker is parked on *that worker's* list, and the next
+    /// submission naming the same worker is written into the block it
+    /// parked.
+    ///
+    /// The worker is driven on this thread, as the other cases that step the
+    /// scheduler by hand are, which is also what puts the allocations on the
+    /// thread the counter counts. One run, no timing: the claim is which
+    /// block the second node is in, not what it saved.
+    #[test]
+    fn a_worker_submitted_node_is_recycled_for_the_next_submission() {
+        let executor = Executor::new(1);
+        let mut worker = WorkerThread::new(Arc::clone(&executor.shared), 0, WorkerQueue::new());
+        // The job of the body doing the submitting, which is what
+        // `Submission::under_node` counts the child against.
+        let submitter = Job::free(&node(), &Parent::Run);
+
+        let (first_blocks, first) = {
+            let to = Submission::under_node(&submitter, &worker);
+            let (blocks, ()) = allocations_of(|| {
+                executor
+                    .shared
+                    .schedule_async_task(Spawn::silent(silent_body()), &to);
+            });
+            (
+                blocks,
+                worker
+                    .pop()
+                    .expect("the child went onto this worker's own queue"),
+            )
+        };
+        assert_eq!(
+            first_blocks, 2,
+            "an empty list allocates both of a free task's blocks"
+        );
+        let address = Arc::as_ptr(first.async_node().expect("a free node's job"));
+
+        worker.invoke(first);
+        assert_eq!(
+            worker.free_nodes().len(),
+            1,
+            "the worker that finished the task parked its node"
+        );
+
+        let (second_blocks, second) = {
+            let to = Submission::under_node(&submitter, &worker);
+            let (blocks, ()) = allocations_of(|| {
+                executor
+                    .shared
+                    .schedule_async_task(Spawn::silent(silent_body()), &to);
+            });
+            (blocks, worker.pop().expect("and so did the next child"))
+        };
+
+        assert!(
+            std::ptr::eq(
+                address,
+                Arc::as_ptr(second.async_node().expect("a free node's job"))
+            ),
+            "the second submission is in the block the first one's tear-down parked"
+        );
+        assert_eq!(
+            second_blocks, 1,
+            "so it allocated the body's box and nothing else"
+        );
+        assert_eq!(worker.free_nodes().len(), 0, "and the list is empty again");
+
+        worker.invoke(second);
     }
 
     /// And the other order, which is the one a lost race would turn into a
