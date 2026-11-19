@@ -6,15 +6,26 @@
 //! likes, and coruns until they are done -- which is what makes recursive
 //! parallelism a plain recursive function rather than a graph somebody has to
 //! build. Only a worker can open one, because the only thing a group can do
-//! to *wait* is corun; [`Executor::task_group`] is the one constructor and
-//! [`CorunError::NotAWorker`] is its refusal.
+//! to *wait* is corun: [`Executor::task_group`] refuses any other thread with
+//! [`CorunError::NotAWorker`], and [`Runtime::task_group`] needs no refusal
+//! because holding a [`Runtime`] is already proof of a worker.
 //!
 //! # Design
 //!
+//! Those two constructors are the two **routes** a group is opened through,
+//! which is the `Route` below and the one thing that differs between two
+//! groups: a group opened on the executor holds its worker's *id* and queues
+//! its children in the shared buffers, where a group opened on a `Runtime`
+//! holds the worker's own scheduling loop -- upstream's `Worker&` itself --
+//! so its children go onto that worker's LIFO queue and its `corun` pops the
+//! same end. `DESIGN.md`'s "Dynamic tasking" has why the id route cannot do
+//! that and what the difference costs a recursion.
+//!
 //! The sixteen spawning forms below are one delegation each onto the
-//! submission core in `executor::async`, under a `Submission` built from the
-//! group's own anchor -- eight body-and-handle shapes, each with a `_named`
-//! twin that adds one `Spawn::named` step. `DESIGN.md` has the anchor's `Arc`
+//! submission core in `executor::async`, through the two private `submit`
+//! methods, which are where the route picks the `Submission` -- eight
+//! body-and-handle shapes, each with a `_named` twin that adds one
+//! `Spawn::named` step. `DESIGN.md` has the anchor's `Arc`
 //! shape and the `Drop` this type does not have, where a child is queued and
 //! the stack-depth ceiling that follows from it, which anchor a child's
 //! failure reaches depending on which of the eight forms raised it, and the
@@ -26,6 +37,7 @@
 //! mid-chain if any of them still has a successor to release.
 
 use std::any::Any;
+use std::cell::RefCell;
 use std::fmt;
 use std::marker::PhantomData;
 use std::panic;
@@ -49,6 +61,11 @@ impl Executor {
     /// Upstream's `Executor::task_group`. The group borrows this executor for
     /// as long as it lives, submits its children to it, and is **not**
     /// counted in [`Executor::wait_for_all`]'s work.
+    ///
+    /// This is the route for a body that has no [`Runtime`] of its own, and
+    /// the group it opens holds the opening worker's *id*:
+    /// [`Runtime::task_group`] is the route that holds the worker itself, and
+    /// `DESIGN.md` has what that buys a recursion of groups.
     ///
     /// ```
     /// use std::sync::Arc;
@@ -102,18 +119,46 @@ impl Executor {
         // scheduling loop to re-enter, which `WorkerThread::corun_view`
         // builds from the id.
         let worker = self.this_worker_id().ok_or(CorunError::NotAWorker)?;
-        Ok(TaskGroup::new(self, worker))
+        Ok(TaskGroup::by_id(self, worker))
     }
+}
+
+/// Where a group's children are queued and what its `corun` runs on:
+/// upstream's `Executor& _executor` and `Worker& _worker`, as the one pair
+/// that differs between the two routes a group is opened through.
+enum Route<'a> {
+    /// A group opened by [`Executor::task_group`], which can name its worker
+    /// only by id: the children go to the shared buffers and the corun runs
+    /// on a [`WorkerThread::corun_view`] built from that id.
+    ById {
+        /// The executor that opened the group, upstream's `Executor&
+        /// _executor`.
+        executor: &'a Executor,
+        /// The id of the opening worker, upstream's `Worker&` reduced to what
+        /// a call on the `Executor` value can see of it.
+        worker: usize,
+    },
+    /// A group opened by [`Runtime::task_group`], which holds the opening
+    /// worker's own scheduling loop: upstream's `Worker&` itself, so the
+    /// children go onto that worker's queue and the corun pops the same end.
+    ///
+    /// The cell is borrowed mutably for the length of a `corun` and at no
+    /// other time, and that borrow can never be contended: a [`TaskGroup`] is
+    /// not [`Send`] and no task body can name one, so the only frame that can
+    /// reach this group is the one blocked inside the corun.
+    OnWorker(RefCell<&'a mut WorkerThread>),
 }
 
 /// A scope one worker spawns asynchronous tasks into and waits for:
 /// upstream's `tf::TaskGroup`.
 ///
-/// Opened with [`Executor::task_group`], which is the only way to get one and
-/// refuses any thread that is not a worker. The eight spawning forms put a
-/// task under the group's anchor; [`TaskGroup::corun`] waits for all of them
-/// on the opening worker without taking that worker out of the pool;
-/// [`TaskGroup::cancel`] stops the ones that have not started.
+/// Opened with [`Executor::task_group`] from any task body, or with
+/// [`Runtime::task_group`] from a body that was handed the scheduler -- the
+/// two routes the module docs set out, and nothing else hands one out. The
+/// eight spawning forms put a task under the group's anchor;
+/// [`TaskGroup::corun`] waits for all of them on the opening worker without
+/// taking that worker out of the pool; [`TaskGroup::cancel`] stops the ones
+/// that have not started.
 ///
 /// **Dropping a group does not join it.** Children outstanding at that point
 /// keep running, with nothing waiting for them and a failure of one of them
@@ -125,13 +170,10 @@ impl Executor {
 /// Neither [`Send`] nor [`Sync`], which is upstream's deleted copy and move
 /// constructors: a group belongs to the worker that opened it.
 pub struct TaskGroup<'a> {
-    /// The executor that opened this group, upstream's `Executor& _executor`:
-    /// where every child is submitted and whose pool the corun runs on.
-    executor: &'a Executor,
-    /// The id of the worker that opened the group, upstream's `Worker&
-    /// _worker`: the worker whose scheduling loop [`TaskGroup::corun`]
+    /// The route this group was opened through: where every child is
+    /// submitted, and the worker whose scheduling loop [`TaskGroup::corun`]
     /// re-enters.
-    worker: usize,
+    route: Route<'a>,
     /// What the children count down and what a failure under them lands on:
     /// upstream's `NodeBase _node_base`, shared rather than owned by this
     /// value because every job of every child holds a share.
@@ -146,10 +188,23 @@ pub struct TaskGroup<'a> {
 }
 
 impl<'a> TaskGroup<'a> {
-    /// Opens a group on `worker` of `executor`: upstream's private
+    /// Opens a group on worker `worker` of `executor`: upstream's private
     /// constructor, with `friend class Executor` spelled as the module
-    /// boundary.
-    fn new(executor: &'a Executor, worker: usize) -> Self {
+    /// boundary, over the id route.
+    fn by_id(executor: &'a Executor, worker: usize) -> Self {
+        Self::opened(Route::ById { executor, worker })
+    }
+
+    /// Opens a group that holds `thread`, the scheduling loop of the worker
+    /// running the body asking for it: the same constructor over the route
+    /// [`Runtime::task_group`] takes.
+    pub(crate) fn on_worker(thread: &'a mut WorkerThread) -> Self {
+        Self::opened(Route::OnWorker(RefCell::new(thread)))
+    }
+
+    /// A group of `route` with nothing outstanding: the half of upstream's
+    /// constructor that is the same whichever route opened it.
+    fn opened(route: Route<'a>) -> Self {
         let anchor = Nested::new(None);
 
         // Upstream's `NSTATE::IMPLICITLY_ANCHORED` constructor argument, and
@@ -164,19 +219,69 @@ impl<'a> TaskGroup<'a> {
             .fetch_or(Node::IMPLICITLY_ANCHORED, Ordering::Relaxed);
 
         Self {
-            executor,
-            worker,
+            route,
             anchor,
             _not_send: PhantomData,
         }
     }
 
-    /// The executor that opened this group: upstream's
-    /// `TaskGroup::executor`. `DESIGN.md` has why a `Runtime` has no
-    /// equivalent accessor.
+    /// The executor that opened this group, or `None` for a group opened
+    /// from a [`Runtime`]: upstream's `TaskGroup::executor`.
+    ///
+    /// The `None` is a route rather than a failure: a runtime body cannot
+    /// name the executor running it, so neither can a group opened from one,
+    /// and `DESIGN.md`'s entry on handing an executor back has why. What
+    /// nearly every caller of upstream's accessor asks it for is the worker
+    /// count, which [`Runtime::num_workers`] answers on that route.
     #[must_use]
-    pub fn executor(&self) -> &'a Executor {
-        self.executor
+    pub fn executor(&self) -> Option<&'a Executor> {
+        match &self.route {
+            Route::ById { executor, .. } => Some(executor),
+            Route::OnWorker(_) => None,
+        }
+    }
+
+    /// Submits one free-standing child under this group's anchor, through
+    /// whichever route opened the group: the one place the sixteen forms
+    /// below differ between the two.
+    fn submit<H>(&self, spawn: Spawn<H>) -> H {
+        match &self.route {
+            Route::ById { executor, .. } => executor
+                .shared
+                .schedule_async_task(spawn, &Submission::under_anchor(&self.anchor)),
+            Route::OnWorker(thread) => {
+                let thread = thread.borrow();
+                let worker: &WorkerThread = &thread;
+                worker
+                    .shared
+                    .schedule_async_task(spawn, &Submission::under_anchor_on(&self.anchor, worker))
+            }
+        }
+    }
+
+    /// [`TaskGroup::submit`] for a child with dependencies: the same pair of
+    /// submissions over `executor::dependent_async`'s core.
+    fn submit_dependent<'t, H>(
+        &self,
+        spawn: Spawn<H>,
+        dependencies: impl IntoIterator<Item = &'t AsyncTask>,
+    ) -> (AsyncTask, H) {
+        match &self.route {
+            Route::ById { executor, .. } => executor.shared.schedule_dependent_async_task(
+                spawn,
+                &Submission::under_anchor(&self.anchor),
+                dependencies,
+            ),
+            Route::OnWorker(thread) => {
+                let thread = thread.borrow();
+                let worker: &WorkerThread = &thread;
+                worker.shared.schedule_dependent_async_task(
+                    spawn,
+                    &Submission::under_anchor_on(&self.anchor, worker),
+                    dependencies,
+                )
+            }
+        }
     }
 
     /// Runs `body` as a task of this group, and hands back a handle on its
@@ -220,10 +325,7 @@ impl<'a> TaskGroup<'a> {
         R: Send + 'static,
         F: FnOnce() -> R + Send + 'static,
     {
-        self.executor.shared.schedule_async_task(
-            Spawn::handled(body),
-            &Submission::under_anchor(&self.anchor),
-        )
+        self.submit(Spawn::handled(body))
     }
 
     /// [`TaskGroup::spawn`] with the free node this task is named `name`:
@@ -235,10 +337,7 @@ impl<'a> TaskGroup<'a> {
         R: Send + 'static,
         F: FnOnce() -> R + Send + 'static,
     {
-        self.executor.shared.schedule_async_task(
-            Spawn::handled(body).named(name),
-            &Submission::under_anchor(&self.anchor),
-        )
+        self.submit(Spawn::handled(body).named(name))
     }
 
     /// Runs `body` as a task of this group, with no handle on it at all.
@@ -296,9 +395,7 @@ impl<'a> TaskGroup<'a> {
     where
         F: FnOnce() + Send + 'static,
     {
-        self.executor
-            .shared
-            .schedule_async_task(Spawn::silent(body), &Submission::under_anchor(&self.anchor));
+        self.submit(Spawn::silent(body));
     }
 
     /// [`TaskGroup::silent_async`] with the free node this task is named
@@ -309,10 +406,7 @@ impl<'a> TaskGroup<'a> {
     where
         F: FnOnce() + Send + 'static,
     {
-        self.executor.shared.schedule_async_task(
-            Spawn::silent(body).named(name),
-            &Submission::under_anchor(&self.anchor),
-        );
+        self.submit(Spawn::silent(body).named(name));
     }
 
     /// Runs `body` as a task of this group, handing it the scheduler, and
@@ -353,10 +447,7 @@ impl<'a> TaskGroup<'a> {
     where
         F: for<'r> FnOnce(&mut Runtime<'r>) + Send + 'static,
     {
-        self.executor.shared.schedule_async_task(
-            Spawn::handled_runtime(body),
-            &Submission::under_anchor(&self.anchor),
-        )
+        self.submit(Spawn::handled_runtime(body))
     }
 
     /// [`TaskGroup::spawn_runtime`] with the free node this task is named
@@ -368,10 +459,7 @@ impl<'a> TaskGroup<'a> {
     where
         F: for<'r> FnOnce(&mut Runtime<'r>) + Send + 'static,
     {
-        self.executor.shared.schedule_async_task(
-            Spawn::handled_runtime(body).named(name),
-            &Submission::under_anchor(&self.anchor),
-        )
+        self.submit(Spawn::handled_runtime(body).named(name))
     }
 
     /// Runs `body` as a task of this group, handing it the scheduler, with no
@@ -387,10 +475,7 @@ impl<'a> TaskGroup<'a> {
     where
         F: for<'r> FnOnce(&mut Runtime<'r>) + Send + 'static,
     {
-        self.executor.shared.schedule_async_task(
-            Spawn::silent_runtime(body),
-            &Submission::under_anchor(&self.anchor),
-        );
+        self.submit(Spawn::silent_runtime(body));
     }
 
     /// [`TaskGroup::silent_async_runtime`] with the free node this task is
@@ -402,10 +487,7 @@ impl<'a> TaskGroup<'a> {
     where
         F: for<'r> FnOnce(&mut Runtime<'r>) + Send + 'static,
     {
-        self.executor.shared.schedule_async_task(
-            Spawn::silent_runtime(body).named(name),
-            &Submission::under_anchor(&self.anchor),
-        );
+        self.submit(Spawn::silent_runtime(body).named(name));
     }
 
     /// Runs `body` as a task of this group once every task in `dependencies`
@@ -451,11 +533,7 @@ impl<'a> TaskGroup<'a> {
         R: Send + 'static,
         F: FnOnce() -> R + Send + 'static,
     {
-        self.executor.shared.schedule_dependent_async_task(
-            Spawn::handled(body),
-            &Submission::under_anchor(&self.anchor),
-            dependencies,
-        )
+        self.submit_dependent(Spawn::handled(body), dependencies)
     }
 
     /// [`TaskGroup::dependent_async`] with the free node this task is named
@@ -472,11 +550,7 @@ impl<'a> TaskGroup<'a> {
         R: Send + 'static,
         F: FnOnce() -> R + Send + 'static,
     {
-        self.executor.shared.schedule_dependent_async_task(
-            Spawn::handled(body).named(name),
-            &Submission::under_anchor(&self.anchor),
-            dependencies,
-        )
+        self.submit_dependent(Spawn::handled(body).named(name), dependencies)
     }
 
     /// Runs `body` as a task of this group once every task in `dependencies`
@@ -531,14 +605,7 @@ impl<'a> TaskGroup<'a> {
     where
         F: FnOnce() + Send + 'static,
     {
-        self.executor
-            .shared
-            .schedule_dependent_async_task(
-                Spawn::silent(body),
-                &Submission::under_anchor(&self.anchor),
-                dependencies,
-            )
-            .0
+        self.submit_dependent(Spawn::silent(body), dependencies).0
     }
 
     /// [`TaskGroup::silent_dependent_async`] with the free node this task is
@@ -555,13 +622,7 @@ impl<'a> TaskGroup<'a> {
     where
         F: FnOnce() + Send + 'static,
     {
-        self.executor
-            .shared
-            .schedule_dependent_async_task(
-                Spawn::silent(body).named(name),
-                &Submission::under_anchor(&self.anchor),
-                dependencies,
-            )
+        self.submit_dependent(Spawn::silent(body).named(name), dependencies)
             .0
     }
 
@@ -582,11 +643,7 @@ impl<'a> TaskGroup<'a> {
     where
         F: for<'r> FnOnce(&mut Runtime<'r>) + Send + 'static,
     {
-        self.executor.shared.schedule_dependent_async_task(
-            Spawn::handled_runtime(body),
-            &Submission::under_anchor(&self.anchor),
-            dependencies,
-        )
+        self.submit_dependent(Spawn::handled_runtime(body), dependencies)
     }
 
     /// [`TaskGroup::dependent_async_runtime`] with the free node this task is
@@ -604,11 +661,7 @@ impl<'a> TaskGroup<'a> {
     where
         F: for<'r> FnOnce(&mut Runtime<'r>) + Send + 'static,
     {
-        self.executor.shared.schedule_dependent_async_task(
-            Spawn::handled_runtime(body).named(name),
-            &Submission::under_anchor(&self.anchor),
-            dependencies,
-        )
+        self.submit_dependent(Spawn::handled_runtime(body).named(name), dependencies)
     }
 
     /// Runs `body` as a task of this group once every task in `dependencies`
@@ -626,13 +679,7 @@ impl<'a> TaskGroup<'a> {
     where
         F: for<'r> FnOnce(&mut Runtime<'r>) + Send + 'static,
     {
-        self.executor
-            .shared
-            .schedule_dependent_async_task(
-                Spawn::silent_runtime(body),
-                &Submission::under_anchor(&self.anchor),
-                dependencies,
-            )
+        self.submit_dependent(Spawn::silent_runtime(body), dependencies)
             .0
     }
 
@@ -651,13 +698,7 @@ impl<'a> TaskGroup<'a> {
     where
         F: for<'r> FnOnce(&mut Runtime<'r>) + Send + 'static,
     {
-        self.executor
-            .shared
-            .schedule_dependent_async_task(
-                Spawn::silent_runtime(body).named(name),
-                &Submission::under_anchor(&self.anchor),
-                dependencies,
-            )
+        self.submit_dependent(Spawn::silent_runtime(body).named(name), dependencies)
             .0
     }
 
@@ -671,17 +712,20 @@ impl<'a> TaskGroup<'a> {
     /// waiting for whatever is outstanding when it starts.
     ///
     /// **A recursion of groups is bounded by the worker's stack, and
-    /// overflowing it aborts the process rather than failing this call.** A
-    /// job this worker picks up while waiting runs on the waiting frame, and a
-    /// group's children are queued where any worker can take them, so the wait
-    /// nests one frame -- about a kilobyte in a release build -- per task still
-    /// outstanding in the pool, which at one worker is the whole subtree. That
-    /// bound is the caller's to respect, in one of three ways: keep the tasks
-    /// outstanding under one corun bounded, submit through
-    /// [`Runtime::silent_async_runtime`] where the shape allows, that route
-    /// nesting one frame per level of recursion instead, or raise the stack
-    /// with `RUST_MIN_STACK`. `DESIGN.md`'s "Executor core" has the decision
-    /// behind it and `BENCHMARKS.md` the measurements.
+    /// overflowing it aborts the process rather than failing this call**, and
+    /// how deep that is is the route the group was opened through. A job this
+    /// worker picks up while waiting runs on the waiting frame, so what
+    /// decides the nesting is which job it is handed. Opened from a
+    /// [`Runtime`], this wait pops the children it queued itself, newest
+    /// first, and nests one frame -- about a kilobyte in a release build --
+    /// per level of *recursion*. Opened from the [`Executor`], it is handed
+    /// the oldest job in the pool instead, so it nests one frame per task
+    /// still outstanding, which at one worker is the whole subtree. That
+    /// bound is the caller's to respect, in one of three ways: open the group
+    /// from a `Runtime` where the shape allows, keep the tasks outstanding
+    /// under one corun bounded, or raise the stack with `RUST_MIN_STACK`.
+    /// `DESIGN.md`'s "Executor core" has the decision behind it and
+    /// `BENCHMARKS.md` the measurements.
     ///
     /// # Panics
     ///
@@ -726,15 +770,36 @@ impl<'a> TaskGroup<'a> {
     /// payload, in that order -- upstream's `corun` body. The guard releases
     /// before the payload is taken, so the bit is already clear when the
     /// caller decides what to do with it.
+    ///
+    /// The predicate is upstream's `_corun_until(_worker, ..)` argument
+    /// either way; what the route decides is the loop it is handed to.
     fn corun_payload(&self) -> Option<Box<dyn Any + Send>> {
         {
             let _anchor = self.anchor.base().anchor_explicitly();
-            let mut worker =
-                WorkerThread::corun_view(Arc::clone(&self.executor.shared), self.worker);
-            worker.corun_until(|| self.anchor.outstanding() == 0);
+            let outstanding = || self.anchor.outstanding() == 0;
+
+            match &self.route {
+                Route::ById { executor, worker } => {
+                    WorkerThread::corun_view(Arc::clone(&executor.shared), *worker)
+                        .corun_until(outstanding);
+                }
+                // The real loop, which is upstream's `_worker`: its `pop` is
+                // the owning end of the queue this group's children were
+                // pushed onto, so the wait takes the newest of them first.
+                Route::OnWorker(thread) => thread.borrow_mut().corun_until(outstanding),
+            }
         }
 
         self.anchor.base().take_panic()
+    }
+
+    /// The id of the worker this group was opened on, whichever route opened
+    /// it: upstream's `_worker.id()`.
+    fn worker_id(&self) -> usize {
+        match &self.route {
+            Route::ById { worker, .. } => *worker,
+            Route::OnWorker(thread) => thread.borrow().id,
+        }
     }
 
     /// Stops the tasks of this group that have not started.
@@ -781,7 +846,7 @@ impl fmt::Debug for TaskGroup<'_> {
     /// is waiting for rather than the executor it borrows.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TaskGroup")
-            .field("worker", &self.worker)
+            .field("worker", &self.worker_id())
             .field("size", &self.size())
             .field("cancelled", &self.is_cancelled())
             .finish()
@@ -1215,13 +1280,16 @@ mod tests {
         assert_eq!(ran.load(Ordering::Relaxed), 4);
     }
 
-    /// A group names the executor that opened it: upstream's
+    /// A group opened on an executor names it: upstream's
     /// `assert(&(tg.executor()) == &executor)`, which is an identity rather
-    /// than an equality there and here.
+    /// than an equality there and here -- and a group opened on a runtime
+    /// names none, which is the one place the two routes differ in what a
+    /// caller can ask them.
     #[test]
     fn a_group_names_the_executor_that_opened_it() {
         let executor = Arc::new(Executor::new(1));
         let same = Arc::new(AtomicBool::new(false));
+        let nameless = Arc::new(AtomicBool::new(false));
 
         executor
             .spawn({
@@ -1230,7 +1298,9 @@ mod tests {
                 move || {
                     let group = executor.task_group().expect("a worker may open a group");
                     same.store(
-                        std::ptr::eq(group.executor(), &*executor),
+                        group
+                            .executor()
+                            .is_some_and(|named| std::ptr::eq(named, &*executor)),
                         Ordering::Release,
                     );
                 }
@@ -1238,7 +1308,89 @@ mod tests {
             .wait()
             .expect("no task panicked");
 
+        executor
+            .spawn_runtime({
+                let nameless = Arc::clone(&nameless);
+                move |runtime: &mut Runtime<'_>| {
+                    let group = runtime.task_group();
+                    nameless.store(group.executor().is_none(), Ordering::Release);
+                }
+            })
+            .wait()
+            .expect("no task panicked");
+
         assert!(same.load(Ordering::Acquire));
+        assert!(nameless.load(Ordering::Acquire));
+    }
+
+    /// Where a group's children are queued, which is the whole of what the
+    /// route decides: the shared buffers for a group holding a worker id,
+    /// and that worker's own queue for one holding the worker (#372).
+    ///
+    /// White-box because the claim is about a destination no public call
+    /// reports, and it is the claim the stack bound in `TaskGroup::corun`'s
+    /// docs rests on: a child in the buffers is one a corun can only be
+    /// handed after every older job in the pool. One worker, so that nothing
+    /// can take the child out from under the assertions -- the only worker
+    /// there is is the one running the body -- and a `corun` at the end of
+    /// each body so that the child still runs.
+    #[test]
+    fn a_groups_children_are_queued_where_its_route_pops_them_from() {
+        let executor = Arc::new(Executor::new(1));
+        let ran = Arc::new(AtomicUsize::new(0));
+
+        executor
+            .spawn({
+                let executor = Arc::clone(&executor);
+                let ran = Arc::clone(&ran);
+                move || {
+                    let group = executor.task_group().expect("a worker may open a group");
+                    group.silent_async(move || {
+                        ran.fetch_add(1, Ordering::Relaxed);
+                    });
+
+                    assert!(
+                        !executor.shared.buffers.is_empty(),
+                        "a group holding a worker id queues through the buffers"
+                    );
+                    assert!(
+                        executor.shared.workers[0].is_queue_empty(),
+                        "and not onto the queue this frame holds the owning end of"
+                    );
+
+                    group.corun();
+                }
+            })
+            .wait()
+            .expect("no task panicked");
+
+        executor
+            .spawn_runtime({
+                let executor = Arc::clone(&executor);
+                let ran = Arc::clone(&ran);
+                move |runtime: &mut Runtime<'_>| {
+                    let group = runtime.task_group();
+                    group.silent_async(move || {
+                        ran.fetch_add(1, Ordering::Relaxed);
+                    });
+
+                    assert_eq!(
+                        executor.shared.workers[0].queue_size(),
+                        1,
+                        "a group holding the worker queues onto that worker"
+                    );
+                    assert!(
+                        executor.shared.buffers.is_empty(),
+                        "and the buffers never see it"
+                    );
+
+                    group.corun();
+                }
+            })
+            .wait()
+            .expect("no task panicked");
+
+        assert_eq!(ran.load(Ordering::Relaxed), 2);
     }
 
     /// A cancelled group runs none of the children it had not started, and

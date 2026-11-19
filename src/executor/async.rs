@@ -208,8 +208,9 @@ impl Spawn<AsyncHandle<()>> {
 ///
 /// Upstream's two trailing arguments to `_async` and `_silent_async` -- a
 /// `Topology*` and a `NodeBase* parent` -- as one value, the run travelling
-/// with the job rather than with the node here. The three constructors are
-/// the three receivers of the family.
+/// with the job rather than with the node here. The constructors are the
+/// receivers of the family, a task group having one of each kind because it
+/// has two routes to open it through.
 pub(crate) struct Submission<'a> {
     /// What the child is counted against.
     parent: Parent,
@@ -244,13 +245,25 @@ impl<'a> Submission<'a> {
         }
     }
 
-    /// A child of a task group's anchor: upstream's `&_node_base`. The
-    /// buffers rather than a worker's queue, for the reason
-    /// `src/task_group.rs` gives -- a group's `corun` pops the other end.
+    /// A child of a task group's anchor, for a group that holds its worker's
+    /// *id*: upstream's `&_node_base` over the buffers, because a `corun`
+    /// that has no owning end of the queue pops the other one.
+    /// `DESIGN.md`'s "Dynamic tasking" has the pair of routes.
     pub(crate) fn under_anchor(anchor: &Arc<Nested>) -> Self {
         Self {
             parent: anchor.as_parent(),
             worker: None,
+        }
+    }
+
+    /// A child of a task group's anchor, for a group that holds the worker
+    /// itself: the same `&_node_base` over upstream's `this_worker()` branch
+    /// of `_schedule_async_task`, which is the branch every one of its
+    /// groups takes.
+    pub(crate) fn under_anchor_on(anchor: &Arc<Nested>, worker: &'a WorkerThread) -> Self {
+        Self {
+            parent: anchor.as_parent(),
+            worker: Some(worker),
         }
     }
 
@@ -269,10 +282,11 @@ impl<'a> Submission<'a> {
     /// `_schedule_async_task`, over the argument rather than over a
     /// thread-local lookup, since the owning end of a worker's queue lives in
     /// the [`WorkerThread`] frame below the task body and a lookup could not
-    /// hand it out. That queue is LIFO and a [`Runtime::corun`] pops the same
-    /// end, so a body that spawns and then coruns gets *that* child back
-    /// where the buffers hand back the oldest job in the pool; `DESIGN.md`
-    /// has what the difference buys.
+    /// hand it out. That queue is LIFO and a [`Runtime::corun`] -- or the
+    /// `corun` of a group opened from one -- pops the same end, so a body
+    /// that spawns and then coruns gets *that* child back where the buffers
+    /// hand back the oldest job in the pool; `DESIGN.md` has what the
+    /// difference buys.
     pub(crate) fn queue(&self, shared: &Shared, job: Job) {
         match self.worker {
             Some(worker) => worker.schedule(job),

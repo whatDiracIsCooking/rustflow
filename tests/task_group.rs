@@ -50,6 +50,23 @@
 //! - **The data is drawn from the crate's own generator**, since the crate
 //!   has no random dependency and `rustflow::Xorshift32` is public. A fixed
 //!   seed per case, so a failure stays reproducible.
+//! - **Every case that opens a group runs over both routes.** A group is
+//!   opened either on the executor, which can name the opening worker only by
+//!   id, or on a `Runtime`, which holds that worker's own scheduling loop --
+//!   `src/task_group.rs` has the pair, and #372 added the second. The two
+//!   routes need different task bodies, which is all `Route` below decides:
+//!   the children, the inputs and the assertions are the same either way.
+//!
+//!   The four recursive cases carry the route down the recursion as well, and
+//!   on the runtime route they take upstream's `FibonacciSwapped` ordering --
+//!   the group borrows the runtime it was opened from, so the branch this
+//!   worker computes itself runs *before* the group opens rather than across
+//!   its life. Upstream's tail-optimised ordering is the id route's alone,
+//!   which is why `fibonacci` and `fibonacci_swapped` are two recursions
+//!   there and one here. The two sorts hand their halves back through a slot
+//!   rather than a handle for a second consequence of the same shape: a body
+//!   that is handed a `Runtime` of its own has no value-returning spawning
+//!   form.
 //! - **The four recursive cases run at smaller inputs than upstream's**, and
 //!   that is the one deviation here which is about the port rather than about
 //!   Rust. Upstream asserts `fib(25)` and sorts up to ten thousand elements;
@@ -57,37 +74,33 @@
 //!
 //!   The reason is stack depth, and it is not the recursion's own. A corun
 //!   keeps its worker in the work-stealing loop, so every job it picks up
-//!   while waiting nests one frame deeper -- and the jobs a *group's* corun
-//!   picks up are the oldest outstanding ones, because a group's children go
-//!   to the executor's shared buffers (crossbeam `Injector`s, which hand work
-//!   back FIFO) and because a group waits on the stealing end of its worker's
-//!   queue, which is FIFO too. Upstream pushes onto the submitting worker's
-//!   own LIFO queue and pops that same end -- the
-//!   `if(auto w = this_worker(); w)` branch of `_schedule_async_task` -- so
-//!   its corun takes its own newest child first and nests one frame per level
-//!   of *recursion*. Here it takes the largest outstanding subtree first and
-//!   nests one frame per outstanding *child*, which for a recursive case is
-//!   most of the task tree.
+//!   while waiting nests one frame deeper -- and the jobs picked up by the
+//!   corun of a group opened on the *executor* are the oldest outstanding
+//!   ones, because that group's children go to the executor's shared buffers
+//!   (crossbeam `Injector`s, which hand work back FIFO) and because its corun
+//!   waits on the stealing end of its worker's queue, which is FIFO too.
+//!   Upstream pushes onto the submitting worker's own LIFO queue and pops
+//!   that same end -- the `if(auto w = this_worker(); w)` branch of
+//!   `_schedule_async_task` -- so its corun takes its own newest child first
+//!   and nests one frame per level of *recursion*. The id route takes the
+//!   largest outstanding subtree first and nests one frame per outstanding
+//!   *child*, which for a recursive case is most of the task tree.
 //!
-//!   #119 gave that branch to the submitters that can name the worker running
-//!   them, and a [`TaskGroup`] is not one of them: it holds a worker *id*,
-//!   because [`Executor::task_group`](rustflow::Executor::task_group) is
-//!   called from inside a task body, and its `corun` has no owning end of the
-//!   queue to pop even if it did. `src/task_group.rs`'s module docs have that
-//!   argument in full, with what lifting it would cost. So the depth is a
-//!   property of the scheduler and not of this file -- while
-//!   `tests/runtimes.rs`, whose recursion goes through a
-//!   [`Runtime`](rustflow::Runtime) and *can* name its worker, now runs
-//!   upstream's own `fib(25)` and ten thousand elements, and
-//!   `tests/subflows.rs` computes `fib(20)` at one worker because a subflow's
-//!   children are a *graph*, scheduled through the worker-aware path all
-//!   along.
-//!
-//!   Re-measured after #119, in a debug build against a worker's default
-//!   2 MiB stack: `fib(15)` passes and `fib(16)` aborts, 2000 elements pass
-//!   and 3000 abort. The inputs below therefore sit a factor of two or so
-//!   inside a cliff the fix does not move, and raising them is a scheduling
-//!   change rather than a test one.
+//!   #119 gave upstream's branch to the submitters that could name the worker
+//!   running them, which a group could not, and #372 gave it to the route
+//!   that can: a group opened on a [`Runtime`](rustflow::Runtime) holds the
+//!   worker rather than its id. The sizes below are still the id route's,
+//!   since every case runs over both -- re-measured in a debug build against
+//!   a worker's default 2 MiB stack, that route passes `fib(15)` and aborts
+//!   at `fib(16)`, passes 2000 elements and aborts at 3000. They therefore
+//!   sit a factor of two or so inside a cliff that belongs to one route and
+//!   not to the other; the last case in this file is where the runtime route
+//!   is taken past it, and raising the shared sizes is a scheduling change
+//!   rather than a test one. `tests/runtimes.rs`, whose recursion goes
+//!   through a `Runtime` directly, runs upstream's own `fib(25)` and ten
+//!   thousand elements, and `tests/subflows.rs` computes `fib(20)` at one
+//!   worker because a subflow's children are a *graph*, scheduled through the
+//!   worker-aware path all along.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -137,6 +150,46 @@ fn group_of(executor: &Executor) -> TaskGroup<'_> {
         .expect("a task body runs on a worker, which may open a task group")
 }
 
+/// Which of the two routes a case opens its groups through.
+///
+/// Upstream has one, its group finding the submitting worker through a
+/// thread-local; the port's two differ in what the group can hold, and the
+/// module docs have what that decides.
+#[derive(Clone, Copy, Debug)]
+enum Route {
+    /// `Executor::task_group`, from a body that was handed nothing: the group
+    /// holds the opening worker's id and queues its children in the shared
+    /// buffers.
+    ById,
+    /// `Runtime::task_group`, from a body that was handed the scheduler: the
+    /// group holds that worker's own scheduling loop and queues its children
+    /// on it.
+    OnWorker,
+}
+
+/// Runs `case` on a worker of `executor`, with a group opened through
+/// `route`, and hands back what the task reported.
+///
+/// The outcome is returned rather than unwrapped because what a failure of it
+/// means is the case's to say -- for most of them a child panicked, and for
+/// the cancellation case a handshake timed out. The two routes take two
+/// different task bodies, which is the whole of what this hides.
+fn in_a_group(
+    executor: &Arc<Executor>,
+    route: Route,
+    case: impl FnOnce(&TaskGroup<'_>) + Send + 'static,
+) -> Result<(), RunError> {
+    match route {
+        Route::ById => {
+            let opener = Arc::clone(executor);
+            executor.spawn(move || case(&group_of(&opener))).wait()
+        }
+        Route::OnWorker => executor
+            .spawn_runtime(move |runtime: &mut Runtime<'_>| case(&runtime.task_group()))
+            .wait(),
+    }
+}
+
 /// Upstream's `TaskGroup.Basics`: a group can be opened from every kind of
 /// task body the executor runs, and a group nothing has been spawned into is
 /// empty.
@@ -178,6 +231,50 @@ fn basics() {
     assert_eq!(opened.load(Ordering::Relaxed), 5);
 }
 
+/// `basics` over the other route: the five kinds of task body that are handed
+/// a [`Runtime`](rustflow::Runtime) can each open a group on the worker
+/// running them, and that group starts empty too.
+///
+/// Upstream has no such case because it has no such route; what this pins is
+/// the half of the precondition the route removes. `Runtime::task_group`
+/// cannot refuse, so a body that gets one is proof on its own, and the
+/// counter is again what says all five ran.
+#[test]
+fn basics_on_worker() {
+    let executor = Arc::new(Executor::new(4));
+    let opened = Arc::new(AtomicUsize::new(0));
+
+    // A runtime-shaped body that opens a group, checks it is empty and says
+    // it ran.
+    let open = {
+        let opened = Arc::clone(&opened);
+        move |runtime: &mut Runtime<'_>| {
+            let group = runtime.task_group();
+            assert_eq!(group.size(), 0);
+            opened.fetch_add(1, Ordering::Relaxed);
+        }
+    };
+
+    // From a runtime task of a taskflow.
+    let mut taskflow = Taskflow::new();
+    taskflow.emplace_runtime(open.clone());
+    executor.run(&taskflow).wait().expect("no task panicked");
+
+    // From the four kinds of free-standing runtime-shaped task.
+    executor
+        .spawn_runtime(open.clone())
+        .wait()
+        .expect("no panic");
+    executor.silent_async_runtime(open.clone());
+    let (_task, handle) = executor.dependent_async_runtime(open.clone(), []);
+    handle.wait().expect("no panic");
+    executor.silent_dependent_async_runtime(open, []);
+
+    // The two silent ones have no handle, so this is what waits for them.
+    executor.wait_for_all();
+    assert_eq!(opened.load(Ordering::Relaxed), 5);
+}
+
 /// Upstream's `TaskGroup.Async.<W>threads`: a thousand of each of the two
 /// plain spawning forms into one group, then one corun.
 ///
@@ -186,56 +283,60 @@ fn basics() {
 /// free, since a handle waited on after it has already been delivered. At one
 /// worker it is also a statement about the corun loop itself: the worker that
 /// spawned the two thousand children is the only one that can run them.
-fn async_tasks(workers: usize) {
+fn async_tasks(workers: usize, route: Route) {
     let executor = Arc::new(Executor::new(workers));
     let counter = Arc::new(AtomicUsize::new(0));
 
-    executor
-        .spawn({
-            let executor = Arc::clone(&executor);
-            let counter = Arc::clone(&counter);
-            move || {
-                let group = group_of(&executor);
-                let mut handles = Vec::with_capacity(TASKS);
+    in_a_group(&executor, route, {
+        let counter = Arc::clone(&counter);
+        move |group| {
+            let mut handles = Vec::with_capacity(TASKS);
 
-                for _ in 0..TASKS {
-                    handles.push(group.spawn({
-                        let counter = Arc::clone(&counter);
-                        move || counter.fetch_add(1, Ordering::Relaxed)
-                    }));
-                    group.silent_async({
-                        let counter = Arc::clone(&counter);
-                        move || {
-                            counter.fetch_add(1, Ordering::Relaxed);
-                        }
-                    });
-                }
-
-                group.corun();
-                assert_eq!(counter.load(Ordering::Relaxed), 2 * TASKS);
-                assert_eq!(group.size(), 0);
-
-                for handle in handles {
-                    handle.wait().expect("no child panicked");
-                }
+            for _ in 0..TASKS {
+                handles.push(group.spawn({
+                    let counter = Arc::clone(&counter);
+                    move || counter.fetch_add(1, Ordering::Relaxed)
+                }));
+                group.silent_async({
+                    let counter = Arc::clone(&counter);
+                    move || {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
             }
-        })
-        .wait()
-        .expect("no task panicked");
+
+            group.corun();
+            assert_eq!(counter.load(Ordering::Relaxed), 2 * TASKS);
+            assert_eq!(group.size(), 0);
+
+            for handle in handles {
+                handle.wait().expect("no child panicked");
+            }
+        }
+    })
+    .expect("no task panicked");
 
     assert_eq!(counter.load(Ordering::Relaxed), 2 * TASKS);
 }
 
 worker_matrix! {
     async_tasks {
-        async_tasks_1thread(1),
-        async_tasks_2threads(2),
-        async_tasks_3threads(3),
-        async_tasks_4threads(4),
-        async_tasks_5threads(5),
-        async_tasks_6threads(6),
-        async_tasks_7threads(7),
-        async_tasks_8threads(8),
+        async_tasks_1thread(1, Route::ById),
+        async_tasks_2threads(2, Route::ById),
+        async_tasks_3threads(3, Route::ById),
+        async_tasks_4threads(4, Route::ById),
+        async_tasks_5threads(5, Route::ById),
+        async_tasks_6threads(6, Route::ById),
+        async_tasks_7threads(7, Route::ById),
+        async_tasks_8threads(8, Route::ById),
+        async_tasks_on_worker_1thread(1, Route::OnWorker),
+        async_tasks_on_worker_2threads(2, Route::OnWorker),
+        async_tasks_on_worker_3threads(3, Route::OnWorker),
+        async_tasks_on_worker_4threads(4, Route::OnWorker),
+        async_tasks_on_worker_5threads(5, Route::OnWorker),
+        async_tasks_on_worker_6threads(6, Route::OnWorker),
+        async_tasks_on_worker_7threads(7, Route::OnWorker),
+        async_tasks_on_worker_8threads(8, Route::OnWorker),
     }
 }
 
@@ -246,78 +347,81 @@ worker_matrix! {
 /// The group is what makes the chain waitable at all: only the last link's
 /// handle knows when the chain is over, and a `silent_dependent_async` chain
 /// has no handle anywhere. One corun covers every link of it.
-fn dependent_async_chains(workers: usize) {
+fn dependent_async_chains(workers: usize, route: Route) {
     let executor = Arc::new(Executor::new(workers));
     let counter = Arc::new(AtomicUsize::new(0));
 
-    executor
-        .spawn({
-            let executor = Arc::clone(&executor);
-            let counter = Arc::clone(&counter);
-            move || {
-                let group = group_of(&executor);
+    in_a_group(&executor, route, {
+        let counter = Arc::clone(&counter);
+        move |group| {
+            // Upstream's first block: the silent form, where the chain is
+            // the only thing that knows the order.
+            let bump = |counter: &Arc<AtomicUsize>| {
+                let counter = Arc::clone(counter);
+                move || {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            };
 
-                // Upstream's first block: the silent form, where the chain is
-                // the only thing that knows the order.
-                let bump = |counter: &Arc<AtomicUsize>| {
-                    let counter = Arc::clone(counter);
+            let mut previous = group.silent_dependent_async(bump(&counter), []);
+            for _ in 1..TASKS {
+                previous = group.silent_dependent_async(bump(&counter), [&previous]);
+            }
+            group.corun();
+            assert_eq!(counter.load(Ordering::Relaxed), TASKS);
+
+            // Upstream's second block: the handle-returning form, whose
+            // first link is the one that resets the counter and which
+            // depends on nothing, as upstream's does.
+            let (reset, reset_handle) = {
+                let counter = Arc::clone(&counter);
+                group.dependent_async(move || counter.store(0, Ordering::Relaxed), [])
+            };
+
+            let mut handles = vec![reset_handle];
+            let mut previous = reset;
+            for _ in 0..TASKS {
+                let counter = Arc::clone(&counter);
+                let (task, handle) = group.dependent_async(
                     move || {
                         counter.fetch_add(1, Ordering::Relaxed);
-                    }
-                };
-
-                let mut previous = group.silent_dependent_async(bump(&counter), []);
-                for _ in 1..TASKS {
-                    previous = group.silent_dependent_async(bump(&counter), [&previous]);
-                }
-                group.corun();
-                assert_eq!(counter.load(Ordering::Relaxed), TASKS);
-
-                // Upstream's second block: the handle-returning form, whose
-                // first link is the one that resets the counter and which
-                // depends on nothing, as upstream's does.
-                let (reset, reset_handle) = {
-                    let counter = Arc::clone(&counter);
-                    group.dependent_async(move || counter.store(0, Ordering::Relaxed), [])
-                };
-
-                let mut handles = vec![reset_handle];
-                let mut previous = reset;
-                for _ in 0..TASKS {
-                    let counter = Arc::clone(&counter);
-                    let (task, handle) = group.dependent_async(
-                        move || {
-                            counter.fetch_add(1, Ordering::Relaxed);
-                        },
-                        [&previous],
-                    );
-                    previous = task;
-                    handles.push(handle);
-                }
-                group.corun();
-                assert_eq!(counter.load(Ordering::Relaxed), TASKS);
-
-                for handle in handles {
-                    handle.wait().expect("no child panicked");
-                }
+                    },
+                    [&previous],
+                );
+                previous = task;
+                handles.push(handle);
             }
-        })
-        .wait()
-        .expect("no task panicked");
+            group.corun();
+            assert_eq!(counter.load(Ordering::Relaxed), TASKS);
+
+            for handle in handles {
+                handle.wait().expect("no child panicked");
+            }
+        }
+    })
+    .expect("no task panicked");
 
     assert_eq!(counter.load(Ordering::Relaxed), TASKS);
 }
 
 worker_matrix! {
     dependent_async_chains {
-        dependent_async_chains_1thread(1),
-        dependent_async_chains_2threads(2),
-        dependent_async_chains_3threads(3),
-        dependent_async_chains_4threads(4),
-        dependent_async_chains_5threads(5),
-        dependent_async_chains_6threads(6),
-        dependent_async_chains_7threads(7),
-        dependent_async_chains_8threads(8),
+        dependent_async_chains_1thread(1, Route::ById),
+        dependent_async_chains_2threads(2, Route::ById),
+        dependent_async_chains_3threads(3, Route::ById),
+        dependent_async_chains_4threads(4, Route::ById),
+        dependent_async_chains_5threads(5, Route::ById),
+        dependent_async_chains_6threads(6, Route::ById),
+        dependent_async_chains_7threads(7, Route::ById),
+        dependent_async_chains_8threads(8, Route::ById),
+        dependent_async_chains_on_worker_1thread(1, Route::OnWorker),
+        dependent_async_chains_on_worker_2threads(2, Route::OnWorker),
+        dependent_async_chains_on_worker_3threads(3, Route::OnWorker),
+        dependent_async_chains_on_worker_4threads(4, Route::OnWorker),
+        dependent_async_chains_on_worker_5threads(5, Route::OnWorker),
+        dependent_async_chains_on_worker_6threads(6, Route::OnWorker),
+        dependent_async_chains_on_worker_7threads(7, Route::OnWorker),
+        dependent_async_chains_on_worker_8threads(8, Route::OnWorker),
     }
 }
 
@@ -335,7 +439,7 @@ worker_matrix! {
 /// here: a child that ran anyway lands on the counter, and a skipped child
 /// whose job was not torn down leaves the anchor's counter above zero, which
 /// the `size` assertion reads before the final corun returns.
-fn cancellation(workers: usize) {
+fn cancellation(workers: usize, route: Route) {
     assert!(
         workers > 1,
         "the case needs a worker besides the one blocked"
@@ -344,73 +448,76 @@ fn cancellation(workers: usize) {
     let executor = Arc::new(Executor::new(workers));
     let ran = Arc::new(AtomicUsize::new(0));
 
-    executor
-        .spawn({
-            let executor = Arc::clone(&executor);
-            let ran = Arc::clone(&ran);
-            move || {
-                let group = group_of(&executor);
-                let arrivals = Arc::new(AtomicUsize::new(0));
-                let release = Arc::new(AtomicBool::new(false));
+    in_a_group(&executor, route, {
+        let ran = Arc::clone(&ran);
+        move |group| {
+            let arrivals = Arc::new(AtomicUsize::new(0));
+            let release = Arc::new(AtomicBool::new(false));
 
-                // Upstream's `tg.async([&](){ ++arrivals; while(arrivals != 0); })`,
-                // once per worker this body is not running on. Silent, so
-                // that a child which gives up waiting reports to the group.
-                for _ in 0..workers - 1 {
-                    let arrivals = Arc::clone(&arrivals);
-                    let release = Arc::clone(&release);
-                    group.silent_async(move || {
-                        arrivals.fetch_add(1, Ordering::Release);
-                        spin_until("the task group to release the blocked child", || {
-                            release.load(Ordering::Acquire)
-                        });
+            // Upstream's `tg.async([&](){ ++arrivals; while(arrivals != 0); })`,
+            // once per worker this body is not running on. Silent, so
+            // that a child which gives up waiting reports to the group.
+            for _ in 0..workers - 1 {
+                let arrivals = Arc::clone(&arrivals);
+                let release = Arc::clone(&release);
+                group.silent_async(move || {
+                    arrivals.fetch_add(1, Ordering::Release);
+                    spin_until("the task group to release the blocked child", || {
+                        release.load(Ordering::Acquire)
                     });
-                }
-
-                // Upstream's `while(arrivals != W-1)`: every other worker is
-                // inside a child of this group and will stay there.
-                spin_until("the other workers to block", || {
-                    arrivals.load(Ordering::Acquire) == workers - 1
                 });
-
-                // The hundred that must never run, queued behind workers that
-                // cannot take them.
-                for _ in 0..100 {
-                    let ran = Arc::clone(&ran);
-                    group.silent_async(move || {
-                        ran.fetch_add(1, Ordering::Relaxed);
-                    });
-                }
-
-                assert!(!group.is_cancelled());
-                group.cancel();
-                assert!(group.is_cancelled());
-
-                release.store(true, Ordering::Release);
-
-                // Every child is still accounted for -- the hundred skipped
-                // ones included -- so this returns only once the counter is
-                // back to zero.
-                group.corun();
-                assert_eq!(group.size(), 0);
-                assert_eq!(ran.load(Ordering::Relaxed), 0);
             }
-        })
-        .wait()
-        .expect("no task panicked, so every blocked child was released in time");
+
+            // Upstream's `while(arrivals != W-1)`: every other worker is
+            // inside a child of this group and will stay there.
+            spin_until("the other workers to block", || {
+                arrivals.load(Ordering::Acquire) == workers - 1
+            });
+
+            // The hundred that must never run, queued behind workers that
+            // cannot take them.
+            for _ in 0..100 {
+                let ran = Arc::clone(&ran);
+                group.silent_async(move || {
+                    ran.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+
+            assert!(!group.is_cancelled());
+            group.cancel();
+            assert!(group.is_cancelled());
+
+            release.store(true, Ordering::Release);
+
+            // Every child is still accounted for -- the hundred skipped
+            // ones included -- so this returns only once the counter is
+            // back to zero.
+            group.corun();
+            assert_eq!(group.size(), 0);
+            assert_eq!(ran.load(Ordering::Relaxed), 0);
+        }
+    })
+    .expect("no task panicked, so every blocked child was released in time");
 
     assert_eq!(ran.load(Ordering::Relaxed), 0);
 }
 
 worker_matrix! {
     cancellation {
-        cancellation_2threads(2),
-        cancellation_3threads(3),
-        cancellation_4threads(4),
-        cancellation_5threads(5),
-        cancellation_6threads(6),
-        cancellation_7threads(7),
-        cancellation_8threads(8),
+        cancellation_2threads(2, Route::ById),
+        cancellation_3threads(3, Route::ById),
+        cancellation_4threads(4, Route::ById),
+        cancellation_5threads(5, Route::ById),
+        cancellation_6threads(6, Route::ById),
+        cancellation_7threads(7, Route::ById),
+        cancellation_8threads(8, Route::ById),
+        cancellation_on_worker_2threads(2, Route::OnWorker),
+        cancellation_on_worker_3threads(3, Route::OnWorker),
+        cancellation_on_worker_4threads(4, Route::OnWorker),
+        cancellation_on_worker_5threads(5, Route::OnWorker),
+        cancellation_on_worker_6threads(6, Route::OnWorker),
+        cancellation_on_worker_7threads(7, Route::OnWorker),
+        cancellation_on_worker_8threads(8, Route::OnWorker),
     }
 }
 
@@ -474,6 +581,36 @@ fn fibonacci_swapped(n: usize, executor: &Arc<Executor>) -> usize {
     res1.load(Ordering::Relaxed) + res2
 }
 
+/// The same recursion through the other route: the group is opened on the
+/// [`Runtime`](rustflow::Runtime) running this level, so its child goes onto
+/// this worker's own queue and the corun pops it straight back.
+///
+/// Upstream's `fibonacci_swapped` ordering, and on this route it is the only
+/// one available: the group borrows the runtime for as long as it is open, so
+/// the branch computed on this worker is the one that runs *before* it. The
+/// child is a runtime-shaped body because it opens a group of its own, which
+/// is also why its answer comes back through `res1` rather than a handle.
+fn fibonacci_on_worker(n: usize, runtime: &mut Runtime<'_>) -> usize {
+    if n < 2 {
+        return n;
+    }
+
+    let res2 = fibonacci_on_worker(n - 2, runtime);
+    let res1 = Arc::new(AtomicUsize::new(0));
+
+    let group = runtime.task_group();
+    group.silent_async_runtime({
+        let res1 = Arc::clone(&res1);
+        move |child: &mut Runtime<'_>| {
+            res1.store(fibonacci_on_worker(n - 1, child), Ordering::Relaxed);
+        }
+    });
+
+    group.corun();
+
+    res1.load(Ordering::Relaxed) + res2
+}
+
 /// Upstream's `fibonacci(T, N)`: the recursion has to start on a worker, so
 /// the whole of it runs inside one async task.
 ///
@@ -492,6 +629,29 @@ fn fibonacci_at(workers: usize, recurse: fn(usize, &Arc<Executor>) -> usize) {
     assert_eq!(fib, FIBONACCI_OF_N);
 }
 
+/// `fibonacci_at` for the runtime route: the same `n` and the same answer,
+/// started in the one task body that hands the recursion a runtime.
+///
+/// The answer comes back through a slot for the reason
+/// [`fibonacci_on_worker`] gives, which is the one shape difference between
+/// this driver and the one above.
+fn fibonacci_on_worker_at(workers: usize) {
+    let executor = Executor::new(workers);
+    let fib = Arc::new(AtomicUsize::new(0));
+
+    executor
+        .spawn_runtime({
+            let fib = Arc::clone(&fib);
+            move |runtime: &mut Runtime<'_>| {
+                fib.store(fibonacci_on_worker(FIBONACCI_N, runtime), Ordering::Relaxed);
+            }
+        })
+        .wait()
+        .expect("no task panicked");
+
+    assert_eq!(fib.load(Ordering::Relaxed), FIBONACCI_OF_N);
+}
+
 worker_matrix! {
     fibonacci_at {
         fibonacci_1thread(1, fibonacci),
@@ -502,6 +662,15 @@ worker_matrix! {
         fibonacci_swapped_2threads(2, fibonacci_swapped),
         fibonacci_swapped_3threads(3, fibonacci_swapped),
         fibonacci_swapped_4threads(4, fibonacci_swapped),
+    }
+}
+
+worker_matrix! {
+    fibonacci_on_worker_at {
+        fibonacci_on_worker_1thread(1),
+        fibonacci_on_worker_2threads(2),
+        fibonacci_on_worker_3threads(3),
+        fibonacci_on_worker_4threads(4),
     }
 }
 
@@ -542,6 +711,41 @@ fn merge_sort(executor: &Arc<Executor>, mut data: Vec<u32>) -> Vec<u32> {
     // The child has finished, so this does not block: what it does is take
     // the half it sorted, which is the value upstream wrote back in place.
     let sorted_left = sorted_left.wait().expect("no child panicked");
+
+    merge(sorted_left, sorted_right)
+}
+
+/// `merge_sort` through the other route, with the two differences the module
+/// docs set out: the half this worker sorts itself is sorted before the group
+/// opens, and the child's half comes back through a slot because a
+/// runtime-shaped body returns nothing.
+fn merge_sort_on_worker(runtime: &mut Runtime<'_>, mut data: Vec<u32>) -> Vec<u32> {
+    if data.len() <= SORT_DIRECTLY {
+        data.sort_unstable();
+        return data;
+    }
+
+    let middle = data.len().div_ceil(2);
+    let right = data.split_off(middle);
+    let left = data;
+
+    let sorted_right = merge_sort_on_worker(runtime, right);
+    let sorted_left = Arc::new(Mutex::new(Vec::new()));
+
+    let group = runtime.task_group();
+    group.silent_async_runtime({
+        let sorted_left = Arc::clone(&sorted_left);
+        move |child: &mut Runtime<'_>| {
+            let sorted = merge_sort_on_worker(child, left);
+            *sorted_left.lock().expect("the slot is not poisoned") = sorted;
+        }
+    });
+
+    group.corun();
+
+    // The child has finished, so this takes the half it sorted rather than
+    // waiting for it.
+    let sorted_left = std::mem::take(&mut *sorted_left.lock().expect("the slot is not poisoned"));
 
     merge(sorted_left, sorted_right)
 }
@@ -602,6 +806,40 @@ fn quick_sort(executor: &Arc<Executor>, mut data: Vec<u32>) -> Vec<u32> {
     result
 }
 
+/// `quick_sort` through the other route, with [`merge_sort_on_worker`]'s two
+/// differences: the side this worker sorts itself goes first, and the child's
+/// side comes back through a slot.
+fn quick_sort_on_worker(runtime: &mut Runtime<'_>, mut data: Vec<u32>) -> Vec<u32> {
+    if data.len() <= SORT_DIRECTLY {
+        data.sort_unstable();
+        return data;
+    }
+
+    let at = partition(&mut data);
+    let right = data.split_off(at + 1);
+    let pivot = data.pop().expect("the partition left the pivot in place");
+    let left = data;
+
+    let mut sorted = quick_sort_on_worker(runtime, right);
+    let sorted_left = Arc::new(Mutex::new(Vec::new()));
+
+    let group = runtime.task_group();
+    group.silent_async_runtime({
+        let sorted_left = Arc::clone(&sorted_left);
+        move |child: &mut Runtime<'_>| {
+            let halved = quick_sort_on_worker(child, left);
+            *sorted_left.lock().expect("the slot is not poisoned") = halved;
+        }
+    });
+
+    group.corun();
+
+    let mut result = std::mem::take(&mut *sorted_left.lock().expect("the slot is not poisoned"));
+    result.push(pivot);
+    result.append(&mut sorted);
+    result
+}
+
 /// Upstream's three lines around `std::partition`: the middle element is
 /// swapped to the end to serve as the pivot, everything smaller than it is
 /// moved to the front, and the pivot is swapped back to the boundary.
@@ -637,10 +875,49 @@ fn data_of(count: usize, rng: &mut Xorshift32) -> Vec<u32> {
     (0..count).map(|_| rng.next_u32() % 100).collect()
 }
 
+/// Runs one of a pair of sorting recursions on a worker and hands back what
+/// it sorted, through whichever route the case is running.
+///
+/// The slot on the runtime side is the shape difference the module docs give,
+/// and it is here rather than in each driver so that the two sorts below stay
+/// one function each.
+fn sorted_on_a_worker(
+    executor: &Arc<Executor>,
+    route: Route,
+    data: Vec<u32>,
+    by_id: fn(&Arc<Executor>, Vec<u32>) -> Vec<u32>,
+    on_worker: fn(&mut Runtime<'_>, Vec<u32>) -> Vec<u32>,
+) -> Vec<u32> {
+    match route {
+        Route::ById => {
+            let opener = Arc::clone(executor);
+            executor
+                .spawn(move || by_id(&opener, data))
+                .wait()
+                .expect("no task panicked")
+        }
+        Route::OnWorker => {
+            let slot = Arc::new(Mutex::new(Vec::new()));
+            executor
+                .spawn_runtime({
+                    let slot = Arc::clone(&slot);
+                    move |runtime: &mut Runtime<'_>| {
+                        let sorted = on_worker(runtime, data);
+                        *slot.lock().expect("the slot is not poisoned") = sorted;
+                    }
+                })
+                .wait()
+                .expect("no task panicked");
+
+            std::mem::take(&mut *slot.lock().expect("the slot is not poisoned"))
+        }
+    }
+}
+
 /// Upstream's `merge_sort(unsigned W)`: four sizes, each sorted by the
 /// recursion above from inside one async task and compared against
 /// `std::sort`'s answer.
-fn merge_sort_at(workers: usize) {
+fn merge_sort_at(workers: usize, route: Route) {
     let executor = Arc::new(Executor::new(workers));
     let mut rng = Xorshift32::new(SEED);
 
@@ -649,13 +926,7 @@ fn merge_sort_at(workers: usize) {
         let mut gold = data.clone();
         gold.sort_unstable();
 
-        let sorted = executor
-            .spawn({
-                let executor = Arc::clone(&executor);
-                move || merge_sort(&executor, data)
-            })
-            .wait()
-            .expect("no task panicked");
+        let sorted = sorted_on_a_worker(&executor, route, data, merge_sort, merge_sort_on_worker);
 
         assert_eq!(sorted, gold, "{size} elements at {workers} workers");
     }
@@ -663,14 +934,22 @@ fn merge_sort_at(workers: usize) {
 
 worker_matrix! {
     merge_sort_at {
-        merge_sort_1thread(1),
-        merge_sort_2threads(2),
-        merge_sort_3threads(3),
-        merge_sort_4threads(4),
-        merge_sort_5threads(5),
-        merge_sort_6threads(6),
-        merge_sort_7threads(7),
-        merge_sort_8threads(8),
+        merge_sort_1thread(1, Route::ById),
+        merge_sort_2threads(2, Route::ById),
+        merge_sort_3threads(3, Route::ById),
+        merge_sort_4threads(4, Route::ById),
+        merge_sort_5threads(5, Route::ById),
+        merge_sort_6threads(6, Route::ById),
+        merge_sort_7threads(7, Route::ById),
+        merge_sort_8threads(8, Route::ById),
+        merge_sort_on_worker_1thread(1, Route::OnWorker),
+        merge_sort_on_worker_2threads(2, Route::OnWorker),
+        merge_sort_on_worker_3threads(3, Route::OnWorker),
+        merge_sort_on_worker_4threads(4, Route::OnWorker),
+        merge_sort_on_worker_5threads(5, Route::OnWorker),
+        merge_sort_on_worker_6threads(6, Route::OnWorker),
+        merge_sort_on_worker_7threads(7, Route::OnWorker),
+        merge_sort_on_worker_8threads(8, Route::OnWorker),
     }
 }
 
@@ -683,21 +962,38 @@ worker_matrix! {
 /// sits under a real topology. The lock stands in for the
 /// `std::vector<int>&` upstream's task body captures by reference -- it is
 /// taken twice per run, outside the recursion.
-fn quick_sort_at(workers: usize) {
+fn quick_sort_at(workers: usize, route: Route) {
     let executor = Arc::new(Executor::new(workers));
     let mut rng = Xorshift32::new(SEED);
     let slot: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
 
     let mut taskflow = Taskflow::new();
-    taskflow.emplace({
-        let executor = Arc::clone(&executor);
-        let slot = Arc::clone(&slot);
-        move || {
-            let data = std::mem::take(&mut *slot.lock().expect("the slot is not poisoned"));
-            let sorted = quick_sort(&executor, data);
-            *slot.lock().expect("the slot is not poisoned") = sorted;
+    match route {
+        Route::ById => {
+            taskflow.emplace({
+                let executor = Arc::clone(&executor);
+                let slot = Arc::clone(&slot);
+                move || {
+                    let data = std::mem::take(&mut *slot.lock().expect("the slot is not poisoned"));
+                    let sorted = quick_sort(&executor, data);
+                    *slot.lock().expect("the slot is not poisoned") = sorted;
+                }
+            });
         }
-    });
+        // The same task of the same taskflow, as the runtime-shaped kind:
+        // this is the one case here whose group is opened from a task of a
+        // running graph on either route.
+        Route::OnWorker => {
+            taskflow.emplace_runtime({
+                let slot = Arc::clone(&slot);
+                move |runtime: &mut Runtime<'_>| {
+                    let data = std::mem::take(&mut *slot.lock().expect("the slot is not poisoned"));
+                    let sorted = quick_sort_on_worker(runtime, data);
+                    *slot.lock().expect("the slot is not poisoned") = sorted;
+                }
+            });
+        }
+    }
 
     for size in QUICK_SORT_SIZES {
         let data = data_of(size, &mut rng);
@@ -714,14 +1010,22 @@ fn quick_sort_at(workers: usize) {
 
 worker_matrix! {
     quick_sort_at {
-        quick_sort_1thread(1),
-        quick_sort_2threads(2),
-        quick_sort_3threads(3),
-        quick_sort_4threads(4),
-        quick_sort_5threads(5),
-        quick_sort_6threads(6),
-        quick_sort_7threads(7),
-        quick_sort_8threads(8),
+        quick_sort_1thread(1, Route::ById),
+        quick_sort_2threads(2, Route::ById),
+        quick_sort_3threads(3, Route::ById),
+        quick_sort_4threads(4, Route::ById),
+        quick_sort_5threads(5, Route::ById),
+        quick_sort_6threads(6, Route::ById),
+        quick_sort_7threads(7, Route::ById),
+        quick_sort_8threads(8, Route::ById),
+        quick_sort_on_worker_1thread(1, Route::OnWorker),
+        quick_sort_on_worker_2threads(2, Route::OnWorker),
+        quick_sort_on_worker_3threads(3, Route::OnWorker),
+        quick_sort_on_worker_4threads(4, Route::OnWorker),
+        quick_sort_on_worker_5threads(5, Route::OnWorker),
+        quick_sort_on_worker_6threads(6, Route::OnWorker),
+        quick_sort_on_worker_7threads(7, Route::OnWorker),
+        quick_sort_on_worker_8threads(8, Route::OnWorker),
     }
 }
 
@@ -782,4 +1086,47 @@ fn a_silent_runtime_shaped_child_is_joined_and_reported_by_its_group() {
         .expect("the group's own failure was taken by `try_corun`");
 
     assert_eq!(ran.load(Ordering::Relaxed), 2);
+}
+
+/// A recursion of groups through the runtime route reaches a depth the id
+/// route cannot (#372).
+///
+/// Both halves of the bar are `BENCHMARKS.md`'s, in the profile the test
+/// suite runs under: at one worker the id route passes `fib(15)` -- 986
+/// spawned children -- and **aborts the process** at `fib(16)`, because a
+/// corun with no owning end of its worker's queue is handed the oldest
+/// outstanding job in the pool and so nests one stack frame per outstanding
+/// *task*. The runtime route pops the child it queued itself and nests one
+/// frame per level of recursion instead, so the `n` here is upstream's own
+/// `fib(25)`: 121392 spawned children, a hundred and twenty times the id
+/// route's largest, under twenty-five nested frames.
+///
+/// One worker, which is the binding end: more of them spread the outstanding
+/// set over more stacks and let the id route reach further. Completion is the
+/// whole assertion, since what a regression does here is abort rather than
+/// return a wrong answer -- queueing these children where the id route does
+/// takes the process with it.
+#[test]
+fn a_recursion_of_groups_on_a_worker_outruns_the_id_routes_stack() {
+    /// Upstream's own `fibonacci(25)`, ten levels past the largest this
+    /// file's other route completes at one worker.
+    const DEEP_N: usize = 25;
+
+    /// `fibonacci(25)`.
+    const DEEP_FIBONACCI: usize = 75025;
+
+    let executor = Executor::new(1);
+    let fib = Arc::new(AtomicUsize::new(0));
+
+    executor
+        .spawn_runtime({
+            let fib = Arc::clone(&fib);
+            move |runtime: &mut Runtime<'_>| {
+                fib.store(fibonacci_on_worker(DEEP_N, runtime), Ordering::Relaxed);
+            }
+        })
+        .wait()
+        .expect("no task panicked");
+
+    assert_eq!(fib.load(Ordering::Relaxed), DEEP_FIBONACCI);
 }
