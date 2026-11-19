@@ -4821,7 +4821,9 @@ and not the notifier poke in `WorkerThread::schedule`, which is called zero
 times a run. It is one shared word per task that nothing reads -- an empty
 batch handed to `Buffers::push_bulk` on every task's release path -- and that
 is worth 11 to 15% of the run region. It does not reach the bar on the
-published ids, so nothing ships here and it is filed as #393.
+published ids, so nothing ships here and it is filed as #393 -- **which has
+since shipped the guard**, on this section's pinned ablation rather than on
+the published ids; the last subsection below is what that cost and bought.
 
 | | |
 |---|---|
@@ -5147,6 +5149,89 @@ this section.
   a cost this section never measures: #367's losing thief, 150 to 285 attempts
   at random over 29 victims, would be drawing on the chain's deque while it
   runs.
+
+### What #393 shipped: the guard is in, and it is worth 16% of the run region
+
+**`if !woken.is_empty()` now guards the release hook's `bulk_schedule` call,
+and a chain's run region is 16% shorter for it.** The acquire hook above is
+left as it stands -- its `bulk_schedule` is already behind
+`if !node.acquire_all(..)`, which is the branch upstream's `to_acquire` guard
+exists to avoid taking -- so the shipped diff is the one `if` this section
+asked for, with the comment at it naming
+`if(node->_semaphores && !node->_semaphores->to_release.empty())`.
+
+One run of the interleaved same-process ablation above, re-taken against the
+shipped guard rather than a flag: A is `origin/main`'s unconditional call, B
+is the guard, rounds alternate A, B, A, B inside one pool and one placement,
+`taskset -c 3`, the run region only, medians of 101 rounds with each side's
+[5th, 95th] band beside it:
+
+| id, pinned to one CPU | A: unconditional | B: guarded | B/A | ns a task |
+|---|---|---|---|---|
+| 24 workers, 16384 | 0.7938 ms [0.7807, 0.8601] | 0.6688 ms [0.6593, 0.7087] | **0.843x** | 48.4 → 40.8 |
+| 1 worker, 16384 | 0.7818 ms [0.7781, 0.7918] | 0.6577 ms [0.6521, 0.6657] | **0.841x** | 47.7 → 40.1 |
+
+Both bands are disjoint, and 0.843x is a little better than the 0.872x the
+flag-driven ablation above read on the same id: the shipped guard spends one
+branch on a local `Vec`'s length where the flag spent that branch plus a
+relaxed atomic load per task on *both* sides, and the rest of the gap is
+between-run variation of the kind the twelve comparisons above show
+(0.854x to 0.889x on one mechanism).
+
+**The second-order effect the section predicted is real, and the 0.843x is
+already net of it.** Counted over 50 runs at 24 workers, `L = 16384`,
+unpinned, the one steal of the run costs what the rotation decides:
+
+| release hook | `push_bulk` calls a run | deque draws | buffer draws | `yield_now` calls |
+|---|---|---|---|---|
+| unconditional | 16384, every one empty | 0.00 | **1.00** | 0.00 |
+| guarded | 0 | 28.8 | 7.00 | 3.56 |
+
+With the empty batches gone, `rotation` advances once a batch as
+`push_bulk`'s own doc says instead of `L + 1` times a run, so the source stops
+landing in the same buffer every run and the woken worker's `sticky_victim`
+stops hitting on its first attempt: 35.8 draws over `num_queues() == 29`
+victims, and the yielding tail entered on the runs where 60 draws were not
+enough, 3.56 `yield_now` calls a run. That is the row the "one steal"
+subsection above priced at 0.6 µs a run, and the pinned ablation is measured
+with it in: 7.6 ns a task won against 0.04 ns a task given back.
+
+The two mean run figures that counting pass printed, 1.02 ms unconditional
+against 2.54 ms guarded, are **not** a comparison: they are two processes, two
+pools and two placements, which is the 2.300 ms row of the unpinned width
+sweep above rather than anything the guard does. That is the whole reason the
+ablation alternates inside one pool.
+
+One run of `devtools/bench-ab.sh origin/main WORKTREE --bench linear_chain
+--rounds 5` as the no-regression check, all four published ids:
+
+| id | A median | B median | B/A | wider within-side spread | verdict |
+|---|---|---|---|---|---|
+| `1w/1024` | 153.7 µs | 143.6 µs | 0.934x | +14.1% | inside it |
+| `1w/16384` | 2.080 ms | 1.982 ms | 0.953x | +15.3% | inside it |
+| `24w/1024` | 155.2 µs | 159.8 µs | 1.030x | +15.4% | inside it |
+| `24w/16384` | 2.061 ms | 2.013 ms | 0.977x | +11.1% | inside it |
+
+Nothing is a result on the published ids, which is what this section said
+would happen: an id times the graph's construction and its drop as well as
+its run, so 16% of the run region is 2 to 5% of the id against a round-to-round
+spread of 11 to 15%. The one id that moves *against* the change, `24w/1024` at
++3.0%, is a fifth of its own spread and its A and B rounds interleave. The
+measurement that can see this change is the pinned ablation; the bench-ab run
+is here to show no id moved outside its spread.
+
+The box was this run's alone, and `/proc/loadavg` either side of each of the
+three measurements:
+
+| measurement | before | after |
+|---|---|---|
+| the draw counts, 50 runs a side | 0.76 1.52 2.59 | 0.76 1.52 2.59 |
+| the ablation, pinned, 101 rounds a side | 0.53 1.39 2.51 | 0.53 1.39 2.51 |
+| `bench-ab.sh`, 5 rounds | 0.39 1.27 2.44 | 1.12 1.48 2.33 |
+
+The counters and the ablation flag were a `src/probe.rs` and its call sites in
+`worker.rs`, reverted before the gate as this section's own were: the shipped
+diff is the `if` and these paragraphs.
 
 ## The #380 measurement: the route halves a task, the ordering sets the width
 
