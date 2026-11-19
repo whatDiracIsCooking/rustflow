@@ -56,6 +56,7 @@ order they were taken in is recorded.
 - [Algorithms](#algorithms) -- the three layers and the ownership rule they share
 - [Pipelines](#pipelines) -- lines, the nonpreemptive node kind and `DataPipeline`
 - [Documentation and tooling](#documentation-and-tooling) -- the surface and the instruments
+- [Benchmarks and performance](#benchmarks-and-performance) -- the suite and its shapes
 
 ## Documentation contract
 
@@ -657,10 +658,14 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   cost every executor 6 MiB of reserved address space a worker, recursive or
   not, and take away the one control a caller has today, since an explicit size
   overrides `RUST_MIN_STACK` and the executor has no configuration surface to
-  put a replacement knob on. What actually lifts the ceiling is the route: the
-  runtime route already carries upstream's whole `skynet` sweep on one worker
-  in eight kilobytes of stack, and #342 is where the preempted-parent resume
-  that would lower the group route's demand is measured.
+  put a replacement knob on. What actually lifts the ceiling is the route, and
+  only the route: the runtime route already carries upstream's whole `skynet`
+  sweep on one worker in eight kilobytes of stack. This entry expected the
+  preempted-parent resume to lower the group route's demand, and #342 measured
+  it and found it cannot -- a group's children count down an anchor that never
+  carries `PREEMPTED`, so what the last child releases is the waiting frame
+  itself, which is the thing the demand is made of. The entry below has the
+  counters.
 
   So the bound is a documented property of the port. An overflow is an abort
   rather than a `RunError`, which is the one failure in the crate a caller
@@ -2387,4 +2392,69 @@ run -- so a number from one is something a reviewer reads rather than something
 that passes or fails. `cargo mutants` is the fifth, run by hand over a module
 at a time, with `.cargo/mutants.toml` carrying the equivalent mutants the entry
 on them dispositions. What does decide a pass is the gate `docs/development.md`
-names, plus `devtools/run-examples.sh` in CI's `examples` job.
+names, plus the two things CI's `examples` job runs: `devtools/run-examples.sh`
+and, since #334, every benchmark id once in criterion's untimed `--test` mode.
+
+## Benchmarks and performance
+
+The benchmark suite is a part of the port with decisions of its own, and this
+is where they are: what is ported out of upstream's `benchmarks/` and what is
+not, and what the harness under `benches/` is allowed to share. The milestone
+that built the suite took three decisions that are *not* here, because they
+decide the scheduler rather than the suite and this file groups by the part of
+the port a decision decides: the nested-corun stack bound (#359) and the
+preempted parent's re-queue (#342), which corrects what that entry expected,
+are both under "Executor core", and the `for_each_index` chunk loop (#343) is
+under "Algorithms". The figures behind all three are in
+[`BENCHMARKS.md`](BENCHMARKS.md), which is where every number in this port
+lives.
+
+- **Twenty-two of upstream's twenty-five benchmarks are ported, and the three
+  that are not are declined for reasons outside the port's control** (issue
+  #345). `benchmarks/CMakeLists.txt` at the pin declares twenty-five `bench_*`
+  targets, twenty-four host ones and `bench_hetero_traversal` behind
+  `TF_BUILD_CUDA`. `hetero_traversal` is that CUDA target, and `cuda/` has
+  been out of scope from the start. `mnist` wants four dataset files
+  downloaded from Kaggle and an Eigen DNN its `dnn.hpp` includes out of
+  `3rd-party/eigen-3.3.7`, so neither half of what it measures is code in the
+  pinned tree's own library -- and `3rd-party/` carries separate terms, which
+  is a fresh licensing question rather than a porting one. `thread_pool`
+  compares `tf::Executor` against the hand-rolled `ThreadPool.hpp` singleton
+  beside it; the rayon pool stands in for TBB rather than for a C++
+  singleton, and the shape it submits -- 1000 independent tasks -- is
+  `embarrassing_parallelism`, which is ported. The declines are recorded in
+  `BENCHMARKS.md`'s header and in the README's "What is not ported", and what
+  would reverse any of them is a change of scope rather than a measurement.
+
+- **A benchmark target shares a fixture module, not a library, and the module
+  is split by what a target needs** (issue #332). Every file directly under
+  `benches/` is its own crate, so a shared helper is compiled separately into
+  each target that declares it, and a helper one target does not call is dead
+  code -- which this crate's lints make a gate failure rather than a warning.
+  So `benches/common/` is `tests/common/`'s shape: `mod.rs` holds only what
+  every target that declares it calls, and each further helper is a topic file
+  pulled by `#[path]`, so `linear_chain.rs` compiles no rayon pool and
+  `sort.rs` no per-task body. Nothing that would move a measurement is shared:
+  sizes, criterion sample settings and a shape's own setup stay in the target,
+  which is what its table reports. The alternative that was rejected is an
+  `#[allow(dead_code)]` over one wide module, which buys convenience by hiding
+  exactly the thing a shared fixture most needs to stay honest about -- whether
+  a helper still has callers. `devtools/bench-ab.sh` (#333) is the other half
+  of the harness and sits outside the crates for the same reason: an
+  interleaved A/B builds two refs, which is a script's job and not a
+  benchmark's.
+
+- **The benchmarks' CI smoke run stays a step of the `examples` job** (issues
+  #334, #345). `cargo bench -- --test` runs every id once, untimed, which is
+  "does it still run" rather than "how fast" and so is not a gate command;
+  what needed deciding was whether 22 targets had outgrown a step of a job
+  built for examples. The timings say no, twice over. On the run that closed
+  #366 the job took 1m35s -- 21 s of container setup and checkout, 30 s of
+  `run-examples.sh`, 42 s of smoke run -- while `two-core` took 2m14s on the
+  same workflow, and all four jobs run in parallel. A job of its own would
+  therefore shorten the workflow by nothing, since `examples` is not the
+  critical path, and would pay the 21 s of setup a second time. The step also
+  wants exactly what that job already has: dev-dependencies built and
+  criterion and rayon already compiled under the profile a bench build gives
+  them. What would reopen this is `examples` becoming the longest job of the
+  four, which is a number the workflow's own run history answers.

@@ -1,29 +1,58 @@
 # Benchmarks
 
-Seven of upstream's benchmarks, ported to criterion with a rayon baseline in
-the role TBB's flow graph plays upstream: `linear_chain`, `binary_tree`,
-`graph_traversal` and `embarrassing_parallelism` from #18, then `async_task`
-and `fibonacci` from #96, then `sort` from #174, each translated from the
-matching directory under Taskflow v4.1.0's `benchmarks/`. The shapes and the
-measured regions are upstream's; what the sizes, the baseline and the
-harness are is set out below, because a number whose provenance is unstated
-is not a result.
+**Twenty-two of upstream's twenty-five benchmarks**, ported to criterion with
+a rayon baseline in the role TBB's flow graph plays upstream, each translated
+from the matching directory under Taskflow v4.1.0's `benchmarks/`. The shapes
+and the measured regions are upstream's; what the sizes, the baseline and the
+harness are is set out below, because a number whose provenance is unstated is
+not a result.
 
-The two shapes #96 added are the two with **no graph in them at all** --
-`silent_async` submissions and a recursive spawn -- so the construction
-asymmetry the first four have to warn about is absent from their tables, and
-they were measured in a separate run with a load of their own. Their section
-records both. The third run is #119's: it is the A/B of one change on the
-scheduling path across all six shapes, and it supersedes the
-`rustflow-runtime` column of the `fibonacci` table. The fourth run is #102's, on the same quiet box: an A/B of the *spill-buffer
-count* across all six shapes, which changed no shipped code and is the reason
-the count is still `bit_width(num_workers)`. The last section is a fifth run,
-#125's, which changed no shipped code either: it takes the per-task cost of
-the `async_task` shape's external submission apart with counters and
-ablations, and records what it is. The sixth is #144's, which makes the one
-change that run named and could not reach: a free async node's arena sized
-to the one node it will ever hold. The seventh and last is #174's, which adds
-the seventh shape, `sort`, and measures it in a run of its own.
+`benchmarks/CMakeLists.txt` at the pin declares twenty-five `bench_*` targets
+-- twenty-four host ones, numbered 1 to 24 in its own comments, and
+`bench_hetero_traversal` behind `TF_BUILD_CUDA` -- and the twenty-two ported
+are these, by the issue that ported each: `linear_chain`, `binary_tree`,
+`graph_traversal` and `embarrassing_parallelism` (#18); `async_task` and
+`fibonacci` (#96); `sort` (#174); `pipeline`, which is upstream's
+`linear_pipeline` (#187); `for_each`, `reduce_sum` and `scan` (#335);
+`primes`, `mandelbrot` and `matrix_multiplication` (#336); `black_scholes`
+(#337); `wavefront` (#338); `graph_pipeline` and `data_pipeline` (#339, the
+second landing as a second criterion group in the file #188 had opened for the
+per-line slot measurement); `skynet` and `nqueens` (#340); and `merge_sort`
+and `integrate` (#341). That is 22 `[[bench]]` targets in `Cargo.toml` and 196
+criterion ids, which `cargo bench --all-features -- --list` counts.
+
+**Three are declined, and this is the whole of that list:**
+
+- **`hetero_traversal`** walks a graph whose tasks are a mix of CPU and GPU
+  work, and is upstream's one CUDA benchmark: `.cu` sources, built only under
+  `TF_BUILD_CUDA`. `cuda/` has been out of scope from the start -- the
+  README's "Upstream pin" says so -- so there is no port of the thing this
+  shape measures to measure.
+- **`mnist`** trains a DNN over the MNIST dataset. Its own `readme.md` asks
+  the caller to download four files from Kaggle, and its `dnn.hpp` includes
+  `Eigen/Dense`, which `benchmarks/CMakeLists.txt` resolves against
+  `3rd-party/eigen-3.3.7`. A downloaded dataset and a linear-algebra library
+  are both outside the pinned tree's own code, and `3rd-party/` carries
+  separate terms besides.
+- **`thread_pool`** compares `tf::Executor` against the hand-rolled
+  `ThreadPool.hpp` singleton sitting beside it in the same directory: 1000
+  independent tasks each way, through `pool->enqueue` on one side and a
+  1000-task `tf::Taskflow` on the other. That baseline has no counterpart
+  here -- the rayon pool stands in for TBB, not for a C++ singleton -- and the
+  shape itself is `embarrassing_parallelism`, which is ported. What the target
+  measures is a comparison between two C++ libraries rather than a shape of
+  the executor.
+
+**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 39
+headings, and they are three kinds: the three method sections that follow this
+preamble, "The machine" through "The upstream C++ column is empty"; 21 shape
+sections carrying the 22 shapes, since `async_task` and `fibonacci` share "The
+two shapes #96 added", which measured the two together in a run of their own;
+and 15 per-decision measurement sections, each named for the issue that took
+it. A shape's section is its table, its sizes and its departures from
+upstream. A measurement section is one question, with the machine, the load
+and the method of its own run in it, and it ends either in a change that
+shipped or in a change declined with what it would have cost.
 
 ```sh
 devtools/devcontainer.sh bench                        # the whole suite
@@ -32,9 +61,12 @@ devtools/devcontainer.sh bench -- --save-baseline x   # keep it to compare again
 ```
 
 Benchmarks are deliberately **not** part of the gate (`fmt`, `clippy`, `test`,
-`deny`): a benchmark answers "how fast", which is not a pass or a fail. What CI
-holds the suite to is that it still compiles, which the gate's
-`cargo clippy --all-targets` already does.
+`deny`, `doc`): a benchmark answers "how fast", which is not a pass or a fail.
+What CI holds the suite to is that it still compiles, which the gate's
+`cargo clippy --all-targets` already does, and that it still *runs*: the
+`examples` job of `.github/workflows/ci.yml` executes every one of the 196 ids
+once in criterion's untimed `--test` mode, which is a smoke test and not a
+measurement -- nothing is timed, saved or compared against a baseline.
 
 ## The machine, and what it was doing
 
@@ -136,8 +168,9 @@ did *not* re-measure is `data_pipeline_slot`: those figures belong to the
 Upstream's `benchmarks/benchmarks.md` publishes **no figures**. It documents how
 to build the suite and how to drive it with `benchmarks.py`, and then shows one
 plot (`image/benchmarks.svg`) with no tabulated numbers behind it. There is
-therefore nothing to quote for any of these four shapes, and the column below
-says so rather than carrying a number from somewhere else. Had there been one,
+therefore nothing to quote for any of the twenty-two shapes, and the
+`upstream C++` column each of their twenty-two tables carries says so rather
+than a number from somewhere else. Had there been one,
 it would still not have been comparable: it would be a different CPU, a
 different compiler and a TBB baseline rather than a rayon one.
 
@@ -476,8 +509,12 @@ task 87, `Oversubscription` with 4 chains spread over all 8 workers.
 **What is still not cached** is the other half of upstream's: a preempted
 parent resumed by its last child goes back on a queue rather than being run on
 the spot (`WorkerThread::finish_job`). A chain has no preempted parents, so
-none of the rows above would move; the shapes that would are the nested ones,
-and nothing here measures those yet.
+none of the rows above would move. The nested shapes were the candidates, and
+the #342 section below has since counted them rather than guessed: a `corun`
+leaves nothing preempted, so **none of the five nested shapes in this file
+moves either**, and the whole suite re-queues a parent twelve times over one
+run of every id -- all twelve in `pipeline`, which is the only shape here
+whose parents are preempted at all.
 
 ## The `Work` decision: `Mutex::try_lock` stays
 
@@ -1264,13 +1301,14 @@ The one-worker column reproduces #340's and #341's figures exactly, which is
 what makes the probe trustworthy for the rest of this section. The 24-worker
 cell for `integrate` does not reproduce: `V = 3` completed ten times out of ten
 here, and so did 4, 6, 8, 12, 16 and 24, with 32 the first to abort (one pass in
-three). The `integrate` section itself records that three sibling agents were
-building on this box while it was written, and 24 workers is the end a load
-moves while one worker is not -- the demand table says why, a
-24-worker run needing 134 KiB for `V = 3` against the one worker's 2.04 MiB. The
-one-worker end is what every size in this file is chosen inside, so no size
-changes on account of this: #352 is where the figures and any resizing are
-taken.
+three). Three sibling agents were building on this box when #341 took that
+cell, which the `merge_sort` and `integrate` sections recorded where their
+figures now are, until #352 replaced that note with a table taken on a quiet
+box. 24 workers is the end a load moves while one worker is not, and the
+demand table says why: a 24-worker run needs 134 KiB for `V = 3` against the
+one worker's 2.04 MiB. The one-worker end is what every size in this file is
+chosen inside, so no size changed on account of this -- #352 re-took every
+figure and resized nothing.
 
 ## The #342 decision: the resumed parent stays on a queue, and no shape here resumes one
 
@@ -3256,30 +3294,30 @@ table is the per-task constant rather than any of those ratios.** At
 task against the rayon scope's 22.9 ns. The body adds ten slots and returns, so
 essentially the whole 184 ns of difference is the submission path: a
 `silent_async` into the shared buffers, an `Arc<[AtomicU64; 10]>` allocated and
-dropped per interior node, and a `corun` whose parent is re-queued when its
-tenth child lands.
+dropped per interior node, and a `corun` whose waiting frame the tenth child
+releases -- #342 counted this shape and found no parent here re-queued at all.
 
 **24 workers make our column slower and rayon's faster, which is the most
 informative pair of rows here.** 237.1 to 539.9 µs at `MaxDepth = 3` and 2.296
 to 2.465 ms at 4, against rayon's 29.05 to 33.08 µs and 254.3 to 119.8 µs. A
 `TaskGroup`'s children go to the shared overflow buffers rather than to the
 submitting worker's own queue, so every one of those tasks is distributed by
-stealing and every parent goes back on a queue instead of being resumed where
-it stopped; with 23 other workers contending for the buffers that costs more
+stealing; with 23 other workers contending for the buffers that costs more
 than the extra hands earn, and a tree of 11110 tasks of nothing never grows
-enough to carry it. These four rows are the preempted parent the paragraph
-below names, priced, and they are the baseline #342's A/B is measured
-against.
+enough to carry it. These four rows price the submission path of the group
+route, and they are the baseline #342's A/B was measured against.
 
-What the shape is here to measure, which is why the ids above are the ones
-#342 will A/B: every one of the `(10^MaxDepth - 1) / 9` interior nodes is a
-**preempted parent**, and when its last child finishes it goes back on a queue
-rather than being resumed on the spot. That is the half of upstream's locality
-optimisation this port has not taken (`WorkerThread::finish_job`), and the
-`Work` decision above says in as many words that nothing in this file measured
-it: "the shapes that would [move] are the nested ones, and nothing here
-measures those yet". This target and `nqueens` below are two of the five that
-now do.
+What the shape is here to measure is the group route's cost per interior node,
+and the mechanism is **not** the one this section first claimed. Each of the
+`(10^MaxDepth - 1) / 9` interior nodes is a parent, but it is an anchored
+*frame* rather than a preempted node: its children count down the group's own
+anchor, which never carries `PREEMPTED` and has no job to resume, so what the
+last child releases is the frame waiting inside `TaskGroup::corun`. #342
+counted exactly that over this shape -- 48880 nested tear-downs, 4915 of them
+driving a counter to zero, **none** finding `PREEMPTED` -- so none of the
+184 ns a task above is a re-queue that resuming a parent on the spot could
+give back. The ids above are still what made the measurement possible; the
+#342 section is what it concluded.
 
 ## nqueens
 
@@ -3306,9 +3344,11 @@ departures in full.
 What this shape adds over `skynet` is that **the tree is ragged**: a level
 spawns between zero and `N` children depending on what the pruning leaves, so
 the fan-out is data rather than a constant and most interior nodes wait on a
-handful of children rather than on ten. The re-queue of a preempted parent is
-therefore a larger share of each parent's cost here than it is there, which
-is what makes the pair worth measuring rather than either one alone.
+handful of children rather than on ten. The group route's per-parent cost is
+therefore spread over fewer children here than there, which is what makes the
+pair worth measuring rather than either one alone. (This section first said
+that cost was a preempted parent's re-queue; #342 counted the suite and found
+no shape here re-queues one.)
 
 **Sizes are `q = 6` and `8`** -- 152 spawned tasks and 2056, a factor of
 thirteen apart, with the same split of roles the other tables use. **Both are
@@ -3353,11 +3393,13 @@ worker is 9.0x behind, because a `nqueens` body copies a board and prunes a
 column and so gives the submission path something to hide behind. At 24
 workers it goes the other way: 2.946 ms against 184.5 µs is 16x, with our
 column 2.5x slower than its own one worker while rayon's scope is 2.9x faster
-than its own. Most interior nodes here wait on a handful of children rather than on
-ten, so a parent is re-queued after very little work and the re-queue is a
-larger share of a node's cost than it is in `skynet` -- which is the reason
-this section gives above for measuring the pair rather than either alone, now
-with a number on it.
+than its own. Most interior nodes here wait on a handful of children rather
+than on ten, so each parent's own share of the group route -- a `task_group()`
+opened, a `parts` vector allocated, a frame parked in `corun` until the anchor
+clears -- is amortised over a handful of submissions instead of ten, which is
+the reason this section gives above for measuring the pair rather than either
+alone, now with a number on it. What that share is *not* is a re-queue: #342
+read 8832 nested tear-downs here and `PREEMPTED` on none of them.
 
 ## graph_pipeline
 
@@ -3552,10 +3594,10 @@ moment are bounded by the 1023 of the larger size. That is what the #359
 section above measures the bound against: a `TaskGroup::corun` nests a frame
 per outstanding *task*, about a kilobyte of stack each in a release build, so a
 thousand `msort` frames is a megabyte of the 2 MiB a worker gets -- inside it,
-checked at both worker counts in a release build rather than assumed -- which is what makes this one of the
-five nested shapes #342 can A/B the preempted-parent resume on without having
-to shrink first, where the `integrate` section below is the one that could
-not.
+checked at both worker counts in a release build rather than assumed -- which
+is what made this one of the five nested shapes #342 could A/B the
+preempted-parent resume on at its published sizes, where the `integrate`
+section below is the one that could not.
 
 **How the two halves reach the two branches, without `unsafe`.** Upstream's
 child captures the whole `std::vector<double>` by reference and is trusted to
@@ -3635,8 +3677,10 @@ exists for, and they go the other way.** 6.5% behind at one worker over 15
 spawned tasks, and 6.2x behind at 24 workers, where our 869.0 µs is 3.4x our
 own one-worker time and rayon's 139.4 µs is 1.7x faster than its own. Fifteen
 tasks whose leaves are 1024-element sorts, distributed by stealing out of the
-shared buffers with a parent re-queued at every level, is the `skynet` and
-`integrate` finding at a thirtieth of their task count. What the
+shared buffers with a frame parked in `corun` at every level, is the `skynet`
+and `integrate` finding at a thirtieth of their task count -- #342 counted
+4152 nested tear-downs here and no preempted parent among them, so the cost is
+the buffers and the frames rather than a re-queue. What the
 million-element rows add is the other half of it: this fork is expensive per
 task and the per task cost is all it is, so a shape with enough work per level
 buries it entirely.
@@ -3691,9 +3735,12 @@ count: this recursion carries five `f64`s and a slot and costs 616 bytes a
 node, where `skynet`'s ten-slot frame costs 1055. This shape has no runtime
 variant, which is the route that would lift it -- upstream's
 `integrate/taskflow.cpp` is written on `task_group()` and the port follows it,
-so what #352 will tabulate is a `TaskGroup` column and the ceiling above is
-`TaskGroup`'s. #342 is where the resume that would raise it is measured, and if
-that work moves the cliff the sizes here move with it.
+so the column in the table below is a `TaskGroup` column and the ceiling above
+is `TaskGroup`'s. The resume that was expected to raise that ceiling does not.
+#342 measured it: the frames that make this cliff are a `corun`'s rather than
+a preempted node's -- 10720 nested tear-downs here and `PREEMPTED` on none of
+them -- so **no size in this section moves on account of #342**, and what
+would lift the cliff is the runtime route this shape does not take.
 
 The answer is checked twice before any id is timed, both outside every
 measured region, because the two checks catch different failures. **Against
@@ -3739,11 +3786,12 @@ behind twenty million of them. At `V = 2` and one worker, 1852 spawned tasks in
 The 24-worker rows then repeat `skynet`'s direction: ours goes from
 636.6 µs to 2.064 ms, 3.2x slower for 23 more workers, because a `TaskGroup`'s
 children are distributed by stealing out of the shared buffers and each parent
-is re-queued when its one child lands, while `rayon::join` on the same tree
-barely moves (41.86 to 39.24 µs). Read with the #359 section above, the two
-measurements are one finding from two directions: a nested corun through this
-route costs about a kilobyte of stack and a few hundred nanoseconds a task,
-and both are the queue destination rather than `corun` itself.
+holds a frame in `corun` until its one child lands, while `rayon::join` on the
+same tree barely moves (41.86 to 39.24 µs). Read with the #359 section above,
+the two measurements are one finding from two directions: a nested corun
+through this route costs about a kilobyte of stack and a few hundred
+nanoseconds a task, and both are the queue destination rather than `corun`
+itself.
 
 ## The #343 attribution: a chunk costs 15 ns, and the gap is the fan-out
 
@@ -4264,7 +4312,8 @@ Four things in that table are worth naming.
 It does not say the port got faster: `git diff` for this change touches
 `benches/` and this file. It does not revisit #343's decision, which stands --
 the per-chunk cost is still 15 ns, the fan-out still reaches 15 to 19 of 24
-workers, and that is still the open question, filed outside this milestone. And
+workers, and that is still the open question, filed outside this milestone as
+#367. And
 it does not make the 24-worker `for_each` row a win for the port: #343
 measured that id's between-run spread at 1.6x on our side against 1.06x on
 rayon's, so 622 µs against 721 µs is the tie that section predicted, now

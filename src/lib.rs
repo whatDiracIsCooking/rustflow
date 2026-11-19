@@ -159,6 +159,22 @@
 //! `DESIGN.md`'s entries for those are under "Documentation and tooling",
 //! "Algorithms" and "Executor core".
 //!
+//! A **benchmarks and performance** milestone ran after those two, porting
+//! twenty-two of upstream's twenty-five benchmarks to criterion against a
+//! rayon baseline, and three of its findings bear on what a caller writes
+//! rather than on a figure. A recursion of nested [`TaskGroup::corun`]s is
+//! bounded by the worker's stack at about a kilobyte a level, where
+//! [`Runtime::corun`] nests one frame per level of recursion instead, and
+//! both methods say so where the wait is written. A parent preempted by work
+//! it left outstanding is resumed through a queue rather than upstream's
+//! continuation slot, which costs nothing any shape in the suite can see.
+//! And an algorithm's per-chunk dispatch is about 15 ns, so a gap against
+//! rayon on a fan-out shape is the submission reaching 15 to 19 of 24
+//! workers rather than the chunk loop. `BENCHMARKS.md` has every number this
+//! crate has, each beside the machine and the load it was taken under, and
+//! `DESIGN.md`'s "Benchmarks and performance" section has the decisions the
+//! suite itself took.
+//!
 //! The crate's `unsafe` blocks live in two modules and nowhere else:
 //! [`notifier`](executor::notifier), in the lock-free waiter stack, and
 //! [`scope`](executor::scope), where [`Runtime::scope`] erases a borrowed
