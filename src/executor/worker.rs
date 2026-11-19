@@ -697,8 +697,16 @@ impl WorkerThread {
         }
         // Outside the `if`, because the releases before the failing one
         // succeeded: dropping the jobs their waiting lists put in `woken` would
-        // leave those counts outstanding for ever.
-        self.shared.bulk_schedule(woken);
+        // leave those counts outstanding for ever. Guarded on a non-empty
+        // batch as upstream's hook is -- `if(node->_semaphores &&
+        // !node->_semaphores->to_release.empty())` -- since `bulk_schedule`
+        // reaches `Buffers::push_bulk`, which advances the shared `rotation`
+        // and divides by a runtime divisor before its loop finds there is
+        // nothing to deal, and a node with no semaphores on it is every task
+        // of every shape in `BENCHMARKS.md`.
+        if !woken.is_empty() {
+            self.shared.bulk_schedule(woken);
+        }
 
         // Upstream's comment, and the reason this is a `fetch_add` of the
         // strong-dependency count rather than a `store`: the counter is re-armed
