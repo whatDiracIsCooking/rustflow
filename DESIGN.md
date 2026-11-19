@@ -2023,6 +2023,37 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   once #406 lands. The figures are in [`BENCHMARKS.md`](BENCHMARKS.md) under
   "The #401 decision".
 
+  **The floor stays at one, the join it was priced against is gone, and
+  `IndexDispatch::dispatch` grows no handoff parameter** (issue #409; issue
+  #406 **declined**). #401's sweep and #400's attribution were both taken
+  before #412 gave `WorkerThread::corun_until` upstream's search, and the
+  cost they measured was that search: re-taken on the post-#412 tree, a
+  re-split prices between **−1.9 and +1.2 µs** of wall against 9 to 13 µs,
+  a sign the harness cannot fix, and `SplittingPartitioner::default()` is
+  level with the same partitioner with its splits off -- 1.12x, 0.85x, 0.84x
+  and 0.97x of it in four processes, every difference inside both rows' own
+  spreads -- where #400 measured 2 to 4x on wall and up to 3.5x on CPU. The
+  counters say the scope still coruns, one `try_corun` a split as before; what
+  changed is that a failed search ends in 32 to 43 attempts instead of 211, so
+  the whole run's time in one falls from 15.7-61.9 ms to 0.663-3.125 ms. Two
+  decisions follow. The floor stays at one, because the re-taken seven-row
+  sweep -- both row orders, six runs a row -- separates no floor from another
+  or from splitting nothing by more than either side's spread, while
+  `default()` now reads **1.19x and 1.18x** of the guided control against
+  #401's 1.99x, 2.48x and 2.25x; `src/algorithm/partitioner.rs`'s `# Design`
+  section carries the new price. And **#406's handoff seam is declined**: a
+  `dispatch` parameter carrying "how this call site hands a far half on", with
+  a detached impl for the three owned entry points and a scoped one for the
+  three borrowed ones and for `spawn_shares`, was worth a new parameter and a
+  new bound on a public trait method while the join it avoided cost 160 to
+  476 µs of CPU a split, and is not worth it now that the join costs what
+  #400's four candidates already account for. The `Scope` route stays
+  everywhere, so the soundness argument `Runtime::scope` rests on is
+  untouched. What is left of the splitting default against the guided one is
+  the static share each task is handed, which is the entry above and #343's
+  fan-out rather than the join. The four passes, their counters and their load
+  tables are in [`BENCHMARKS.md`](BENCHMARKS.md) under "The #409 decision".
+
 - **`sort_by` keeps upstream's live partition, and the sort's own figures do
   not show it** (issues #375, #381). The pinned header defines two sort cores
   and `make_sort_task` calls only `parallel_pdqsort`; the `parallel_3wqsort`

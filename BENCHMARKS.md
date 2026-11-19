@@ -43,12 +43,12 @@ criterion ids, which `cargo bench --all-features -- --list` counts.
   measures is a comparison between two C++ libraries rather than a shape of
   the executor.
 
-**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 51
+**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 52
 headings, and they are three kinds: the three method sections that follow this
 preamble, "The machine" through "The upstream C++ column is empty"; 21 shape
 sections carrying the 22 shapes, since `async_task` and `fibonacci` share "The
 two shapes #96 added", which measured the two together in a run of their own;
-and 27 per-decision measurement sections, each named for the issue that took
+and 28 per-decision measurement sections, each named for the issue that took
 it. A shape's section is its table, its sizes and its departures from
 upstream. A measurement section is one question, with the machine, the load
 and the method of its own run in it, and it ends either in a change that
@@ -6916,6 +6916,16 @@ cost cannot come off *here* stated rather than asserted.
   the structural reason the guided default is cheap at 24 workers and not an
   accident of its tuning.
 
+**Outcome: the join went with #412, not with #406.** The wait this section
+attributed turned out to be `WorkerThread::corun_until`'s own search granularity
+("The #407 measurement"), and once #412 gave a corun upstream's loop the whole
+of the cost measured here was gone: "The #409 decision" below re-takes this
+harness on the post-#412 tree and prices a split between −1.9 and +1.2 µs,
+with the splitting default level with the non-splitting row on wall and CPU in
+four processes. So **#406's handoff seam is declined** -- no `dispatch`
+parameter ships -- and the 14 µs this section priced is a figure about a tree
+that no longer exists.
+
 ## The #401 decision: the floor stays at one index, and only an uncapped chain separates
 
 **`SplittingPartitioner::default()`'s floor of one index is the type's most
@@ -7116,6 +7126,15 @@ docs rather than only in this file. It does not say a derived floor is wrong
 splitting at all, which is a different claim and the reason nothing ships. And
 it does not re-measure the `rustflow-split` criterion ids: no code changed, so
 #381's part 2 table stands as taken.
+
+**Outcome: the sweep was re-taken and the floor still stays, at a price this
+one over-states.** #409 re-took these seven rows in both orders on the
+post-#412 tree, where the uncapped chain's 9 to 13 µs a split -- the one
+separation this sweep found -- reads between −1.9 and +1.2 µs and the floor-1
+row reads **1.19x and 1.18x** of its own guided control against the 1.99x,
+2.48x and 2.25x above. Nothing separates from anything there either, so the
+floor of one stays for the reason this section gave; see "The #409 decision"
+below for the figures the type's docs now carry.
 
 ## The #395 change: the group lends its runtime back, and the ordering is 30x
 
@@ -7750,7 +7769,9 @@ of the four candidates as written.
   `merge_sort`, `skynet` and `nqueens` tables' 24-worker rows, and the
   `SplittingPartitioner`'s 14 µs a re-split that #400 priced -- that join is
   this wait, so #406's handoff-seam change may no longer be needed and #409's
-  floor question moves with it. It would not touch the fan-out ceiling (#367),
+  floor question moves with it. (It did: "The #409 decision" measures that
+  join at between −1.9 and +1.2 µs a split on the post-#412 tree, **#406 is
+  declined** and the floor stays at one.) It would not touch the fan-out ceiling (#367),
   the per-task constants (#382), the 1000-element algorithm floor (#343) or
   external submission (#60), none of which corun.
 
@@ -8102,3 +8123,301 @@ be looser than the defect it is looking for.
 #407 closes with this change; #406's handoff seam and #409's floor question
 are the two issues it was expected to move, and both now read against these
 figures rather than against #400's.
+
+## The #409 decision: the floor stays at one index, and the join it was priced against is gone
+
+**The floor stays, and #406 is overtaken.** On the post-#412 tree a
+`SplittingPartitioner` re-split no longer costs the join it opens: the
+splitting default's wall is level with the *same partitioner with its splits
+off* in every one of the four processes measured here -- 1.12x of it in one,
+0.85x, 0.84x and 0.97x in the other three, every difference inside both rows'
+own spreads -- which prices a split at between **−1.9 and +1.2 µs** against
+"The #400 attribution"'s 9 to 13, inside the 1 to 2 µs that section's four
+candidates account for. So the handoff seam **#406** proposed, a `dispatch`
+parameter carrying "how this call site hands a far half on", is **declined**:
+the join it would have avoided now costs what its candidates account for, and
+what is left of the splitting default against the guided one -- 1.19x and
+1.18x of its own process's control in the two sweep orders -- is the static
+share each task is handed, which is #381's finding and not the join's. #401's
+seven-row floor sweep, re-taken in both orders, now puts `default()` **inside
+the 1.5x of the guided default** it asked for, where #401 read 1.99x, 2.48x
+and 2.25x; no floor separates from another or from splitting nothing by more
+than either side's spread, so **the floor stays at one index** and the price
+in its docs comes down from 9 to 13 µs a split to nothing this harness can
+measure.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| harness | #381's observer harness rebuilt, not criterion: six runs a row, a fresh executor a row, the pool confirmed fully parked (`Executor::num_waiters() == 24`) before every run, the graph built outside the clock |
+| CPU reading | `sum_exec_runtime` summed over `/proc/self/task/*/schedstat` either side of the timed region, as #400 and #407 read it |
+| Date | 2026-11-19 |
+| **Load average** | **0.26 0.52 1.27 either side of pass A, 0.37 0.53 1.25 before pass B's first order and 0.42 0.54 1.25 after it, 0.25 0.49 1.21 either side of the second order, 0.15 0.44 1.17 either side of the counter pass** |
+
+The box was this run's alone: no sibling agent, no other `cargo` -- both
+builds finished before the first pass started -- and `/proc/loadavg`'s
+runnable-task field read 1 or 2 at every reading either side of all four
+passes. Every figure below is **one** run of one row, quoted as the range over
+that row's six runs with the row's median beside it where a ratio is taken,
+which is the convention #381's part 2 set for this harness. There is no
+best-of-anything here, and a row is read only against the control rows
+measured in the same process: this box's processes disagree by up to 1.4x
+about the same row, which is the drift "The #400 attribution" named, and the
+four passes below reproduce it -- the guided control's own median is 1.286,
+0.876, 0.936 and 1.035 ms in the four.
+
+### Method: #400's harness and #401's sweep, rebuilt, with the floor moved alone
+
+The harness is #381's: a `for_each_by_index` over a million `AtomicU64` cells,
+each replaced by its own tangent, under a #343-shaped observer counting which
+worker enters each dispatched async task, with an untimed check of all million
+cells against a sequential `f64::tan` after every run -- which every run of
+every row below passed. What is added to it is #400's counter bank in
+`run_share` (entries, home hits, splits, body calls, covered indices and the
+nanoseconds of the split's three phases) and in `WorkerThread::corun_until`
+and its post-#412 `steal_until` (corun calls, rounds, pops, searches by
+outcome, steal attempts, yields and the nanoseconds in a search), and #401's
+floor knob: a `probe::FLOOR` the harness sets per row, read by
+`SplittingPartitioner::split_floor`, so that the sweep moves the **floor**
+where `new(k)` moves the floor and the chunk walk together.
+
+Both of #407's gates are here too. The counters are compiled out by a `const`
+gate on `option_env!("RUSTFLOW_PROBE")`, so the three wall-clock passes carry
+no observer weight at all and the counter pass is a build of its own, quoted
+for its counts rather than its clocks; the floor knob is one relaxed load a
+`split_floor` call in both builds, which is the knob #401's pass 3 showed
+free. Rows are selected at run time inside one process -- never by rebuilding
+or by checking a file out -- and nothing was committed: `src/probe.rs`, the
+call sites in `partitioner.rs` and `worker.rs`, the harness example and its
+runner were reverted before the gate ran, and the PR that landed this section
+carries their source.
+
+Two notes on what the counters count. `indices` reads 958,334 and not
+1,000,000 because `spawn_splitting` walks the 24th share **inline**, outside
+`run_share`, so the bank never sees it: 958,334 + 41,666 = `n` exactly, and
+the untimed check covers all million either way. And the `join` column is the
+scope's whole elapsed time less its spawn phase and its near walk -- the wait
+-- which is still the nested number #400 warned against dividing, a parent's
+join containing its children's.
+
+### Pass A, #406's question: the splitting default against its own control
+
+Three rows in one process, the uninstrumented build. The non-splitting control
+is `SplittingPartitioner::new(262144)`, reached through the shipped API
+exactly as #400 took it.
+
+| row | tasks | distinct workers | wall | median | ÷ guided | ÷ non-splitting | CPU |
+|---|---|---|---|---|---|---|---|
+| guided, floor 1 (`DefaultPartitioner`) | 23 | 14-18 / 24 | 1.211-1.399 ms | 1.286 ms | 1.00x | 1.27x | 17.4-19.9 ms |
+| splitting, `new(262144)` -- nothing splits | 23 | 22-23 / 24 | 0.914-1.219 ms | 1.014 ms | 0.79x | 1.00x | 19.3-25.6 ms |
+| **splitting, floor 1 (`default()`)** | **113-132** | **21-24 / 24** | **0.893-1.275 ms** | **1.134 ms** | **0.88x** | **1.12x** | **20.2-28.5 ms** |
+
+#406's bar, re-read for a tree where coruns return promptly, was the splitting
+default's wall at or under the non-splitting row's range in the same process
+with its CPU inside that row's range too, and this pass reads it as **level
+with both**:
+
+- **The wall ranges straddle each other.** The splitting default spans
+  0.893-1.275 ms where its control spans 0.914-1.219: four of its six runs
+  fall inside the control's range, its fastest run is faster than the
+  control's fastest, and the two medians are 120 µs apart where the rows' own
+  spreads are 382 and 305 µs. By this file's own rule that is the band and not
+  a separation -- the two rows are not distinguishable here -- and it is the
+  comparison #400 measured at **2.14-4.19 ms against 1.06-1.34**.
+- **So is the CPU.** 20.2-28.5 ms against 19.3-25.6, medians 25.2 and 22.0,
+  3.2 ms apart where the spreads are 8.3 and 6.2 ms. #400's reading of the
+  same two rows was **33.4-79.1 ms against 17.9-22.6**, with the difference
+  attributed in full to a corun's spin.
+- **Per split, the join prices at +1.2 µs.** The median difference, 120 µs
+  over the 102 splits the median run's 125 tasks imply, is 1.2 µs a split
+  against #400's 8 to 23 and #401's 9 to 13 -- and the other three processes
+  below put the same subtraction at **−1.9, −0.4 and −1.4 µs**, the splitting
+  default being the *faster* of the two rows in each. A quantity that changes
+  sign between processes of the same binary is a quantity inside this
+  harness's noise, which is the finding: the per-split cost is no longer
+  measurable here, where it used to be the row's whole gap.
+- **The worker count is still what the type is for.** 21 to 24 of 24 against
+  the guided control's 14 to 18, and it reaches 24 of 24, which no other row
+  of any pass does.
+
+Because the default row met the bar, #400's **build B -- the far half detached
+to `silent_async_runtime` -- was not rebuilt**: it is the ablation that would
+say what the API change still buys, and there is no gap left here for it to
+buy back. What the counters do say about the route is below.
+
+### The counters: the corun is still there, and it now costs 32 to 43 attempts
+
+The instrumented build, the same three rows, a process of its own. This is the
+table to read for counts; its clocks carry two `Instant::now()` calls per
+phase and a search.
+
+| run | entries | home | splits | bodies | indices | spawn, µs | near walk, ms | join, ms | corun calls / rounds / pops | searches ok / stopped | attempts / yields | in search, ms | CPU, ms | wall, ms |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 126 | 23 | 103 | 126 | 958334 | 142 | 12.9 | 17.8 | 103 / 136 / 23 | 67 / 46 | 3598 / 450 | 0.663 | 21.3 | 0.957 |
+| 2 | 142 | 23 | 119 | 142 | 958334 | 134 | 13.5 | 25.2 | 119 / 166 / 23 | 87 / 56 | 5340 / 1457 | 1.704 | 20.8 | 0.909 |
+| 3 | 146 | 22 | 123 | 146 | 958334 | 97 | 15.5 | 26.4 | 123 / 171 / 22 | 91 / 58 | 5450 / 1242 | 1.456 | 23.9 | 0.989 |
+| 4 | 149 | 23 | 126 | 149 | 958334 | 124 | 16.0 | 34.5 | 126 / 179 / 23 | 94 / 62 | 6710 / 2136 | 2.405 | 24.0 | 0.970 |
+| 5 | 147 | 23 | 124 | 147 | 958334 | 88 | 17.8 | 32.6 | 124 / 162 / 23 | 92 / 47 | 5883 / 2468 | 3.125 | 27.9 | 1.070 |
+| 6 | 145 | 23 | 122 | 145 | 958334 | 90 | 18.7 | 37.4 | 122 / 176 / 23 | 95 / 58 | 5432 / 1444 | 2.004 | 29.9 | 1.242 |
+
+Everything #400 read off this table still holds about the *shape* of the
+scheme: 22 or 23 entries of every run find themselves at home and are the far
+halves nobody stole, `pops` is the same number from the other side, `bodies`
+equals `entries` so nothing is walked twice, the covered indices sum to `n`
+with the inline share, and **`corun calls` equals `splits` in all six runs**
+-- one scope, one `try_corun`, one split, exactly as before. #406's acceptance
+clause asking for "the splitting row's corun-call count at zero" described the
+detached route and is not what this measures: the scope still coruns, and the
+question is what the corun costs.
+
+What changed is that cost, on the same instrumentation, against #400's six
+runs of the same row:
+
+| | #400, pre-#412 | here, post-#412 |
+|---|---|---|
+| wall | 2.14-4.19 ms | **0.909-1.242 ms** |
+| CPU | 33.4-79.1 ms | **20.8-29.9 ms** |
+| splits | 98-130 | 103-126 |
+| corun calls | 98-130 (= splits) | 103-126 (= splits) |
+| spawn phase, whole row | 70-873 µs | 88-142 µs |
+| near walk | 12.4-16.3 ms | 12.9-18.7 ms |
+| join (nested) | 63.1-251.9 ms | **17.8-37.4 ms** |
+| time in a search, whole row | 15.7-61.9 ms (its spin, failed rounds only) | **0.663-3.125 ms** (every search) |
+| a failed search | 143-172 µs, 211 attempts, 150 yields | 5.9-22.5 µs mean, 32-43 attempts mean |
+
+The spawn phase and the near walk are unchanged, which is what says the two
+builds are measuring the same work. The join is **0.17 to 0.31 ms a split** on
+that nested clock against #400's 0.62 to 1.94, a factor of 3.6 to 6.3; the
+whole row's time in a search falls from a median of 26.2 ms to **1.85 ms**,
+14x, and per search from 143 to 172 µs to 5.9 to 22.5, 6 to 29x. The
+attempts-per-search figure is a mean over both outcomes -- this bank cannot
+separate a search that found a job from one the predicate stopped -- and at
+32 to 43 attempts against a pre-#412 failed round's flat 211 it is the figure
+"The #412 change" published from the other two shapes, reproduced here from
+the partitioner's side.
+
+### Pass B, #409's question: seven rows, two orders, no separation
+
+#401's sweep re-taken: `n = 1e6` at 24 workers, the floor moved alone through
+the knob, six runs a row, two processes of the same binary with the row order
+reversed between them. The last row is a floor above `n / w`, so nothing
+splits -- the same control as pass A's middle row but with `chunk_size` left
+at `0`, one body call a share, so that the floor is the only thing that moves.
+
+**First order, top to bottom** (guided control's median 0.876 ms):
+
+| row | floor | tasks | distinct workers | wall | median | ÷ guided | CPU |
+|---|---|---|---|---|---|---|---|
+| guided, floor 1 (`DefaultPartitioner`) | 1 | 23 | 20-22 / 24 | 0.817-1.018 ms | 0.876 ms | 1.00x | 19.2-22.5 ms |
+| **splitting, floor 1 (`default()`)** | 1 | **91-130** | **19-22 / 24** | **0.958-1.141 ms** | **1.045 ms** | **1.19x** | 19.2-26.2 ms |
+| splitting, `n / (2w)` | 20833 | 46 | 19-20 / 24 | 0.987-1.064 ms | 1.001 ms | 1.14x | 19.6-22.3 ms |
+| splitting, `n / (4w)` | 10416 | 61-67 | 17-20 / 24 | 1.000-1.364 ms | 1.190 ms | 1.36x | 18.7-22.2 ms |
+| splitting, `n / (8w)` | 5208 | 73-92 | 20-21 / 24 | 1.035-1.156 ms | 1.101 ms | 1.26x | 19.2-23.6 ms |
+| splitting, `n / (16w)` | 2604 | 100-111 | 22-24 / 24 | 0.864-1.128 ms | 0.903 ms | 1.03x | 21.9-24.9 ms |
+| splitting, floor 262144 -- nothing splits | 262144 | 23 | 17-22 / 24 | 1.219-1.361 ms | 1.237 ms | 1.41x | 20.1-24.1 ms |
+
+**Second order, bottom to top** (guided control's median 0.936 ms):
+
+| row | floor | tasks | distinct workers | wall | median | ÷ guided | CPU |
+|---|---|---|---|---|---|---|---|
+| splitting, floor 262144 -- nothing splits | 262144 | 23 | 22-23 / 24 | 0.978-1.348 ms | 1.140 ms | 1.22x | 21.6-26.7 ms |
+| splitting, `n / (16w)` | 2604 | 91-102 | 20-24 / 24 | 0.979-1.140 ms | 1.118 ms | 1.19x | 19.8-25.0 ms |
+| splitting, `n / (8w)` | 5208 | 86-89 | 20-21 / 24 | 0.952-1.321 ms | 1.062 ms | 1.14x | 21.5-28.0 ms |
+| splitting, `n / (4w)` | 10416 | 62-69 | 17-18 / 24 | 1.046-1.259 ms | 1.156 ms | 1.24x | 19.1-22.3 ms |
+| splitting, `n / (2w)` | 20833 | 45-46 | 19-20 / 24 | 1.000-1.203 ms | 1.086 ms | 1.16x | 17.9-23.1 ms |
+| **splitting, floor 1 (`default()`)** | 1 | **101-141** | **19-22 / 24** | **0.970-1.107 ms** | **1.101 ms** | **1.18x** | 19.9-22.8 ms |
+| guided, floor 1 (`DefaultPartitioner`) | 1 | 23 | 16-19 / 24 | 0.868-1.122 ms | 0.936 ms | 1.00x | 17.2-20.0 ms |
+
+Four readings, in the order they decide the question.
+
+- **The separation #401 found is gone.** Its one finding was the uncapped
+  chain at 9 to 13 µs of wall a split over the same partitioner with its
+  splits off, in all three of its passes. Here the same subtraction is
+  **negative in both orders**: the floor-1 row's median is 192 µs *below* the
+  non-splitting row's in the first and 39 µs below it in the second, which
+  over the ~100 splits the median run makes is −1.9 and −0.4 µs a split. Pass
+  A, which takes the non-splitting control through `new(262144)` instead of
+  the knob, reads +1.2 µs, and the counter pass −1.4 µs. The four together put
+  a split between **−1.9 and +1.2 µs**, which is a number whose sign the
+  harness cannot fix, and that is the result: the 9 to 13 µs was the join, and
+  #412 removed it.
+- **`default()` now clears #401's 1.5x bar, in both orders.** 1.19x and 1.18x
+  of the guided control measured in the same process, against **1.99x, 2.48x
+  and 2.25x** in #401's three passes -- and the non-splitting control, which
+  was the closest row to guided there at 1.22x and 1.48x, is 1.41x and 1.22x
+  here, in one order the *worst* of the seven. The remaining 1.2x is therefore
+  the mechanism #381's counters named -- a splitting dispatch hands each task
+  `n / w` of the range outright where the guided cursor hands out what is left
+  -- and not the re-splitting, which is the same conclusion from the other
+  side.
+- **The seven rows are still one band, and the band still resolves nothing.**
+  The medians span 0.876 to 1.237 ms in the first order and 0.936 to 1.156 in
+  the second while each row's own six runs span 0.08 to 0.37 ms, and no row
+  keeps its place: `n / (16w)` is the best of the six splitting rows in the
+  first order (1.03x) and the fourth in the second (1.19x), the non-splitting
+  floor is the worst in the first (1.41x) and third-best in the second
+  (1.22x), and the floor-1 row is the fourth of the seven in both orders.
+  **No pair of rows is separated by more than either side's spread**, so by
+  this file's rule and #409's own acceptance there is nothing here to move a
+  floor onto.
+- **The distinct-worker count, read as #401 read it.** The floor-1 row reads
+  19-22, 19-22, 21-24 and 21-23 across the four passes, at or above its own
+  process's guided control in three of them and one worker below it at the
+  bottom edge in the first sweep order (19-22 against 20-22), with the two
+  bands overlapping. As in #401 this count moves by up to 8 of 24 between
+  orders -- the guided control itself reads 14-18, 20-22, 16-19 and 21-22 --
+  so it is not a count that discriminates floors; what it still supports is
+  that the floor of one is the only row that ever reaches 24 of 24.
+
+### The decision: the floor stays at one index, #406 is declined, and the price in the docs comes down
+
+#409's acceptance was the sweep plus one of two outcomes, and the figures pick
+the second again, for the opposite reason to #401's: not because no floor
+reaches the bar, but because the default now does and nothing separates from
+it. **`SplittingPartitioner::default()` keeps its floor of one index**, and
+`src/algorithm/partitioner.rs`'s `# Design` section now carries this price
+instead of the 9 to 13 µs it carried. No code changes: the whole of this
+PR's diff under `src/` is that section.
+
+- **A floor is only moved on a separation, and there is none.** Four passes,
+  two of them row-order reversals of each other, put every bounded floor and
+  the unbounded one inside one band; a default has to be one number, and
+  picking inside a spread is the one thing this file's rule forbids.
+- **The reason #401 gave for keeping it has come true.** It kept the floor
+  because a raise would tune a shipped default against a cost another change
+  removes. That change was expected to be #406 and turned out to be #412, and
+  the cost is gone: a split priced at 9 to 13 µs there prices between −1.9 and
+  +1.2 µs here, so the floor of one now buys its ~100 extra tasks and its
+  fifteen-level chain for nothing this harness can see.
+- **#406 is overtaken and closes with no API change.** The `dispatch` handoff
+  parameter -- a new parameter and a new bound on a public trait method,
+  carrying a detached impl for the three owned entry points and a scoped one
+  for the three borrowed ones and for `spawn_shares` -- was worth that surface
+  when the join it avoided cost 160 to 476 µs of CPU a split. It no longer
+  does: the join's wait is 0.663 to 3.125 ms of search across a whole run
+  against 15.7 to 61.9, and the splitting default is level with its own
+  non-splitting control on wall and CPU in four processes. The `Scope` route
+  therefore stays everywhere, which also keeps the soundness argument
+  `Runtime::scope` rests on unchanged, and `DESIGN.md`'s "Algorithms" section
+  records the parameter as declined with this as the reason.
+- **What is left of the splitting default is not a join.** 1.19x and 1.18x of
+  the guided control, with the non-splitting control at 1.41x and 1.22x of it
+  in the same two processes: the residual is the static share, which is #381's
+  entry and #343's fan-out territory, and no change to how a far half is
+  handed on would touch it.
+
+**What this does not say.** It does not say the splitting default is now the
+better choice: `GuidedPartitioner` stays `DefaultPartitioner`, the splitting
+rows are 1.18x and 1.19x of it on this shape, and what they buy is the
+distinct-worker count the type exists for. It does not say a split is free --
+it says a split's cost is below what this harness can resolve on this shape at
+this `n`, which bounds it rather than measuring it, and the bound is the 1 to
+2 µs "The #400 attribution"'s four candidates already account for. It does not
+re-measure the `rustflow-split` criterion ids: no code changed here, so
+#381's part 2 table stands as taken, and the #412 A/B did not publish those
+ids. And it does not re-test the four bounded floors at other shapes or
+widths: `for_each_by_index` at `n = 1e6` and 24 workers is the one shape
+#381, #400, #401 and this section share, which is what makes the four passes
+comparable and is also the whole of their reach.
