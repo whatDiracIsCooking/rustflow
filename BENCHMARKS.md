@@ -43,12 +43,12 @@ criterion ids, which `cargo bench --all-features -- --list` counts.
   measures is a comparison between two C++ libraries rather than a shape of
   the executor.
 
-**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 44
+**How this file is laid out.** `grep -c "^## " BENCHMARKS.md` counts 45
 headings, and they are three kinds: the three method sections that follow this
 preamble, "The machine" through "The upstream C++ column is empty"; 21 shape
 sections carrying the 22 shapes, since `async_task` and `fibonacci` share "The
 two shapes #96 added", which measured the two together in a run of their own;
-and 20 per-decision measurement sections, each named for the issue that took
+and 21 per-decision measurement sections, each named for the issue that took
 it. A shape's section is its table, its sizes and its departures from
 upstream. A measurement section is one question, with the machine, the load
 and the method of its own run in it, and it ends either in a change that
@@ -2393,27 +2393,28 @@ why.
 | OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
 | criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id |
 | Date | 2026-11-19 |
-| **Load average** | **0.34 rising to 2.80 over the run, all of it this run's own** |
+| **Load average** | **0.21 rising to 4.13 over the run, all of it this run's own** |
 
-The figures below were re-taken in the "#381 measurement" pass at the end of
-this file, on a quiet box: no sibling agent and nothing else building. They
-replace the #366 pass's set, which read 19.51 µs, 23.00 µs, 36.26 ms and
-15.51 ms on the same four ids and predates #375's change to the partition --
-the two sets differ by more than that change does, and that section says why.
+The figures below were re-taken in the "#399 change" pass at the end of this
+file, on a quiet box: no sibling agent and nothing else building. They
+replace the "#381 measurement" pass's set, which read 15.69 µs, 17.34 µs,
+21.11 ms and 15.01 ms on the same four ids and predates the comparator's call
+shape changing, and that in turn replaced the #366 pass's.
 
 | size | workers | rustflow | rayon | upstream C++ |
 |---|---|---|---|---|
-| 1000 | 1 | 15.69 µs ±0.2% | 12.00 µs ±0.2% | not published |
-| 1000 | 24 | 17.34 µs ±0.5% | 15.74 µs ±0.7% | not published |
-| 1000000 | 1 | 21.11 ms ±0.6% | 23.94 ms ±0.1% | not published |
-| 1000000 | 24 | 15.01 ms ±6.9% | 3.362 ms ±0.7% | not published |
+| 1000 | 1 | 15.70 µs ±0.5% | 11.88 µs ±0.4% | not published |
+| 1000 | 24 | 17.56 µs ±0.3% | 15.96 µs ±1.4% | not published |
+| 1000000 | 1 | 21.07 ms ±0.1% | 23.99 ms ±0.1% | not published |
+| 1000000 | 24 | 13.32 ms ±11.9% | 3.386 ms ±0.5% | not published |
 
 **`rustflow/24w/1000000` is the one id of this shape too wide to read as a
-point**: ±6.9%, where its baseline beside it is ±0.7%. It is quoted rather
+point**: ±11.9%, where its baseline beside it is ±0.5%. It is quoted rather
 than dropped and rather than re-run -- one run per id is the rule every pass
-here is measured under -- but it means "about 15 ms" and nothing finer, and
+here is measured under -- but it means "about 13 ms" and nothing finer, and
 the "#381 measurement"'s own three interleaved rounds put its round-to-round
-spread at 15.3%, which is wider than any change #375 made to it.
+spread at 15.3%, which is wider than the difference between this reading and
+the 15.01 ms of the pass before it.
 
 At 1000 elements -- below this type's parallel cutoff on every worker count --
 both columns take their serial path, so the gap is construction and dispatch
@@ -2428,17 +2429,20 @@ neither column's sort is this crate's**: `Runtime::sort_by` short-circuits to
 `[T]::sort_unstable_by` whenever the pool has one worker or the range is at or
 under `parallel_sort_cutoff::<T>()`, which for `f64` is 4096, so three of this
 table's four `rustflow` ids measure the standard library's pdqsort with a
-taskflow built around it. 21.11 ms against `par_sort_unstable_by`'s 23.94 ms
-on one thread is those two sorts, and the "#381 measurement" below found that
-this id swings by 1.7x on the *call shape* of that short-circuit -- the
-comparator reaches the sort as a `&C`, whose instantiation optimises in some
-calling crates and not others -- so read the row as "the two libraries' serial
-sorts, within the noise that #399 is filed to remove" rather than as a win.
+taskflow built around it. 21.07 ms against `par_sort_unstable_by`'s 23.99 ms
+on one thread is those two sorts. The "#381 measurement" below found this id
+swinging by 1.7x on the *call shape* of that short-circuit -- the comparator
+reached the sort as a `&C`, whose instantiation optimises in some calling
+crates and not others -- and the "#399 change" at the end of this file is that
+line fixed: the comparator is passed by value now, the four caller binaries
+measured there agree to 1.03x where they had disagreed by 1.86x, and the row
+is readable as "the two libraries' serial sorts" rather than as a figure that
+depends on the caller.
 
 At 1000000 elements and 24 workers the parallel path runs on both sides and
-rayon is 4.5x ahead, the figure as wide as the id it comes from. **What that
-row is about is scaling and not the partition**: this column goes 21.11 ms to
-15.01 ms over 24 workers, 1.41x, where rayon goes 23.94 ms to 3.362 ms, 7.1x.
+rayon is 3.9x ahead, the figure as wide as the id it comes from. **What that
+row is about is scaling and not the partition**: this column goes 21.07 ms to
+13.32 ms over 24 workers, 1.58x, where rayon goes 23.99 ms to 3.386 ms, 7.1x.
 Every spawned half here goes through this crate's own node machinery --
 `Scope::spawn_runtime`, a fresh arena, a join -- where rayon's split is a
 `join` of two closures with one atomic, which is the gap `binary_tree`'s own
@@ -6115,14 +6119,17 @@ tree, calling `taskflow.sort_by` on the same buffer with the same comparator,
 reads 35.4 to 36.1 ms; with `127e3b7`'s library the same two harnesses read
 36.62 ms and 19.9 ms. Both versions have both regimes, the regimes are 1.7x
 apart, and #375's diff shuffled which crate lands in which. The A/B's
-headline figure is that lottery. **#399** is the fix -- pass the comparator by
-value or through a closure, both of which read 21.8 ms above -- and the same
-`&C` reaches `[T]::sort_unstable_by` from `sort_loop`'s own leaves, which the
-parallel path runs once per leaf.
+headline figure is that lottery. **#399 is the fix, and it has since
+shipped** -- pass the comparator by value or through a closure, both of which
+read 21.8 ms above, at all three of the call's sites, the two in
+`sort_loop`'s own leaves included. "The #399 change" at the end of this file
+is that change, with the ablation re-taken against criterion and four caller
+binaries measured either side of it: the regimes are gone and the four agree
+to 1.03x.
 
-The re-taken `sort` table in that shape's section above is today's regime, and
-the one row that is about #375 at all is the 24-worker million-element one,
-unchanged at about 15 ms.
+The `sort` table in that shape's section above has been re-taken again since,
+by that change; the one row that is about #375 at all is the 24-worker
+million-element one, which neither pass moves outside its own interval.
 
 ### The decision: nothing new ships, two defaults stand, three leads filed
 
@@ -6156,7 +6163,8 @@ places.
 - **The three leads are filed.** #399 (the `&cmp` call shape, 1.7x on a
   one-worker sort), #400 (what 13 µs a re-split is made of), #401
   (`SplittingPartitioner::default()`'s floor). Each names a bar and none of
-  them is this section's to take.
+  them is this section's to take. The first of them has since been taken:
+  "The #399 change" below is its section.
 
 **What this does not say.** It does not say `SplittingPartitioner` is useless:
 a box wider than its pool, a body longer than the arrival spread, or a cursor
@@ -6168,3 +6176,128 @@ it, it did neither. And it does not resolve `sort/rustflow/24w/1000000`, whose
 ±6.9% interval and 15.3% round-to-round spread are wider than any change #375
 could plausibly have made; what would resolve it is an id with a tighter
 spread, which is a harness question and not this one's.
+
+## The #399 change: the comparator reaches the sort by value, and the 1.8x regime is gone
+
+**The lottery the "#381 measurement" above found is closed by one word on
+three lines.** `Runtime::sort_by`'s sequential short-circuit handed
+`[T]::sort_unstable_by` a `&C`; it now hands it the `C` the frame owns, and
+the two leaves inside `sort_loop`, which hold a reference a whole scope
+shares, hand it `|a, b| cmp(a, b)`. In one binary the reference form costs
+**1.77x** against all three alternatives, and across four caller binaries the
+*same* library used to read 20.06 to 37.23 ms on the same million `f64`s
+depending on nothing a caller can see. It now reads 21.86 to 22.54 ms
+everywhere, a 1.03x spread.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release`, no `lto`, 16 codegen units |
+| criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id, as every target declares |
+| Date | 2026-11-19 |
+| **Load average** | **each measurement's own, below; 0.19 to 0.97 before and 0.26 to 4.13 after, with nothing else on the box** |
+
+The box was this run's alone: no sibling agent and no other `cargo`.
+`/proc/loadavg` read either side of every measurement -- the before pair of
+the suite's id 0.97 to 0.97, its after pair 0.19 to 0.26, the example
+harness 0.76 to 0.78 and 0.30 to 0.36, the plain harness 0.30 to 0.30 at one
+call site, 0.38 to 0.38 at two and 0.33 to 0.33 after the change, the
+four-way ablation 0.29 to 0.49, and the re-taken shape
+table 0.21 to 4.13, whose tail is its own 24-worker ids. Every criterion
+figure is **one** run of one id, quoted as the point estimate of the mean
+with half the width of the 95% confidence interval as a plus-or-minus
+percentage; the plain harness is twenty timed samples of its own, quoted as
+the mean with its min and max, because it carries no criterion at all --
+which is the point of it.
+
+### The four call shapes, in one binary
+
+A million `f64`s from `benches/sort.rs`'s own generator, re-shuffled untimed
+before every sample, sorted four ways by four generic functions with
+`Runtime::sort_by`'s signature shape -- a `C: Fn(&T, &T) -> Ordering` taken
+by value -- so that the only thing that differs between the first three is
+how `cmp` reaches the standard library's sort.
+
+| call shape | time | against the floor |
+|---|---|---|
+| `data.sort_unstable_by(&cmp)` -- what the short-circuit wrote | **37.19 ms ±0.3%** | **1.77x** |
+| `data.sort_unstable_by(cmp)` -- what it writes now | 21.03 ms ±0.4% | 1.00x |
+| `data.sort_unstable_by(\|a, b\| cmp(a, b))` -- what the leaves write now | 20.76 ms ±0.3% | 0.99x |
+| `data.sort_unstable_by(f64::total_cmp)`, no generic in the way | 20.97 ms ±0.1% | the floor |
+
+This is the ablation the "#381 measurement" ran, re-taken against criterion
+rather than a wall clock, and it reproduces: 37.19 ms against 20.76 to 21.03,
+with every interval under half a percent, so the 77% is two orders of
+magnitude outside the widest of them. **The two fixed forms are not faster
+than a sort with no generic in
+the way** -- they are the floor, within 1% -- which is what says the cost is
+the forwarding call through `impl Fn for &F` and not the comparator.
+
+### Four caller crates, before and after, on the same library
+
+The rule the "#381 measurement" could only state is here demonstrated:
+whether the `&C` instantiation optimises is a property of the **calling**
+crate, because that is where a generic instance is compiled. The two columns
+below differ in nothing but the three lines of `src/algorithm/sort.rs`.
+
+| caller | what it calls | before | after | ratio |
+|---|---|---|---|---|
+| `benches/sort.rs` | `sort/rustflow/1w/1000000` | 20.78 ms ±0.2% | 21.86 ms ±0.3% | 1.05x |
+| example, criterion | the same work, same comparator | 20.19 ms ±0.2% | 22.54 ms ±0.1% | 1.12x |
+| example, no criterion, one call site | the same work, `f64::total_cmp` | 20.06 ms (19.99-20.33) | -- | -- |
+| example, no criterion, two call sites | the same work, `f64::total_cmp` | **32.06 ms** (31.89-32.15) | 22.24 ms (22.06-22.53) | **0.69x** |
+| the same binary's second site | the same work, a closure comparator | **37.23 ms** (37.03-37.42) | 22.32 ms (22.09-22.79) | **0.60x** |
+
+**The third and fourth rows are the same source file, and the only difference
+between them is a second call site.** The plain harness began as one timed
+loop over `taskflow.sort_by(.., f64::total_cmp)` and read 20.06 ms; adding a
+second loop over the same work with a closure comparator -- a second
+instantiation, in the same crate, which the first does not call -- moved that
+*first* loop to 32.06 ms and put the new one at 37.23 ms. Nothing else
+changed, and no edit to this crate was involved. That is the whole of what
+"the instantiation does not optimise" means in practice, and it is why the
+published 1.7x of #375's A/B was not the partition.
+
+After the change, the four harnesses read 21.86, 22.54, 22.24 and 22.32 ms:
+a 1.03x spread where there had been 1.86x, and every one of them at or under
+the floor-plus-10% the acceptance named (23.80 ms).
+
+**What this does not buy is a faster sort on a build that was already
+lucky.** The suite's own id goes 20.78 to 21.86 ms and the criterion example
+20.19 to 22.54 -- 1.05x and 1.12x the wrong way, both against a shape whose
+A/A control in the "#381 measurement" puts its own floor at about 5% and
+whose three readings of that one id in this run alone are 20.78, 21.07 and
+21.86 ms. The change is not an optimisation of the lucky regime; it deletes
+the unlucky one. A caller who had the 37 ms build gains 1.67x, a caller who
+had the 20 ms build loses nothing that this shape can resolve, and no caller
+is left where the figure depends on how many times its own crate happens to
+instantiate the call.
+
+### What was checked beside it, and found not to be the shape
+
+- **`sort_loop`'s two leaves are fixed too**, though no id of this suite
+  measures them: three of the `sort` shape's four ids never enter the loop,
+  and the fourth, `24w/1000000`, reads 13.32 ms ±11.9% against the 15.01 ms
+  the shape's table carried before -- inside its own interval, which is the
+  only thing an id this wide can say.
+- **`merge_sort` has no `&C` to fix.** Its three leaf sorts
+  (`benches/merge_sort.rs`'s two `msort_*` cutoffs and `msort_rayon`'s) pass
+  `f64::total_cmp` by value already, which is the ablation's last row -- the
+  floor itself.
+  There is no `src/algorithm/merge_sort.rs`: the shape is a benchmark over
+  `Executor::task_group` and `rayon::join`, not a ported algorithm.
+- **`src/algorithm/merge.rs` is a different shape.** Its `&cmp` reaches this
+  crate's own `merge_serial` and `co_rank`, which take `&impl Fn` so that one
+  comparator can serve every spawned chunk, and never a standard-library
+  sort. Nothing here measures it, and it is not what this section's figures
+  are about.
+
+### The re-taken shape table
+
+The `sort` section's table is this change's, re-taken in one
+`cargo bench --bench sort` with the three lines in place, and the figures
+above are the same code read id by id. Its one-worker million-element row
+moves 21.11 to 21.07 ms, which is nothing; the shape's own prose, which
+carried "within the noise that #399 is filed to remove", now carries the
+outcome instead.

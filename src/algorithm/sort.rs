@@ -87,6 +87,20 @@
 //! `std` be the floor under it, rather than carrying a hand-rolled heap
 //! sort whose only caller is one branch.
 //!
+//! **No `&C` reaches `[T]::sort_unstable_by`.** Upstream takes `Compare` by
+//! value everywhere and its `std::sort(.., comp)` calls hand the sort a copy
+//! of the functor, so this port does the same: [`Runtime::sort_by`] owns
+//! `cmp` at its short-circuit and moves it in, and the two calls inside the
+//! loop, which hold the `&C` a whole scope shares and cannot copy it because
+//! `C` need not be [`Clone`], pass `|a, b| cmp(a, b)` instead. Handing
+//! `sort_unstable_by` that reference is the same program with a different
+//! cost: `impl Fn for &F` is a forwarding call that some instantiations
+//! inline and others do not, worth up to 1.8x on a million `f64`s at one
+//! worker, and which regime a build lands in is a property of the *calling*
+//! crate, because that is where a generic instance is compiled. One extra
+//! call site in a caller was enough to flip it. `BENCHMARKS.md`'s section on
+//! that call shape has the four-way ablation and the before and after.
+//!
 //! **Tail-recursion elimination survives as one [`Runtime::scope`] call per
 //! stack frame, not a C++ `goto`.** Upstream's `while(true)` spawns the left
 //! partition through `rt.silent_async` and loops back onto the right one in
@@ -471,7 +485,10 @@ fn sort_loop<'scope, T, C>(
         }
 
         if n <= cutoff {
-            data[begin..].sort_unstable_by(cmp);
+            // `|a, b| cmp(a, b)` and not `cmp`: handing the standard
+            // library's sort the `&C` this frame holds is the call shape the
+            // module's `# Design` section prices at 1.8x.
+            data[begin..].sort_unstable_by(|a, b| cmp(a, b));
             return;
         }
 
@@ -497,7 +514,8 @@ fn sort_loop<'scope, T, C>(
             // Upstream's `if (--bad_allowed == 0)`, which cannot underflow
             // here because the fallback is taken at one rather than at zero.
             if bad_allowed <= 1 {
-                data[begin..].sort_unstable_by(cmp);
+                // The closure is the leaf above's, for the same reason.
+                data[begin..].sort_unstable_by(|a, b| cmp(a, b));
                 return;
             }
             bad_allowed -= 1;
@@ -567,7 +585,11 @@ impl<'rt> Runtime<'rt> {
 
         let cutoff = parallel_sort_cutoff::<T>();
         if self.num_workers() <= 1 || data.len() <= cutoff {
-            data.sort_unstable_by(&cmp);
+            // `cmp` and not `&cmp`: this frame owns the comparator and the
+            // sort is the last thing it does with it, and the `&C` form
+            // costs up to 1.8x here -- the module's `# Design` section has
+            // the measurement.
+            data.sort_unstable_by(cmp);
             return;
         }
 
