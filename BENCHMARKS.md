@@ -61,6 +61,38 @@ noise is between runs rather than within one.
 
 ## What is measured
 
+**The fourteen sections this milestone added were measured in one pass on a
+quiet box**, a condition only the #359 measurement below has had before: no
+sibling agent, no other `cargo` anywhere, and `/proc/loadavg`'s runnable-task
+field at 1 or 2 throughout, so the load each shape ran under is its own 24
+threads and the decay of the shape before it rather than another workload.
+Those sections carry a figures table and no machine table of their own,
+because the machine is this one:
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| criterion | 0.8.2, 20 samples, 1s warm-up, 3s measurement per id -- every one of the fourteen targets, unchanged |
+| Date | 2026-11-19 |
+| **Load average** | **each shape's own: 3.2 to 11.1 before a shape and 5.6 to 13.0 after it, with nothing else on the box** |
+
+The shapes ran back to back, one `cargo bench --bench <name>` each, which is
+why a shape's "before" reading is its predecessor's tail rather than zero; the
+pass's own PR records the pair around each shape. No sample count was reduced:
+the caveat for a shape too slow to measure in one pass did not apply to any of
+the fourteen, the longest single id being `black_scholes/rustflow/1w/4000` at
+350 ms a sample. Every figure is **one** run of one id -- criterion's twenty
+samples are the statistic, so there is no best-of-N anywhere below -- quoted as
+the point estimate of the mean with half the width of criterion's 95%
+confidence interval as a plus-or-minus percentage, the convention every table
+in this file uses. A wide interval or a high outlier count is named under the table
+that has one rather than smoothed away. The one group this pass deliberately
+did *not* re-measure is `data_pipeline_slot`: those figures belong to the
+#186 decision below and re-taking them was not this pass's job, so
+`benches/data_pipeline.rs`'s two groups carry figures from two different runs.
+
 - **Ours includes building the graph.** Upstream's `measure_time_taskflow`
   wraps constructing the `tf::Taskflow` as well as running it, so the ported
   benchmarks do too. rayon has no graph to construct, which is the asymmetry to
@@ -2269,14 +2301,38 @@ array is filled with and fails whatever the tolerance, and the condition
 task's own lap count is asserted too, so a loop that quietly took one lap
 instead of `N` fails rather than benchmarks.
 
-**Figures for this section come from #352**, which measures every shape this
-milestone adds in one pass on a quiet box. This issue lands the shape, the ids
-(`rustflow/{1,24}w` and `rayon/{1,24}w` at sizes 1000 and 4000) and the
-assertions; three agents were building on this box while it was written, so
-any number taken here would record the load and not the shape. What is
-verified here is that the benchmark runs and that its answer is right:
-`cargo bench --all-features --bench black_scholes -- --test` drives all eight
-ids and the untimed check behind them.
+The eight ids are `black_scholes/{rustflow,rayon}/{1w,24w}/{1000,4000}`.
+
+| size | workers | rustflow | rayon | upstream C++ |
+|---|---|---|---|---|
+| 1000 | 1 | 22.38 ms ±1.1% | 23.18 ms ±0.2% | not published |
+| 1000 | 24 | 27.87 ms ±0.2% | 25.57 ms ±0.4% | not published |
+| 4000 | 1 | 349.6 ms ±0.2% | 354.8 ms ±0.7% | not published |
+| 4000 | 24 | 133.7 ms ±0.1% | 160.9 ms ±0.9% | not published |
+
+Criterion flagged 5 of 20 measurements as outliers on `rustflow/1w/1000` and 4
+of 20 on `rayon/1w/4000`; both intervals are nonetheless at or under ±1.1%.
+
+**At one worker the re-dispatchable loop is marginally the cheaper of the
+two**, by 3.6% at 1000 options and 1.5% at 4000. With one thread in either
+pool a lap is a condition task and a module dispatch on our side against
+ending and restarting a parallel iterator on rayon's, and those come out close
+enough that the row is a tie with a sign rather than a result. **At 1000
+options and 24 workers neither column gains, and ours loses** -- 27.87 ms
+against its own 22.38 ms at one worker, where rayon goes from 23.18 to
+25.57 ms. That is the section's own prediction met: 1000 laps of 42 options a
+worker is a lap boundary repeated a thousand times with almost nothing to
+amortise it against, so what the row measures is the boundary. At 4000 options
+it is amortised enough for both to gain -- 2.6x for ours, 2.2x for rayon's --
+and ours comes out 17% ahead, 133.7 ms against 160.9 ms.
+
+Dividing by the lap count puts the whole table on one line: at 4000 options a
+lap costs 33.4 µs through the graph against 40.2 µs through the barrier, and at
+1000 options 27.9 against 25.6. Both columns are far short of what 24 workers
+do to a flat fan-out of this much arithmetic, which is what a shape whose
+parallelism is bounded by a serial re-dispatch looks like; the condition task
+and the module dispatch are the cheaper boundary of the two at the size where
+either boundary is amortised at all.
 
 ## for_each
 
@@ -2323,11 +2379,42 @@ exactly one input element and both columns call the same `f64::tan` on it --
 so a chunk the partitioner never handed out fails the run instead of
 producing a figure.
 
-**Figures: measured by #352, which takes every M11 section's table in one
-quiet-box pass.** This section lands with its shape, its ids, its sizes and
-its baseline fixed and no numbers, deliberately: three agents were building
-on this box while it was written, and a figure taken then would record the
-load rather than the shape.
+| size | workers | rustflow | rayon | upstream C++ |
+|---|---|---|---|---|
+| 1000 | 1 | 19.78 µs ±5.1% | 12.12 µs ±8.5% | not published |
+| 1000 | 24 | 44.86 µs ±1.2% | 31.52 µs ±2.8% | not published |
+| 1000000 | 1 | 9.243 ms ±2.1% | 7.869 ms ±0.6% | not published |
+| 1000000 | 24 | 1.658 ms ±0.7% | 765.6 µs ±1.2% | not published |
+
+The 1000-element one-worker rows carry the loosest intervals in this pass after
+`reduce_sum`'s -- ±5.1% and ±8.5% -- and 4 of 20 measurements were flagged as
+outliers on `rustflow/1w/1000000` and on `rayon/24w/1000000`. A twelve
+microsecond run is a thousand `tan` calls and a pool hand-off, which is little
+for twenty samples to average over; read the ratios below against those widths
+rather than past them.
+
+**This is the closest the port comes to its baseline on a fan-out shape, and
+it is still behind at every row**: 1.63x at 1000 and one worker, 1.42x at 1000
+and 24, 1.17x at a million and one worker, 2.17x at a million and 24. The
+one-worker million-element row is the honest best case -- 9.24 ns an element
+against 7.87 ns, a gap of 1.4 ns on a body that is most of the 7.87 by itself.
+What opens the gap again at 24 workers is the split rather than the body:
+rayon turns its 7.869 ms into 765.6 µs, a 10.3x speed-up, where we turn
+9.243 ms into 1.658 ms, 5.6x. Neither is near linear, since a million `tan`s
+is a few milliseconds of arithmetic over a memory pass and both columns are
+partly bound by the array; the factor of nearly two between the two speed-ups
+is the partitioner's and the per-chunk dispatch's, which is what this shape
+isolates.
+
+**The cross-table comparison this section was added for.** At 24 workers
+`for_each` spends 1.66 ns an element end to end (1.658 ms over a million),
+where `embarrassing_parallelism` above spends 176 ns a task (11.54 ms over
+65536) of which some 153 ns is not the body. Splitting an index range is
+therefore two orders of magnitude cheaper a unit of work than enqueuing a node
+per unit -- which is what that table's declaration-only id was pointing at.
+Read the order of magnitude and not the digits: those rows come from a
+different run, at a load of 7.9 to 10.6, with a different body and a different
+size.
 
 ## reduce_sum
 
@@ -2363,8 +2450,36 @@ writes it, so every round there sums zeroes -- an answer a run that skipped
 half the range would also reach -- while the port fills the vector from the
 same generator `sort`'s does.
 
-**Figures: measured by #352**, for the reason the `for_each` section above
-states.
+| size | workers | rustflow | rayon | upstream C++ |
+|---|---|---|---|---|
+| 1000 | 1 | 10.22 µs ±22.8% | 4.897 µs ±0.4% | not published |
+| 1000 | 24 | 135.4 µs ±1.0% | 28.45 µs ±2.2% | not published |
+| 1000000 | 1 | 643.5 µs ±0.1% | 618.7 µs ±0.1% | not published |
+| 1000000 | 24 | 283.4 µs ±0.8% | 111.4 µs ±0.9% | not published |
+
+**`rustflow/1w/1000` is the one cell in this pass whose interval is too wide to
+read as a point**: ±22.8%, against the ±0.4% of the baseline beside it. It is
+quoted rather than dropped and rather than re-run -- one run per id is the
+rule this pass is measured under -- but it means "about 10 µs" and nothing
+finer. 6 of 20 measurements were flagged as outliers on `rayon/1w/1000000`,
+whose interval is nonetheless ±0.1%.
+
+**The million-element one-worker row is a near tie, which is this section's own
+prediction**: 643.5 µs against 618.7 µs, 4% apart, for a fold whose body is one
+`f64` addition over a pass of eight megabytes -- both columns are reading
+memory and a schedule has little room to show. What the merge costs shows at
+the other three rows. At a million elements and 24 workers we reach 283.4 µs,
+2.3x our own one worker, where rayon reaches 111.4 µs, 5.6x. The per-worker
+local and its one `gop` merge cannot be the difference -- there are 24 of them
+in a run of a quarter of a millisecond -- so what is left is the per-chunk
+dispatch `for_each` isolates, now spread over a fold cheap enough an element
+that it hides none of it.
+
+The 1000-element rows say the same thing from the other side. At 24 workers a
+thousand-element sum costs us 135.4 µs against 10.2 µs at one worker: a factor
+of thirteen **lost** by adding workers, where rayon loses 5.8x. Both columns
+agree that the right worker count for a sum this short is one, and this table
+puts the crossover somewhere above a thousand elements for either of them.
 
 ## scan
 
@@ -2408,8 +2523,35 @@ measured region and its whole output buffer is compared, slot by slot,
 against the sequential baseline's, so a block whose carry-in was never
 applied fails the run rather than producing a figure.
 
-**Figures: measured by #352**, for the reason the `for_each` section above
-states.
+| size | workers | rustflow | sequential | upstream C++ |
+|---|---|---|---|---|
+| 1000 | 1 | 10.53 µs ±0.5% | 630.8 ns ±0.1% | not published |
+| 1000 | 24 | 241.7 µs ±0.9% | 630.8 ns ±0.1% | not published |
+| 1000000 | 1 | 635.8 µs ±0.1% | 640.5 µs ±0.1% | not published |
+| 1000000 | 24 | 343.1 µs ±0.8% | 640.5 µs ±0.1% | not published |
+
+5 of 20 measurements were flagged as outliers on `rustflow/24w/1000000`; every
+interval in the table is at or under ±0.9%.
+
+**The question this section asks -- whether two passes over the data across
+several workers beat one pass on one -- comes out "only at the larger size, and
+then by less than a factor of two."** At a million elements the two columns
+tie at a single worker, 635.8 µs against 640.5 µs -- as they must, since
+`inclusive_scan` takes upstream's own `W <= 1` single-pass path there and is
+then the same one pass through a different loop -- and the parallel scan beats
+the sequential one 1.87x at 24 workers. The sequential column is why that win
+is so small rather than the parallel column being slow: 640.5 µs for a million
+`wrapping_mul`s is 0.64 ns an element, one integer multiply's latency at this
+clock, so the baseline is a dependency chain running at the hardware's limit
+and the two-pass algorithm has to do twice the multiplies before any of its
+workers helps.
+
+At a thousand elements the parallel scan loses by 17x at one worker and by
+383x at 24. A 630 ns sequential scan is shorter than building the one-node
+taskflow and handing out its chunks, and at 24 workers it is shorter than
+waking the workers that would take them: 241.7 µs for 41 elements a worker is
+the clearest statement in this file of what a parallel algorithm's floor costs
+when there is nothing above it.
 
 ## primes
 
@@ -2444,11 +2586,36 @@ worker count and their counts asserted against a single-threaded reference
 over the same `is_prime` -- a count that is only right on one thread is still
 wrong, so each worker count checks its own.
 
-**The figures and the load this section's run saw come from #352**, which
-measures every M11 section in one pass on a quiet box. This issue landed the
-benchmark, not the numbers: three agents were building on this machine while
-it was written, and a figure taken then would have recorded the load rather
-than the shape.
+| size | workers | rustflow | rayon | upstream C++ |
+|---|---|---|---|---|
+| 10000 | 1 | 66.82 µs ±2.9% | 64.79 µs ±1.2% | not published |
+| 10000 | 24 | 160.9 µs ±5.3% | 52.20 µs ±0.8% | not published |
+| 1000000 | 1 | 29.58 ms ±0.1% | 29.03 ms ±0.1% | not published |
+| 1000000 | 24 | 2.925 ms ±0.4% | 2.636 ms ±1.3% | not published |
+
+`rustflow/24w/10000` is the loosest cell at ±5.3%, which is small against the
+factor of three that row reports.
+
+**At one worker the two columns are the same program**: 66.82 against 64.79 µs
+at 10000 and 29.58 against 29.03 ms at a million, 3.1% and 1.9% apart. That is
+what a shape whose body is trial division should say about a scheduler, and it
+is the control the other two rows are read against. At a million and 24
+workers the gap is 11% -- 2.925 ms against 2.636 ms -- with both columns
+reaching 10.1x and 11.0x of their own one worker, which is the range twelve
+physical cores with SMT give an ALU-bound body and not a scheduling ceiling
+either side is hitting.
+
+**The 10000-element 24-worker row is the one the two sides' chunk sizes
+decide, and it costs us 3.1x**: 160.9 µs against 52.20 µs, and 2.4x our own one
+worker. `value = 10000` is a thousand chunks of ten, each about 70 ns of
+division at this end of the range, handed out one at a time through one shared
+cursor -- a thousand hand-offs inside 160.9 µs is 161 ns of wall clock each,
+more than twice the division a chunk contains, which is what a row bounded by
+its cursor rather than by its arithmetic looks like. rayon splits the same range adaptively from its
+length and hands each worker a contiguous four hundred integers instead. The
+section says above that forcing rayon to ten would measure a rayon nobody
+writes; this row is what the difference is worth, and it is the dominant term
+in it rather than anything about the two schedulers' queues.
 
 ## mandelbrot
 
@@ -2492,8 +2659,29 @@ because the quantity is an iteration count rather than a floating-point
 result, and the per-variant buffer is what makes a skipped line fail here
 instead of silently reading the other column's work.
 
-**The figures and the load this section's run saw come from #352**, for the
-reason the `primes` section above gives.
+| size | workers | rustflow | rayon | upstream C++ |
+|---|---|---|---|---|
+| 100 | 1 | 16.11 ms ±0.1% | 16.38 ms ±0.5% | not published |
+| 100 | 24 | 1.042 ms ±1.5% | 1.229 ms ±0.6% | not published |
+| 500 | 1 | 405.9 ms ±0.7% | 410.9 ms ±0.7% | not published |
+| 500 | 24 | 21.96 ms ±2.1% | 22.67 ms ±0.5% | not published |
+
+**This is the first shape in this file where the port is ahead of its rayon
+baseline at every row**, and the margin is small everywhere but one: 1.7% at
+100 lines and one worker, 1.2% at 500 and one worker, 3.2% at 500 and 24
+workers, and 15% at 100 lines and 24 workers. The two one-worker rows are a
+tie by construction -- one thread renders every line whatever order it picks
+them in -- and that is what makes them the control: the two columns' buffers,
+locks and kernels cost the same to within a percent or two, so the 24-worker
+rows can be read as scheduling and nothing else.
+
+There the chunk of one earns its keep. 100 unequal lines over 24 workers is
+four lines a worker if the deal is even and a visible imbalance if it is
+static, and `for_each_index`'s dynamic partitioner at a chunk of one reaches
+15.5x of its own one worker where rayon's adaptive split reaches 13.3x. At 500
+lines there are twenty lines a worker, enough that either policy averages out,
+and the two reach 18.5x and 18.1x -- the imbalance stops being what the row is
+about and the row goes back to being a tie.
 
 ## matrix_multiplication
 
@@ -2548,8 +2736,30 @@ and legitimately so: every value is a whole number,
 under `2^53`, so every partial sum is exactly representable and the summation
 order cannot change the answer.
 
-**The figures and the load this section's run saw come from #352**, for the
-reason the `primes` section above gives.
+| size | workers | rustflow | rayon | upstream C++ |
+|---|---|---|---|---|
+| 128 | 1 | 1.908 ms ±1.1% | 2.145 ms ±0.5% | not published |
+| 128 | 24 | 256.6 µs ±0.3% | 317.8 µs ±1.1% | not published |
+| 512 | 1 | 264.1 ms ±0.1% | 266.8 ms ±0.1% | not published |
+| 512 | 24 | 14.86 ms ±1.0% | 16.06 ms ±1.7% | not published |
+
+**The port is ahead at all four rows -- 11% and 19% at 128, 1.0% and 7.5% at
+512 -- and the representation is why that is a surprise rather than why it
+happens.** `AtomicU64` cells accessed `Relaxed` can only cost us against plain
+`f64`s: the same `mov`, but neither vectorisable nor hoistable. So the table's
+sign is the thing to read first, and its size second.
+
+Two of the four rows are not about the graph at all. At 512 and one worker the
+`O(N³)` product is the run and the two inner loops agree to 1.0%, which is
+what a relaxed store per `j` against a plain one should cost. At 128 and one
+worker nothing runs concurrently on either side -- three init passes and a
+product, in order -- so that row's 11% is those passes' own cost and not the
+three sources. What the edges are worth is the *change* between the worker
+counts: 11% to 19% at 128 and 1.0% to 7.5% at 512, eight and six and a half
+points gained by letting `init_a`, `init_b` and `init_c` run together where
+rayon's three `par_iter_mut`s are three barriers. That is the one place in this
+suite where "ours includes building the graph" buys something back, and six to
+eight points of a run is what it buys.
 
 ## wavefront
 
@@ -2610,12 +2820,34 @@ which is what upstream reports. The six ids are therefore
 `wavefront/sequential/{1024, 16384}` and
 `wavefront/rustflow/{1w, 24w}/{1024, 16384}`.
 
-**The figures for this section come from #352**, the one quiet-box pass that
-measures every section this milestone adds at full width; the machine and load
-table belongs to that run and is recorded there with them. Nothing was timed
-for this section, deliberately: three agents were building and testing on this
-box while it was written, and a number measured under that load would describe
-the load rather than the shape.
+| size | workers | rustflow | sequential | upstream C++ |
+|---|---|---|---|---|
+| 1024 (32x32) | 1 | 1.110 ms ±0.9% | 930.6 µs ±0.1% | not published |
+| 1024 (32x32) | 24 | 472.9 µs ±0.2% | 930.6 µs ±0.1% | not published |
+| 16384 (128x128) | 1 | 21.04 ms ±7.7% | 14.13 ms ±0.2% | not published |
+| 16384 (128x128) | 24 | 5.324 ms ±1.3% | 14.13 ms ±0.2% | not published |
+
+`rustflow/1w/16384` carries ±7.7%, the widest interval in this pass after
+`reduce_sum`'s one wide cell, so read it as "40 to 60% over the sequential
+sweep" rather than as the 49% its point estimate gives.
+
+**One worker pays for the graph and gets nothing back**: 1.110 ms against the
+sequential sweep's 930.6 µs at 1024 blocks and 21.04 ms against 14.13 ms at
+16384. That is this file's standing asymmetry with no parallelism to offset
+it -- 16384 placeholders, their bodies and 32512 edges are built inside the
+measured region, where a row-major sweep builds nothing -- and it is the
+reason the one-worker column of a dependency shape is a cost and not a
+comparison.
+
+**24 workers buy 2.0x at 1024 blocks and 2.65x at 16384, and the
+anti-diagonal is the ceiling rather than the scheduler.** A 128x128 grid's
+frontier averages 64 blocks over its 255 steps but begins and ends at one, and
+each of those steps is a join the blocks behind it wait on; the sequential
+column puts a block's own work at 862 ns, so there is not much for a worker to
+do between two joins. Against that, 24 workers turn 862 ns of serial work a
+block into 325 ns of wall clock a block: the graph pays for itself by 2.65x
+where its one-worker column cost 49%, and what separates those two figures is
+the shape's own parallelism rather than anything the scheduler decides.
 
 What the benchmark does assert, with no timing involved, is the answer. The
 sweep's result is a deterministic function of the grid, so
@@ -2682,15 +2914,33 @@ criterion times anything, which upstream does not do at all --
 recursion that lost a subtree fails the bench rather than reporting a good
 number for doing less work.
 
-**The figures are not in this section yet, and that is deliberate.** This
-shape landed while sibling agents were building and testing this crate on the
-box, so a number taken now would be the load and not the shape -- the same
-trap "The machine, and what it was doing" and the `Work` decision above each
-record falling into. **#352 measures every section this milestone adds in one
-pass on a quiet box at full width**, and fills in the machine-and-load table
-and the size × workers × {`rustflow-group`, `rayon`, upstream C++ = not
-published} table in the format the `sort` section uses, together with the
-paragraph reading them.
+| size | workers | rustflow-group | rayon | upstream C++ |
+|---|---|---|---|---|
+| `MaxDepth = 3` | 1 | 237.1 µs ±0.7% | 29.05 µs ±0.4% | not published |
+| `MaxDepth = 3` | 24 | 539.9 µs ±1.5% | 33.08 µs ±1.6% | not published |
+| `MaxDepth = 4` | 1 | 2.296 ms ±0.8% | 254.3 µs ±0.3% | not published |
+| `MaxDepth = 4` | 24 | 2.465 ms ±1.9% | 119.8 µs ±0.6% | not published |
+
+**The port loses this shape by between 8 and 21x, and what to take from the
+table is the per-task constant rather than any of those ratios.** At
+`MaxDepth = 4` and one worker, 11110 spawned tasks in 2.296 ms is 207 ns a
+task against the rayon scope's 22.9 ns. The body adds ten slots and returns, so
+essentially the whole 184 ns of difference is the submission path: a
+`silent_async` into the shared buffers, an `Arc<[AtomicU64; 10]>` allocated and
+dropped per interior node, and a `corun` whose parent is re-queued when its
+tenth child lands.
+
+**24 workers make our column slower and rayon's faster, which is the most
+informative pair of rows here.** 237.1 to 539.9 µs at `MaxDepth = 3` and 2.296
+to 2.465 ms at 4, against rayon's 29.05 to 33.08 µs and 254.3 to 119.8 µs. A
+`TaskGroup`'s children go to the shared overflow buffers rather than to the
+submitting worker's own queue, so every one of those tasks is distributed by
+stealing and every parent goes back on a queue instead of being resumed where
+it stopped; with 23 other workers contending for the buffers that costs more
+than the extra hands earn, and a tree of 11110 tasks of nothing never grows
+enough to carry it. These four rows are the preempted parent the paragraph
+below names, priced, and they are the baseline #342's A/B is measured
+against.
 
 What the shape is here to measure, which is why the ids above are the ones
 #342 will A/B: every one of the `(10^MaxDepth - 1) / 9` interior nodes is a
@@ -2755,11 +3005,30 @@ Upstream checks the same table after its clock stops; the difference is only
 that the check here runs once per id, before criterion times that id a
 hundred times.
 
-**The figures are not in this section yet, for the reason the `skynet`
-section above gives, and #352 takes them**: the machine-and-load table, the
-size × workers × {`rustflow-group`, `rayon`, upstream C++ = not published}
-table and the paragraph reading them, measured on a quiet box in one pass with
-every other section this milestone adds.
+| size | workers | rustflow-group | rayon | upstream C++ |
+|---|---|---|---|---|
+| `q = 6` | 1 | 84.09 µs ±0.4% | 31.97 µs ±1.0% | not published |
+| `q = 6` | 24 | 829.7 µs ±6.5% | 28.20 µs ±2.0% | not published |
+| `q = 8` | 1 | 1.156 ms ±0.5% | 535.8 µs ±0.1% | not published |
+| `q = 8` | 24 | 2.946 ms ±4.6% | 184.5 µs ±1.1% | not published |
+
+The two 24-worker `rustflow-group` cells carry ±6.5% and ±4.6%, the loosest in
+either recursive section, with 3 of 20 measurements flagged on `rayon/24w/8`.
+The gaps below are factors rather than percentages, so those widths change
+nothing about any of them.
+
+**The ragged tree costs the port less than the regular one at one worker and
+more at 24.** At `q = 8` and one worker it is 2.2x behind -- 1.156 ms against
+535.8 µs, or 562 ns a task against 261 over 2056 tasks -- where `skynet` at one
+worker is 9.0x behind, because a `nqueens` body copies a board and prunes a
+column and so gives the submission path something to hide behind. At 24
+workers it goes the other way: 2.946 ms against 184.5 µs is 16x, with our
+column 2.5x slower than its own one worker while rayon's scope is 2.9x faster
+than its own. Most interior nodes here wait on a handful of children rather than on
+ten, so a parent is re-queued after very little work and the re-queue is a
+larger share of a node's cost than it is in `skynet` -- which is the reason
+this section gives above for measuring the pair rather than either alone, now
+with a number on it.
 
 ## graph_pipeline
 
@@ -2817,15 +3086,28 @@ that sums the wrong predecessors fails the benchmark instead of winning it.
 The ids are `graph_pipeline/mpsc/<|V|+|E|>` and
 `graph_pipeline/rustflow/8l_<workers>w/<|V|+|E|>`.
 
-**No figures here yet, and that is deliberate.** Three sibling agents were
-building and testing on this box while this shape was written, so any number
-measured now would be the load rather than the shape. #352 measures every
-section this milestone adds in one quiet-box pass at full width; the
-machine-and-load table and the `|V| + |E|` × workers × {rustflow, mpsc,
-upstream C++ = not published} table land with it, in the format the `sort` and
-`pipeline` sections above use. What is established here is that both ids run to
-completion at both worker counts and that both agree with upstream's `gold`
-answer.
+| graph size | workers | rustflow | mpsc | upstream C++ |
+|---|---|---|---|---|
+| 857 (16x16) | 1 | 592.4 µs ±0.4% | 277.4 µs ±0.7% | not published |
+| 857 (16x16) | 24 | 534.8 µs ±0.3% | 277.4 µs ±0.7% | not published |
+| 51055 (121x121) | 1 | 32.77 ms ±0.2% | 11.37 ms ±0.4% | not published |
+| 51055 (121x121) | 24 | 28.71 ms ±0.2% | 11.37 ms ±0.4% | not published |
+
+**An all-serial chain has no pipe-level parallelism to win, and the table says
+so twice.** 24 workers buy 10% at the smaller graph and 12% at the larger over
+our own one worker -- not nothing, since lines do overlap stages -- and the
+four-thread mpsc chain is 1.9x and 2.5x ahead of the better of our two rows at
+the two sizes. Per token the larger graph is 14641 nodes through four pipes:
+1.96 µs a token for us at 24 workers against the chain's 777 ns, or about
+300 ns a pipe hop more than a channel send.
+
+That is the `pipeline` section's `L = 1` finding reached from a different
+direction -- there one line removed the pipeline parallelism, here every pipe
+being serial does -- and it is the comparison the shape offers rather than a
+defect in it: four `std::thread`s dedicated to four stages are a very good
+implementation of a four-stage serial chain, and what a `Pipeline` adds over
+them is the ability to make a middle pipe parallel, which upstream's own
+benchmark never does.
 
 ## data_pipeline
 
@@ -2877,14 +3159,28 @@ either id is registered.
 The ids are `data_pipeline/mpsc/<size>` and
 `data_pipeline/rustflow/8l_<workers>w/<size>`.
 
-**No figures here yet, for the same reason the `graph_pipeline` section above
-gives:** the box was loaded by sibling agents while this shape was written, and
-#352 takes the figures for every section this milestone adds in one quiet-box
-pass. The machine-and-load table and the size × workers × {rustflow, mpsc,
-upstream C++ = not published} table land with it. What is established here is
-that both ids run to completion at both worker counts, that each agrees with
-the sequential fold, and that every id the #186/#188 section quotes still
-exists under the name it quotes (`cargo bench -- --list`).
+| size | workers | rustflow | mpsc | upstream C++ |
+|---|---|---|---|---|
+| 1024 | 1 | 1.838 ms ±1.0% | 929.5 µs ±0.6% | not published |
+| 1024 | 24 | 1.980 ms ±0.1% | 929.5 µs ±0.6% | not published |
+| 16384 | 1 | 29.30 ms ±0.5% | 12.92 ms ±0.4% | not published |
+| 16384 | 24 | 31.32 ms ±0.2% | 12.92 ms ±0.4% | not published |
+
+**Upstream's own typed chain is `graph_pipeline`'s result with even the
+24-worker gain removed**: 2.0x and 2.3x behind the mpsc chain at one worker,
+2.1x and 2.4x at 24, and 24 workers cost 8% and 7% here rather than buying
+anything. Four serial pipes over eight lines are four stages of concurrency
+whatever the worker count, so the extra 23 workers have nothing to do but
+contend for the line locks -- which is what those two rows are.
+
+Per token at 16384 the chain is 789 ns and our line is 1.91 µs at 24 workers,
+so a typed hop costs about 280 ns more than a typed channel send. Against
+`graph_pipeline`'s 300 ns on this same pass, the two shapes' per-hop overheads
+agree to within what their pipes do differently, which is the thing to want
+from two ports of one scheduler: the figure belongs to this crate's per-pipe
+dispatch rather than to either benchmark's own arithmetic, and the typed slot
+the `DataPipeline` adds over the untyped `Pipeline` is inside that agreement
+rather than visible above it.
 
 ## merge_sort
 
@@ -2962,15 +3258,42 @@ sequence of a multiset of `f64`s is unique whatever order the halves were
 merged in -- and a mutation confirms it bites: a left branch handed one
 element fewer fails at index 762 of the 10_000 rather than producing a figure.
 
-**Figures: measured by #352**, which takes every M11 section's table in one
-quiet-box pass. This section lands with the shape, the ids
-(`rustflow/{1,24}w` and `rayon/{1,24}w` at sizes 10_000 and 1_000_000), the
-sizes and the baseline fixed, and no numbers and no load row: three sibling
-agents were building on this box while it was written, so a figure taken here
-would record the load rather than the shape. What is verified here is that
-the benchmark runs and that its answer is right --
-`cargo bench --all-features --bench merge_sort -- --test` drives all eight
-ids and the untimed comparison behind them.
+The eight ids are `merge_sort/{rustflow,rayon}/{1w,24w}/{10000,1000000}`.
+
+| size | workers | rustflow | rayon | upstream C++ |
+|---|---|---|---|---|
+| 10000 | 1 | 268.5 µs ±1.6% | 247.5 µs ±0.3% | not published |
+| 10000 | 24 | 835.1 µs ±4.7% | 145.0 µs ±0.8% | not published |
+| 1000000 | 1 | 57.14 ms ±0.3% | 59.86 ms ±1.1% | not published |
+| 1000000 | 24 | 17.39 ms ±1.1% | 19.16 ms ±2.5% | not published |
+
+`rustflow/24w/10000` is ±4.7% with 4 of 20 measurements flagged as outliers,
+and 5 of 20 were flagged on each of the million-element one-worker ids, whose
+intervals are ±0.3% and ±1.1%.
+
+**The two million-element rows go the port's way, and they are not a scheduler
+result.** 57.14 ms against 59.86 ms at one worker and 17.39 ms against
+19.16 ms at 24 -- 4.6% and 9.3%, both outside either id's interval. At a
+million elements the recursion is 1023 spawned tasks against some twenty
+million compare-and-copy operations, and at one worker nothing is stolen and
+nothing is contended, so a 4.6% difference there can only be in the merge loop
+and the buffer rather than in the fork: the `rustflow` column merges through a
+slice of `AtomicU64` with relaxed loads and stores, which is the instruction
+sequence a plain `f64` merge compiles to on this target, and the rayon column
+gets real `&mut [f64]` halves. Which way round that asymmetry would be expected
+to fall is the point: it falls the other way, by five percent, and this table
+cannot say why.
+
+**The 10_000-element rows are the ones that answer the question this section
+exists for, and they go the other way.** 8.5% behind at one worker over 15
+spawned tasks, and 5.8x behind at 24 workers, where our 835.1 µs is 3.1x our
+own one-worker time and rayon's 145.0 µs is 1.7x faster than its own. Fifteen
+tasks whose leaves are 1024-element sorts, distributed by stealing out of the
+shared buffers with a parent re-queued at every level, is the `skynet` and
+`integrate` finding at a thirtieth of their task count. What the million-element
+rows add is the other half of it: this fork is expensive per task and the per
+task cost is all it is, so a shape with enough work per level buries it
+entirely.
 
 ## integrate
 
@@ -3048,7 +3371,30 @@ slot fails the closed-form check outright, while a parent that scales its
 child's area by `1 - 1e-12` passes it and fails the reference check at a
 relative `4.3e-12`.
 
-**Figures: measured by #352**, for the reason the `merge_sort` section above
-states. The ids are `rustflow/{1,24}w` and `rayon/{1,24}w` at `V = 1` and
-`V = 2`, and `cargo bench --all-features --bench integrate -- --test` drives
-all eight of them and both untimed checks.
+The eight ids are `integrate/{rustflow,rayon}/{1w,24w}/{1,2}`.
+
+| size | workers | rustflow | rayon | upstream C++ |
+|---|---|---|---|---|
+| `V = 1` | 1 | 277.4 µs ±1.5% | 20.02 µs ±0.4% | not published |
+| `V = 1` | 24 | 1.287 ms ±2.6% | 30.93 µs ±1.8% | not published |
+| `V = 2` | 1 | 636.6 µs ±0.6% | 41.86 µs ±0.6% | not published |
+| `V = 2` | 24 | 2.064 ms ±2.5% | 39.24 µs ±1.4% | not published |
+
+4 of 20 measurements were flagged as outliers on `rustflow/1w/1`; no interval
+in the table exceeds ±2.6%, which is nothing against the ratios in it.
+
+**This is the widest gap in the file -- 14x and 15x at one worker, 42x and 53x
+at 24 -- and it is the per-task constant with nothing in front of it.** A node
+bisects an interval, evaluates two trapezoids and compares them: five or six
+`f64` operations, where `merge_sort`'s million-element rows hide the same fork
+behind twenty million of them. At `V = 2` and one worker, 1852 spawned tasks in
+636.6 µs is 344 ns a task against the `rayon::join` column's 22.6 ns.
+
+The 24-worker rows then repeat `skynet`'s direction: ours goes from
+636.6 µs to 2.064 ms, 3.2x slower for 23 more workers, because a `TaskGroup`'s
+children are distributed by stealing out of the shared buffers and each parent
+is re-queued when its one child lands, while `rayon::join` on the same tree
+barely moves (41.86 to 39.24 µs). Read with the #359 section above, the two
+measurements are one finding from two directions: a nested corun through this
+route costs about a kilobyte of stack and a few hundred nanoseconds a task,
+and both are the queue destination rather than `corun` itself.
