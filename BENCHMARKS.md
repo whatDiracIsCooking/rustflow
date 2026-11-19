@@ -751,7 +751,11 @@ core boundary. Closing the rest of this gap means giving the scheduler a
 splittable source range, i.e. something `tf::Taskflow` does not have and
 `tf::TaskGroup`'s `for_each` is the nearest thing to; it is a milestone, not a
 patch. **That is the recorded cost of the architecture, with the numbers above
-as the evidence.**
+as the evidence.** That milestone has since been measured: `for_each_by_index`
+with a partitioner is that splittable range, and the "#343 attribution"
+section at the end of this file finds its chunk loop to be rayon's equal and
+the remaining gap to be this paragraph's own handoff, reaching only 15 to 19
+of 24 workers on a fan-out shape.
 
 ## The two shapes #96 added, and how they were measured
 
@@ -2697,6 +2701,12 @@ partly bound by the array; the factor of nearly two between the two speed-ups
 is the partitioner's and the per-chunk dispatch's, which is what this shape
 isolates.
 
+**Read that last sentence against the "#343 attribution" section at the end of
+this file, which takes it apart and finds it wrong on both counts**: the
+per-chunk cost is 15 ns and 1.3% of the run, and most of the 24-worker gap in
+the table above is this harness's own per-iteration input buffer rather than
+either schedule.
+
 **The cross-table comparison this section was added for.** At 24 workers
 `for_each` spends 1.66 ns an element end to end (1.658 ms over a million),
 where `embarrassing_parallelism` above spends 176 ns a task (11.54 ms over
@@ -3689,3 +3699,296 @@ barely moves (41.86 to 39.24 µs). Read with the #359 section above, the two
 measurements are one finding from two directions: a nested corun through this
 route costs about a kilobyte of stack and a few hundred nanoseconds a task,
 and both are the queue destination rather than `corun` itself.
+
+## The #343 attribution: a chunk costs 15 ns, and the gap is the fan-out
+
+The `for_each` section above reads a 2.17x gap at a million elements and 24
+workers and says what to look for: "the factor of nearly two between the two
+speed-ups is the partitioner's and the per-chunk dispatch's". #343 took that
+apart with counters and ablations, in the shape #125's section is the model
+for, and **both halves of that sentence are wrong**. A chunk costs about 15 ns
+and there are 547 of them, which is 1.3% of the run; the port's own chunk loop,
+fanned out by rayon instead of by this executor, is *faster* than rayon's own
+range split on the same body and the same buffer. What is left is two things
+that have nothing to do with chunks: **the fan-out reaches only 15 to 19 of the
+24 workers** in an uninstrumented-length run, and **most of the published gap
+is the benchmark harness's own per-iteration input buffer**.
+
+**No shipped code changed**, and the decision at the end says why. Nothing in
+`src/` carries a counter from this run either: everything below was counted
+through the public API from a harness outside the repo -- the chunk body counts
+its own chunks, and `Executor::make_observer` counts which worker entered each
+dispatched task -- so there was nothing a `cfg` was needed for. (A new `cfg`
+name would also have to be declared in `Cargo.toml`'s `check-cfg`, since
+`unexpected_cfgs` is a warning and the gate denies warnings.) The `for_each`
+table above is therefore untouched, and the two ids it reads were re-run as
+published rather than replaced.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 9 5900X, 12 cores / 24 threads |
+| `available_parallelism` | 24 |
+| OS / toolchain | Debian 12 (bookworm) container, rustc 1.100.0, `--release` |
+| criterion | 0.8.2, where used: 20 samples, 1s warm-up, 3s measurement |
+| Date | 2026-11-19 |
+| **Load average** | **0.04 to 1.5, and all of it this run's own** |
+
+The box was this run's alone: no sibling agent, nothing else building, and
+`/proc/loadavg` was recorded either side of every measurement below (the raw
+output names them one by one). Two regimes appear in the tables and the
+difference between them turns out to be most of the finding:
+
+- **Regime A**, the one the ablations are read in: the input buffer is
+  allocated and written before the timer and freed after it, so what is timed
+  is the run. Each variant is one run per rep, variants **rotated** so none is
+  always first, medians of 11 to 21 reps, with each side's own min and max
+  printed.
+- **Regime B**, criterion's: `iter_batched` with `BatchSize::LargeInput` is
+  `ceil(iters/1000)`, which is **1** for every sample either id of this shape
+  reaches, so each iteration allocates and writes a fresh 8 MB input outside
+  the timer and *frees it inside* -- the bench's own closure takes the input by
+  value. The `for_each` table is regime B.
+
+### The counters: what the chunk loop actually runs
+
+One instrumented run per partitioner, `n = 1000000` at 24 workers, three runs
+each, counts and emphatically not timings. "Workers that ran a chunk" is the
+number of distinct threads a chunk body was ever called on; "busy / span" is
+the sum of the chunk bodies' own durations over the wall span of the whole
+dispatch, which is the same quantity read as an effective worker count.
+
+| partitioner (chunk size) | chunks | min / median / max chunk | tasks | workers that ran a chunk | busy / span |
+|---|---|---|---|---|---|
+| guided, floor 1 (`DefaultPartitioner`) | **547** | 1 / 67 / 20833 | 24 | **17 / 19 / 18** | 12.0 / 16.7 / 13.2 |
+| static, chunk 0 | **24** | 41666 / 41667 / 41667 | 24 | 18 / 22 / 18 | 10.7 / 13.0 / 10.8 |
+| guided, 4096 | 126 | 1066 / 5647 / 20833 | 24 | 19 / 21 / 17 | 12.8 / 16.9 / 15.3 |
+| dynamic, 4096 | 245 | 576 / 4096 / 4096 | 24 | 16 / 20 / 18 | 14.6 / 17.8 / 15.6 |
+| dynamic, floor 1 | **1000000** | 1 / 1 / 1 | 24 | 24 | 0.3 |
+
+**A method note that is itself a result.** The first version of this counter
+took one shared `Mutex` per chunk, and under it 22 to 24 of the 24 workers ran
+a chunk and the dispatch took 1134 to 1342 µs instead of 760 to 1205. The log
+is now one `Mutex` *per thread*, so a chunk record is an uncontended lock, and
+the worker count fell -- the observer below, the lightest instrument of the
+three, reads 15 to 18. The three instruments agree in the direction that
+matters: **how many workers arrive is a race against the run finishing**, so a
+heavier instrument lengthens the run and lets more of them in. Every count in
+this section is from the light log or the observer, and the shared-log figures
+are quoted only here, as the control that found the effect.
+
+Three things in that table are the whole section.
+
+- **A chunk allocates nothing.** The arena #144 sized to one node is allocated
+  per *task*, not per chunk: `dispatch` builds `w` of them, `w - 1` through
+  `Runtime::silent_async` and one run inline, so 547 chunks cost 23 free nodes
+  and not 547. Each of those 23 is one `Arc<AsyncNode>`, one one-node arena,
+  two boxed closures (the chunk body is boxed by `dispatch` and again by
+  `silent_async`) and one `notify_one`. `Scope::spawn` and
+  `Scope::spawn_runtime` are called **zero** times on this shape: the bench
+  reaches `for_each_by_index` through `AlgorithmBuilder`, whose dispatch
+  submits through `Runtime::silent_async`, and `Runtime::scope` is only on the
+  borrowed form -- whose ablation below costs nothing measurable anyway.
+- **The default partitioner's floor of 1 spends 328 of its 547 chunks on the
+  last 1% of the elements.** Guided takes `r / 2w` of whatever remains, so the
+  chunk size decays geometrically to the floor; the end of the range is handed
+  out a few elements at a time. That end game is 3%, 23% and 26% of the span
+  in the three runs. Upstream's own default is the same floor (`chunk_size == 0
+  ? 1 : chunk_size`, `DefaultPartitioner = GuidedPartitioner<>`, both confirmed
+  against `taskflow/algorithm/partitioner.hpp` at the pinned tag), so this is
+  the port reproducing upstream and not a translation slip.
+- **`DynamicPartitioner::default()` hands out a million chunks of one
+  element.** That is upstream's default too, and it is unusable at this size:
+  18.3 ms through rayon's fan-out against 593 µs for the same body under the
+  guided cursor. It is in the table because a reader who sets a partitioner but
+  not a chunk size needs to see it.
+
+### The fan-out counter: 24 tasks, 15 to 18 workers
+
+The same question asked by a second instrument, with no chunk log at all: an
+`Observer` registered on the executor, counting task entries per worker id.
+Nine runs, `n = 1000000`, 24 workers:
+
+| | entries | distinct workers | first entries spread over |
+|---|---|---|---|
+| guided, floor 1 | 25, 25, 25 | **16, 17, 17** / 24 | 90 µs; 85 µs + one at 1.1 ms; 47 µs + two at 1.2 ms |
+| static | 25, 25, 24 | **17, 15, 18** / 24 | 83 µs; 74 µs; 72 µs + two at 0.7 ms |
+| guided, 4096 | 24, 25, 25 | **15, 15, 17** / 24 | 31 µs + three at 1.2 ms; 90 µs; 57 µs + one at 1.2 ms |
+
+Twenty-five entries is the runtime node plus its 24 chunk tasks, so every task
+*is* dispatched and every one does run. But they run on 15 to 18 distinct
+workers out of 24, which agrees with the chunk log's own 16 to 22, and the
+first-entry times say how: a dozen to seventeen workers enter a task within
+30 to 90 µs of each other, and the rest enter one **after the range is already
+exhausted** -- the 1.2 ms entries in the table are at the very end of a 1.2 ms
+run. A task entered then finds the shared cursor past `n` and returns without
+calling the body once.
+
+That is the mechanism, and it is a property of the dispatch shape rather than
+of a chunk: there are exactly `w` tasks, all pushed onto *one* worker's queue,
+and a worker that misses the steal window has no way to take a share of the
+work afterwards. Rayon's split has no such window -- a worker that wakes late
+steals half of whatever range is left -- which is why its figures below have a
+spread of 1.06x between runs where ours has 1.6x.
+
+### The ablations: what each candidate costs
+
+Regime A, `n = 1000000` at 24 workers, medians of 11 to 21 reps with the
+variants rotated. `rayon-*` rows run **the port's own code** under rayon's
+thread pool wherever the name says so: `rayon-guided-cursor` is
+`GuidedPartitioner::loop_dynamic` over our chunk body, fanned out by
+`(0..w).into_par_iter()` instead of by `dispatch`, and `rayon-static-loop` is
+`StaticPartitioner::loop_static` with a private cursor per worker. `nobody` is
+the shipped dispatch with the body replaced by `black_box(sub.size())`.
+
+| variant | median | min | max |
+|---|---|---|---|
+| **shipped** (guided, floor 1) | 631 / 607 / 805 / 964 µs | 590 | 1296 |
+| static | 786 / 934 µs | 580 | 1598 |
+| guided, 4096 | 632 µs | 587 | 804 |
+| dynamic, 4096 | 638 µs | 578 | 673 |
+| `Runtime::scope` form, guided | 786 µs | 704 | 1002 |
+| `Runtime::scope` form, static | 1010 µs | 693 | 1115 |
+| **shipped, body removed** | **73.0 µs** | 65 | 80 |
+| static, body removed | **65.3 µs** | 59 | 93 |
+| one empty runtime node, built and run | **14.3 µs** | 4 | 24 |
+| `rayon` (`par_iter_mut`, plain `f64`) | 660 / 647 / 651 / 689 µs | 609 | 1768 |
+| `rayon-cells` (rayon's split, our atomics) | 658 / 633 µs | 605 | 889 |
+| **`rayon-guided-cursor`** (our cursor, rayon's fan-out) | **610 / 593 / 628 µs** | 561 | 843 |
+| `rayon-static-loop` (our static loop, private cursor) | 766 / 558 µs | 543 | 1974 |
+| `rayon-dynamic-cursor` (floor 1) | 18295 µs | 17880 | 19005 |
+| sequential, our body | 7761 µs | 7525 | 8319 |
+| sequential, `*d = d.tan()` | 7634 µs | 7419 | 8228 |
+
+Read as differences:
+
+- **A chunk is 15 ns.** The body-removed pair differ by 547 − 24 = 523 chunks
+  and by 7.7 µs: **14.7 ns a chunk**, which cannot contain an allocation
+  (#125 measured one 64-byte block allocated by a producer and freed by a
+  worker at ~70 ns) and matches a contended cursor acquisition and a closure
+  call. Against the 631 µs the shipped path takes, the 547 chunks are **8 µs,
+  1.3%**. The issue's premise does not survive this line.
+- **The fan-out is 51 µs of the 73.** Take the empty one-node flow off the
+  body-removed static run and 24 tasks cost 51 µs of wall time between them --
+  about 2 µs a task, of which #125's and #144's numbers say ~0.3 µs is the node
+  the producer builds and the rest is the wake-up and the steal.
+- **The cursor is not worth removing.** `static` -- 24 chunks, no shared cursor
+  at all -- is *slower* than the guided floor-1 cursor with its 547 chunks
+  (786/934 against 631/607/805/964), and the counters say why: with 15 to 18
+  workers arriving, a fixed `1/24` share each means one worker runs two or
+  three shares back to back, and static's own end game starts at 51 to 56% of
+  its span. Under rayon's fan-out, where every worker does arrive, the cursor
+  costs 610 against the private-cursor 766/558 -- inside that side's own
+  spread, so **≤ 60 ns a chunk acquisition and not a result**.
+- **The scope's join is free.** 786 against 805 for guided, 1010 against 934
+  for static: both inside either side's spread. `Runtime::scope`'s
+  `catch_unwind` plus `try_corun` does not show against a 24-way fan-out.
+- **Our partitioner beats rayon's splitter.** 610 µs for the port's guided
+  cursor under rayon's fan-out against 658 µs for rayon's own split over the
+  same atomic cells. **The chunk loop this issue was about is not the gap**;
+  the executor-side difference is 631 against 610 in the best-measured run and
+  up to 964 against 628 in the worst, which is the same lottery the fan-out
+  counter counts.
+- **The body is not the gap either.** Our atomic-cell body is 1.7% off
+  `*d = d.tan()` sequentially (7761 against 7634 µs), so the `AtomicU64`
+  departure `benches/for_each.rs` documents costs the comparison nothing.
+
+### Most of the published gap is the harness's input buffer
+
+Regime B is where the `for_each` table's figures come from, and it carries a
+term that has nothing to do with either scheduler. Re-running the two
+published ids today reproduces them: 1.6500 ms and 723.7 µs, then 1.6349 ms
+and 737.2 µs on a second pass, against the table's 1.658 ms and 765.6 µs. The
+same variants under regime B in the harness say where that comes from:
+
+| variant | regime A | B, one fresh buffer per iteration | B, plus the bench's own `cells(&inputs(n))` setup | criterion itself |
+|---|---|---|---|---|
+| shipped | 631 µs | 949 / 1056 µs | **1558 / 1771 µs** | **1635 / 1650 µs** |
+| `rayon` | 660 µs | 706 / 720 µs | 888 / 964 µs | **724 / 737 µs** |
+| `rayon-cells` | 658 µs | 775 µs | **1636 µs** | n/a |
+
+The third column is the decisive one: `rayon-cells` runs **no code of this
+crate at all** -- rayon's split, rayon's pool, our atomic cells -- and it goes
+from 775 µs to 1636 µs when the input is built the way the bench builds the
+`rustflow` column's, +861 µs. The `rustflow` column's setup is
+`cells(&inputs(size))`: an 8 MB `Vec<f64>` allocated, written and dropped, and
+an 8 MB `Vec<AtomicU64>` built from it, **per iteration**, where the `rayon`
+column's is `inputs(size)` alone. Churning the second buffer, not running the
+chunk loop, is what the extra ~700 µs buys.
+
+Put as two differences: criterion's figure for the `rustflow` column is
+**~1000 µs above** the same program in regime A, and its figure for the
+`rayon` column is **~80 µs above** it. The published gap of ~900 µs is the
+difference between those two harness terms, and what is left in regime A is a
+median ratio between **0.93x and 1.40x across four runs** whose own
+between-run spread (1.6x on our side, 1.06x on rayon's) is wider than the
+difference. **The honest reading of `for_each/24w/1000000` is a tie with a
+worse spread, not 2.17x.** `reduce_sum` and `scan` are not affected the same
+way -- both use plain `Bencher::iter` over an input allocated once -- so this
+is a `for_each`-shaped finding and not a suite-wide correction.
+
+### At a thousand elements the shape is four fifths overhead
+
+The other published row, `n = 1000` at 24 workers, is a different regime and
+the counters are blunter about it. The whole job is 1000 `tan` calls: 10 to
+12 µs on one thread, measured. Counters, one run each:
+
+| partitioner | chunks | median chunk | workers that ran a chunk | workers that entered a task |
+|---|---|---|---|---|
+| guided, floor 1 | **218** | 2 | 16 | **7 / 24** |
+| static | 24 | 42 | 6 | **5 / 24** |
+| dynamic, floor 1 | 1000 | 1 | 13 | -- |
+| guided, 4096 | **1** (the `n <= chunk_size` early-out) | 1000 | 1 | -- |
+
+And regime A timings, medians of 15 reps: shipped **63.5 µs**, static 43.1,
+guided-4096 **22.2**, shipped body removed **38.2**, static body removed 38.8,
+one empty runtime node 7.3, sequential 12.1.
+
+- **218 chunks for 1000 elements**, median width 2, and the two body-removed
+  rows are indistinguishable (38.2 against 38.8 for 218 chunks against 24), so
+  again the chunks are free and the 24-task fan-out is the cost: of the 63.5 µs
+  the shipped path takes, 12 µs is the work and 38 µs is the dispatch with the
+  body removed -- 31 µs of that above the empty one-node flow, to hand 24 tasks
+  to the 7 of 24 workers that arrive.
+- **A chunk size turns the whole thing off and wins.** `guided-4096` takes
+  `make_for_each_by_index_task`'s `n <= part.chunk_size()` branch -- one
+  sequential call, no tasks, no cursor -- for 22.2 µs against the shipped
+  path's 63.5 and the published rayon column's 31.5. A size sweep in the same
+  regime puts the crossover between 1000 and 10000 elements: at `n = 10000`
+  shipped is 71.6 µs against 109.8 sequential, and at `n = 100000` 149.8
+  against 825.0.
+
+### The decision: declined, and what would reopen it
+
+**Nothing ships.** The bar is the issue's own -- a change needs a mechanism the
+counters name *and* an A/B across `for_each`, `reduce_sum`, `primes`,
+`mandelbrot` and `sort` outside both spreads -- and no candidate reaches the
+first half of it:
+
+- The per-chunk cost this issue was about is 15 ns and 1.3% of the run. There
+  is nothing to win there, and the counters rather than a clock are what say
+  so.
+- The one knob that moves the clock is the guided chunk floor, and it is not
+  the port's to choose: `chunk_size == 0 ? 1 : chunk_size` and
+  `DefaultPartitioner = GuidedPartitioner<>` are upstream's at the pinned tag,
+  a caller who wants a wider floor passes a chunk size, and the API to pass one
+  is already here.
+  Changing a ported default to flatter a benchmark is the wrong trade; what the
+  measurement earns is this section saying what the default costs and where the
+  crossover is.
+- The mechanism the counters *do* name -- `w` tasks on one queue reaching 15 to
+  19 of 24 workers -- is not reachable from `src/algorithm/for_each_index.rs`
+  at all. It is the steal loop and the notifier, i.e. #60's and #102's
+  territory, and the next measurement is theirs: count, inside
+  `WorkerThread`'s steal loop, how many of the `w - 1` pokes wake a worker that
+  then fails to steal a task that is sitting in the victim's deque, and whether
+  a poke spent on an already-awake worker is what the late arrivals are
+  missing. Until that is counted, the fan-out's 1.33x to 1.6x of lost
+  parallelism is named but not explained.
+
+What this does close is the question #60's last paragraph left open. "A
+splittable source range" is exactly what `for_each_by_index` with a
+partitioner is, and the measurement says the split itself was never the
+problem: this port's chunk loop is rayon's equal on the same fan-out. The gap
+that remains on a fan-out shape is **how the first `w` tasks reach `w`
+workers**, which is the same handoff that section priced at ~100 ns a task and
+not a per-item cost at all.
