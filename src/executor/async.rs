@@ -49,7 +49,12 @@
 //! What a submission costs was measured rather than argued: most of an
 //! externally submitted `silent_async` is the free node's heap blocks, and 2
 //! to 4% of it the counters below. `BENCHMARKS.md` has the ablations and what
-//! a block cost; `DESIGN.md` has why the node is two blocks and not one.
+//! a block cost; `DESIGN.md` has why the node is two blocks and not one. The
+//! node's own block is recycled rather than freed when the worker that
+//! finished the task holds the last share of it, so a submission that names a
+//! worker writes into a block that worker parked whenever it has one --
+//! [`FreeNodes`], and `DESIGN.md` for why that list is one per worker and
+//! what it deliberately does not pool.
 
 use core::fmt;
 use std::any::Any;
@@ -60,7 +65,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
 
-use crate::executor::async_node::AsyncNode;
+use crate::executor::async_node::{AsyncNode, FreeNodes};
 use crate::executor::run_handle::RunError;
 use crate::executor::runtime;
 use crate::executor::topology::{Cancellable, Job, Nested, Parent, Topology};
@@ -276,6 +281,15 @@ impl<'a> Submission<'a> {
     /// condition the executor's own counters are kept under.
     fn is_parentless(&self) -> bool {
         matches!(self.parent, Parent::Run)
+    }
+
+    /// The free list this submission's node may be written into: the list of
+    /// the worker whose queue the job is going onto, which is a worker
+    /// running the body that submits. `None` for a submission that goes to
+    /// the shared buffers instead, which allocates its node as it always did
+    /// -- no worker's list is that job's, the buffers being everybody's.
+    fn free_nodes(&self) -> Option<&FreeNodes> {
+        self.worker.map(WorkerThread::free_nodes)
     }
 
     /// Queues one job of this submission: upstream's two branches of
@@ -767,7 +781,9 @@ impl Shared {
     ///
     /// The estate word is set before any job of the node exists, because a
     /// node that is to be an anchor has to be one before anything under it
-    /// can fail.
+    /// can fail. Where the node itself comes from -- a block the submitting
+    /// worker parked, or the allocator -- is [`FreeNodes`]'s, and changes
+    /// nothing a caller can see.
     pub(crate) fn new_free_node(
         &self,
         name: String,
@@ -779,7 +795,10 @@ impl Shared {
             self.increment_async();
         }
 
-        let node = AsyncNode::new(name, handle);
+        let node = match to.free_nodes() {
+            Some(free) => free.animate(name, handle),
+            None => AsyncNode::new(name, handle),
+        };
         node.node()
             .base()
             .estate()
@@ -924,10 +943,11 @@ pub(crate) fn invoke(worker: &mut WorkerThread, job: &Job, work: &AsyncWork) -> 
     // `if(node->_parent == nullptr) _decrement_topology();`, under the
     // condition `Shared::new_free_node` increments under -- the two are one
     // claim. The job itself is spent by `WorkerThread::invoke` immediately
-    // after this returns, which drops the node and the body with it; that it
-    // happens *after* these decrements is what makes an `Executor::drop`
-    // released by them safe, the thread it releases going on to join every
-    // worker.
+    // after this returns, which gives up the node and the body with it --
+    // to this worker's free list if nothing else still names the node, and
+    // to the allocator otherwise; that it happens *after* these decrements
+    // is what makes an `Executor::drop` released by them safe, the thread it
+    // releases going on to join every worker, free list and all.
     if release.is_some() && matches!(job.parent(), Parent::Run) {
         worker.shared.finish_async();
     }

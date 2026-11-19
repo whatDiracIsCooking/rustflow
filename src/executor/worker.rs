@@ -78,6 +78,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use super::Shared;
+use crate::executor::async_node::FreeNodes;
 use crate::executor::notifier::Notifier;
 use crate::executor::queue::{Thief, WorkerQueue};
 use crate::executor::rng::Xorshift32;
@@ -222,6 +223,12 @@ pub(crate) struct WorkerThread {
     /// This worker's victim-picking generator. Per-worker, a shared one being a
     /// contended cache line on the hottest path there is.
     pub(crate) rng: Xorshift32,
+    /// The free async nodes this worker has finished with, which a submission
+    /// made from inside one of its task bodies is written into instead of a
+    /// fresh allocation: upstream's `NodePool`, per worker. Reached only from
+    /// this worker's own thread, and dropped with this frame -- parking a
+    /// block keeps it until the worker ends and no longer.
+    free_nodes: FreeNodes,
 }
 
 /// Which end of a worker's queue a scheduling loop holds.
@@ -267,6 +274,7 @@ impl WorkerThread {
             // worker which is handed work directly finds it without a draw.
             sticky_victim: id,
             rng: Xorshift32::new(seed_from_current_thread()),
+            free_nodes: FreeNodes::new(),
         }
     }
 
@@ -287,6 +295,9 @@ impl WorkerThread {
             queue: LocalQueue::Corun,
             sticky_victim,
             rng: Xorshift32::new(seed_from_current_thread()),
+            // Its own, and empty: the worker's list is in the frame below,
+            // which this view cannot name -- `LocalQueue`'s reason.
+            free_nodes: FreeNodes::new(),
         }
     }
 
@@ -407,6 +418,30 @@ impl WorkerThread {
         self.shared.notifier.notify_one();
     }
 
+    /// The free async nodes this worker has finished with, which is where a
+    /// submission naming this worker takes its node from: upstream's
+    /// `NodePool`, per worker rather than per process.
+    pub(crate) fn free_nodes(&self) -> &FreeNodes {
+        &self.free_nodes
+    }
+
+    /// Spends `job` and offers the free node it ran, if it ran one, to this
+    /// worker's own free list: upstream's `recycle(Node*)` in
+    /// `_tear_down_async`.
+    ///
+    /// The share is cloned before the job is spent and tested after it,
+    /// which is what [`FreeNodes::recycle`]'s decision rests on; `DESIGN.md`
+    /// has why that decision is taken at all. Nothing else is deferred past
+    /// [`Job::finish`], whose counters may end the run.
+    fn spend_job(&self, job: Job) {
+        let finished = job.async_node().cloned();
+        self.finish_job(job.finish());
+
+        if let Some(node) = finished {
+            self.free_nodes.recycle(node);
+        }
+    }
+
     /// Runs `job`, and then whatever that job hands straight back to this worker,
     /// until one of them hands back nothing.
     ///
@@ -492,7 +527,7 @@ impl WorkerThread {
                 // node still owes `FINISHED` and the tasks waiting for it,
                 // each counted against this job's parent at submission.
                 dependent_async::release_skipped(self, &job);
-                self.finish_job(job.finish());
+                self.spend_job(job);
                 return None;
             }
 
@@ -762,7 +797,7 @@ impl WorkerThread {
         // continuation held across this call was counted against this job's
         // parent before it was kept, so the counter spent here cannot be the
         // one that ends the run.
-        self.finish_job(job.finish());
+        self.spend_job(job);
 
         // Upstream's `TF_INVOKE_CONTINUATION()`, which is a `goto` where this
         // is a return to the `while let` in `invoke`.
