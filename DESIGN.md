@@ -1883,9 +1883,14 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   to the static share each task is handed rather than to the re-split: with
   the splits turned off by a high floor the count is unchanged and the wall is
   a third of it. A re-split costs 12 to 16 µs where a fan-out task costs
-  2 µs, which is #400's to attribute, and the floor of 1 that `default()`
-  sets is the type's worst setting on every shape measured, which is #401's
-  to decide.
+  2 µs, and **#400 has since attributed that gap to the join a split opens**:
+  the far half goes to a `Runtime::scope`, whose `try_corun` cannot park, so
+  the waiting worker searches instead and the whole of the splitting default's
+  extra CPU is that search. `BENCHMARKS.md`'s "The #400 attribution" has the
+  counters, the four candidates it dismisses and the two issues it filed; no
+  code changed for it, so the figures in this entry stand. The floor of 1 that
+  `default()` sets is the type's worst setting on every shape measured, which
+  is #401's to decide.
 
 - **`sort_by` keeps upstream's live partition, and the sort's own figures do
   not show it** (issues #375, #381). The pinned header defines two sort cores
