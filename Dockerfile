@@ -71,6 +71,32 @@ RUN cargo install cargo-llvm-cov --locked --version ${CARGO_LLVM_COV_VERSION} \
  && cargo mutants --version \
  && rm -rf /usr/local/cargo/registry/*
 
+# Miri, which is a rustup component rather than a crate and nightly-only: on
+# this image's stable pin `cargo miri --version` reports that the component
+# "is not available for the 1.100.0 toolchain". So a second toolchain is
+# installed beside the pinned stable one, used for nothing but Miri, and its
+# date is as much a pin as RUST_VERSION is -- a bare `nightly` would make the
+# interpreter's verdict depend on the day the image was built. `rust-src` comes
+# with it because Miri interprets the standard library rather than linking a
+# precompiled one, so `cargo miri` builds a sysroot from source on first use
+# and fails without those sources.
+#
+# `.github/workflows/miri.yml` runs this install line and the command below
+# weekly; the date here and the date there are kept equal by hand, exactly as
+# RUST_VERSION and the images in ci.yml and loom.yml are, and that workflow is
+# the only check that this layer works. In the container:
+#
+#   MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" \
+#     cargo +nightly-2026-11-18 miri test --lib -- executor::notifier::tests
+#
+# docs/development.md says which modules that covers, why not all of them, and
+# what each of those two flags is for -- both are about crossbeam-epoch being
+# in the tree rather than about this crate.
+ARG MIRI_NIGHTLY=nightly-2026-11-18
+RUN rustup toolchain install ${MIRI_NIGHTLY} \
+        --profile minimal --component miri --component rust-src \
+ && cargo +${MIRI_NIGHTLY} miri --version
+
 # --- What the in-container agent needs --------------------------------------
 # curl: fetches the Claude Code installer below.
 # python3: `.claude/settings.json` wires devtools/hooks/session-env.py as a

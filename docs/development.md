@@ -52,6 +52,63 @@ wake-after-last-release rule, the delivery of a failure under a runtime task,
 delivery slot, the `TaskGroup` counter, and the semaphore's
 park-and-reschedule rule.
 
+[`.github/workflows/miri.yml`](../.github/workflows/miri.yml) is the second
+weekly lane, and what it checks is the half loom cannot: loom explores every
+ordering of a *model* whose atomics it swapped out, while Miri interprets the
+real code and objects to what that code does along the way — an aliasing rule
+broken, a read of dangling or uninitialised memory, a misaligned access, a
+data race. Miri is a nightly-only rustup component, so the lane carries a
+second toolchain pinned by date in the two places that have to agree,
+`ARG MIRI_NIGHTLY` in the [`Dockerfile`](../Dockerfile) and the toolchain name
+in the workflow; a bare `nightly` would make the interpreter's verdict depend
+on the day it ran. What runs under it is the unit tests of the three modules
+holding most of the crate's `unsafe` — `executor::notifier`,
+`executor::async_node` and `pipeline::scheduler` — rather than the whole
+`--lib` suite: at roughly a hundredth of native speed, the four-hundred-odd
+cases of that suite — many of them a multi-worker executor over thousands of
+nodes — are not a job that finishes, and a lane that covers the `unsafe`
+weekly is worth more than one that times out. Within those three, **nothing is
+`#[cfg_attr(miri, ignore)]`d**: an ignore would owe a reason both here and in
+the workflow's reason table, and the job fails on an ignored test that is
+missing from that table, so the two lists cannot drift apart.
+
+Two `MIRIFLAGS` are set, and both are there because `crossbeam-epoch` is in
+the tree rather than because of anything in this crate — which is also why
+each says so out loud in the workflow beside the flag:
+
+- `-Zmiri-tree-borrows` picks Miri's newer aliasing model over the default
+  Stacked Borrows. It is not a weakening: the aliasing check and the data-race
+  detector both still run, under a different set of rules for what a derived
+  pointer may do. Stacked Borrows rejects `crossbeam_epoch`'s `element_of`,
+  which derives a pointer to a whole `Local` from a pointer to its list
+  `Entry` field — the `container_of` pattern, which Tree Borrows allows — and
+  `Stealer::steal` reaches it the moment a second worker steals.
+- `-Zmiri-ignore-leaks` turns off the exit-time leak check and nothing else.
+  The leaks are that crate's epoch-based reclamation working as designed: a
+  worker's `Local` and the sealed garbage bag its thread-local handle pushes
+  at thread exit are freed only when some thread pins again, and once an
+  `Executor` has joined its workers nothing does. No frame of this crate
+  appears in their allocation backtraces, and a leak is not undefined
+  behaviour.
+
+The limit that leaves is in the log rather than hidden: the same crate earns
+an integer-to-pointer cast warning, and Tree Borrows does not model such a
+cast, so a pointer derived that way is one this lane cannot fully vouch for.
+Between a model that rejects the dependency outright and one that does not
+model one of its casts, the job is as strict as the dependency allows.
+`-Zmiri-disable-isolation` is deliberately absent, since none of the three
+modules reads the host's clock, environment or filesystem. In the container:
+
+```sh
+MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" \
+  cargo +nightly-2026-11-18 miri test --lib -- executor::notifier::tests
+```
+
+That toolchain is in the image rather than in `Cargo.toml`, so, exactly as for
+the coverage pins below, a container created before the layer that installs it
+has no `+nightly-2026-11-18` to run and needs a **host-side**
+`devtools/devcontainer.sh rebuild` first.
+
 CI runs the suite a second time as the `two-core` job of
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml): once, pinned with
 `taskset -c 0,1`, because most of the lifecycle races closed in this port were

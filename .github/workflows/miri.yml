@@ -1,0 +1,286 @@
+# The crate's `unsafe` under Miri, which is an interpreter for rustc's MIR
+# rather than a test: it executes the real code and checks, at every step, the
+# things a compiled run cannot see -- an aliasing rule broken (Stacked
+# Borrows), a read of uninitialised or dangling memory, a misaligned access,
+# and a data race between two threads. That is the complement to
+# `loom.yml`, not a duplicate of it: loom explores every ordering of a *model*
+# whose atomics it replaced, while Miri runs the actual notifier against the
+# actual queue once and objects to what the code does along the way.
+#
+# Deliberately NOT on `pull_request` or `push`, for loom.yml's reason: the gate
+# stays the five commands, and the interpreter is something like two orders of
+# magnitude slower than native, so this is not a per-PR check. The failure it
+# catches is "a `// SAFETY:` argument stopped holding", which a week's latency
+# is fine for.
+#
+# Two pins, both by hand, both of which have to move together:
+#
+#   * `nightly-2026-11-18` below is the Miri toolchain. Miri is a nightly-only
+#     component -- on this repo's stable pin `cargo miri --version` reports
+#     that the component "is not available for the 1.100.0 toolchain" -- and a
+#     bare `nightly` would make this job's result depend on the day it ran,
+#     which is exactly what the repo's pinning policy refuses. The same date is
+#     `ARG MIRI_NIGHTLY` in the root Dockerfile, so that the command below is
+#     the command a developer runs in the container; when you bump one, bump
+#     the other.
+#   * The container image is the stable pin, `ARG RUST_VERSION` in the root
+#     Dockerfile, as ci.yml's and loom.yml's are. The nightly is installed
+#     *into* it, which is also how the Dockerfile does it, so this job running
+#     green is the check that that Dockerfile line works -- nothing in the gate
+#     or in CI builds the image.
+#
+# One GitHub rule worth knowing before you edit this on a branch:
+# `workflow_dispatch` only dispatches the copy of this file that is on the
+# DEFAULT branch, the same way loom.yml's comment says and automerge.yml's
+# `workflow_run` does. A new or renamed workflow is therefore undispatchable
+# until it lands on main, however green it is on the branch that adds it.
+name: miri
+
+on:
+  schedule:
+    # Mondays at 05:23 UTC. Off the hour for loom.yml's reason -- GitHub queues
+    # every cron that fires on the hour together -- and an hour after it rather
+    # than beside it, so the two slow weekly jobs do not contend for the same
+    # runner minutes.
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+# Nothing here reads or writes the repository beyond the checkout.
+permissions:
+  contents: read
+
+jobs:
+  miri:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.100-slim-bookworm
+    steps:
+      # loom.yml's first step verbatim, for its reasons: before checkout,
+      # because the slim image has no git and actions/checkout silently falls
+      # back to a REST tarball without it; plus `zstd`, which actions/cache
+      # compresses with when it is present and warns its way down to gzip when
+      # it is not.
+      - name: Install container prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates pkg-config libssl-dev zstd
+          rm -rf /var/lib/apt/lists/*
+
+      - uses: actions/checkout@v4
+
+      # The same install line as the root Dockerfile's `MIRI_NIGHTLY` layer.
+      # `rust-src` is not optional and not implied by `--component miri`: Miri
+      # interprets the standard library rather than linking a precompiled one,
+      # so `cargo miri` builds itself a sysroot from source on first use and
+      # fails without those sources.
+      - name: Install the pinned Miri nightly
+        run: |
+          rustup toolchain install nightly-2026-11-18 \
+            --profile minimal --component miri --component rust-src
+
+      - name: Toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+          cargo +nightly-2026-11-18 miri --version
+
+      # Keyed `miri-`, separately from `loom-` and from anything `ci` may cache
+      # later: a Miri build shares no artifact with either, so one cache would
+      # be several trees evicting each other. The registry path is
+      # /usr/local/cargo, not ~/.cargo, because that is where the official
+      # `rust` images put CARGO_HOME. The key carries the nightly date, so
+      # bumping the pin starts a fresh cache instead of restoring objects built
+      # by a different rustc.
+      - name: Cache the Miri build
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+            target/miri
+          key: miri-nightly-2026-11-18-${{ hashFiles('Cargo.lock') }}
+          restore-keys: miri-nightly-2026-11-18-
+
+      - name: Run the unsafe modules' unit tests under Miri
+        env:
+          # Under the runner's workspace, as loom.yml's is, so a Miri build
+          # cannot fight a normal one's artifacts; `target/` is this repo's
+          # ignored build output, so a subdirectory of it is also out of git's
+          # way. Miri's from-source sysroot lands under here too, which is what
+          # the cache above is mostly restoring.
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/miri
+          # Tree Borrows, which is Miri's newer aliasing model, rather than
+          # the default Stacked Borrows -- and NOT a weakening: the aliasing
+          # check and the data-race detector both still run, under a different
+          # set of rules for what a derived pointer may do.
+          #
+          # It is here because Stacked Borrows rejects crossbeam-epoch, not
+          # this crate. The first run of this lane failed inside
+          # `crossbeam_epoch::internal`, where `element_of` derives a pointer
+          # to a whole `Local` from a pointer to its list `Entry` field
+          # (`&*local_ptr`, the `container_of` pattern) -- a derivation Stacked
+          # Borrows forbids and Tree Borrows allows. The path into it is
+          # `Stealer::steal`, so it fires the moment a second worker steals:
+          # every test here that runs a real executor hit it, and no frame of
+          # the crate's own `unsafe` was involved. Disabling the aliasing check
+          # instead (`-Zmiri-disable-stacked-borrows`) would have thrown away
+          # half of what this job is for.
+          #
+          # `-Zmiri-ignore-leaks` is the exit-time leak check and nothing
+          # else; the aliasing and data-race checks above are untouched by it.
+          # It is off for the same reason: the leaks are crossbeam-epoch's, by
+          # that crate's design. The nine this lane reported were
+          # `Box<crossbeam_epoch::internal::Local>` (the per-thread
+          # participant, registered on a worker's first pin) and
+          # `Box<Node<SealedBag>>` (the sealed garbage bag `Local::finalize`
+          # pushes into the global queue when that worker's thread-local
+          # handle is dropped at thread exit). Epoch-based reclamation frees
+          # either only when some thread pins again and advances the epoch,
+          # and once an `Executor`'s `Drop` has joined its workers nothing
+          # does, so both are still allocated when the process ends. Their
+          # allocation backtraces -- read with `-Zmiri-backtrace=full`,
+          # because the crate's own counting allocator in `async_node.rs`'s
+          # tests truncates the default one -- contain no frame of this crate,
+          # and a leak is not undefined behaviour either way.
+          #
+          # Deliberately NOT set: `-Zmiri-disable-isolation`, since no test
+          # below reads the host's clock, environment or filesystem, and
+          # leaving isolation on keeps the run independent of the machine; and
+          # `-Zmiri-permissive-provenance`, which would only hide the
+          # integer-to-pointer warning crossbeam-epoch also earns -- "Tree
+          # Borrows does not support integer-to-pointer casts, so the program
+          # is likely to go wrong when this pointer gets used", as Miri itself
+          # puts it. That is the limit of this lane stated out loud and worth
+          # leaving in the log: between a model that rejects the dependency
+          # outright and one that does not model one of its casts, this job is
+          # as strict as the dependency allows. It costs nothing either way --
+          # it is a warning, not a failure, and the pointer in question has
+          # not gone wrong in any run so far.
+          MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-ignore-leaks"
+        run: |
+          # POSIX only, no bashism: the container's /bin/sh is dash and the
+          # image ships no bash, so GitHub runs this step as `sh -e {0}` and
+          # dash rejects `set -o pipefail` before `cargo` is ever reached
+          # (#151). That is also why nothing below pipes a command whose status
+          # matters.
+          set -eu
+
+          # The three test modules of the files that hold most of the crate's
+          # `unsafe` -- the notifier's waiter slot, the free-node list's
+          # recycling, the pipeline scheduler's line state -- rather than the
+          # whole `--lib` suite. The suite is over four hundred cases, a good
+          # many of which run a multi-worker executor over thousands of nodes,
+          # and at Miri's speed that is not a job that finishes: a lane that
+          # covers the `unsafe` weekly is worth more than one that times out.
+          # Adding a module here is a one-line edit, and the guard below makes
+          # a filter that matches nothing a failure rather than a green run.
+          modules="executor::notifier::tests executor::async_node::tests pipeline::scheduler::tests"
+
+          ran_total=0
+          ignored_total=0
+          {
+            echo "## Miri, nightly-2026-11-18"
+            echo
+            echo "\`MIRIFLAGS=$MIRIFLAGS cargo +nightly-2026-11-18 miri test --lib\`, per module."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for module in $modules; do
+            log="$RUNNER_TEMP/$(echo "$module" | tr ':' '-').log"
+            echo "::group::$module"
+            # Redirect rather than `| tee`: a pipeline's status is its last
+            # command's, so the pipe would report `tee`'s success and mask a
+            # failing module unless `pipefail` restored cargo's -- and pipefail
+            # is the bashism this step cannot have. Keep cargo's own status,
+            # then show the log either way.
+            status=0
+            cargo +nightly-2026-11-18 miri test --lib -- "$module" \
+              > "$log" 2>&1 || status=$?
+            cat "$log"
+            echo "::endgroup::"
+            if [ "$status" -ne 0 ]; then
+              echo "::error::$module failed under Miri."
+              echo "**$module: FAILED** -- see the job log." \
+                >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+
+            # A filter that matches nothing is a green `cargo test` reporting
+            # "0 passed", so a renamed module would silently empty this lane --
+            # loom.yml guards its own version of that trap the same way.
+            passed=$(sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' \
+              "$log" | head -n 1)
+            if [ "${passed:-0}" -lt 1 ]; then
+              echo "::error::$module ran no test -- has the module been renamed?"
+              exit 1
+            fi
+            ignored=$(sed -n \
+              's/^test result: ok\..* \([0-9]*\) ignored.*/\1/p' \
+              "$log" | head -n 1)
+            ignored=${ignored:-0}
+            ran_total=$((ran_total + passed))
+            ignored_total=$((ignored_total + ignored))
+
+            # The names, from libtest's own per-case lines, so the summary
+            # cannot drift from what ran. Matched loosely before the dots and
+            # after them on purpose: a `should_panic` case prints
+            # ` - should panic` before them, and a case that earns a Miri
+            # warning gets the warning where its `ok` would be and the `ok`
+            # on a later line -- so the obvious `\.\.\. ok$` pattern drops
+            # both kinds silently, which is how the first draft of this job
+            # lost four cases out of eleven from its summary.
+            sed -n 's/^test \([^ ]*\)\( - should panic\)\{0,1\} \.\.\. ignored$/\1/p' \
+              "$log" > "$log.ignored"
+            sed -n 's/^test \([^ ]*\)\( - should panic\)\{0,1\} \.\.\. .*/\1/p' \
+              "$log" | grep -vxF -f "$log.ignored" > "$log.ran" || true
+
+            # And the names are counted against libtest's own figure, because
+            # a summary that names fewer cases than ran is the quiet failure
+            # this whole job is trying not to be.
+            named=$(grep -c '' "$log.ran")
+            if [ "$named" -ne "$passed" ]; then
+              echo "::error::$module: $passed passed but $named named -- the summary is wrong."
+              exit 1
+            fi
+
+            {
+              echo "### $module"
+              echo
+              echo "$passed passed, $ignored ignored."
+              echo
+              sed 's/^/- `/; s/$/`/' "$log.ran"
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            # Every `#[cfg_attr(miri, ignore)]` owes a reason, and an ignore
+            # without one is the outcome #422 refuses -- so the reason lives in
+            # the table below and a name missing from it fails the job rather
+            # than passing quietly. Keep each entry equal to the sentence
+            # docs/development.md gives for the same test.
+            for name in $(cat "$log.ignored"); do
+              case "$name" in
+                *)
+                  reason="" ;;
+              esac
+              if [ -z "$reason" ]; then
+                echo "::error::$name is ignored under Miri with no reason recorded in miri.yml."
+                exit 1
+              fi
+              echo "- ignored: \`$name\` -- $reason" >> "$GITHUB_STEP_SUMMARY"
+            done
+          done
+
+          {
+            echo "### Total"
+            echo
+            echo "$ran_total passed, $ignored_total ignored."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # The summary again, in the log. GitHub renders a step summary only
+          # in the web UI, so without this nobody reading the job through the
+          # API or `gh run view --log` -- which is how this lane was brought
+          # up, and how an agent reads it -- can check what it says.
+          echo "::group::step summary"
+          cat "$GITHUB_STEP_SUMMARY"
+          echo "::endgroup::"
