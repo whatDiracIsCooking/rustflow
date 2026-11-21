@@ -146,6 +146,33 @@ or in CI builds the image, so that rebuild is the check that a `Dockerfile`
 edit works, and a container that predates a pin simply lacks the tool (the
 coverage script says so and names this command).
 
+`--functions` is the mode the coverage dispositions read: it lists every
+function the suite never executed, grouped by file, one line per *instantiation
+group* — llvm-cov counts a generic function once however many
+monomorphisations it emitted — with `file:line:col` and the demangled symbol.
+The listing is sorted and carries no timestamp, so two runs differ only where
+the coverage did, and the script refuses to print one whose counts disagree
+with the table above it. The `coverage` job in
+[`.github/workflows/coverage.yml`](../.github/workflows/coverage.yml) runs that
+same command on every pull request and every push to `main`, in the image `ci`
+uses with `llvm-tools` and the pinned `cargo-llvm-cov` added, and publishes the
+table in the job summary and the listing as a `functions-never-executed`
+artifact. **It has no floor**: it goes red when the measurement fails, never
+when a figure is low.
+
+The baseline that job starts from, measured on 2026-11-21 by
+`devtools/coverage.sh --functions` at commit 59cf9e4: **96.20% of 17035 lines**
+(647 missed), **89.51% of 2412 functions** (253 never executed, spread over 43
+files) and 96.29% of 19746 regions, with the per-file low end `flow_builder.rs`
+at 50.55% of its functions (45 of 91) and 84.95% of its lines (56 of 372). The
+line and region figures move by a few lines between runs of the same tree —
+which worker steals what decides which scheduler paths a run takes, and the
+spread behind this entry was 96.17% to 96.21% of lines — so read them to two
+significant figures. The function figure is the one the dispositions work from,
+and the one the listing is checked against, which is why it is the count stated
+per file rather than a percentage. That listing is what the milestone's
+disposition issues read, and this is the before their after is set against.
+
 One more thing is in the image for a measurement rather than for the build:
 `g++`, `cmake` and `make`, in the last layer of the
 [`Dockerfile`](../Dockerfile) and there for `devtools/upstream-bench.sh`, which
@@ -199,8 +226,9 @@ against the type it reaches rather than against a bare function name.
 **Which of these decide anything: none of them.** All five of
 `devtools/doc-ratio.sh`, `devtools/test-names.sh`, `devtools/coverage.sh`,
 `devtools/api-witness.py` and `devtools/upstream-bench.sh` are **reports** —
-each exits 0 whatever it finds, no CI job reads any of them, and a number from
-one is something a reviewer reads rather than something that passes or fails.
+each exits 0 whatever it finds, no CI job makes one a pass or a fail, and a
+number from one is something a reviewer reads rather than something that
+passes or fails.
 `test-names.sh diff` and `coverage.sh` exit non-zero only on a difference the
 PR running them asked about or a measurement that could not run at all;
 `api-witness.py` exits 2 for the same second reason, and `upstream-bench.sh`
