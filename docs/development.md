@@ -205,11 +205,32 @@ coverage script says so and names this command).
 
 `--functions` is the mode the coverage dispositions read: it lists every
 function the suite never executed, grouped by file, one line per *instantiation
-group* — llvm-cov counts a generic function once however many
-monomorphisations it emitted — with `file:line:col` and the demangled symbol.
-The listing is sorted and carries no timestamp, so two runs differ only where
-the coverage did, and the script refuses to print one whose counts disagree
-with the table above it. The `coverage` job in
+group* — llvm-cov counts a generic function once however many monomorphisations
+it emitted — with `file:line:col` and the demangled symbol. It comes in two
+sections, **production code** and **`src/`'s own `#[cfg(test)]` code**, because
+the exclusion above is a path regex and a path cannot see a module: most of
+what no test runs is unit-test code, and without the split a disposition reads
+a number that is mostly its own test closures. The partition tests for
+`::tests::` in the demangled symbol's path up to the first `::<`, so a
+production generic instantiated with a test's closure is counted where it is
+defined, and it tests **every** monomorphisation in the group rather than the
+one symbol the group prints: a blanket impl writes its Self type ahead of that
+cut, and the symbol a group is named after is the lowest mangled name among its
+instantiations, which embeds the crate's disambiguator hash and so differs
+between this container and the CI runner. Deciding over all of them is what
+keeps the two counts the same number on both (31 of today's groups have
+instantiations that disagree). It tracks the convention that a `#[cfg(test)]`
+module is called `tests` and nothing stronger, so a `#[cfg(test)]` helper
+declared outside one — `Semaphore::num_waiters` and `FreeNodes::len` today —
+counts as production, as does a `const _` compile-time assertion, which no run
+executes at all. **Only the function counts are split**: the line and region
+percentages are llvm-cov's own, and count `src/`'s test code in their
+denominators too, so those and the production function count do not share a
+denominator. Each section states its own count and its own denominator, and
+both are checked against the table above them. The listing is sorted and
+carries no timestamp, so two runs differ only where the coverage did, and the
+script refuses to print either section when the counts disagree with that
+table. The `coverage` job in
 [`.github/workflows/coverage.yml`](../.github/workflows/coverage.yml) runs that
 same command on every pull request and every push to `main`, in the image `ci`
 uses with `llvm-tools` and the pinned `cargo-llvm-cov` added, and publishes the
@@ -229,6 +250,28 @@ significant figures. The function figure is the one the dispositions work from,
 and the one the listing is checked against, which is why it is the count stated
 per file rather than a percentage. That listing is what the milestone's
 disposition issues read, and this is the before their after is set against.
+
+How those 253 divide, which is why #442 split the listing: measured at commit
+5d804e4, where the total was still that same 253 of 2412, **55 of 1267
+production groups** and **198 of 1145 groups in `src/`'s own `#[cfg(test)]`
+code**. The figure the disposition issues were scoped against was mostly their
+own test closures — empty ones filling a handle variant's argument slot in a
+test asserting which variant landed there, 45 of them in `flow_builder.rs`
+(whose misses are *all* test closures, so the 50.55% above is not a production
+gap at all), 27 in `executor/topology/mod.rs`, 18 in `task.rs` and 14 in
+`subflow.rs`. Re-measured on 2026-11-21 at commit 3d9a290, with all five of
+this milestone's dispositions landed — #424, #425, #426, #427 and #428:
+**223 of 2416** never executed, **25 of 1267 production** over 16 files and
+**198 of 1149** in test code over 33, at 97.36% of 17072 lines and 97.10% of
+19797 regions. Their tests took the production count from 55 to 25 and left
+the test-code count exactly where it was, which is the split earning its keep:
+the files they covered are out of the production section altogether —
+`algorithm/partitioner.rs`'s 11 groups, `algorithm/mod.rs`'s 6, and the five
+between `pipeline/` and `observer/` — and the production low end is now
+`executor/async.rs` at 4 groups, then `executor/topology/run.rs` at 3. The
+253-including-test-code total is what this milestone's merged pull requests
+quote and is still the first line of the listing; the production number is the
+one a coverage gap can be read off.
 
 One more thing is in the image for a measurement rather than for the build:
 `g++`, `cmake` and `make`, in the last layer of the
