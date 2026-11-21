@@ -116,12 +116,32 @@ jobs:
           # way. Miri's from-source sysroot lands under here too, which is what
           # the cache above is mostly restoring.
           CARGO_TARGET_DIR: ${{ github.workspace }}/target/miri
-          # No MIRIFLAGS. The defaults are what this job is for (Stacked
-          # Borrows plus the data-race detector), and in particular
-          # `-Zmiri-disable-isolation` is NOT set: no test below reads the
-          # host's clock, environment or filesystem, so none of them needs it,
-          # and leaving isolation on keeps the run independent of the machine.
-          MIRIFLAGS: ""
+          # Tree Borrows, which is Miri's newer aliasing model, rather than
+          # the default Stacked Borrows -- and NOT a weakening: the aliasing
+          # check and the data-race detector both still run, under a different
+          # set of rules for what a derived pointer may do.
+          #
+          # It is here because Stacked Borrows rejects crossbeam-epoch, not
+          # this crate. The first run of this lane failed inside
+          # `crossbeam_epoch::internal`, where `element_of` derives a pointer
+          # to a whole `Local` from a pointer to its list `Entry` field
+          # (`&*local_ptr`, the `container_of` pattern) -- a derivation Stacked
+          # Borrows forbids and Tree Borrows allows. The path into it is
+          # `Stealer::steal`, so it fires the moment a second worker steals:
+          # every test here that runs a real executor hit it, and no frame of
+          # the crate's own `unsafe` was involved. Disabling the aliasing check
+          # instead (`-Zmiri-disable-stacked-borrows`) would have thrown away
+          # half of what this job is for.
+          #
+          # Deliberately NOT set: `-Zmiri-disable-isolation`, since no test
+          # below reads the host's clock, environment or filesystem, and
+          # leaving isolation on keeps the run independent of the machine; and
+          # `-Zmiri-permissive-provenance`, which would only hide the
+          # integer-to-pointer warning crossbeam-epoch also earns. That
+          # warning is a true statement about the limit of this lane -- Miri
+          # can miss a pointer bug behind such a cast -- so it stays in the
+          # log, where it costs nothing: it is a warning, not a failure.
+          MIRIFLAGS: "-Zmiri-tree-borrows"
         run: |
           # POSIX only, no bashism: the container's /bin/sh is dash and the
           # image ships no bash, so GitHub runs this step as `sh -e {0}` and
@@ -146,7 +166,7 @@ jobs:
           {
             echo "## Miri, nightly-2026-11-18"
             echo
-            echo "\`cargo +nightly-2026-11-18 miri test --lib\`, per module."
+            echo "\`MIRIFLAGS=$MIRIFLAGS cargo +nightly-2026-11-18 miri test --lib\`, per module."
             echo
           } >> "$GITHUB_STEP_SUMMARY"
 

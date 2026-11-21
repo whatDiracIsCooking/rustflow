@@ -64,10 +64,10 @@ in the workflow; a bare `nightly` would make the interpreter's verdict depend
 on the day it ran. What runs under it is the unit tests of the three modules
 holding most of the crate's `unsafe` — `executor::notifier`,
 `executor::async_node` and `pipeline::scheduler` — rather than the whole
-`--lib` suite: at roughly a hundredth of native speed, four hundred-odd cases
-of which many run a multi-worker executor over thousands of nodes is not a job
-that finishes, and a lane that covers the `unsafe` weekly is worth more than
-one that times out. Within those three, **nothing is
+`--lib` suite: at roughly a hundredth of native speed, the four-hundred-odd
+cases of that suite — many of them a multi-worker executor over thousands of
+nodes — are not a job that finishes, and a lane that covers the `unsafe`
+weekly is worth more than one that times out. Within those three, **nothing is
 `#[cfg_attr(miri, ignore)]`d** and no `MIRIFLAGS` is set — including
 `-Zmiri-disable-isolation`, which none of them needs because none reads the
 host's clock, environment or filesystem. An ignore would owe a reason both
