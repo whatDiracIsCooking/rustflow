@@ -2358,3 +2358,39 @@ fn a_state_bit_on_a_node_is_not_added_to_its_join_counter() {
         executor.wait_for_all();
     }
 }
+
+// --------------------------------------------------------
+// Invented: the executor's own Debug dump
+// --------------------------------------------------------
+
+/// An executor's `Debug` reports the pool's own state: the worker count, the
+/// queue count, how many workers are parked and how many runs are in flight.
+///
+/// Hand-written for `a_nodes_debug_names_the_work_it_holds`'s reason -- a
+/// vector of `JoinHandle`s, a notifier and a condvar have nothing worth
+/// deriving -- so what it prints is a choice, and those four numbers are what
+/// a pool that has stopped making progress is asked about. Each is checked
+/// against the accessor that answers it: a dump that described some other
+/// pool, or printed nothing at all, is the one thing it must not do.
+#[test]
+fn an_executors_debug_reports_the_pool_it_dumps() {
+    const WORKERS: usize = 3;
+    let executor = Executor::new(WORKERS);
+
+    // The one of the four that is not fixed at construction: read it once the
+    // pool has settled, so the dump is taken against a known value rather
+    // than against workers still on their way to sleep.
+    spin_until("every worker to park", || executor.num_waiters() == WORKERS);
+
+    // The whole string, as `tests/semaphores.rs` asserts a semaphore's --
+    // with the queue count read off the accessor rather than written out,
+    // since how many shared buffers an executor has is `queue.rs`'s business
+    // and not this case's.
+    assert_eq!(
+        format!("{executor:?}"),
+        format!(
+            "Executor {{ num_workers: 3, num_queues: {}, num_waiters: 3, num_topologies: 0 }}",
+            executor.num_queues()
+        )
+    );
+}

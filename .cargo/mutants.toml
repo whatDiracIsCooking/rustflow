@@ -33,4 +33,40 @@ exclude_re = [
     # A guard over `unpark_chain`, which walks no chain without it either.
     'executor/notifier\.rs:747:30: replace & with \| in <impl Notifier for NonblockingNotifier>::notify_all',
     'executor/notifier\.rs:747:30: replace & with \^ in <impl Notifier for NonblockingNotifier>::notify_all',
+    # A guard over a `notify_n` that wakes nobody when it is asked for zero.
+    'executor/mod\.rs:224:21: replace > with >= in Shared::bulk_schedule',
+    # A worker's wait for a publication nothing can observe being absent.
+    'executor/mod\.rs:264:9: replace StartGate::wait with \(\)',
+    # Insurance against an unwind only a scheduler bug can cause, on a frame
+    # that has already ended its run on every path a program takes.
+    'executor/corun\.rs:223:9: replace <impl Drop for InnerRun>::drop with \(\)',
+    # The corun search's attempt counter, which gates nothing but a
+    # `yield_now`: its predicate is the only thing that ends the search.
+    'executor/worker\.rs:430:43: replace \* with \+ in WorkerThread::steal_until',
+    'executor/worker\.rs:430:43: replace \* with / in WorkerThread::steal_until',
+    'executor/worker\.rs:430:38: replace \+ with - in WorkerThread::steal_until',
+    'executor/worker\.rs:430:38: replace \+ with \* in WorkerThread::steal_until',
+    'executor/worker\.rs:450:24: replace \+= with \*= in WorkerThread::steal_until',
+    'executor/worker\.rs:451:27: replace > with == in WorkerThread::steal_until',
+    'executor/worker\.rs:451:27: replace > with < in WorkerThread::steal_until',
+    'executor/worker\.rs:451:27: replace > with >= in WorkerThread::steal_until',
+    # The scheduling loop's own two thresholds, where what a mutant moves is
+    # the attempt a worker yields on or gives up after. The mutants of the
+    # same two lines that stop it giving up at all are caught.
+    'executor/worker\.rs:1033:43: replace \* with \+ in WorkerThread::explore_task',
+    'executor/worker\.rs:1033:43: replace \* with / in WorkerThread::explore_task',
+    'executor/worker\.rs:1033:38: replace \+ with - in WorkerThread::explore_task',
+    'executor/worker\.rs:1033:38: replace \+ with \* in WorkerThread::explore_task',
+    'executor/worker\.rs:1051:27: replace > with >= in WorkerThread::explore_task',
+    'executor/worker\.rs:1056:31: replace > with == in WorkerThread::explore_task',
+    'executor/worker\.rs:1056:31: replace > with >= in WorkerThread::explore_task',
+    'executor/worker\.rs:1056:31: replace > with < in WorkerThread::explore_task',
+    'executor/worker\.rs:1056:37: replace \+ with - in WorkerThread::explore_task',
+    'executor/worker\.rs:1056:37: replace \+ with \* in WorkerThread::explore_task',
+    # A sticky victim is where the next search starts, not where the work is.
+    'executor/worker\.rs:1104:64: replace \+ with - in WorkerThread::wait_for_task',
+    # A worker's seed, which is a value nothing promises: what the fold is for
+    # is that two threads get different streams, and both of these keep it.
+    'executor/worker\.rs:1305:31: replace \^ with \| in seed_from_current_thread',
+    'executor/worker\.rs:1305:31: replace \^ with & in seed_from_current_thread',
 ]

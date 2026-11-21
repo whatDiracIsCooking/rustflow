@@ -73,7 +73,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use rustflow::algorithm::module::make_module_task;
 use rustflow::observer::{Observer, TaskView, WorkerView};
 use rustflow::prelude::*;
-use rustflow::{AsyncTask, Executor};
+use rustflow::{AsyncTask, AsyncWork, Executor};
 
 // The matrix macro, and the payload check the panic-path case at the end of
 // the file makes. Not `common/counters.rs`: what the cases here record is a
@@ -1910,4 +1910,52 @@ fn the_debug_output_names_the_node_and_never_a_captured_value() {
         finished.contains("use_count: 1"),
         "the pool is down, so this handle is the only share left: {finished}"
     );
+}
+
+// ----------------------------------------------------------------------------
+// The panic path's other side: a graph-built handle a cancelled run skips
+// ----------------------------------------------------------------------------
+
+/// A `Handle::DependentAsync` built into a taskflow's graph and then *skipped*
+/// by a cancelled run has nothing drained for it, and the worker that dequeued
+/// the skipped job survives it.
+///
+/// The counterpart of `executor::dependent_async`'s own
+/// `a_dependent_async_node_in_a_graph_refuses_the_run`, which dispatches such
+/// a node where this one never gets that far. A successor list is a *free*
+/// node's state, so the cancellation early-out asks both questions -- is this
+/// a free node at all, and is it a dependent-async one -- before it drains
+/// anything; an early-out that asked only the second would go looking for a
+/// list a graph node does not have.
+#[test]
+fn a_graph_built_dependent_async_handle_is_skipped_with_nothing_drained() {
+    let executor = Executor::new(1);
+
+    let mut taskflow = Taskflow::new();
+    let failing = taskflow.emplace(|| panic!("x"));
+    let free = taskflow
+        .graph_mut()
+        .add_named_node("free", Handle::DependentAsync(AsyncWork::plain(|| {})));
+    taskflow.task(failing).precede([free]);
+
+    let error = executor
+        .run(&taskflow)
+        .wait()
+        .expect_err("the first task panicked, so the run failed");
+    assert_panicked_with(error, "x");
+
+    // One worker, which is the worker that dequeued the skipped job: that the
+    // run above returned at all is half the claim, and that this one does is
+    // the other half.
+    let ran = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&ran);
+    let mut after = Taskflow::new();
+    after.emplace(move || {
+        counted.fetch_add(1, Ordering::Relaxed);
+    });
+    executor
+        .run(&after)
+        .wait()
+        .expect("the executor is usable after the skipped job");
+    assert_eq!(ran.load(Ordering::Relaxed), 1);
 }

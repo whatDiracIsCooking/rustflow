@@ -296,6 +296,47 @@ fn a_panicking_task_cancels_the_rest_of_a_multi_conditioner_chain() {
 }
 
 // ----------------------------------------------------------------------------
+// Invented: the multi-condition arm's own panic path
+// ----------------------------------------------------------------------------
+
+/// A multi-condition body that panics selects nothing, and its payload comes
+/// back from `wait` exactly as a static task's does.
+///
+/// Not a repeat of the case above, and the reason is a line of
+/// [`exception_chain`]: it replaces `C`'s work through
+/// `taskflow.task(c).work(..)`, which turns a conditioner into a *static*
+/// task -- upstream's own case does the same -- so none of the three chains
+/// above ever enters a conditioner arm's failure path. The single-condition
+/// counterpart is `tests/control_flow.rs`'s
+/// `a_panicking_conditioner_selects_nothing`; this is the arm beside it,
+/// whose empty selection is an `unwrap_or_default` on a `Vec` rather than a
+/// `None`, and the one the coverage listing showed nothing reaching.
+#[test]
+fn a_panicking_multi_conditioner_selects_nothing() {
+    for workers in 1..=4 {
+        let context = format!("{workers} worker(s)");
+        let executor = Executor::new(workers);
+        let mut taskflow = Taskflow::new();
+
+        let counter = counter();
+        let cond = taskflow.emplace_multi_condition(|| panic!("x"));
+        let branches: Vec<Task> = (0..3).map(|_| taskflow.emplace(bump(&counter))).collect();
+        taskflow.task(cond).precede(branches);
+
+        let error = executor
+            .run(&taskflow)
+            .wait()
+            .expect_err("the multi-conditioner panicked");
+        assert_failed_with_x(&error, &context);
+        assert_eq!(
+            count(&counter),
+            0,
+            "{context}: a panicking multi-conditioner selects no successor"
+        );
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Testcase: ThreadSafety
 // ----------------------------------------------------------------------------
 

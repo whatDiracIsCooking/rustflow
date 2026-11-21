@@ -41,6 +41,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use rustflow::AsyncWork;
 use rustflow::Executor;
 use rustflow::prelude::*;
 
@@ -472,4 +473,54 @@ fn a_corun_returns_within_fifty_microseconds_of_a_child_on_another_worker() {
         Duration::from_nanos(samples[0]),
         Duration::from_nanos(samples[ROUNDS - 1])
     );
+}
+
+// --------------------------------------------------------
+// Invented: the failure a corun's anchor never sees
+// --------------------------------------------------------
+
+/// A corun reports a failure recorded against the *run* rather than against a
+/// node of it.
+///
+/// The anchor is where a failing task reports, and the run's own payload slot
+/// is the backstop for a failure with no node to walk up from. This is the one
+/// such failure a graph can carry to a corun: a `Handle::DependentAsync`
+/// somebody built into a taskflow is refused by its dispatch arm through the
+/// run's slot directly -- an async task's dependencies are other async tasks
+/// rather than edges of a graph -- so a corun that read only its anchor would
+/// return `Ok` from a graph that ran nothing.
+#[test]
+fn a_corun_reports_a_failure_recorded_against_the_run() {
+    let executor = Arc::new(Executor::new(2));
+
+    let inner = Arc::new({
+        let mut inner = Taskflow::new();
+        inner
+            .graph_mut()
+            .add_named_node("free", Handle::DependentAsync(AsyncWork::plain(|| {})));
+        inner
+    });
+
+    let mut outer = Taskflow::new();
+    outer.emplace({
+        let executor = Arc::clone(&executor);
+        let inner = Arc::clone(&inner);
+        move || {
+            let error = executor
+                .try_corun(&inner)
+                .expect_err("a dependent-async handle in a graph is refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains("a dependent-async node cannot be run as part of a taskflow"),
+                "{error}"
+            );
+        }
+    });
+
+    executor
+        .run(&outer)
+        .wait()
+        .expect("the corunning task caught the refusal");
+    executor.wait_for_all();
 }
