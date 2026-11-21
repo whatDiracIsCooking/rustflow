@@ -1132,3 +1132,82 @@ fn a_recursion_of_groups_on_a_worker_outruns_the_id_routes_stack() {
 
     assert_eq!(fib.load(Ordering::Relaxed), DEEP_FIBONACCI);
 }
+
+/// A group's hand-written `Debug` reports what it is waiting for, and never
+/// the executor it borrows.
+///
+/// That is the impl's own reason for not being a derive, and the three fields
+/// are the whole of it: the worker the group was opened on, how many children
+/// are outstanding and whether it has been cancelled. A derive would print
+/// the anchor and the `Route` instead, and the route *is* the borrow -- the
+/// whole executor on one side of it and the lent scheduling loop on the other
+/// -- so each reading below is asserted as an exact string: a return to a
+/// derive, or a fourth field, fails the case rather than widening a line.
+///
+/// The worker is read back through [`Executor::this_worker_id`] rather than
+/// assumed, which is why the case runs at four workers instead of one and
+/// over both routes: that field is the one the two routes compute
+/// differently, the id route holding the number and the runtime route asking
+/// the worker it borrows for it, and a pool with one worker in it could not
+/// tell a wrong answer from the right one.
+///
+/// Both readings with a child in them are deterministic without a sleep. The
+/// middle one is taken while the child spins on a release only this body can
+/// set, so the child is outstanding until the body says otherwise; the last
+/// is taken after the corun, where the count is zero whether the cancellation
+/// skipped the child or it ran to the end, since a skipped child's tear-down
+/// counts the same anchor down. The middle reading is *compared* after the
+/// release rather than where it is taken, so that a regression in it fails
+/// the case at once instead of leaving the child spinning into
+/// [`spin_until`]'s deadline.
+#[test]
+fn the_debug_output_reports_the_group_and_not_the_executor_it_borrows() {
+    const WORKERS: usize = 4;
+
+    for route in [Route::ById, Route::OnWorker] {
+        let executor = Arc::new(Executor::new(WORKERS));
+
+        in_a_group(&executor, route, {
+            let opener = Arc::clone(&executor);
+            move |group| {
+                let worker = opener
+                    .this_worker_id()
+                    .expect("a task group is opened on a worker");
+
+                assert_eq!(
+                    format!("{group:?}"),
+                    format!("TaskGroup {{ worker: {worker}, size: 0, cancelled: false }}"),
+                    "a group nothing has been spawned into names its worker and waits for nothing"
+                );
+
+                let release = Arc::new(AtomicBool::new(false));
+                group.silent_async({
+                    let release = Arc::clone(&release);
+                    move || {
+                        spin_until("the debug case to release the group's one child", || {
+                            release.load(Ordering::Acquire)
+                        });
+                    }
+                });
+
+                let outstanding = format!("{group:?}");
+
+                group.cancel();
+                release.store(true, Ordering::Release);
+                group.corun();
+
+                assert_eq!(
+                    outstanding,
+                    format!("TaskGroup {{ worker: {worker}, size: 1, cancelled: false }}"),
+                    "a child that cannot finish yet is what the group is waiting for"
+                );
+                assert_eq!(
+                    format!("{group:?}"),
+                    format!("TaskGroup {{ worker: {worker}, size: 0, cancelled: true }}"),
+                    "the corun emptied the group and the cancelled bit is never cleared"
+                );
+            }
+        })
+        .expect("no child panicked, so the group's one child was released in time");
+    }
+}

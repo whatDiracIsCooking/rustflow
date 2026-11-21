@@ -3083,6 +3083,27 @@ zero is a function nothing ran, a per-instantiation zero a *type* nothing ran
 it on -- and for a port whose seams are generic over the writer, the
 partitioner and the callable, the second is the more interesting question.
 
+**A hand-written `Debug` is a test; one kept for a derive is an exception**
+(issue #426). `src/task_group.rs`'s two never-executed production functions
+were `TaskGroup`'s `Debug::fmt` and the private `worker_id` its first field
+calls, and what the impl is *for* is why they are a test rather than the
+exception the entries above record. It is hand-written in order to choose
+three fields -- the worker the group was opened on, how many children are
+outstanding, whether it has been cancelled -- over the two a derive would
+print, and one of those two, the `Route`, **is** the borrow a group holds:
+the whole executor on one side of it and a lent scheduling loop on the
+other. A field list chosen on purpose is a claim about what a group tells a
+log, so it is asserted as an exact string, over both routes, at a worker
+count where the id could be wrong. What stays an exception is the other
+kind: a `Debug` written only because something in a derive's way needs one,
+which no test should execute because its output is nobody's claim.
+
+`src/subflow.rs` had nothing to record at all. All fourteen of its
+never-executed groups are closures in its own `#[cfg(test)]` module, so no
+production function in it was owed a test, a demotion or an exception: the
+handle's own `Debug`, its two state-bit queries and `num_workers` are
+already covered by the cases beside them.
+
 ## Benchmarks and performance
 
 The benchmark suite is a part of the port with decisions of its own, and this
