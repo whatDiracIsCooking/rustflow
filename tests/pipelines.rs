@@ -54,7 +54,9 @@
 //!
 //! The file's last section is not upstream's: `Pipe::set_callable` is the one
 //! member of the pipe's own surface whose effect only a run can show, so the
-//! case that names it is here rather than in a doc example.
+//! case that names it is here rather than in a doc example. The pipe's own
+//! `Debug` is beside it for the same reason -- asserting what a rendering
+//! must *not* carry takes a body with something in it to close over.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -895,6 +897,56 @@ fn a_reset_pipeline_runs_again_after_a_panicking_pipe() {
 // ----------------------------------------------------------------------------
 // The pipe's own setter (not upstream's)
 // ----------------------------------------------------------------------------
+
+/// [`Pipe`]'s `Debug` names the pipe's direction and nothing of the body it
+/// carries.
+///
+/// The impl is hand-written rather than derived because a callable has no
+/// `Debug` of its own, and what that leaves is a choice. Both halves of it
+/// are asserted here: the direction printed is the pipe's own field, so it
+/// tracks [`Pipe::set_type`] rather than the type the pipe was built with,
+/// and a marker the body closes over appears nowhere in the rendering --
+/// which the case makes a real absence rather than a vacuous one by running
+/// the body afterwards and reading the marker back out of it. A pipe body is
+/// where a caller's own data lives in a pipeline, and `{pipe:?}` in a log is
+/// the way it would otherwise leave.
+#[test]
+fn the_debug_output_of_a_pipe_names_its_direction_and_never_its_bodys_data() {
+    /// A value whose appearance in a rendering could not be a coincidence.
+    const MARKER: &str = "a-pipe-bodys-own-captured-marker";
+
+    let captured = MARKER.to_string();
+    let seen = Arc::new(Mutex::new(String::new()));
+    let recorded = Arc::clone(&seen);
+    let mut pipe = Pipe::new(PipeType::Serial, move |_pf: &mut Pipeflow| {
+        *recorded.lock().expect("uncontended") = captured.clone();
+    });
+
+    assert_eq!(format!("{pipe:?}"), "Pipe { type: Serial }");
+    pipe.set_type(PipeType::Parallel);
+    assert_eq!(
+        format!("{pipe:?}"),
+        "Pipe { type: Parallel }",
+        "the direction printed is the field, not the one `new` was given"
+    );
+
+    let pretty = format!("{pipe:#?}");
+    assert!(
+        pretty.contains("type: Parallel"),
+        "the alternate form reports the same direction: {pretty}"
+    );
+    assert!(
+        !pretty.contains(MARKER) && !format!("{pipe:?}").contains(MARKER),
+        "neither form prints what the body closed over: {pretty}"
+    );
+
+    pipe.invoke(&mut Pipeflow::default());
+    assert_eq!(
+        *seen.lock().expect("the pipe has run"),
+        MARKER,
+        "the body did hold the marker, so neither rendering above was empty of it by accident"
+    );
+}
 
 /// `Pipe::set_callable` -- upstream's `Pipe::callable(U&&)` -- replaces the
 /// body the scheduler runs for every token that reaches the pipe, and leaves

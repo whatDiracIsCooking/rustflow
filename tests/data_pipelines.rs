@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rustflow::Executor;
-use rustflow::pipeline::data_pipeline::{DataPipeline, serial_pipe_with_flow};
+use rustflow::pipeline::data_pipeline::{DataPipeline, parallel_pipe, serial_pipe_with_flow};
 use rustflow::prelude::*;
 
 #[macro_use]
@@ -873,6 +873,132 @@ fn the_taskflow_a_data_pipeline_hands_back_runs_the_typed_chain() {
             *seen.lock().expect("the run is over"),
             vec![0, 10, 20, 30, 40],
             "every token's value reached the second pipe through the slots"
+        );
+    });
+}
+
+// ----------------------------------------------------------------------------
+// The typed chain's own renderings (not upstream's)
+// ----------------------------------------------------------------------------
+
+/// `DataPipe`'s and [`DataPipeline`]'s `Debug` name the chain's shape and
+/// nothing of the data moving through it.
+///
+/// Both impls are hand-written rather than derived because neither a user
+/// callable nor a `Box<dyn Any>` has a `Debug` of its own, and what that
+/// leaves is a choice. A `DataPipe` prints its direction and not what its
+/// callable closed over; a `DataPipeline` prints the `Pipeline` it wraps
+/// and not the per-line slots, which is where every value in flight between
+/// two pipes lives -- the strongest case in the crate for a `Debug` that
+/// keeps a caller's own data out of a log.
+///
+/// The absences are made real rather than vacuous: the marker is read inside
+/// the source's body, and the second rendering is taken after a run, when
+/// the last pipe's own tagged output is what each line's slot is left
+/// holding. The `num_tokens` readings either side of the run are the other
+/// half of that -- what a `DataPipeline` prints is live state, not a
+/// snapshot taken at `build`.
+#[test]
+fn the_debug_output_of_a_typed_chain_names_its_shape_and_never_the_values_it_carries() {
+    /// Lines, so that there is more than one slot to leave a value in.
+    const LINES: usize = 2;
+    /// Tokens the source lets through before it stops.
+    const TOKENS: usize = 4;
+    /// A value the source's body closes over, distinctive enough that its
+    /// appearance in a rendering could not be a coincidence.
+    const MARKER: &str = "a-data-pipes-own-captured-marker";
+    /// The same for a value the chain carries between its two pipes.
+    const VALUE_TAG: &str = "a-value-in-flight-between-two-pipes";
+
+    serialized(|| {
+        let produced = Arc::new(AtomicUsize::new(0));
+        let source = {
+            let captured = MARKER.to_string();
+            let produced = Arc::clone(&produced);
+            serial_pipe_with_flow::<(), usize>(move |(), pf| {
+                // Read, so that the body really does hold the marker the
+                // renderings below are asserted not to carry.
+                assert_eq!(captured, MARKER);
+                let token = produced.load(Ordering::Relaxed);
+                if token == TOKENS {
+                    pf.stop();
+                    return 0;
+                }
+                produced.fetch_add(1, Ordering::Relaxed);
+                token
+            })
+        };
+        assert_eq!(format!("{source:?}"), "DataPipe { type: Serial }");
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let tail = {
+            let seen = Arc::clone(&seen);
+            parallel_pipe::<usize, String>(move |value| {
+                let tagged = format!("{VALUE_TAG}-{value}");
+                seen.lock().expect("uncontended").push(tagged.clone());
+                tagged
+            })
+        };
+        assert_eq!(format!("{tail:?}"), "DataPipe { type: Parallel }");
+        assert!(
+            !format!("{tail:#?}").contains(VALUE_TAG),
+            "the alternate form prints no more of a pipe than the plain one"
+        );
+
+        let pipeline = DataPipeline::builder(LINES).pipe(source).pipe(tail).build();
+
+        let built = format!("{pipeline:?}");
+        assert!(
+            built.starts_with("DataPipeline { pipeline: Pipeline {"),
+            "the rendering is the wrapped scheduler's own: {built}"
+        );
+        assert!(
+            built.contains(&format!("num_lines: {LINES}")),
+            "with the shape it was built for: {built}"
+        );
+        assert!(
+            built.contains("Pipe { type: Serial }") && built.contains("Pipe { type: Parallel }"),
+            "and each lowered pipe's direction: {built}"
+        );
+        assert!(
+            built.contains("num_tokens: 0"),
+            "nothing has run yet: {built}"
+        );
+        assert!(
+            !built.contains("slots"),
+            "the per-line slots are no part of the rendering: {built}"
+        );
+        assert!(
+            !built.contains(MARKER),
+            "nor is what the source's body closed over: {built}"
+        );
+
+        let mut taskflow = Taskflow::new();
+        compose_module(&mut taskflow, &pipeline, "module_of_pipeline");
+        Executor::new(2)
+            .run(&taskflow)
+            .wait()
+            .expect("no task panicked");
+
+        assert_eq!(pipeline.num_tokens(), TOKENS);
+        let mut carried = seen.lock().expect("the run is over").clone();
+        carried.sort();
+        assert_eq!(
+            carried,
+            (0..TOKENS)
+                .map(|token| format!("{VALUE_TAG}-{token}"))
+                .collect::<Vec<String>>(),
+            "every token's value reached the tail pipe, which left it in its line's slot"
+        );
+
+        let run = format!("{pipeline:?}");
+        assert!(
+            run.contains(&format!("num_tokens: {TOKENS}")),
+            "the rendering reports live state: {run}"
+        );
+        assert!(
+            !run.contains(VALUE_TAG),
+            "and a populated slot is still printed nowhere: {run}"
         );
     });
 }

@@ -3104,6 +3104,48 @@ production function in it was owed a test, a demotion or an exception: the
 handle's own `Debug`, its two state-bit queries and `num_workers` are
 already covered by the cases beside them.
 
+**#426's rule has a reason behind it: the listing cannot report the other
+kind at all** (issue #427). `rustc` emits no coverage mapping for an
+`#[automatically_derived]` item, so `coverage.sh --functions` never sees a
+derived `Debug` or `Default`: every one of the 37 `Debug::fmt` symbols the
+JSON export carries for this crate belongs to a hand-written impl, against 39
+`#[derive(..)]` sites in `src/` naming `Debug`. `Pipeline`'s and `State`'s
+derived `Debug` and `ChromeObserver`'s derived `Default` are therefore absent
+from the listing while `Pipe`'s, `DataPipe`'s, `DataPipeline`'s and
+`ObserverList`'s `Debug` and `TfProfObserver`'s `Default` are in it. So "a
+`Debug` kept only because a derive demands it" is not a shape this instrument
+can show, and the exception half of the rule above applies to a function
+found by reading the source rather than by reading the listing.
+
+The five it does name over `src/pipeline/` and `src/observer/` are each
+hand-written for a reason -- a callable, a `Box<dyn Any>` and a `dyn Observer`
+have no `Debug` of their own, and a `TfProfObserver`'s id comes from a
+counter rather than from a zeroed field -- so which field is printed, or
+where the value comes from, is a decision with a behaviour behind it. All
+five are disposed of with tests and none is a recorded exception.
+`DataPipeline`'s is the crate's strongest instance: the field it does not
+print is the per-line slots, which is where every value in flight between two
+pipes lives, so `{pipeline:?}` in a log carries the chain's shape and none of
+a caller's data.
+
+No demotion follows either, and the one item where deletion was the
+alternative is `ObserverList`'s `Debug`: the type is already `pub(crate)` and
+nothing in the crate formats it, `Executor`'s own hand-written `Debug`
+printing four counts and not its observer list. It stays because it is what
+lets that crate-private field be printed at all, and because it keeps an
+invariant of this module's own -- a formatter reads the count off the atomic
+beside the list, so registering, un-registering and snapshotting remain the
+only operations that take the list's lock. The milestone's expectation that a
+never-executed function in `src/observer/mod.rs` would be on #304's
+panic-in-hook path does not hold: that seam reaches `ObserverList::is_empty`
+and `ObserverList::snapshot`, both of which the suite executes. #424's
+per-instantiation reading was run over these files too and found no second
+gap -- every zero-count monomorphisation is a production generic covered
+under other type arguments, instantiated by a case that builds a pipe and
+never invokes it. The remaining 22 groups are closures and trait methods
+inside these files' own `#[cfg(test)]` modules, which is #442's reading
+rather than a decision here.
+
 ## Benchmarks and performance
 
 The benchmark suite is a part of the port with decisions of its own, and this
