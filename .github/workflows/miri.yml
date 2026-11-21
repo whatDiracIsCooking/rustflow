@@ -133,6 +133,23 @@ jobs:
           # instead (`-Zmiri-disable-stacked-borrows`) would have thrown away
           # half of what this job is for.
           #
+          # `-Zmiri-ignore-leaks` is the exit-time leak check and nothing
+          # else; the aliasing and data-race checks above are untouched by it.
+          # It is off for the same reason: the leaks are crossbeam-epoch's, by
+          # that crate's design. The nine this lane reported were
+          # `Box<crossbeam_epoch::internal::Local>` (the per-thread
+          # participant, registered on a worker's first pin) and
+          # `Box<Node<SealedBag>>` (the sealed garbage bag `Local::finalize`
+          # pushes into the global queue when that worker's thread-local
+          # handle is dropped at thread exit). Epoch-based reclamation frees
+          # either only when some thread pins again and advances the epoch,
+          # and once an `Executor`'s `Drop` has joined its workers nothing
+          # does, so both are still allocated when the process ends. Their
+          # allocation backtraces -- read with `-Zmiri-backtrace=full`,
+          # because the crate's own counting allocator in `async_node.rs`'s
+          # tests truncates the default one -- contain no frame of this crate,
+          # and a leak is not undefined behaviour either way.
+          #
           # Deliberately NOT set: `-Zmiri-disable-isolation`, since no test
           # below reads the host's clock, environment or filesystem, and
           # leaving isolation on keeps the run independent of the machine; and
@@ -141,7 +158,7 @@ jobs:
           # warning is a true statement about the limit of this lane -- Miri
           # can miss a pointer bug behind such a cast -- so it stays in the
           # log, where it costs nothing: it is a warning, not a failure.
-          MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-backtrace=full"
+          MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-ignore-leaks"
         run: |
           # POSIX only, no bashism: the container's /bin/sh is dash and the
           # image ships no bash, so GitHub runs this step as `sh -e {0}` and
