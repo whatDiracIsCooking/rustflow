@@ -3089,6 +3089,107 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   asserting that agreement over a graph of chains and sources, where a
   worker's own queue is empty at every dispatch.
 
+  **#433's run over `executor/topology/` and `run_handle.rs` adds five entries
+  to that list, in two groups, and corrects how every run in this series is
+  driven.** `src/executor/topology/{mod,run,job,ownership}.rs` and
+  `src/executor/run_handle.rs` generate 220 mutants -- **none of them in
+  `mod.rs`**, which is 16 lines of production code in front of a 1467-line
+  `#[cfg(test)] mod tests` -- of which 80 are caught, 61 time out, 69 are
+  unviable for want of a `Default` on `RunHandle`, `Job`, `Topology` and
+  `MutexGuard`, and 10 survive. Five of the ten are mutants no test should
+  kill; the other five are owed tests and get them.
+
+  **Three more `|`s over disjoint single bits.** `Cancellable::claim_panic`
+  builds `EXCEPTION | CAUGHT` and both `Cancellable::cancelled` and
+  `Parent::ancestor_cancelled` build the `CANCELLED | EXCEPTION` that
+  "cancelled" means, out of constants that are one bit each -- `0x4000_0000`,
+  `0x1000_0000`, `0x2000_0000` -- so `a | b == a ^ b` and `^` leaves the same
+  word. These are `NodeBase::claim_panic`'s case in its third, fourth and fifth
+  instances, and what makes them evidence rather than assertion is that the run
+  contains its own control: for each of the three, the mutant of the **same
+  expression at the same line and column** is caught, under two independent
+  test selections. One pair dies and the other lives, so the selection plainly
+  reaches the line.
+
+  **A third guard over a call that is a no-op without it.** `set_up_graph`
+  clears a node's payload slot under
+  `if node.estate().swap(0, ..) & Cancellable::CAUGHT != 0`, and
+  `NodeBase::clear_panic` on an unclaimed slot drops a `None`. `|` for that `&`
+  makes the condition always true, and `^` makes it true for every word the
+  unmutated program can produce -- the one word it would be false for is
+  `CAUGHT` alone, which `claim_panic` rules out by always setting `EXCEPTION`
+  beside it -- so both clear every node unconditionally. What that costs is a
+  mutex per node per set-up and the guard is what the swap is there to avoid;
+  what it changes is nothing. The third mutant of the same line, `==` for the
+  `!=`, is a different program and is the one survivor of this run with a
+  consequence: see below.
+
+  **How a `cargo mutants` run over this crate must be driven** (issue #433).
+  A run at `-j 4` under a single `CARGO_TARGET_DIR` **produces false results**,
+  and that is a property of this crate's layout rather than of one invocation.
+  Every mutant job writes its artifacts to content-independent paths --
+  `-C extra-filename` derives from the package, profile and features, not from
+  the source -- so concurrent jobs sharing a target directory overwrite each
+  other's rlib and each other's test binaries, and a job then tests whatever
+  binary was in place when it reached its test phase. The evidence is one
+  mutant: `Canceller::cancel -> bool with false` was reported MISSED in 6 s
+  build + 9 s test at `-j 4`, and it cannot be missed --
+  `tests/cancellation.rs`'s `cancel_from_another` asserts `canceller.cancel()`
+  inside a task body over a graph that cannot terminate by itself. Its log
+  carries one rustc invocation for the package, no rlib build, and the seven
+  integration binaries reused unrebuilt at the baseline's own paths; run alone
+  at `-j 1`, everything else unchanged, it rebuilds the rlib and returns
+  TIMEOUT. The error runs at least in the direction of a **false MISSED**, a
+  spurious survivor that costs a test nobody needed; one observation is
+  stronger than staleness and leaves the other direction open, a mutant being
+  reported MISSED although the one target that job *did* rebuild asserts the
+  mutated output as an exact string, which means the binary a job ran was not
+  the binary it built.
+
+  So a run is **`-j 1`**, there being no per-job target directory to give
+  `cargo mutants` 27.1.0 and the image setting `CARGO_TARGET_DIR` globally, and
+  it passes its test selection through **`--cargo-arg`** rather than
+  `--cargo-test-arg`: the latter reaches only the test phase, leaving the build
+  phase to compile all 90 targets for every mutant, which is the difference
+  between ~95 s and ~3.5 s a mutant and therefore the difference between serial
+  being affordable and not. Survivors are then re-measured unfiltered, over the
+  whole suite, which is where a mutant killed by a suite outside the selection
+  turns up. One reading note that is not about concurrency at all: `cargo
+  mutants` writes only MISSED, TIMEOUT and UNVIABLE to stdout when stdout is
+  not a tty, so **`outcomes.json` is the file to tally** -- the stdout stream of
+  #433's run shows 0 caught of 67 lines where `outcomes.json` has 80 of 220.
+
+  **What a timeout means here, which is not what it means elsewhere in this
+  entry.** 61 of the 220 time out, and reading their logs is the step that tells
+  detection from a miss: a mutated topology **hangs** rather than failing an
+  assertion, and 59 of the 61 hang inside the lib unit-test binary, which is
+  `topology/mod.rs`'s own 48 cases. `Topology::finish -> ()` completes 0 of 426
+  unit tests and prints no `test result` line at all against a 0.49 s baseline;
+  `Topology::job_finished -> bool with true` completes 372 and stops dead. At
+  `-j 1` each was already the only thing on the box, so "a timeout is re-run
+  alone before it is believed" is satisfied by construction.
+
+  **Five survivors that looked like this entry's groups and are not.** Two are
+  `Job`'s hand-written `Hash` and `Debug`, which #426's rule sends to tests
+  rather than to this list: the hash has one caller, `Buffers::push`, and what
+  it stands in for is upstream's `Node*`, so a hash that cannot tell two jobs
+  apart sends every job of every run to one buffer -- and `GraphOwner::identity`
+  returning a null pointer, a third survivor, is that same break reached
+  through the owner. The fourth is `Topology`'s own `Debug`. The fifth is the
+  one worth the run's time: **`==` for the `!=` in `set_up_graph`'s clearing
+  guard** inverts it, so the node that *did* catch a payload is the one node
+  whose slot is not emptied, and `NodeBase::take_panic` takes a slot
+  unconditionally -- a payload left by a failure nobody collected would surface
+  as the **next** run's failure, which is exactly what that line and
+  `keep_panic`'s docs promise it will not. The path that leaves one uncollected
+  is a cancelled run whose implicitly anchored parent is never resumed,
+  followed by a second run of the same taskflow; it is pinned at the
+  `set_up_graph` seam instead, deterministically, by widening
+  `setting_up_the_same_graph_again_rearms_it` -- which had looked like the case
+  that owned it and did not, leaving `CANCELLED` in the estate word and never
+  putting a payload in the slot at all, so it asserted nothing about the
+  clearing it was named for.
+
 - **Four API-shape questions the friction log left open are all "keep", and
   the reasons are here rather than in code** (issue #260).
 
@@ -3402,6 +3503,51 @@ only. `a_panicking_multi_conditioner_selects_nothing` is that case for the arm
 beside it: the payload comes back from `wait` and the empty selection ends the
 branch, which is an `unwrap_or_default` on a `Vec` where the other arm has a
 `None`.
+
+**A 27-function hole that is a test module, and the one borrowed overload the
+suite never drove** (issue #433). The mutation run over
+`src/executor/topology/{mod,run,job,ownership}.rs` and
+`src/executor/run_handle.rs` was scoped around a question about the first of
+them: 27 of its 93 functions never executed, the second-largest hole in the
+crate, in a 1484-line module. The answer is that **the file has no production
+function at all.** Sixteen of those 1484 lines are production code -- seven of
+`//!`, three `mod` declarations, three `pub(crate) use` re-exports -- and lines
+17 to 1484 are one `#[cfg(test)] mod tests`, 48 cases over the three
+submodules and the largest unit-test module in the crate. `cargo mutants
+--list` generates zero mutants in it, and the listing read after #442 puts zero
+of its never-executed groups in the production section and all 27 in the
+`#[cfg(test)]` one. It is #424's reading of `flow_builder.rs`'s 45 exactly, and
+nothing in it is owed a test, a demotion or an exception.
+
+The other four files have four never-executed production groups between them
+and `assert_send_sync` three times over, which is #425's recorded design
+exception in its fifth, sixth and seventh instances.
+
+`Executor::run_until` and its one closure were a **real gap**, and the one the
+matrix could not have found: `RunHandle` has no `Default`, so the mutant of
+that method is unviable and the function's absence from the coverage listing is
+the only instrument that reports it. Twelve methods spell upstream's twelve
+`run` overloads and each forwards in two lines, which makes it tempting to
+treat the family as covered when its two long forms are -- and the suite did
+exactly that, reaching `run_until_with` through `run_n`/`run_n_with` and the
+owned `run_owned_until` through `tests/movable.rs`, and never the borrowed
+two-argument form. `run_until_runs_the_graph_k_times_and_fires_the_callback_once`
+now drives both, over the same counting predicate, because what the
+callback-less member has to agree about is the run count and the number of
+questions put to the predicate.
+
+`Topology::free_standing`'s and `Topology::nothing_to_run`'s on-finish closures
+are both **recorded exceptions**, and they are #432's `InnerRun::new` case in
+its second and third instances: `Topology::over` asks for a callback
+(`C: FnOnce()`), and neither of those two runs is ever carried out by the run
+machinery that would call one. The sentinel never finishes by construction --
+its join counter is pinned at one, so `job_finished` never reports a last job
+and the tear-down is unreachable -- and `nothing_to_run` is finished before it
+is handed out, the real callback of a zero-times or sourceless run having
+already been called on the caller's own thread by `run_until_with`. `|| {}` is
+what the signature asks for and no path reaches it; deleting it means putting
+an `Option` in `Topology::over`'s signature for two callers with nothing to say,
+on behalf of every run that does.
 
 ## Benchmarks and performance
 
