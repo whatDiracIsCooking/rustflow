@@ -68,7 +68,7 @@
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 
 use rustflow::algorithm::module::make_module_task;
 use rustflow::observer::{Observer, TaskView, WorkerView};
@@ -1839,5 +1839,75 @@ fn take_panic_hands_a_silent_tasks_own_failure_over_once() {
     assert!(
         failed.take_panic().is_none(),
         "taken rather than peeked: a second caller gets nothing"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// What the handle prints
+// ----------------------------------------------------------------------------
+
+/// `AsyncTask`'s `Debug` is hand-written so that a task's own captures never
+/// reach the output: what it prints is the node's address, whether the task
+/// has finished and how many shares of it are outstanding, and an empty
+/// handle prints no node at all. Upstream's handle has no `operator<<` for
+/// this to translate -- but a handle that printed its captures would put a
+/// caller's data in every log line that formatted one.
+///
+/// The unfinished reading is made deterministic by a barrier the body parks
+/// on: the body cannot be past it until this thread arrives there too, so
+/// `done: false` is a fact rather than a race. The finished reading is taken
+/// with the pool down, where the handle is the only owner left, exactly as
+/// [`use_count_counts_the_shares_of_one_task`] above takes its own.
+#[test]
+fn the_debug_output_names_the_node_and_never_a_captured_value() {
+    assert_eq!(
+        format!("{:?}", AsyncTask::default()),
+        "AsyncTask { node: None }",
+        "an empty handle names no node, so it has nothing else to print"
+    );
+
+    let gate = Arc::new(Barrier::new(2));
+    let task = {
+        let executor = Executor::new(2);
+        let secret = String::from("a-captured-secret");
+        let parked = Arc::clone(&gate);
+        let (task, done) = executor.dependent_async(
+            move || {
+                assert_eq!(secret, "a-captured-secret", "the body got its capture");
+                parked.wait();
+            },
+            [],
+        );
+
+        // The body is parked on the barrier until this thread arrives, so the
+        // task stays unfinished for as long as the reading takes.
+        let running = format!("{task:?}");
+        assert!(
+            running.starts_with("AsyncTask { node: 0x"),
+            "a live handle prints the node it names, by address: {running}"
+        );
+        assert!(
+            running.contains("done: false"),
+            "the body has not returned yet: {running}"
+        );
+        assert!(
+            !running.contains("secret"),
+            "a body's captures are what this impl exists to keep out: {running}"
+        );
+
+        gate.wait();
+        done.wait().expect("the body did not panic");
+        executor.wait_for_all();
+        task
+    };
+
+    let finished = format!("{task:?}");
+    assert!(
+        finished.contains("done: true"),
+        "the body returned before the pool came down: {finished}"
+    );
+    assert!(
+        finished.contains("use_count: 1"),
+        "the pool is down, so this handle is the only share left: {finished}"
     );
 }

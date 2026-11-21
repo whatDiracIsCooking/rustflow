@@ -568,6 +568,19 @@ mod tests {
         let _ = graph.node(Task::new(0));
     }
 
+    /// `node_mut` refuses an erased handle the way `node` refuses a stale
+    /// one, and says which handle and how much of the arena is live: the
+    /// counts are the diagnostic's whole point, because a handle that
+    /// addresses a tombstone is in range and indistinguishable from a live
+    /// one without them.
+    #[test]
+    #[should_panic(expected = "Task(0) is out of range or erased: 1 live nodes in 2 slots")]
+    fn node_mut_panics_on_an_erased_handle() {
+        let (mut graph, t) = graph_of(2);
+        assert!(graph.erase(t[0]));
+        let _ = graph.node_mut(t[0]);
+    }
+
     #[test]
     #[should_panic(expected = "out of range")]
     fn add_edge_panics_on_a_stale_handle() {
