@@ -2900,6 +2900,48 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   driver has already returned for `n == 0` and taken the serial path for
   `w_total <= 1` before a partitioner sees either number.
 
+  **#430's run over `src/executor/notifier.rs`, `src/executor/rng.rs` and
+  `src/executor/queue.rs` adds three entries to that list and nothing else.**
+  232 mutants, 20 survivors; seventeen are killed by twelve of the thirteen
+  tests that run's own PR adds, and three are mutants no test should kill, for
+  the two reasons this entry already names.
+
+  **A third `|` over disjoint bits.** `NonblockingNotifier::commit_wait`
+  builds the state word it pushes itself into as
+  `(resolved & !STACK_MASK) | index`, where `index` is a worker id and so
+  below `2^16 - 1`: the left operand's low sixteen bits are zero by
+  construction, so `a | b == a ^ b` and `^` for that `|` leaves the same word.
+  The `&` mutant of the same expression is a different program and is killed,
+  exactly as `claim_panic`'s is.
+
+  **Two mutants of a guard over a call that is a no-op without it.**
+  `notify_all` ends with
+  `if state & STACK_MASK != STACK_MASK { self.unpark_chain(state & STACK_MASK) }`,
+  and `unpark_chain`'s own loop is `while index != STACK_MASK`: the guard
+  saves a call and decides nothing, because handed `STACK_MASK` the callee
+  walks no chain. `|` for that `&` makes the condition "the epoch or the
+  pre-waiter count is non-zero", `^` makes it that or "the stack top is not
+  zero", and both are *true* wherever the original is -- a waiter reaches the
+  stack only through the compare-exchange above it, which adds `EPOCH_INC` as
+  it pushes, so a non-empty stack means a non-zero epoch -- while where they
+  differ from it, the stack being empty, the extra call returns at once. The
+  one input that separates them is a 32-bit epoch wrapped to exactly zero with
+  a waiter still parked, which is 2^32 resolved requests away and is the same
+  boundary the group above argues from. A test for either would pin the
+  mutation rather than the behaviour, there being no behaviour to pin: the two
+  programs differ only in whether a function is entered in order to return.
+
+  What the same run did *not* put here is worth one line, because two of its
+  survivors looked at first like the equivalent-mutant case and were not.
+  `reduce`'s `hash >> 16` as `hash << 16` routes every item to buffer zero
+  whenever the buffer count is a power of two, which is every executor of 2 to
+  3 workers, 8 to 15 and 128 to 255; and `^=` as `|=` in `Xorshift64`'s
+  recurrence costs the generator its period, surviving only because the
+  known-answer test's seed is 1, where each step's shifted word is disjoint
+  from the state and `|` *is* `^`. Both are owed a test, and the shift that
+  `buffer_of`'s doc comment calls free is free in its *cost*, not in its
+  value.
+
 - **Four API-shape questions the friction log left open are all "keep", and
   the reasons are here rather than in code** (issue #260).
 
@@ -3152,6 +3194,34 @@ under other type arguments, instantiated by a case that builds a pipe and
 never invokes it. The remaining 22 groups are closures and trait methods
 inside these files' own `#[cfg(test)]` modules, which is #442's reading
 rather than a decision here.
+
+**A poison branch nothing can poison is an exception; a `Default` kept for a
+lint is a test** (issue #430). The mutation run over
+`src/executor/notifier.rs`, `src/executor/rng.rs` and `src/executor/queue.rs`
+leaves those three files with two never-executed production groups between
+them, one of each kind, and `src/executor/rng.rs` with none. None of the three
+has an entry in the listing's `#[cfg(test)]` section either.
+
+`AtomicWaiter::lock`'s closure is the arm that takes a poisoned lock instead
+of propagating it, and it is a **recorded exception**, because nothing can
+reach it. The lock guards one `Option<Thread>` and all three of its critical
+sections are a move into or out of that slot -- `arm`, `disarm` and `unpark` --
+so no path can panic while holding it, which is the argument the method's own
+doc comment already makes for recovering rather than propagating. A test would
+have to poison the mutex, and poisoning it is the one thing no caller can do.
+Both other dispositions are worse: `expect` would turn an unreachable state
+into a panic on a notifier's wake path, and deleting the recovery means
+deleting the lock, which is what `NonblockingNotifier` does and is the reason
+*it* is the default rather than something to retrofit here.
+
+`WorkerQueue`'s `Default` is the other kind, and it is owed a test. It exists
+because `clippy::new_without_default` warns by default and the gate's
+`-D warnings` makes that a failure, the queue's `new` taking no argument, so
+nothing in `src/` calls it -- which is a reason for the impl to exist and not a
+reason for it to be unasserted. `tests/wsq.rs`'s
+`a_defaulted_queue_is_an_empty_one` pins the only thing a reader wants from it:
+that it is the queue `new` builds and not a second constructor with a second
+meaning. Deleting it is not available, the lint being on in the gate.
 
 ## Benchmarks and performance
 

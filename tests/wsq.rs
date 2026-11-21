@@ -212,6 +212,66 @@ fn emptiness_is_the_queues_own_from_either_end() {
     assert!(buffers.is_empty());
 }
 
+/// A defaulted queue is an empty queue, and the same queue
+/// [`WorkerQueue::new`] builds.
+///
+/// The impl exists because `clippy::new_without_default` warns by default and
+/// the gate's `-D warnings` makes that a failure, the queue's `new` taking no
+/// argument -- so nothing in `src/` calls it and no case above reaches it,
+/// which is how it came to be the one never-executed production function of
+/// `src/executor/queue.rs` (#430). What it owes a reader is that it is not a
+/// second constructor with a second meaning.
+#[test]
+fn a_defaulted_queue_is_an_empty_one() {
+    let queue: WorkerQueue<usize> = WorkerQueue::default();
+    assert!(queue.is_empty());
+    assert_eq!(queue.len(), 0);
+    assert_eq!(queue.pop(), None);
+
+    queue.push(1);
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue.pop(), Some(1));
+}
+
+/// The hash routing reaches every buffer, at every buffer count an executor
+/// can have.
+///
+/// `Buffers::buffer_of` promises a caller nothing about *which* buffer an item
+/// lands in, but the buffers exist so that two threads scheduling two items
+/// usually contend on two different ones, and a routing that reached only some
+/// of them would quietly give that up -- one buffer taking every push, with
+/// the rest of the sweep a cost paid for nothing. The counts that need
+/// watching are the powers of two, where a reduction that happened to be a
+/// multiple of the count collapses onto buffer zero and no other; the buffer
+/// count being `bit_width(num_workers)`, those are the executors of 2 to 3
+/// workers, 8 to 15, and 128 to 255 (#430).
+#[test]
+fn the_routing_reaches_every_buffer_at_every_buffer_count() {
+    /// Enough items that a buffer missed is a routing fact and not a draw:
+    /// the widest count here is 9 buffers.
+    const ITEMS: usize = 4_096;
+
+    for workers in 1..=256_usize {
+        let buffers: Buffers<usize> = Buffers::new(workers);
+        let count = buffers.num_buffers();
+        let mut hits = vec![0_usize; count];
+
+        for item in 0..ITEMS {
+            let index = buffers.buffer_of(&item);
+            assert!(
+                index < count,
+                "{workers} workers: item {item} routed to buffer {index} of {count}"
+            );
+            hits[index] += 1;
+        }
+
+        assert!(
+            hits.iter().all(|&count| count > 0),
+            "{workers} workers: unused buffer in {hits:?}"
+        );
+    }
+}
+
 // ============================================================================
 // Thieves against the owner
 // ============================================================================

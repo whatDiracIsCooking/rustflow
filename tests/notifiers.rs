@@ -34,17 +34,41 @@
 //!   thread it is about to join is the one still parked --
 //!   [`notify_one_at_prewaiter_window`] records the verdict, drains the
 //!   notifier so the join can finish, and asserts after the scope.
+//!
+//! Five case shapes are this file's own rather than upstream's, and each says
+//! so in its own doc comment: [`notify_n_resolves_k_prewaiter_tickets`],
+//! [`a_spurious_unpark_does_not_end_a_wait`],
+//! [`a_finished_waiter_is_not_claimable`], the two that read a notifier's
+//! `Debug`, and the two that drop a notifier with a waiter still registered.
+//! Three of them follow from the port's one departure from upstream -- a
+//! thread handle and [`std::thread::park`] where upstream has a futex -- and
+//! the other two ask of `notify_n` and of a dump what upstream's suite never
+//! asks.
 
 // The notifiers are built out of `loom`'s atomics under `cfg(loom)`, and
 // loom's only run inside its own model: this suite is the `std` one, and
 // `tests/loom_notifier.rs` is the other half.
 #![cfg(not(loom))]
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use rustflow::executor::notifier::{AtomicNotifier, NonblockingNotifier, Notifier};
+
+/// How many times a case that manufactures spurious wakeups unparks the
+/// sleeping thread. One unpark would do -- a thread holds at most one token --
+/// but the waiter is somewhere in a park loop rather than at a known point, so
+/// the case spends enough of them, yielding between, that it lands inside the
+/// loop rather than only before it.
+const SPURIOUS_WAKES: usize = 1_000;
+
+/// How many times a case yields before notifying, where what it needs is a
+/// waiter that has reached its `park` rather than one that is still on its way
+/// there. Nothing observable says "it is asleep now", which is why the cases
+/// that need it also run rounds.
+const SETTLE_YIELDS: usize = 64;
 
 // Only the matrix macro: every helper this file would otherwise take from
 // `tests/common/` it does without, because a notifier case counts with the
@@ -414,6 +438,67 @@ fn notify_n_does_not_over_release<T: Notifier + Sync>(notifier: &T, k: usize, ro
     assert_eq!(notifier.num_waiters(), 0);
 }
 
+/// A wait ends on a notification and on nothing else: a waiter whose thread is
+/// unparked without one re-reads the condition and sleeps on.
+///
+/// This case is the port's rather than upstream's, and it is the one the park
+/// registry asks for. Upstream parks on a futex word, so the only thing that
+/// can wake its waiter is a write to that word; here the sleep is
+/// [`std::thread::park`], and a `park` returns both for an `unpark` and for no
+/// reason at all -- and a waiter that was claimed but left without parking
+/// leaves a token behind that makes its *next* `park` return at once, which
+/// both notifiers' docs name as a consequence they tolerate. So the condition
+/// has to be the state word rather than the wake, and that is what this
+/// asserts: the token is manufactured by unparking the sleeper's own thread,
+/// no notification having happened, and `commit_wait` is still waiting
+/// afterwards (#430).
+fn a_spurious_unpark_does_not_end_a_wait<T: Notifier + Sync>(notifier: &T) {
+    let sleeper = OnceLock::new();
+    let committed = AtomicBool::new(false);
+    let (sleeper, committed) = (&sleeper, &committed);
+
+    let mut left_on_a_spurious_wake = false;
+
+    thread::scope(|scope| {
+        scope.spawn(move || {
+            notifier.prepare_wait(0);
+            sleeper
+                .set(thread::current())
+                .expect("the waiter publishes its own handle once");
+            notifier.commit_wait(0);
+            committed.store(true, Ordering::Release);
+        });
+
+        let sleeper = loop {
+            if let Some(handle) = sleeper.get() {
+                break handle;
+            }
+            thread::yield_now();
+        };
+
+        for _ in 0..SPURIOUS_WAKES {
+            sleeper.unpark();
+            thread::yield_now();
+        }
+
+        left_on_a_spurious_wake = committed.load(Ordering::Acquire);
+
+        // Drain: `notify_all` releases a waiter wherever it is in the protocol,
+        // which is what lets this loop end whether or not the wait was still
+        // running when the verdict above was taken.
+        while !committed.load(Ordering::Acquire) {
+            notifier.notify_all();
+            thread::yield_now();
+        }
+    });
+
+    assert!(
+        !left_on_a_spurious_wake,
+        "an unpark that was not a notification ended the wait"
+    );
+    assert_eq!(notifier.num_waiters(), 0);
+}
+
 // ============================================================================
 // NonblockingNotifier-only helpers, for semantics the two types do not share
 // ============================================================================
@@ -484,6 +569,160 @@ fn rapid_cancel_epoch_integrity(cycles: usize) {
     });
 
     assert_eq!(committed.load(Ordering::Acquire), 1);
+    assert_eq!(notifier.num_waiters(), 0);
+}
+
+/// `notify_n(k)` resolves exactly `k` of the tickets outstanding in the
+/// pre-wait window, and the waiters behind them still sleep.
+///
+/// Upstream's `notify_n` battery, and the three cases above it here, drive
+/// every thread to a *committed* wait before notifying, which is the other arm
+/// of [`NonblockingNotifier`]'s loop: the arm that pops the waiter stack. This
+/// one is the pre-waiter arm, which a notification reaches whenever work is
+/// published while a worker is still deciding whether to sleep -- the common
+/// case under load, and the arm whose own accounting the type's docs rest on,
+/// the epoch advancing once per resolved ticket so that `k` of them are
+/// resolved and the rest stay owed. A waiter whose ticket was resolved returns
+/// from `commit_wait` without parking at all, so the number still parked
+/// afterwards is `size() - k` exactly (#430).
+fn notify_n_resolves_k_prewaiter_tickets(notifier: &NonblockingNotifier, k: usize, rounds: usize) {
+    let n = notifier.size();
+    assert!(k < n, "the pre-waiter arm needs more tickets than wakes");
+
+    for round in 0..rounds {
+        let prepared = AtomicUsize::new(0);
+        let go = AtomicBool::new(false);
+        let committed = AtomicUsize::new(0);
+        let (prepared, go, committed) = (&prepared, &go, &committed);
+
+        let mut parked = usize::MAX;
+
+        thread::scope(|scope| {
+            for id in 0..n {
+                scope.spawn(move || {
+                    notifier.prepare_wait(id);
+                    prepared.fetch_add(1, Ordering::Release);
+                    while !go.load(Ordering::Acquire) {
+                        thread::yield_now();
+                    }
+                    notifier.commit_wait(id);
+                    committed.fetch_add(1, Ordering::Release);
+                });
+            }
+
+            while prepared.load(Ordering::Acquire) != n {
+                thread::yield_now();
+            }
+
+            // Every ticket is outstanding and nobody has committed: this is the
+            // window the pre-waiter arm is reached from.
+            notifier.notify_n(k);
+            go.store(true, Ordering::Release);
+
+            // The `k` resolved tickets leave without parking, so the count can
+            // only climb to `n - k`; reading it the moment it gets there is
+            // reading it at its peak.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while notifier.num_waiters() != n - k && Instant::now() < deadline {
+                thread::yield_now();
+            }
+            parked = notifier.num_waiters();
+
+            while committed.load(Ordering::Acquire) != n {
+                notifier.notify_all();
+                thread::yield_now();
+            }
+        });
+
+        assert_eq!(
+            parked,
+            n - k,
+            "round {round}: notify_n({k}) left {parked} of {n} pre-waiters asleep",
+        );
+        assert_eq!(notifier.num_waiters(), 0);
+    }
+}
+
+// ============================================================================
+// AtomicNotifier-only helpers, for semantics the two types do not share
+// ============================================================================
+
+/// A waiter that has left its wait is not claimable: the next notification
+/// goes to a waiter that is still asleep, not to the slot of one that has
+/// already finished.
+///
+/// This case is [`AtomicNotifier`]'s alone, and it is the price of the simpler
+/// state word: with no waiter stack to pop, a notifier hands out a wake by
+/// scanning the slots for an armed one, so a slot whose owner has gone must be
+/// out of service by the time that owner returns. Spending the wake on it
+/// would leave a genuine waiter asleep -- it is `claim_one` that stops at the
+/// first armed slot, so a stale one shadows every slot behind it.
+///
+/// Rounds, because what the case needs is one round in which the second waiter
+/// is really parked when the notification arrives: `num_waiters()` counts a
+/// waiter from its `prepare_wait`, so nothing observable says "it is asleep
+/// now", and a waiter that has not parked yet reads the new epoch and leaves
+/// without needing the wake at all (#430).
+fn a_finished_waiter_is_not_claimable(rounds: usize) {
+    let notifier = AtomicNotifier::new(2);
+
+    for round in 0..rounds {
+        // Slot 0 completes a whole wait, which is what makes it a slot with a
+        // past rather than a slot nobody has used.
+        let first = AtomicBool::new(false);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                notifier.prepare_wait(0);
+                notifier.commit_wait(0);
+                first.store(true, Ordering::Release);
+            });
+
+            while notifier.num_waiters() != 1 {
+                thread::yield_now();
+            }
+            notifier.notify_all();
+        });
+        assert!(
+            first.load(Ordering::Acquire),
+            "round {round}: the first waiter never left"
+        );
+
+        // Now slot 1 waits, and the one wake handed out has to reach it.
+        let woke = AtomicBool::new(false);
+        let mut woke_in_time = false;
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                notifier.prepare_wait(1);
+                notifier.commit_wait(1);
+                woke.store(true, Ordering::Release);
+            });
+
+            while notifier.num_waiters() != 1 {
+                thread::yield_now();
+            }
+            for _ in 0..SETTLE_YIELDS {
+                thread::yield_now();
+            }
+            notifier.notify_one();
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !woke.load(Ordering::Acquire) && Instant::now() < deadline {
+                thread::yield_now();
+            }
+            woke_in_time = woke.load(Ordering::Acquire);
+            if !woke_in_time {
+                // Unstick the waiter so the scope's join can finish and the
+                // assertion below is what fails, not the test harness.
+                notifier.notify_all();
+            }
+        });
+
+        assert!(
+            woke_in_time,
+            "round {round}: the wake went to a slot whose owner had finished"
+        );
+    }
+
     assert_eq!(notifier.num_waiters(), 0);
 }
 
@@ -632,6 +871,67 @@ worker_matrix! {
         atomic_notifier_rapid_cancel_integrity_1k_cycles(&AtomicNotifier::new(2), 1_000),
         atomic_notifier_rapid_cancel_integrity_100k_cycles(&AtomicNotifier::new(2), 100_000),
     }
+}
+
+// --- a wake goes to a waiter that is still waiting ---
+
+worker_matrix! {
+    a_spurious_unpark_does_not_end_a_wait {
+        atomic_notifier_a_spurious_unpark_does_not_end_a_wait(&AtomicNotifier::new(1)),
+    }
+}
+
+worker_matrix! {
+    a_finished_waiter_is_not_claimable {
+        atomic_notifier_a_finished_waiter_is_not_claimable_50rounds(50),
+    }
+}
+
+// --- the dump, and the drop ---
+
+/// A dump reports the notifier's own state: the two halves of the state word,
+/// read apart, and the slot count beside them. The two fields share one word,
+/// so a `Debug` that reported either of them wrong -- or reported the word
+/// itself -- would be a dump that lies about the thing it exists to show, and
+/// a scheduling bug read off it would be read off the wrong number (#430).
+#[test]
+fn atomic_notifier_debug_reports_its_own_state() {
+    let notifier = AtomicNotifier::new(4);
+
+    let dump = format!("{notifier:?}");
+    assert!(dump.starts_with("AtomicNotifier"), "{dump}");
+    assert!(dump.contains("size: 4"), "{dump}");
+    assert!(dump.contains("epoch: 0"), "{dump}");
+    assert!(dump.contains("num_waiters: 0"), "{dump}");
+
+    // Both halves away from zero at once, and moved by different amounts, so
+    // that neither can stand in for the other.
+    notifier.prepare_wait(0);
+    notifier.prepare_wait(1);
+    notifier.notify_all();
+
+    let dump = format!("{notifier:?}");
+    assert!(dump.contains("epoch: 1"), "{dump}");
+    assert!(dump.contains("num_waiters: 2"), "{dump}");
+
+    notifier.cancel_wait(1);
+    notifier.cancel_wait(0);
+    let dump = format!("{notifier:?}");
+    assert!(dump.contains("epoch: 1"), "{dump}");
+    assert!(dump.contains("num_waiters: 0"), "{dump}");
+}
+
+/// Dropping a notifier a thread is still waiting on is a programming error,
+/// not a condition to recover from: the thread would be left parked with
+/// nothing to wake it. Upstream asserts it in its destructor and so does this
+/// port, which is a promise only a debug build keeps -- hence the `cfg` (#430).
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "an AtomicNotifier was dropped with waiters still registered")]
+fn dropping_an_atomic_notifier_with_a_waiter_registered_panics() {
+    let notifier = AtomicNotifier::new(2);
+    notifier.prepare_wait(0);
+    drop(notifier);
 }
 
 // ============================================================================
@@ -817,4 +1117,69 @@ worker_matrix! {
         nonblocking_notifier_notify_one_at_prewaiter_window_50rounds(&NonblockingNotifier::new(1), 50),
         nonblocking_notifier_notify_one_at_prewaiter_window_200rounds(&NonblockingNotifier::new(1), 200),
     }
+}
+
+// --- notify_n(k) over the pre-waiter arm resolves k tickets and no more ---
+
+worker_matrix! {
+    notify_n_resolves_k_prewaiter_tickets {
+        nonblocking_notifier_notify_n_resolves_1_of_4_prewaiter_tickets(&NonblockingNotifier::new(4), 1, 20),
+        nonblocking_notifier_notify_n_resolves_3_of_8_prewaiter_tickets(&NonblockingNotifier::new(8), 3, 20),
+        nonblocking_notifier_notify_n_resolves_7_of_15_prewaiter_tickets(&NonblockingNotifier::new(15), 7, 10),
+    }
+}
+
+// --- a wake goes to a waiter that is still waiting ---
+
+worker_matrix! {
+    a_spurious_unpark_does_not_end_a_wait {
+        nonblocking_notifier_a_spurious_unpark_does_not_end_a_wait(&NonblockingNotifier::new(1)),
+    }
+}
+
+// --- the dump, and the drop ---
+
+/// A dump reports the notifier's own state: the epoch, the pre-waiter count
+/// and the stack top, read apart out of the one word that holds all three, and
+/// the slot count beside them. The empty stack is all ones rather than zero --
+/// index 0 is a real waiter -- so a `Debug` that passed the raw field through
+/// would report a waiter that is not there, which is the one thing a dump of a
+/// sleeping executor must not do (#430).
+#[test]
+fn nonblocking_notifier_debug_reports_its_own_state() {
+    let notifier = NonblockingNotifier::new(4);
+
+    let dump = format!("{notifier:?}");
+    assert!(dump.starts_with("NonblockingNotifier"), "{dump}");
+    assert!(dump.contains("size: 4"), "{dump}");
+    assert!(dump.contains("epoch: 0"), "{dump}");
+    assert!(dump.contains("prewaiters: 0"), "{dump}");
+    assert!(dump.contains("stack_top: None"), "{dump}");
+
+    notifier.prepare_wait(0);
+    let dump = format!("{notifier:?}");
+    assert!(dump.contains("epoch: 0"), "{dump}");
+    assert!(dump.contains("prewaiters: 1"), "{dump}");
+    assert!(dump.contains("stack_top: None"), "{dump}");
+
+    // A cancel resolves the ticket: the epoch moves off zero while the stack
+    // stays empty, which is the state an all-ones stack field has to survive.
+    notifier.cancel_wait(0);
+    let dump = format!("{notifier:?}");
+    assert!(dump.contains("epoch: 1"), "{dump}");
+    assert!(dump.contains("prewaiters: 0"), "{dump}");
+    assert!(dump.contains("stack_top: None"), "{dump}");
+}
+
+/// Dropping a notifier a thread is still waiting on is a programming error,
+/// not a condition to recover from: the thread would be left parked with
+/// nothing to wake it. Upstream asserts it in its destructor and so does this
+/// port, which is a promise only a debug build keeps -- hence the `cfg` (#430).
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "a NonblockingNotifier was dropped with waiters still registered")]
+fn dropping_a_nonblocking_notifier_with_a_waiter_registered_panics() {
+    let notifier = NonblockingNotifier::new(2);
+    notifier.prepare_wait(0);
+    drop(notifier);
 }
