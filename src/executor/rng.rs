@@ -117,6 +117,30 @@ mod tests {
         );
     }
 
+    /// A known answer at the folded zero seed, where every step of the
+    /// recurrence overlaps its own shifted copy.
+    ///
+    /// The two answers above are seed 1, which is the easiest case to redo by
+    /// hand for the same reason it is the weakest one to assert: `1 << 13` and
+    /// `1` share no bit, nor do the words either later step combines, so at
+    /// that seed an `|` in place of any `^` is the *same* word. The
+    /// golden-ratio seed is dense in both widths, so each step's exclusive-or
+    /// genuinely clears bits as well as setting them, and a recurrence that
+    /// only ever set them -- which would cost the generator its period, the
+    /// state saturating -- parts company here. Hand-derivable the same way,
+    /// just longer: the 64-bit state after one round is `0xDC1B_77AE_0BF3_4DAD`
+    /// and the value returned is that times [`OUTPUT_MULTIPLIER`].
+    #[test]
+    fn the_recurrence_clears_bits_as_well_as_setting_them() {
+        assert_eq!(Xorshift32::new(0).next_u32(), 0x510C_4619);
+
+        assert_eq!(Xorshift64::new(0).next_u64(), 0x7403_D1A2_8C9A_2599);
+        assert_eq!(
+            Xorshift64::new(0).next_u64(),
+            0xDC1B_77AE_0BF3_4DAD_u64.wrapping_mul(OUTPUT_MULTIPLIER)
+        );
+    }
+
     /// A zero seed is the one input that breaks the recurrence -- zero is a
     /// fixed point of every xorshift -- so it must not survive construction.
     #[test]

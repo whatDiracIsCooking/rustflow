@@ -27,4 +27,10 @@ exclude_re = [
     'algorithm/partitioner\.rs:408:24: replace \* with / in <impl DynamicLoop for GuidedPartitioner<C>>::loop_dynamic_until',
     'algorithm/partitioner\.rs:408:38: replace \+ with \* in <impl DynamicLoop for GuidedPartitioner<C>>::loop_dynamic_until',
     'algorithm/partitioner\.rs:408:38: replace \+ with - in <impl DynamicLoop for GuidedPartitioner<C>>::loop_dynamic_until',
+    # `(resolved & !STACK_MASK) | index` over two disjoint fields, again
+    # `a | b == a ^ b`.
+    'executor/notifier\.rs:668:17: replace \| with \^ in <impl Notifier for NonblockingNotifier>::commit_wait',
+    # A guard over `unpark_chain`, which walks no chain without it either.
+    'executor/notifier\.rs:747:30: replace & with \| in <impl Notifier for NonblockingNotifier>::notify_all',
+    'executor/notifier\.rs:747:30: replace & with \^ in <impl Notifier for NonblockingNotifier>::notify_all',
 ]
