@@ -1684,13 +1684,32 @@ fn counting_chain(counter: &Arc<AtomicUsize>) -> Taskflow {
     taskflow
 }
 
+/// Upstream's `[repeat]() mutable { return repeat-- == 0; }`, which is also
+/// what `run_n` passes: counts its own calls and stops after `runs` of them.
+fn counting_predicate(
+    asked: Arc<AtomicUsize>,
+    runs: usize,
+) -> impl FnMut() -> bool + Send + 'static {
+    let mut remaining = runs;
+    move || {
+        asked.fetch_add(1, Ordering::Relaxed);
+        let stop = remaining == 0;
+        remaining = remaining.saturating_sub(1);
+        stop
+    }
+}
+
 /// `run_until` with a counter predicate runs the graph exactly as many times as
 /// the counter allows and calls the callback exactly once -- including when
 /// that number is zero, where the graph must not run at all and the callback
 /// must still fire.
 ///
-/// The predicate is upstream's `[repeat]() mutable { return repeat-- == 0; }`,
-/// which is also what `run_n` passes, so this pins down both.
+/// Both members of the family that take a predicate, because they are two
+/// methods rather than one overload and only one of them is `_with`: the
+/// callback-less `Executor::run_until` has to run the graph the same number of
+/// times and ask the predicate the same number of questions, and nothing else
+/// in the suite drives it -- `run_n`/`run_n_with` reach `run_until_with`, and
+/// `tests/movable.rs` reaches the owned `run_owned_until`.
 #[test]
 fn run_until_runs_the_graph_k_times_and_fires_the_callback_once() {
     const TASKS: usize = 3;
@@ -1704,16 +1723,7 @@ fn run_until_runs_the_graph_k_times_and_fires_the_callback_once() {
             let asked = Arc::new(AtomicUsize::new(0));
             let called = Arc::new(AtomicUsize::new(0));
 
-            let predicate = {
-                let asked = Arc::clone(&asked);
-                let mut remaining = runs;
-                move || {
-                    asked.fetch_add(1, Ordering::Relaxed);
-                    let stop = remaining == 0;
-                    remaining = remaining.saturating_sub(1);
-                    stop
-                }
-            };
+            let predicate = counting_predicate(Arc::clone(&asked), runs);
             let on_finish = {
                 let called = Arc::clone(&called);
                 move || {
@@ -1741,6 +1751,25 @@ fn run_until_runs_the_graph_k_times_and_fires_the_callback_once() {
                 runs + 1,
                 "the predicate is asked once before the first run and once after each"
             );
+            assert_eq!(executor.num_topologies(), 0);
+
+            // The same two counts through the two-argument form, over a fresh
+            // graph and a fresh predicate so the two are measured apart.
+            let counter = Arc::new(AtomicUsize::new(0));
+            let taskflow = counting_chain(&counter);
+            let asked = Arc::new(AtomicUsize::new(0));
+
+            executor
+                .run_until(&taskflow, counting_predicate(Arc::clone(&asked), runs))
+                .wait()
+                .expect("a task panicked");
+
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                runs * TASKS,
+                "{runs} runs at {workers} workers, without a callback"
+            );
+            assert_eq!(asked.load(Ordering::Relaxed), runs + 1);
             assert_eq!(executor.num_topologies(), 0);
         }
     }

@@ -16,6 +16,7 @@ pub(crate) use run::{Cancellable, Topology, set_up_graph};
 
 #[cfg(test)]
 mod tests {
+    use std::hash::{DefaultHasher, Hash, Hasher};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::{Poll, Wake, Waker};
@@ -130,6 +131,15 @@ mod tests {
             .node(b)
             .estate()
             .store(Cancellable::CANCELLED, Ordering::Relaxed);
+        // And a payload nobody came for, left exactly as a failure under an
+        // anchor leaves one: claimed in the estate word, which is the bit
+        // set-up reads to decide whether the slot is worth locking at all.
+        assert!(taskflow.graph().node(b).base().claim_panic());
+        taskflow
+            .graph()
+            .node(b)
+            .base()
+            .keep_panic(Box::new("a payload nobody came for"));
 
         assert_eq!(set_up_graph(taskflow.graph()), 1);
         let graph = taskflow.graph();
@@ -140,6 +150,10 @@ mod tests {
             "the state bits of the last run did not survive set-up"
         );
         assert_eq!(graph.node(b).estate().load(Ordering::Relaxed), 0);
+        assert!(
+            graph.node(b).base().take_panic().is_none(),
+            "a payload nobody came for must not be reported by the next run"
+        );
     }
 
     /// The strong-dependency rule #31 settled, which set-up is the only place
@@ -1084,6 +1098,34 @@ mod tests {
         });
     }
 
+    /// A run's dump reports its own four counters: how much of the graph is
+    /// still outstanding, whether the run is over, whether a task failed and
+    /// whether it was cancelled.
+    ///
+    /// Hand-written because nothing it stands in front of has a
+    /// [`Debug`](core::fmt::Debug) of its own -- a `Box<dyn Any + Send>`
+    /// payload, two boxed callables and a condvar -- so which four a stuck run
+    /// is asked about is a choice, and each is checked against the state the
+    /// accessor beside it answers for.
+    #[test]
+    fn a_runs_debug_reports_its_own_four_counters() {
+        let topology = once();
+        assert_eq!(
+            format!("{topology:?}"),
+            "Topology { outstanding: 0, finished: false, panicked: false, cancelled: false }"
+        );
+
+        topology.jobs_queued(3);
+        assert!(topology.cancel());
+        topology.record_panic(Box::new("a task panicked"));
+        topology.finish();
+
+        assert_eq!(
+            format!("{topology:?}"),
+            "Topology { outstanding: 3, finished: true, panicked: true, cancelled: true }"
+        );
+    }
+
     /// The index every one of the four cases below resolves, which is task 1
     /// of a two-node graph -- live in the nested arena and live in the outer
     /// one, with a different node behind it. That is the whole point of the
@@ -1239,6 +1281,92 @@ mod tests {
     fn a_job_is_five_words() {
         assert_eq!(size_of::<GraphOwner>(), 16, "a tag and one pointer");
         assert_eq!(size_of::<Job>(), 40);
+    }
+
+    /// What `Buffers::buffer_of` hashes a job with, read on its own: that
+    /// method's docs call the mapping "stable for a given item and buffer
+    /// count, which is what makes the routing testable".
+    fn hash_of(job: &Job) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        job.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// A job's hash varies with each of the three things that identify it.
+    ///
+    /// The one caller is `Buffers::push`, which routes a job to one of the
+    /// shared overflow buffers by its hash where upstream hashes the `Node*`
+    /// it is about to push; the port's stand-in for that pointer is the
+    /// owner's allocation and the run's, with the task index separating two
+    /// jobs of one run. A hash that cannot tell two jobs apart sends every job
+    /// of every run to one buffer, which is the contention the routing exists
+    /// to spread. Stability is the other half: resuming a preempted node
+    /// queues a *clone* of the job it was dequeued as, which has to route
+    /// where the original did.
+    #[test]
+    fn a_jobs_hash_separates_it_by_task_by_owner_and_by_run() {
+        let taskflow = nesting(Handle::Placeholder);
+        let elsewhere = nesting(Handle::Placeholder);
+        let run = run_of(taskflow.flow());
+        let second_run = run_of(taskflow.flow());
+        let owner = GraphOwner::flow(taskflow.flow());
+        let other_owner = GraphOwner::flow(elsewhere.flow());
+
+        let job = Job::new(NESTED, &owner, &run, &Parent::Run);
+
+        assert_eq!(
+            hash_of(&job),
+            hash_of(&job.clone()),
+            "a clone of a job routes where the job did"
+        );
+        assert_ne!(
+            hash_of(&job),
+            hash_of(&Job::new(Task::new(0), &owner, &run, &Parent::Run)),
+            "the task index separates two jobs of one run"
+        );
+        assert_ne!(
+            hash_of(&job),
+            hash_of(&Job::new(NESTED, &other_owner, &run, &Parent::Run)),
+            "the owner's allocation stands in for upstream's node pointer"
+        );
+        assert_ne!(
+            hash_of(&job),
+            hash_of(&Job::new(NESTED, &owner, &second_run, &Parent::Run)),
+            "and so does the run's"
+        );
+    }
+
+    /// A job's dump names the task, the parent and the two addresses that
+    /// identify it, and does not expand the graph behind the owner -- which is
+    /// the whole reason the impl is hand-written: a job's owner is an owning
+    /// handle, so a derived dump would print every node of the graph where
+    /// what a scheduler log wants is which graph and which run.
+    #[test]
+    fn a_jobs_debug_identifies_it_without_expanding_its_graph() {
+        let taskflow = nesting(Handle::Placeholder);
+        let run = run_of(taskflow.flow());
+        let second_run = run_of(taskflow.flow());
+        let owner = GraphOwner::flow(taskflow.flow());
+
+        let dumped = format!("{:?}", Job::new(NESTED, &owner, &run, &Parent::Run));
+
+        assert!(dumped.starts_with("Job {"), "{dumped}");
+        assert!(dumped.contains("task: Task(1)"), "{dumped}");
+        assert!(dumped.contains("parent: Run"), "{dumped}");
+        assert!(
+            !dumped.contains("root-1"),
+            "the owner is an address, not the graph it owns: {dumped}"
+        );
+        assert_eq!(
+            dumped,
+            format!("{:?}", Job::new(NESTED, &owner, &run, &Parent::Run)),
+            "two jobs of one task of one run of one graph are one job"
+        );
+        assert_ne!(
+            dumped,
+            format!("{:?}", Job::new(NESTED, &owner, &second_run, &Parent::Run)),
+            "the run is one of the two addresses"
+        );
     }
 
     /// The sentinel run's whole estate word, which every case that records a

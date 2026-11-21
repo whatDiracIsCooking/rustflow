@@ -69,4 +69,19 @@ exclude_re = [
     # is that two threads get different streams, and both of these keep it.
     'executor/worker\.rs:1305:31: replace \^ with \| in seed_from_current_thread',
     'executor/worker\.rs:1305:31: replace \^ with & in seed_from_current_thread',
+    # Three more `|`s over disjoint single bits, where `a | b == a ^ b`: the
+    # run's half of `claim_panic`, and the `CANCELLED | EXCEPTION` pair that
+    # "cancelled" means, read on the run and walked up the parent chain. The
+    # `&` mutant of all three is a different program and all three are caught.
+    'executor/topology/run\.rs:98:36: replace \| with \^ in Cancellable::claim_panic',
+    'executor/topology/run\.rs:105:64: replace \| with \^ in Cancellable::cancelled',
+    'executor/topology/ownership\.rs:202:49: replace \| with \^ in Parent::ancestor_cancelled',
+    # A third guard over a call that is a no-op without it: `set_up_graph` reads
+    # `CAUGHT` to decide whether a node's payload slot is worth locking, and
+    # `clear_panic` on an unclaimed slot drops a `None`. Both mutants clear
+    # every node unconditionally, which costs a mutex per node and changes
+    # nothing. The `!=` mutant of the same line is a different program and is
+    # caught by `setting_up_the_same_graph_again_rearms_it`.
+    'executor/topology/run\.rs:639:53: replace & with \| in set_up_graph',
+    'executor/topology/run\.rs:639:53: replace & with \^ in set_up_graph',
 ]
