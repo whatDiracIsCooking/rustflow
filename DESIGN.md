@@ -3023,22 +3023,29 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   `#[cfg(test)]` module having no path of its own.
 
 **The instruments, and which of them decides anything.** Four measurements of
-this crate's own documentation and tests live in `devtools/`, and all four are
-**reports**: `doc-ratio.sh` (#126, with #228's `design` column) measures the
+this crate's own documentation and tests live in `devtools/`, and all four
+**report**: `doc-ratio.sh` (#126, with #228's `design` column) measures the
 ratio this contract names, `test-names.sh` (#262) is the test-name comparison a
 documentation pass is held to, `coverage.sh` (#263) runs `cargo-llvm-cov` over
 `src/` alone, and `api-witness.py` (#325, made type-aware there and precise
 about signatures and annotations in #331) counts the public declarations no
 test, example, benchmark or doc example witnesses, each call site read against
-the type it reaches rather than against a bare name. None of them is a gate:
-each exits 0 whatever it finds -- `test-names.sh diff` and `coverage.sh` exit
-non-zero only on a difference a PR asked for or a measurement that could not
-run -- so a number from one is something a reviewer reads rather than something
-that passes or fails. `cargo mutants` is the fifth, run by hand over a module
-at a time, with `.cargo/mutants.toml` carrying the equivalent mutants the entry
-on them dispositions. What does decide a pass is the gate `docs/development.md`
-names, plus the two things CI's `examples` job runs: `devtools/run-examples.sh`
-and, since #334, every benchmark id once in criterion's untimed `--test` mode.
+the type it reaches rather than against a bare name. Three of them are a gate
+in no mode: each exits 0 whatever it finds -- `test-names.sh diff` non-zero
+only on a difference a PR asked for, `api-witness.py` only on a measurement
+that could not run -- so a number from one is something a reviewer reads rather
+than something that passes or fails, and `doc-ratio.sh`'s 1.2x stays the guide
+this contract names. For `coverage.sh` the distinction is drawn per **mode**
+rather than per script: its plain and `--functions` runs are reports on those
+same terms, exiting non-zero only when the measurement itself could not run,
+while `--check-floors` (#431) is a gate, which fails and names every file of
+`src/` whose line coverage is below its line in `devtools/coverage-floors.txt`.
+`cargo mutants` is the fifth, run by hand over a module at a time, with
+`.cargo/mutants.toml` carrying the equivalent mutants the entry on them
+dispositions. What does decide a pass is the gate `docs/development.md` names,
+that floors check in the `coverage` job, and the two things CI's `examples` job
+runs: `devtools/run-examples.sh` and, since #334, every benchmark id once in
+criterion's untimed `--test` mode.
 
 **A function the suite never executes is not always a function a test is
 missing** (issue #425). `src/graph/mod.rs` asserts `Send + Sync` for its nine

@@ -234,9 +234,14 @@ table. The `coverage` job in
 [`.github/workflows/coverage.yml`](../.github/workflows/coverage.yml) runs that
 same command on every pull request and every push to `main`, in the image `ci`
 uses with `llvm-tools` and the pinned `cargo-llvm-cov` added, and publishes the
-table in the job summary and the listing as a `functions-never-executed`
-artifact. **It has no floor**: it goes red when the measurement fails, never
-when a figure is low.
+table, the total and the floors report in the job summary and the listing as a
+`functions-never-executed` artifact. It runs `--check-floors` in the same step,
+after the report and last of all, so that a floor it does not meet fails the
+job with the table already in the log — the summary step is `if: always()` and
+posts it either way. One step rather than two deliberately: the figures the
+check judges have to be the figures the job published, and a second step would
+be a second measurement of a tree whose figures move by a few lines between
+runs.
 
 The baseline that job starts from, measured on 2026-11-21 by
 `devtools/coverage.sh --functions` at commit 59cf9e4: **96.20% of 17035 lines**
@@ -272,6 +277,87 @@ between `pipeline/` and `observer/` — and the production low end is now
 253-including-test-code total is what this milestone's merged pull requests
 quote and is still the first line of the listing; the production number is the
 one a coverage gap can be read off.
+
+**The floors.** [`devtools/coverage-floors.txt`](../devtools/coverage-floors.txt)
+holds one `path  percent` line per measured file of `src/`, sorted and keyed on
+the repository-relative path. `devtools/coverage.sh --check-floors` measures,
+names every file whose **line** coverage is below its floor with the floor and
+the measured value, and exits non-zero, which is what the `coverage` job turns
+into a red check; `--write-floors` rewrites the file from the run it has just
+done, and is how a floor rises once a tree has earned it. **A file with no
+line of its own there has no floor**, so a new module is ungated until someone
+writes its line — the check counts the files it finds in that state rather than
+passing over them in silence, but it does not fail over them. The opposite case
+does fail: a floor whose file the measurement does not report, which is a
+renamed or deleted file about to lose its floor without a word, and the message
+says to re-run `--write-floors` rather than reporting a regression. One of the
+crate's 55 `src/` files is in neither state and never will be — `pipeline/mod.rs`
+is re-exports only, so llvm-cov reports no line of it at all — which is why
+there are 54 floors and not 55.
+
+**The margin is the larger of two percentage points and four missed lines,
+rounded down to a whole point**, and the figure behind that is the run-to-run
+spread, measured rather than assumed. The same measured tree — `src/` and
+`tests/` at commit af137aa, identical there to 3d9a290's and untouched by the
+change that added the floors — read sixteen times in this container and once in
+the `coverage` job of the same code: the crate line total moved between
+**97.34% and 97.39%** here (446 to 454 missed lines of 17072) and read
+**97.33%** on the runner (455). Per file, **45 of the 54 are
+the same figure in every one of those seventeen measurements**; the nine that
+move are the concurrency-sensitive ones, because which worker steals what
+decides which scheduler paths a run takes. The largest movement is
+`executor/notifier.rs`, **five lines of 535 and 0.93 points** (10 to 15 missed),
+then `algorithm/partitioner.rs` at four lines and `algorithm/for_each_index.rs`
+at three; the other six move by one. Nothing under 226 lines moved at all, and
+no file's figure on the runner is outside the range this box produced — though
+`notifier.rs` on the runner sits at the bottom of it.
+
+The issue proposed one point. One point would have survived all seventeen of
+those measurements — floors written from any one of them are met by all of
+them — but the headroom it leaves is a line or two: **0.55 points** on
+`algorithm/partitioner.rs` for the floors as actually written, and **0.20
+points, one line of 535**, on `notifier.rs` had they been written from the
+luckiest of the seventeen runs. And because it is a percentage, it leaves the
+small files tighter still. Six files under 100 lines would tolerate less than
+one extra missed line: `lib.rs` 0.03 of a line, `graph/handle.rs` 0.33,
+`executor/scope.rs` 0.40, `executor/rng.rs` 0.55, `runtime.rs` 0.85,
+`observer/timeline.rs` 0.97. A 33-line file at 100% is the clearest case — one
+point below it is a floor that one missed line fails. So two points, which
+governs every file where movement was actually observed (10.7 lines on
+`notifier.rs`, 12.4 on `partitioner.rs`), and four lines for the files under
+200 where two points is less than that and where no measurement moved by even
+one line. Over the same seventeen measurements this rule leaves a thinnest
+headroom of **1.55 points** (1.20 from the luckiest source run), and no single
+interleaving-dependent line can fail the gate on any file.
+
+**The risk it takes is the other one**, deliberately. A margin this wide will
+not notice a small loss: four lines on a small file, two points on a large one,
+and on the smallest files a floor only a gross regression trips —
+`executor/scope.rs` is floored at 80% against a measured 93.33%, and `src/lib.rs`,
+three executable lines long, gets a floor of 0, which gates nothing and says so
+when it is written. That is the trade taken on purpose. A floor that flakes is
+paid for by every pull request, and the first thing it buys is the habit of
+ignoring a red `coverage`; a floor that is too low is paid for once, by a
+reviewer, and `--write-floors` raises it in one command on a tree that has
+earned it. The floors can only rise from here: the mutation chain adds tests,
+and this milestone's closing docs issue re-measures.
+
+**They are floors on line coverage only, and a line floor is partly a floor on
+test code.** Regions and functions are not floored: the never-executed function
+count is the figure the dispositions work from and is already split per file
+into production and test code, while llvm-cov's line and region denominators
+are not split at all, for the reason above — the exclusion is a path regex and
+a `#[cfg(test)] mod tests` lives in the same file as the code it tests. So a
+file's line percentage counts its own unit tests, and a floor on it gates them
+too: **32.4% of the crate's `src/` lines sit below a column-0 `#[cfg(test)]`**,
+and `executor/topology/mod.rs` is 1468 of 1484 lines of test module, so its
+floor is almost entirely a statement about test code. Two consequences follow.
+Adding unit tests raises a file's percentage by itself, since a test's own
+lines are covered by the fact of having run — a floor can be met without
+covering any more production code. And deleting a test module takes its lines
+out of the denominator as well as the numerator, so what a floor catches is
+coverage going away, not coverage never written. For production coverage the
+figure to read is still the production function count above.
 
 One more thing is in the image for a measurement rather than for the build:
 `g++`, `cmake` and `make`, in the last layer of the
@@ -323,18 +409,22 @@ The third is Python 3 with nothing outside its standard library:
 test, example, benchmark or doc example witnesses, reading each call site
 against the type it reaches rather than against a bare function name.
 
-**Which of these decide anything: none of them.** All five of
+**Which of these decide anything: one of them, in one mode.** Four of
 `devtools/doc-ratio.sh`, `devtools/test-names.sh`, `devtools/coverage.sh`,
 `devtools/api-witness.py` and `devtools/upstream-bench.sh` are **reports** —
 each exits 0 whatever it finds, no CI job makes one a pass or a fail, and a
 number from one is something a reviewer reads rather than something that
 passes or fails.
-`test-names.sh diff` and `coverage.sh` exit non-zero only on a difference the
-PR running them asked about or a measurement that could not run at all;
-`api-witness.py` exits 2 for the same second reason, and `upstream-bench.sh`
-for a missing tool or a clone, configure, build or run that failed. `cargo mutants` is in the same class, run by hand over
-a module at a time. What **gates** is the five-command `check` above, plus the
-two things CI's `examples` job runs: `devtools/run-examples.sh`, and every
+`test-names.sh diff` and a plain or `--functions` run of `coverage.sh` exit
+non-zero only on a difference the PR running them asked about or a measurement
+that could not run at all; `api-witness.py` exits 2 for the same second reason,
+and `upstream-bench.sh` for a missing tool or a clone, configure, build or run
+that failed. `cargo mutants` is in the same class, run by hand over
+a module at a time. The exception is `coverage.sh --check-floors`, which the
+`coverage` job runs on every pull request and which fails over a figure: a file
+of `src/` below its line in `devtools/coverage-floors.txt`. What **gates** is
+the five-command `check` above, that one check, and the two things CI's
+`examples` job runs: `devtools/run-examples.sh`, and every
 benchmark id once in criterion's untimed `--test` mode, which asks whether the
 suite still runs and deliberately times nothing.
 
