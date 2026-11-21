@@ -361,6 +361,9 @@ impl fmt::Debug for ObserverList {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     use super::*;
     use crate::executor::async_node::AsyncNode;
@@ -430,6 +433,57 @@ mod tests {
         assert_eq!(view.num_weak_dependencies(), 0);
         assert_eq!(view.num_strong_dependencies(), 0);
         assert_ne!(view.hash_value(), 0);
+    }
+
+    /// The `Debug` output reports how many observers are registered and
+    /// nothing about the observers themselves, and reads that count off the
+    /// atomic beside the list rather than through the list's own lock.
+    ///
+    /// The second half is the module docs' "one atomic check on the path with
+    /// no observers, and a mutex only when there is work to do" applied to a
+    /// fourth operation: a formatter is not registering, un-registering or
+    /// snapshotting, so it must not wait on a writer. There is nothing of the
+    /// observers to assert is absent -- `dyn Observer` has no `Debug` for the
+    /// impl to have printed -- so the lock is what the case pins instead.
+    #[test]
+    fn the_debug_output_reports_the_count_without_taking_the_lock() {
+        let list = ObserverList::new();
+        assert_eq!(format!("{list:?}"), "ObserverList { len: 0 }");
+
+        let first: Arc<dyn Observer> = Arc::new(Counting {
+            entries: AtomicUsize::new(0),
+            exits: AtomicUsize::new(0),
+        });
+        let second: Arc<dyn Observer> = Arc::new(Counting {
+            entries: AtomicUsize::new(0),
+            exits: AtomicUsize::new(0),
+        });
+        list.insert(Arc::clone(&first));
+        list.insert(Arc::clone(&second));
+        assert_eq!(format!("{list:?}"), "ObserverList { len: 2 }");
+
+        list.remove(&first);
+        assert_eq!(format!("{list:?}"), "ObserverList { len: 1 }");
+
+        // The reading below is taken with the registration lock held by this
+        // thread, which an impl that locked would block on for ever. The
+        // probe runs on a thread of its own, and the guard is released
+        // before the scope joins it, so such a regression fails this case on
+        // the timeout instead of hanging the suite.
+        let (sender, receiver) = mpsc::channel();
+        let probe = &list;
+        let held = list.lock();
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                let _ = sender.send(format!("{probe:?}"));
+            });
+            let rendered = receiver.recv_timeout(Duration::from_secs(30));
+            drop(held);
+            assert_eq!(
+                rendered.expect("formatting does not wait on the registration lock"),
+                "ObserverList { len: 1 }"
+            );
+        });
     }
 
     /// Removing an `Arc` that was never registered is a no-op, not a panic.

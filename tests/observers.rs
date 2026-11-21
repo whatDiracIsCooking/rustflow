@@ -925,6 +925,55 @@ fn tfprof_clear_discards_every_segment_and_keeps_the_worker_count() {
     );
 }
 
+/// [`TfProfObserver::default`] is [`TfProfObserver::new`], which is the one
+/// thing a hand-written `Default` here can get wrong: the observer's id comes
+/// from the same monotonic counter rather than from a zeroed field.
+///
+/// Three claims. A default-constructed observer has recorded nothing. Two of
+/// them carry different ids, so `Default` draws one per value instead of
+/// handing back a constant. And a default's dump is byte-identical to a
+/// `new`'s apart from those eight id bytes, which is the whole of "the same
+/// as `new`" that is observable from outside the crate. `ChromeObserver`
+/// beside it can `#[derive(Default)]` precisely because it has no id to draw.
+#[test]
+fn a_default_tfprof_observer_is_a_fresh_one_with_an_id_of_its_own() {
+    let first = TfProfObserver::default();
+    let second = TfProfObserver::default();
+    let from_new = TfProfObserver::new();
+
+    for observer in [&first, &second, &from_new] {
+        assert_eq!(observer.num_tasks(), 0, "a fresh observer recorded nothing");
+        assert_eq!(observer.num_workers(), 0, "and counted no worker");
+    }
+
+    let dumped = |observer: &TfProfObserver| {
+        let mut bytes = Vec::new();
+        observer
+            .dump(&mut bytes)
+            .expect("writing to a Vec never fails");
+        bytes
+    };
+    let (first_bytes, second_bytes, new_bytes) =
+        (dumped(&first), dumped(&second), dumped(&from_new));
+
+    let (first_uid, first_segments) = parse_tfp_block(&first_bytes);
+    let (second_uid, second_segments) = parse_tfp_block(&second_bytes);
+    let (new_uid, new_segments) = parse_tfp_block(&new_bytes);
+    assert!(
+        first_segments.is_empty() && second_segments.is_empty() && new_segments.is_empty(),
+        "a fresh observer dumps a well-formed block with nothing in it"
+    );
+
+    assert_ne!(first_uid, second_uid, "each default drew an id of its own");
+    assert_ne!(first_uid, new_uid, "and drew it from `new`'s own counter");
+    assert_eq!(
+        &first_bytes[8..],
+        &new_bytes[8..],
+        "the id is the only thing a default and a `new` differ in"
+    );
+    assert_eq!(&second_bytes[8..], &new_bytes[8..]);
+}
+
 // ----------------------------------------------------------------------------
 // The panic-path cells: a hook that fails
 // ----------------------------------------------------------------------------
