@@ -44,6 +44,12 @@ on:
     # runner minutes.
     - cron: "23 5 * * 1"
   workflow_dispatch:
+  # TEMPORARY, and removed again by the next commit on this branch -- see the
+  # PR body. `workflow_dispatch` cannot reach a workflow that is not yet on the
+  # default branch (the comment above says so, and both `gh workflow run` and
+  # the REST endpoint answered 404 here), so this is the only way to watch the
+  # lane run before it lands. It is NOT how this job is meant to be triggered.
+  pull_request:
 
 # Nothing here reads or writes the repository beyond the checkout.
 permissions:
