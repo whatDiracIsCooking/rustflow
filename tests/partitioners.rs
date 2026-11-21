@@ -33,8 +33,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use rustflow::algorithm::partitioner::{
-    DefaultClosureWrapper, DynamicLoop, DynamicPartitioner, GuidedPartitioner, Partitioner,
-    RandomPartitioner, StaticLoop, StaticPartitioner,
+    ClosureWrapper, DefaultClosureWrapper, DynamicLoop, DynamicPartitioner, GuidedPartitioner,
+    Partitioner, RandomPartitioner, SplittingPartitioner, StaticLoop, StaticPartitioner,
 };
 
 /// Upstream's `check_visited`: every index in `[0, n)` was covered by exactly
@@ -496,6 +496,7 @@ fn every_partitioner_reports_and_replaces_its_chunk_size() {
     round_trip(GuidedPartitioner::<DefaultClosureWrapper>::new(3));
     round_trip(DynamicPartitioner::<DefaultClosureWrapper>::new(3));
     round_trip(RandomPartitioner::<DefaultClosureWrapper>::new(3));
+    round_trip(SplittingPartitioner::<DefaultClosureWrapper>::new(3));
 
     // And the setter is not just a field write: the chunks a later loop hands
     // out are the size last set.
@@ -505,6 +506,76 @@ fn every_partitioner_reports_and_replaces_its_chunk_size() {
     let mut chunks = Vec::new();
     p.loop_dynamic(10, 1, &next, |b, e| chunks.push((b, e)));
     assert_eq!(chunks, vec![(0, 5), (5, 10)]);
+}
+
+/// A closure wrapper with state of its own, so that a mutation reaching it
+/// has somewhere to be seen: it runs the chunk body it is handed `times`
+/// times, which a default-constructed one puts at none.
+#[derive(Default)]
+struct Repeat {
+    /// How many times `invoke` runs the body.
+    times: usize,
+}
+
+impl ClosureWrapper for Repeat {
+    fn invoke<F: FnMut()>(&self, mut body: F) {
+        for _ in 0..self.times {
+            body();
+        }
+    }
+}
+
+/// [`Partitioner::closure_wrapper_mut`] -- upstream's non-`const`
+/// `closure_wrapper()` -- hands out the partitioner's own wrapper and not a
+/// copy of it: a chunk body dispatched after a mutation made through that
+/// reference runs under the mutated wrapper, for all five families.
+///
+/// A [`Repeat`] rather than one of the counting closures the cases above use,
+/// because a closure has no state a caller could reach through a `&mut` to
+/// it; what the mutable accessor is *for* is a wrapper that is configured
+/// after the partitioner holding it was built.
+#[test]
+fn a_wrapper_mutated_through_its_partitioner_is_the_one_its_chunks_run_under() {
+    fn mutate_and_dispatch<P: Partitioner<Wrapper = Repeat>>(mut p: P) {
+        let mut calls = 0;
+        p.call(|| calls += 1);
+        assert_eq!(calls, 0, "a default `Repeat` runs the body not at all");
+
+        p.closure_wrapper_mut().times = 3;
+        assert_eq!(
+            p.closure_wrapper().times,
+            3,
+            "the write landed in the partitioner's own wrapper"
+        );
+
+        let mut calls = 0;
+        p.call(|| calls += 1);
+        assert_eq!(
+            calls, 3,
+            "and that is the wrapper `call` dispatches through"
+        );
+    }
+
+    mutate_and_dispatch(StaticPartitioner::<Repeat>::new(3));
+    mutate_and_dispatch(GuidedPartitioner::<Repeat>::new(3));
+    mutate_and_dispatch(DynamicPartitioner::<Repeat>::new(3));
+    mutate_and_dispatch(RandomPartitioner::<Repeat>::new(3));
+    mutate_and_dispatch(SplittingPartitioner::<Repeat>::new(3));
+}
+
+/// A default-constructed [`SplittingPartitioner`] -- the one family whose
+/// `Default` the four cases above do not reach, the others being built by
+/// `new` throughout this file -- configures no chunk size, which that family
+/// reads as a splitting floor of one index, and a default-constructed
+/// wrapper, which runs a chunk body exactly once.
+#[test]
+fn a_default_splitting_partitioner_configures_no_chunk_size() {
+    let part = SplittingPartitioner::<DefaultClosureWrapper>::default();
+    assert_eq!(part.chunk_size(), 0);
+
+    let mut calls = 0;
+    part.call(|| calls += 1);
+    assert_eq!(calls, 1);
 }
 
 /// The static loop stops *at* `n`: a range its chunk size divides exactly ends

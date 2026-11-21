@@ -2998,6 +2998,30 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   does not build those targets and the `use` an intra-doc link would need is
   `unused_imports` under `clippy --all-targets`.
 
+- **The one production function in `src/algorithm/` that no test executes and
+  none should is pdqsort's bad-partition fallback** (issue #428).
+
+  `sort_loop`'s `data[begin..].sort_unstable_by(|a, b| cmp(a, b))` under `if
+  bad_allowed <= 1` is reached only after `ilog2(n) - 1` partitions in one
+  chain each worse than 1:8 against a median-of-ninther pivot, with
+  `break_patterns` reshuffling both sides between consecutive attempts. An
+  input that wins that is the adversary the arm defends against rather than a
+  case, and the arm stays for the reason the `choose_pivot` median-of-three
+  branch above it does -- it is the shape upstream's own live code has, and
+  dropping it as dead would give the sort back its quadratic worst case.
+
+  Every other function the listing reported over these files was either
+  disposed of with a test naming it, or is a closure inside a `#[cfg(test)]
+  mod tests` in `src/`: the `|_| unreachable!()` predicate an empty-input case
+  hands an algorithm, the two task bodies of the cyclic target graph
+  `module.rs`'s sourceless case asserts never starts, the body
+  `partitioner.rs`'s skipping closure wrapper is asserted not to run. Each of
+  those is a function whose not running *is* its test's assertion, so neither
+  a test nor a demotion is owed one; they are recorded per file rather than
+  per closure, and #442 takes in-`src` test code out of the production
+  listing, `coverage.sh`'s own exclusion being a path regex and a
+  `#[cfg(test)]` module having no path of its own.
+
 **The instruments, and which of them decides anything.** Four measurements of
 this crate's own documentation and tests live in `devtools/`, and all four are
 **reports**: `doc-ratio.sh` (#126, with #228's `design` column) measures the
