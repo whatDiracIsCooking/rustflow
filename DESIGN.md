@@ -3016,6 +3016,25 @@ on them dispositions. What does decide a pass is the gate `docs/development.md`
 names, plus the two things CI's `examples` job runs: `devtools/run-examples.sh`
 and, since #334, every benchmark id once in criterion's untimed `--test` mode.
 
+**A function the suite never executes is not always a function a test is
+missing** (issue #425). `src/graph/mod.rs` asserts `Send + Sync` for its nine
+graph types in a `const _: () = { ... }` block, whose `assert_send_sync::<T>`
+is called once per type in a const context. `coverage.sh --functions` counts
+the instantiation group because the function is codegened, but the only call
+that can exist is the one the compile already made: a runtime call would add
+nothing the build has not checked, so this is a recorded exception rather
+than a test that is owed. It is the one *design* exception among the
+never-executed functions of `src/task.rs`, `src/graph/mod.rs`,
+`src/async_task.rs` and `src/semaphore.rs`.
+
+The other thirty-two are not a design decision at all. They are closures
+inside those files' own `#[cfg(test)]` modules -- a body installed because a
+handle variant needs an argument, in a case that asserts which variant fills
+a node's slot rather than what the body does -- and so they say something
+about what the listing *measures*, `src/`'s own test code counting toward its
+figures, rather than about the port. Issue #442 is where the listing learns
+to separate the two, and the reading of those thirty-two belongs to it.
+
 ## Benchmarks and performance
 
 The benchmark suite is a part of the port with decisions of its own, and this
