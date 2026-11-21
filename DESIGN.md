@@ -1675,6 +1675,62 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   and not the job's to drop, and it is not counted off until it is woken and
   dispatched through the same early-out.
 
+  **The inventory that claim rests on** (issue #423). The flake was reported
+  twice: #423 is the same incident as #416 -- one failure in some 22
+  full-suite runs during the #409 measurements, no assertion text captured --
+  reopened from the test-hardening side, and closing it meant enumerating the
+  seam rather than rerunning it, as #138 and #141 require. The enumeration is
+  short, because the whole join is one number:
+
+  - **Who raises it.** `Parent::count_queued`, once per `Scope::spawn`, on
+    the frame that will wait -- and before the queue push that lets any child
+    be picked up, so the frame's own read of the number comes after every
+    raise by program order, and the raising half has no race to model.
+    `enter`'s own extra reference is why the predicate is `== 1` rather than
+    `== 0`.
+  - **Who observes it.** `Runtime::try_corun`, through
+    `WorkerThread::corun_until`, which reads it after every job it runs and
+    after every failed steal; and `WorkerThread::finish_job`, whose own read
+    resumes a preempted parent. Nothing else. `corun_until` has no exit but
+    that predicate -- `steal_until` gives up only when it turns true -- so a
+    child that is never dispatched at all is a hang rather than an early
+    return, which is a different failure from this one and not a quieter
+    version of it.
+  - **Who releases it.** `finish_job`'s decrement, reached through
+    `spend_job` on four paths, and the body is gone before all four: a body
+    that ran and a body that panicked were taken out of the node's slot and
+    consumed by the arm that ran them; a body skipped by cancellation is
+    dropped by `discard_skipped_body`, which is #416's fix; a bypass clone
+    requeued by the early-out carries its own count, paid when it committed,
+    and reaches the same early-out, whose discard is a no-op on a slot
+    already emptied.
+  - **What is left over.** One path, and it is not a window `scope` can
+    close: `scope`'s `catch_unwind` covers `f` and not the join, so an unwind
+    raised *inside* the wait would leave it. Every piece of a user's code the
+    corun loop can run is already under a `catch_unwind` of its own -- the
+    body, each observer hook, and the `Drop` the discard runs -- so what
+    remains is the scheduler's own `expect`s on its invariants, and one of
+    those firing leaves the job's count unpaid, which no retry of the wait
+    could recover from.
+
+  The capture was made by mutation rather than by repetition, which is the
+  same rule in its other direction: pinned to two cores at 32 test threads,
+  5,000 runs of `tests/scope.rs` found nothing, and the same 5,000 with
+  #416's discard call commented out failed 52 times, always exactly one child
+  short of the count -- `left: 63, right: 64`, or one zero in the frame array
+  -- which is the one-`recycle` window and the assertion text the original
+  incident never recorded. A harness that catches the known order and then
+  finds nothing is what the enumeration above is checked against. Two gaps
+  it found are now covered: `tests/scope.rs` has the entry neither
+  cancellation case had, the run cancelled while the join is already in
+  flight so that some children run their bodies and the rest are skipped by
+  the scope's own corun loop; and `tests/loom_scope.rs` models the counter
+  the real predicate reads rather than one child's flag, with #416's order on
+  one of two children and a frame released by the first of two counts as its
+  two mutations -- the second being an ordering a one-child model cannot
+  state, there being no difference between the first count and the last when
+  there is only one.
+
 ## Observers
 
 - **The observer list is one atomic check on the path with no observers, and a
