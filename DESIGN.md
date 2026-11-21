@@ -3059,6 +3059,30 @@ about what the listing *measures*, `src/`'s own test code counting toward its
 figures, rather than about the port. Issue #442 is where the listing learns
 to separate the two, and the reading of those thirty-two belongs to it.
 
+**The same reading over four more files, and the one gap a per-group figure
+cannot show** (issue #424). `src/flow_builder.rs`, `src/taskflow.rs`,
+`src/dump.rs` and `src/runtime.rs` answer exactly as #425's four did: of their
+56 never-executed groups -- 45 of 91, 5 of 32, 4 of 42 and 2 of 13 -- 55 are
+their own `#[cfg(test)]` closures and the fifty-sixth is `src/taskflow.rs`'s
+`assert_send_sync` over `Taskflow` and `Flow`, the design exception above in
+its other instance. What that settles is the question the pass was scoped
+around: a 45-function hole in the user-facing builder, the largest in the
+crate, is neither a test gap nor a public surface too wide, and nothing was
+demoted or tested to close it. It also rules one thing out as a disposition --
+moving a unit test into `tests/` hides a fixture from an instrument whose
+denominator excludes that directory, and disposes of nothing.
+
+One real gap did come out of the other end of the same instrument. A group
+counts as executed when *any* of its monomorphisations ran, so reading the
+JSON export per instantiation found `dump_subgraph` and `dump_module_node`
+never executed over a `core::fmt::Formatter`: the nested-cluster goldens all
+go through `Taskflow::dump`, a `String`, while the one `Display` case was a
+flat graph, so `{taskflow}` had never recursed into a subgraph or a module
+target. `tests/dump.rs` pins it now. The reading generalises -- a per-group
+zero is a function nothing ran, a per-instantiation zero a *type* nothing ran
+it on -- and for a port whose seams are generic over the writer, the
+partitioner and the callable, the second is the more interesting question.
+
 ## Benchmarks and performance
 
 The benchmark suite is a part of the port with decisions of its own, and this

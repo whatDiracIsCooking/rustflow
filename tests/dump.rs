@@ -267,6 +267,37 @@ fn display_writes_the_same_document() {
     assert_unique_node_ids(&taskflow.dump());
 }
 
+/// `Display` over a graph with nested clusters, which is the part of the dump
+/// that is generic over the writer and has somewhere to recurse into: a
+/// subflow subgraph and a module target both hang off the top-level graph
+/// here, so the `{taskflow}` route walks the module stack and the subgraph
+/// branch rather than the flat node loop the case above drives.
+///
+/// The document a writer gets cannot depend on which writer it is, so the
+/// assertion is against `dump()`'s own output -- the same pinning
+/// [`display_writes_the_same_document`] does, over the shape that has two more
+/// code paths to disagree in.
+#[test]
+fn display_writes_the_same_document_for_a_nested_graph() {
+    let target = target("target", "x");
+
+    let mut taskflow = Taskflow::with_name("nested");
+    let graph = taskflow.graph_mut();
+    let spawner = graph.add_named_node("spawner", subflow_handle(child_graph(&["c0"])));
+    let module = graph.add_named_node("call-target", Handle::Module(target));
+    graph.add_edge(spawner, module);
+
+    let document = taskflow.dump();
+    assert_eq!(format!("{taskflow}"), document);
+    assert_eq!(taskflow.to_string(), document);
+
+    // Both nested branches really are in what was compared, so this is not
+    // two writers agreeing on a flat graph.
+    assert!(document.contains("subgraph cluster_p0_sub {\n"));
+    assert!(document.contains("subgraph cluster_p1 {\n"));
+    assert_unique_node_ids(&document);
+}
+
 /// The graph-level entry point emits the cluster body alone -- upstream's
 /// per-graph `_dump`, which is a fragment and not a document.
 #[test]
