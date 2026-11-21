@@ -67,6 +67,28 @@
 //! belief passed against the broken order and would have passed against any
 //! order, which is why it had no cancelled-path mutation to fail.
 //!
+//! [`one_scope`] is one child and one flag, and the real `scope` waits on a
+//! **number**: issue #423 asked what else could let a frame past that wait,
+//! and the answer no one-child model can express is a predicate that reads
+//! the number wrong. So [`two_children`] is the same property over
+//! `Runtime::try_corun`'s own shape of signal -- a counter raised once per
+//! child and counted off once per child's teardown, which the frame waits to
+//! see back at the bottom -- and it carries two mutations of its own. One is
+//! #416's order again, on *one* of two children, where the sibling's honest
+//! count is what hides it: loom has to find that a counter reaching bottom is
+//! not the same claim as every body being dropped. The other is a
+//! [`Join::SomeChild`] frame, which goes on as soon as the counter has moved
+//! at all -- the shape a predicate off by one child would have -- and is the
+//! one ordering the flag model cannot even state, a single child's flag
+//! making "something finished" and "everything finished" the same sentence.
+//!
+//! The *raising* of that counter is deliberately not modelled, and cannot
+//! race: every raise is made by the frame that then waits, before the queue
+//! push that lets any child be picked up, so the frame's own read of the
+//! number is ordered after all of them by program order. What a child does to
+//! the number is the only half two threads disagree about, and that is the
+//! half above.
+//!
 //! What the model does not say anything about: the accounting that makes
 //! `done` get set at all (that is the join counter and the preemption
 //! protocol `executor::runtime`'s own module docs and `tests/loom_anchor.rs`
@@ -77,7 +99,7 @@
 #![cfg(loom)]
 
 use loom::sync::Arc;
-use loom::sync::atomic::{AtomicBool, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use loom::thread;
 
 /// What a child closure borrowed, stood in for by one flag: `true` for as
@@ -142,14 +164,17 @@ enum Outcome {
     CancelledCountedFirst,
 }
 
-/// Runs one child against `borrow` under `outcome`, then marks `done` --
-/// upstream's teardown, which runs on every one of the three paths and is
-/// the one thing `one_scope`'s wait can actually wait on.
-fn run_child(outcome: Outcome, borrow: &Borrow, done: &AtomicBool) {
+/// Runs one child against `borrow` under `outcome`, then takes `count_off`
+/// -- upstream's teardown, which runs on every one of the three paths and is
+/// the one thing a waiting frame can actually wait on. A parameter rather
+/// than one flag, because the two frames below wait on different shapes of
+/// the same signal: `one_scope` on a flag, `two_children` on the counter the
+/// real predicate reads.
+fn run_child(outcome: Outcome, borrow: &Borrow, count_off: impl Fn()) {
     match outcome {
         Outcome::Completes => {
             borrow.access();
-            done.store(true, Ordering::Release);
+            count_off();
         }
         Outcome::Panics => {
             borrow.access();
@@ -160,19 +185,20 @@ fn run_child(outcome: Outcome, borrow: &Borrow, done: &AtomicBool) {
             // uncaught unwind would abort the model instead of just this
             // one child.
             let _ = std::panic::catch_unwind(|| panic!("the child's own failure"));
-            done.store(true, Ordering::Release);
+            count_off();
         }
         Outcome::Cancelled => {
             // The one touch a never-called closure makes: the `Drop` of what
             // it captured, which the early-out runs by dropping the body --
             // before it counts the job off.
             borrow.access();
-            done.store(true, Ordering::Release);
+            count_off();
         }
         Outcome::CancelledCountedFirst => {
-            // #416's order: counted off first, so a frame waiting on `done`
-            // may already have moved on when the drop touches the borrow.
-            done.store(true, Ordering::Release);
+            // #416's order: counted off first, so a frame waiting on the
+            // count may already have moved on when the drop touches the
+            // borrow.
+            count_off();
             borrow.access();
         }
     }
@@ -189,7 +215,9 @@ fn one_scope(outcome: Outcome, join: bool) {
     let child = {
         let borrow = Arc::clone(&borrow);
         let done = Arc::clone(&done);
-        thread::spawn(move || run_child(outcome, &borrow, &done))
+        thread::spawn(move || {
+            run_child(outcome, &borrow, || done.store(true, Ordering::Release));
+        })
     };
 
     if join {
@@ -210,6 +238,55 @@ fn one_scope(outcome: Outcome, join: bool) {
     // `JoinHandle` would leave the spawned thread dangling past the end of
     // the model closure.
     child.join().unwrap();
+}
+
+/// How a frame reads the one number it waits on, which is the knob
+/// `two_children`'s mutations turn.
+#[derive(Clone, Copy)]
+enum Join {
+    /// `Runtime::try_corun`'s own predicate: the counter back at the bottom,
+    /// which is every child counted off.
+    EveryChild,
+    /// **A mutation**: the frame goes on as soon as the counter has moved at
+    /// all. The shape a predicate off by one child has -- and the one the
+    /// single-child model above cannot express, there being no difference
+    /// between the first count and the last when there is only one.
+    SomeChild,
+}
+
+/// Two children under one scope, joined through the counter rather than
+/// through a flag: `outstanding` starts at one per child, as
+/// `Parent::count_queued` raises the runtime node's join counter per spawn,
+/// and each child counts itself off where a real job's teardown does.
+fn two_children(first: Outcome, second: Outcome, join: Join) {
+    let borrow = Arc::new(Borrow::new());
+    let outstanding = Arc::new(AtomicUsize::new(2));
+
+    let children = [first, second].map(|outcome| {
+        let borrow = Arc::clone(&borrow);
+        let outstanding = Arc::clone(&outstanding);
+        thread::spawn(move || {
+            run_child(outcome, &borrow, || {
+                outstanding.fetch_sub(1, Ordering::Release);
+            });
+        })
+    });
+
+    let settled = match join {
+        Join::EveryChild => 0,
+        Join::SomeChild => 1,
+    };
+    while outstanding.load(Ordering::Acquire) > settled {
+        thread::yield_now();
+    }
+
+    // `Runtime::scope` has returned, as in `one_scope`: the caller's next
+    // line may reclaim whatever either child borrowed.
+    borrow.reclaim();
+
+    for child in children {
+        child.join().unwrap();
+    }
 }
 
 /// `bounded_model`'s identical reason in `tests/loom_notifier.rs`: the
@@ -293,4 +370,44 @@ fn mutation_a_cancelled_child_is_found_without_the_join() {
 #[should_panic(expected = "a child used its borrow after the frame that owned it took it back")]
 fn mutation_a_cancelled_childs_drop_after_the_count_is_found_with_the_join() {
     bounded_model(|| one_scope(Outcome::CancelledCountedFirst, true));
+}
+
+// --- The same property over the counter the real predicate reads, and the
+// --- two mutations only more than one child can have ------------------------
+
+/// Two children taking two different paths -- one runs its body, one is
+/// dropped unstarted -- and the frame waits for the counter to come back to
+/// the bottom, which is what `Runtime::try_corun` waits for. Neither child
+/// can see its borrow reclaimed, whichever order they finish in.
+#[test]
+fn a_mixed_pair_of_children_is_joined_before_the_borrow_is_reclaimed() {
+    bounded_model(|| two_children(Outcome::Completes, Outcome::Cancelled, Join::EveryChild));
+}
+
+/// Mutation, issue #416's order on one of two children: the honest sibling
+/// counts off after its own access, so the counter can reach the bottom with
+/// the cancelled child's drop still to come. Loom has to find that the
+/// counter settling is a claim about *counts* and not about bodies, which is
+/// the whole of what #416 was.
+#[test]
+#[should_panic(expected = "a child used its borrow after the frame that owned it took it back")]
+fn mutation_one_of_two_children_counted_before_its_drop_is_found() {
+    bounded_model(|| {
+        two_children(
+            Outcome::Completes,
+            Outcome::CancelledCountedFirst,
+            Join::EveryChild,
+        );
+    });
+}
+
+/// Mutation, the predicate rather than the order: both children are honest
+/// -- each drops before it counts off -- and the frame goes on as soon as the
+/// counter has moved at all, which is what `Runtime::scope` would do if its
+/// wait were short by one child. Loom finds the sibling still holding the
+/// borrow, and the single-child model cannot state this at all.
+#[test]
+#[should_panic(expected = "a child used its borrow after the frame that owned it took it back")]
+fn mutation_a_join_satisfied_by_the_first_of_two_counts_is_found() {
+    bounded_model(|| two_children(Outcome::Cancelled, Outcome::Cancelled, Join::SomeChild));
 }

@@ -255,6 +255,14 @@ fn a_sibling_is_dropped_not_run_when_one_worker_favours_its_panicking_twin() {
 /// what makes every child here "unstarted" by construction rather than by a
 /// race against however many workers happen to be free -- the same
 /// determinism `tests/runtimes.rs`'s own cancellation case relies on.
+///
+/// This is the case whose one historical failure opened #416, and issue #423
+/// closed that report by enumerating the seam rather than by rerunning it:
+/// with #416's `discard_skipped_body` call commented out, this case fails
+/// some six times in a thousand runs of the suite pinned to two cores, always
+/// exactly one child short of the count. So the assertion below is a live
+/// detector of that order and is not one to loosen; `DESIGN.md`'s `Scope`
+/// entry has the inventory of every waiter and every signal behind it.
 #[test]
 fn a_cancelled_run_drops_every_unstarted_child_before_scope_returns() {
     const CHILDREN: usize = 64;
@@ -395,6 +403,93 @@ fn a_cancelled_run_drops_every_childs_frame_guard_before_scope_returns() {
             reached.load(Ordering::Acquire)
         });
         assert!(run.cancel(), "the run had not finished");
+
+        run.wait().expect("a cancelled run is not a failed one");
+        assert!(
+            checked.load(Ordering::Acquire),
+            "{workers} worker(s): the body read the frame back after scope"
+        );
+    }
+}
+
+/// Issue #423: the guarantee above with the cancellation arriving **while the
+/// join is already in flight**, which is the one entry into this seam the two
+/// cases above do not reach -- both of those cancel the run before `scope` is
+/// entered, so every child is unstarted by construction and no child's body
+/// ever runs. Here `f` is held open until the main thread's `cancel` has
+/// returned, so the children spawned ahead of it are dispatched across the
+/// moment the run is cancelled: some run their bodies, the rest take the
+/// early-out, and at one worker all of them are skipped by the scope's own
+/// corun loop rather than by a thief.
+///
+/// Which child took which path is deliberately not pinned -- that is the
+/// race, and it is the executor's to resolve -- because both paths owe the
+/// same write: a body that ran dropped its [`FrameGuard`] itself, a body that
+/// was skipped had it dropped for it, and either way the slot is written
+/// exactly once before the count that releases the join. So the array read on
+/// the line after `scope` returns asserts the whole of the contract for a
+/// mixed outcome, with the scope frame still on the stack, and the count of
+/// children that did run is carried into the message for forensics rather
+/// than into an assertion of its own.
+#[test]
+fn a_cancel_during_the_join_still_drops_every_remaining_childs_frame_guard() {
+    const CHILDREN: usize = 64;
+
+    for workers in 1..=4 {
+        let reached = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let ran = Arc::new(AtomicUsize::new(0));
+        let checked = Arc::new(AtomicBool::new(false));
+
+        let mut taskflow = Taskflow::new();
+        taskflow.emplace_runtime({
+            let reached = Arc::clone(&reached);
+            let cancelled = Arc::clone(&cancelled);
+            let ran = Arc::clone(&ran);
+            let checked = Arc::clone(&checked);
+            move |runtime: &mut Runtime<'_>| {
+                let mut written = [0usize; CHILDREN];
+
+                reached.store(true, Ordering::Release);
+                runtime.scope(|s| {
+                    for slot in written.iter_mut() {
+                        let ran = Arc::clone(&ran);
+                        let guard = FrameGuard(slot);
+                        s.spawn(move || {
+                            ran.fetch_add(1, Ordering::Release);
+                            drop(guard);
+                        });
+                    }
+
+                    // The whole of this case: `f` does not return -- and so
+                    // the join below it does not start -- until the run has
+                    // been cancelled, which is a flag the *main* thread sets
+                    // and not one a worker could be waiting on, so one worker
+                    // is enough.
+                    spin_until("the run to be cancelled", || {
+                        cancelled.load(Ordering::Acquire)
+                    });
+                });
+
+                let ran = ran.load(Ordering::Acquire);
+                assert!(
+                    written.iter().all(|&writes| writes == 1),
+                    "{workers} worker(s): every child's guard wrote through the \
+                     frame before scope returned, {ran} of {CHILDREN} of them \
+                     from a body that ran: {written:?}"
+                );
+                checked.store(true, Ordering::Release);
+            }
+        });
+
+        let executor = Executor::new(workers);
+        let run = executor.run(&taskflow);
+        spin_until("the runtime body to start", || {
+            reached.load(Ordering::Acquire)
+        });
+        // The body is inside `f`, so the run cannot have finished.
+        assert!(run.cancel(), "the run had not finished");
+        cancelled.store(true, Ordering::Release);
 
         run.wait().expect("a cancelled run is not a failed one");
         assert!(
