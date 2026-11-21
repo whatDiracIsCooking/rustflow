@@ -61,16 +61,62 @@ data race. Miri is a nightly-only rustup component, so the lane carries a
 second toolchain pinned by date in the two places that have to agree,
 `ARG MIRI_NIGHTLY` in the [`Dockerfile`](../Dockerfile) and the toolchain name
 in the workflow; a bare `nightly` would make the interpreter's verdict depend
-on the day it ran. What runs under it is the unit tests of the three modules
-holding most of the crate's `unsafe` — `executor::notifier`,
-`executor::async_node` and `pipeline::scheduler` — rather than the whole
-`--lib` suite: at roughly a hundredth of native speed, the four-hundred-odd
-cases of that suite — many of them a multi-worker executor over thousands of
-nodes — are not a job that finishes, and a lane that covers the `unsafe`
-weekly is worth more than one that times out. Within those three, **nothing is
-`#[cfg_attr(miri, ignore)]`d**: an ignore would owe a reason both here and in
-the workflow's reason table, and the job fails on an ignored test that is
-missing from that table, so the two lists cannot drift apart.
+on the day it ran. The lane is **two steps**, and neither is the whole `--lib`
+suite: at roughly a hundredth of native speed, the four-hundred-odd cases of
+that suite — many of them a multi-worker executor over thousands of nodes —
+are not a job that finishes, and a lane that covers the protocols weekly is
+worth more than one that times out.
+
+The first step runs the unit tests of the three modules the interpreter is
+worth the most over: `executor::notifier`'s lock-free waiter stack,
+`executor::async_node`'s recycling of free nodes, and
+`pipeline::scheduler`'s line protocol. That is not the same list as "the
+modules holding the crate's `unsafe`", and the difference is worth keeping
+straight: production `unsafe` is two modules and two only,
+`executor::notifier` and `executor::scope`, as the README's own bullet and
+[`porting.md`](porting.md)'s "The two `unsafe` modules" both say;
+`async_node`'s is a counting allocator inside its own `#[cfg(test)]` module,
+and `pipeline::scheduler` has none at all, its docs having argued the
+`UnsafeCell` upstream reaches for down to a `Mutex`. What those three share is
+a discipline the type system is not checking for them, which is the half of
+Miri that is the data-race detector rather than the aliasing model.
+
+The second step is the **lifecycle witness set**, and it is where the lane
+reaches `executor::scope`: that module's two lifetime-erasing `transmute`s
+appear in no test module of the step above. The unit tests drive one waiter
+slot, one free node, one scheduler at a time, from the test's own thread,
+while the races those disciplines exist for are in the lifecycle — a worker
+parking in the notifier while another wakes it, a free node released by its
+last share on a thread that did not allocate it, `Runtime::scope` returning
+while a child it spawned is still being dropped. Reaching those takes a real
+pool with real work in it, so the step runs four cases from the integration
+suites, one per guarded module, each at **two workers**, the smallest pool in
+which every ordering those disciplines are for is possible:
+`basics::run_and_wait_simple` for the notifier,
+`task_group::a_silent_runtime_shaped_child_is_joined_and_reported_by_its_group`
+for `async_node`,
+`scope::a_cancelled_run_drops_every_unstarted_child_before_scope_returns` for
+`scope`, and `pipelines::set_callable_replaces_the_body_a_pipe_runs` for the
+pipeline scheduler. Three of those four pin the count; the cancellation case
+sweeps one to four workers, `tests/scope.rs` having no two-worker-only
+cancellation case, so two is one of the four shapes it runs rather than the
+only one. Each runs on its own, with its own wall time written into
+the job summary, because the affordability of this step is a measurement and
+not a hope: the four cost ten seconds of interpretation between them, seven
+and a half of those the cancelled-scope case, and some twenty seconds for the
+step including the build of the four test binaries. A `timeout` caps each case
+at **five minutes** of interpretation, forty times the slowest of them — a
+watchdog on a witness that has stopped making progress, not a target.
+
+**Nothing in either step is `#[cfg_attr(miri, ignore)]`d.** In the first, an
+ignore would owe a reason both here and in the workflow's reason table, and
+the job fails on an ignored test missing from that table, so the two lists
+cannot drift apart. In the second there is no such table and no need of one:
+each witness must report exactly one passing case or the step fails, so an
+ignore, a rename and a filter that matches nothing all stop the lane instead
+of emptying it quietly. Nor is any witness `cfg(miri)`-only — all four are
+ordinary members of the gate's `cargo test`, which is what keeps a case the
+interpreter depends on from rotting behind a flag nothing else builds.
 
 Two `MIRIFLAGS` are set, and both are there because `crossbeam-epoch` is in
 the tree rather than because of anything in this crate — which is also why
@@ -96,12 +142,23 @@ an integer-to-pointer cast warning, and Tree Borrows does not model such a
 cast, so a pointer derived that way is one this lane cannot fully vouch for.
 Between a model that rejects the dependency outright and one that does not
 model one of its casts, the job is as strict as the dependency allows.
-`-Zmiri-disable-isolation` is deliberately absent, since none of the three
-modules reads the host's clock, environment or filesystem. In the container:
+`-Zmiri-disable-isolation` is deliberately absent, since nothing either step
+runs reads the host's environment or filesystem. The witness set does read a
+clock — every rendezvous in `tests/` is a `spin_until` with an
+`Instant::now()` deadline — and that is the one isolation answers rather than
+refuses: Miri serves the monotonic clock from a virtual one of its own,
+advanced by interpreter steps rather than by the host, which is also why the
+120-second give-up in `tests/common/spin.rs` is unreachable under it. Only
+`SystemTime` would have wanted the host's. Both flags live on the job rather
+than on either step, there being two steps that want the same two. In the
+container:
 
 ```sh
 MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" \
   cargo +nightly-2026-11-18 miri test --lib -- executor::notifier::tests
+MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" \
+  cargo +nightly-2026-11-18 miri test --test scope -- \
+  --exact a_cancelled_run_drops_every_unstarted_child_before_scope_returns
 ```
 
 That toolchain is in the image rather than in `Cargo.toml`, so, exactly as for
