@@ -41,7 +41,9 @@
 # variants and `Fn` bounds that `src/` and the corpus themselves declare. So
 # `taskflow.task_ref(task).hash_value()` reaches `TaskRef::hash_value`, and
 # `executor.scoped_spawn(|scope| scope.spawn(..))` reaches `Scope::spawn`
-# through the bound on `scoped_spawn`'s own parameter.
+# through the bound on `scoped_spawn`'s own parameter. A block expression in
+# argument position is transparent to that last rule, a closure being so often
+# built inside one.
 #
 # Four conveniences keep that honest rather than approximate. `Arc`, `Rc` and
 # `Box` are seen through, since a caller calls through them. `Option` and
@@ -866,8 +868,31 @@ def element_of(ty):
     return None
 
 
+def argument_block(text, opening):
+    """Whether the `{` at `opening` opens a block expression in an argument.
+
+    Read from what precedes it: a `,` or a `(` is a block handed to a call,
+    where an identifier before it is a struct literal, a `)` a function body
+    and a `|` a closure body.
+    """
+    j = opening
+    while j > 0 and text[j - 1] in " \t\r\n":
+        j -= 1
+    return j > 0 and text[j - 1] in ",("
+
+
 def enclosing_call(text, position):
-    """(name, index of its `(`) of the call whose arguments enclose `position`."""
+    """(name, index of its `(`) of the call whose arguments enclose `position`.
+
+    A block expression written as an argument is walked straight through, so
+    that a closure built inside one still belongs to the call it is handed to.
+    That is the case that defeated the earlier reading: `tests/task_group.rs`
+    writes every one of its cases as `in_a_group(&executor, route, { let ran =
+    Arc::clone(&ran); move |group| .. })`, the block being where the `Arc`s a
+    `'static` closure needs are cloned, and stopping at that `{` left `group`
+    with no type -- so `TaskGroup::cancel`, whose only two call sites are in
+    that file, read as unwitnessed while both of them assert its behaviour.
+    """
     depth, i = 0, position
     while i > 0:
         ch = text[i - 1]
@@ -875,6 +900,9 @@ def enclosing_call(text, position):
             depth += 1
         elif ch in "([{":
             if depth == 0:
+                if ch == "{" and argument_block(text, i - 1):
+                    i -= 1  # a block in argument position, not the call
+                    continue
                 break
             depth -= 1
         i -= 1
