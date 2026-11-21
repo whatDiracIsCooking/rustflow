@@ -141,7 +141,7 @@ jobs:
           # warning is a true statement about the limit of this lane -- Miri
           # can miss a pointer bug behind such a cast -- so it stays in the
           # log, where it costs nothing: it is a warning, not a failure.
-          MIRIFLAGS: "-Zmiri-tree-borrows"
+          MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-backtrace=full"
         run: |
           # POSIX only, no bashism: the container's /bin/sh is dash and the
           # image ships no bash, so GitHub runs this step as `sh -e {0}` and

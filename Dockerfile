@@ -86,9 +86,11 @@ RUN cargo install cargo-llvm-cov --locked --version ${CARGO_LLVM_COV_VERSION} \
 # RUST_VERSION and the images in ci.yml and loom.yml are, and that workflow is
 # the only check that this layer works. In the container:
 #
-#   cargo +nightly-2026-11-18 miri test --lib -- executor::notifier::tests
+#   MIRIFLAGS=-Zmiri-tree-borrows \
+#     cargo +nightly-2026-11-18 miri test --lib -- executor::notifier::tests
 #
-# docs/development.md says which modules that covers and why not all of them.
+# docs/development.md says which modules that covers, why not all of them, and
+# why the aliasing model is the flagged one.
 ARG MIRI_NIGHTLY=nightly-2026-11-18
 RUN rustup toolchain install ${MIRI_NIGHTLY} \
         --profile minimal --component miri --component rust-src \

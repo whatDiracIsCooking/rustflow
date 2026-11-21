@@ -68,15 +68,24 @@ holding most of the crate's `unsafe` — `executor::notifier`,
 cases of that suite — many of them a multi-worker executor over thousands of
 nodes — are not a job that finishes, and a lane that covers the `unsafe`
 weekly is worth more than one that times out. Within those three, **nothing is
-`#[cfg_attr(miri, ignore)]`d** and no `MIRIFLAGS` is set — including
-`-Zmiri-disable-isolation`, which none of them needs because none reads the
-host's clock, environment or filesystem. An ignore would owe a reason both
-here and in the workflow's reason table, and the job fails on an ignored test
-missing from that table, so the two lists cannot drift apart. In the
-container:
+`#[cfg_attr(miri, ignore)]`d**: an ignore would owe a reason both here and in
+the workflow's reason table, and the job fails on an ignored test that is
+missing from that table, so the two lists cannot drift apart.
+
+The one flag the lane sets is `-Zmiri-tree-borrows`, Miri's newer aliasing
+model, and it is not a weakening — the aliasing check and the data-race
+detector both still run, under a different set of rules for what a derived
+pointer may do. It is there because the default model, Stacked Borrows,
+rejects `crossbeam-epoch` rather than this crate: `element_of` derives a
+pointer to a whole `Local` from a pointer to its list `Entry` field, the
+`container_of` pattern, which Tree Borrows allows and Stacked Borrows does
+not, and `Stealer::steal` reaches it the moment a second worker steals.
+`-Zmiri-disable-isolation` is deliberately absent, since none of the three
+modules reads the host's clock, environment or filesystem. In the container:
 
 ```sh
-cargo +nightly-2026-11-18 miri test --lib -- executor::notifier::tests
+MIRIFLAGS=-Zmiri-tree-borrows \
+  cargo +nightly-2026-11-18 miri test --lib -- executor::notifier::tests
 ```
 
 That toolchain is in the image rather than in `Cargo.toml`, so, exactly as for
