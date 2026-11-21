@@ -223,14 +223,34 @@ jobs:
             ran_total=$((ran_total + passed))
             ignored_total=$((ignored_total + ignored))
 
+            # The names, from libtest's own per-case lines, so the summary
+            # cannot drift from what ran. Matched loosely before the dots and
+            # after them on purpose: a `should_panic` case prints
+            # ` - should panic` before them, and a case that earns a Miri
+            # warning gets the warning where its `ok` would be and the `ok`
+            # on a later line -- so the obvious `\.\.\. ok$` pattern drops
+            # both kinds silently, which is how the first draft of this job
+            # lost four cases out of eleven from its summary.
+            sed -n 's/^test \([^ ]*\)\( - should panic\)\{0,1\} \.\.\. ignored$/\1/p' \
+              "$log" > "$log.ignored"
+            sed -n 's/^test \([^ ]*\)\( - should panic\)\{0,1\} \.\.\. .*/\1/p' \
+              "$log" | grep -vxF -f "$log.ignored" > "$log.ran" || true
+
+            # And the names are counted against libtest's own figure, because
+            # a summary that names fewer cases than ran is the quiet failure
+            # this whole job is trying not to be.
+            named=$(grep -c '' "$log.ran")
+            if [ "$named" -ne "$passed" ]; then
+              echo "::error::$module: $passed passed but $named named -- the summary is wrong."
+              exit 1
+            fi
+
             {
               echo "### $module"
               echo
               echo "$passed passed, $ignored ignored."
               echo
-              # The names, from libtest's own per-case lines, so this summary
-              # cannot drift from what ran.
-              sed -n 's/^test \([^ ]*\) \.\.\. ok$/- `\1`/p' "$log"
+              sed 's/^/- `/; s/$/`/' "$log.ran"
               echo
             } >> "$GITHUB_STEP_SUMMARY"
 
@@ -239,7 +259,7 @@ jobs:
             # the table below and a name missing from it fails the job rather
             # than passing quietly. Keep each entry equal to the sentence
             # docs/development.md gives for the same test.
-            for name in $(sed -n 's/^test \([^ ]*\) \.\.\. ignored$/\1/p' "$log"); do
+            for name in $(cat "$log.ignored"); do
               case "$name" in
                 *)
                   reason="" ;;
@@ -257,3 +277,11 @@ jobs:
             echo
             echo "$ran_total passed, $ignored_total ignored."
           } >> "$GITHUB_STEP_SUMMARY"
+
+          # The summary again, in the log. GitHub renders a step summary only
+          # in the web UI, so without this nobody reading the job through the
+          # API or `gh run view --log` -- which is how this lane was brought
+          # up, and how an agent reads it -- can check what it says.
+          echo "::group::step summary"
+          cat "$GITHUB_STEP_SUMMARY"
+          echo "::endgroup::"
