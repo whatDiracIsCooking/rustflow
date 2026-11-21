@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rustflow::Executor;
+use rustflow::Semaphore;
 use rustflow::observer::chrome::ChromeObserver;
 use rustflow::observer::tfprof::TfProfObserver;
 use rustflow::observer::{Observer, TaskView, WorkerView};
@@ -157,9 +158,19 @@ worker_matrix! {
 /// sibling to steal between the two reads, so the two methods describing the
 /// same queue cannot disagree -- unlike across workers, which
 /// `WorkerView::queue_size`'s own doc says not to expect.
+///
+/// The fan-out is what gives the agreement something to be about, and the
+/// witness count is what keeps it that way. A worker keeps *one* ready
+/// successor out of its queue and pushes the rest, and a run's sources go to
+/// the shared buffers rather than to any worker's queue -- so a graph of
+/// chains and sources alone, which is what [`mixed_graph`] is, hands every
+/// hook an empty queue, and "zero reads as empty" is the only half of the
+/// claim such a run can make.
 #[test]
 fn queue_size_agrees_with_is_queue_empty_on_one_worker() {
-    struct Checking;
+    struct Checking {
+        nonempty: AtomicUsize,
+    }
 
     impl Observer for Checking {
         fn set_up(&self, _num_workers: usize) {}
@@ -168,23 +179,40 @@ fn queue_size_agrees_with_is_queue_empty_on_one_worker() {
             assert_eq!(
                 worker.queue_size() == 0,
                 worker.is_queue_empty(),
-                "queue_size and is_queue_empty disagree on worker {}",
+                "queue_size {} and is_queue_empty {} disagree on worker {}",
+                worker.queue_size(),
+                worker.is_queue_empty(),
                 worker.id()
             );
+            if !worker.is_queue_empty() {
+                self.nonempty.fetch_add(1, Ordering::SeqCst);
+            }
         }
 
         fn on_exit(&self, _worker: WorkerView<'_>, _task: TaskView<'_>) {}
     }
 
     let executor = Executor::new(1);
-    let _observer = executor.make_observer(Checking);
+    let observer = executor.make_observer(Checking {
+        nonempty: AtomicUsize::new(0),
+    });
 
     let mut taskflow = Taskflow::new();
     mixed_graph(&mut taskflow);
+    let head = taskflow.emplace(|| {});
+    let fan: Vec<Task> = (0..4).map(|_| taskflow.emplace(|| {})).collect();
+    taskflow.task(head).precede(fan);
+
     executor
         .run(&taskflow)
         .wait()
         .expect("no task of the graph panicked");
+
+    assert!(
+        observer.nonempty.load(Ordering::SeqCst) > 0,
+        "no hook was handed a non-empty queue, so the agreement above was \
+         asserted of nothing but zero"
+    );
 }
 
 /// Every [`TaskView`] query, read for tasks whose shape the graph pins:
@@ -1070,31 +1098,41 @@ fn a_panicking_set_up_hook_is_reported_to_the_registering_caller() {
     still_runs(&executor);
 }
 
-/// A panicking `on_entry` fails the run it was called from and leaves the
-/// executor usable.
+/// A panicking `on_entry` fails the run it was called from, lets the body it
+/// brackets run anyway, and leaves the executor usable.
 ///
 /// The bar #304 set, which took the first of its two answers: the hook is
 /// called under a `catch_unwind` and its payload goes to the run, where
 /// before it unwound out of the worker's scheduling loop, dropped the job in
 /// flight without finishing it and hung the `wait` below for ever. What the
-/// case pins is all three halves of that answer -- the error, the payload
-/// being the *hook's* rather than the task's, and the executor still being
-/// usable afterwards.
+/// case pins is all four halves of that answer -- the error, the payload
+/// being the *hook's* rather than the task's, the dispatch the hook brackets
+/// not being withdrawn by its failure, and the executor still being usable
+/// afterwards. The third is the one an empty body said nothing about.
 #[test]
 fn a_panicking_on_entry_hook_fails_the_run_and_leaves_the_executor_usable() {
     let executor = Executor::new(2);
     let observer = executor.make_observer(Panicking(Hook::OnEntry));
 
+    let ran = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&ran);
     let mut taskflow = Taskflow::new();
-    taskflow.emplace(|| {});
+    taskflow.emplace(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+    });
     let error = executor
         .run(&taskflow)
         .wait()
         .expect_err("`on_entry` panicked, so the run failed");
 
     // The payload is the hook's own and not a task's: the one task of the
-    // graph above is an empty body that cannot panic.
+    // graph above counts and cannot panic.
     assert_panicked_with(error, "x");
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "a failing entry hook still let the body it brackets run"
+    );
 
     executor.remove_observer(&observer);
     still_runs(&executor);
@@ -1104,13 +1142,22 @@ fn a_panicking_on_entry_hook_fails_the_run_and_leaves_the_executor_usable() {
 /// the one before it: #304's fix covers both, where before the unwind from
 /// here skipped the node's own tear-down, so neither the semaphores it held
 /// nor its successors were released.
+///
+/// The count the one task takes and gives back is that half of it, and it is
+/// the half an empty graph cannot make: `Node::release_all` runs *after* this
+/// hook, so a payload escaping here would leave the count taken, which is
+/// what `tests/exceptions.rs`'s `semaphore1` shows a run that loses its
+/// releasing task doing.
 #[test]
 fn a_panicking_on_exit_hook_fails_the_run_and_leaves_the_executor_usable() {
     let executor = Executor::new(2);
     let observer = executor.make_observer(Panicking(Hook::OnExit));
 
+    let semaphore = Arc::new(Semaphore::new(1));
     let mut taskflow = Taskflow::new();
-    taskflow.emplace(|| {});
+    let task = taskflow.emplace(|| {});
+    taskflow.task(task).acquire(&semaphore).release(&semaphore);
+
     let error = executor
         .run(&taskflow)
         .wait()
@@ -1119,6 +1166,11 @@ fn a_panicking_on_exit_hook_fails_the_run_and_leaves_the_executor_usable() {
     // The payload is the hook's own and not a task's: the one task of the
     // graph above is an empty body that cannot panic.
     assert_panicked_with(error, "x");
+    assert_eq!(
+        semaphore.value(),
+        1,
+        "a failing exit hook still left the node its own tear-down"
+    );
 
     executor.remove_observer(&observer);
     still_runs(&executor);

@@ -2942,6 +2942,153 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   `buffer_of`'s doc comment calls free is free in its *cost*, not in its
   value.
 
+  **#432's run over the scheduling loop and its five neighbours adds
+  twenty-four entries to that list, in seven groups.**
+  `src/executor/worker.rs`, `src/executor/mod.rs`, `src/executor/scope.rs`,
+  `src/executor/corun.rs`, `src/executor/module.rs` and
+  `src/executor/dependent_async.rs` generate 227 mutants, of which 33 survive
+  at least one of this run's measurements of them -- the 31 the first pass
+  reported missed, and two it reported as timeouts that later passes showed
+  passing. One of the 33 is killed by a suite outside the ten and one by an
+  out-of-range index in two measurements of three; four are killed by tests
+  that run's own PR adds, three are owed an instrument the suite cannot be
+  (issue #452, below), and the twenty-four left are mutants no test should
+  kill. Three of the groups are this entry's two
+  existing reasons; the other four are one reason it did not have, and it is
+  worth stating once because it covers twenty-one of the twenty-four: **a
+  work-stealing search is tuned rather than specified.** Which queue a worker
+  tries first, how many failed attempts it makes before it yields and how many
+  before it gives up are upstream's own constants; what the port promises is
+  that the search ends, that the worker parks and that no job is lost, with
+  `BENCHMARKS.md` as the place the numbers themselves are argued. The suite
+  draws that line itself, which is the evidence for these groups rather than a
+  claim made about them: the mutants of the very same lines that break one of
+  those three promises are caught -- by `tests/work_stealing.rs`'s `waiter`
+  matrix watching a pool that will not settle, or by a run that stops
+  finishing -- and what is left over changes how much stealing happens on the
+  way and nothing else.
+
+  **A second guard over a call that is a no-op without it.**
+  `Shared::bulk_schedule` ends with
+  `if num_jobs > 0 { self.notifier.notify_n(num_jobs) }`, and both notifiers'
+  `notify_n` opens with `if n == 0 { return }`: `>=` for that `>` asks for
+  zero workers to be woken where the original asks for none, which is the
+  same program. The other two mutants of the comparison, `==` and `<`, are
+  false for every batch that pushed something, so a run's sources wake nobody
+  and both are caught.
+
+  **A worker's wait at the start gate.** `StartGate::wait` replaced with `()`
+  is a worker that enters its scheduling loop without waiting for the
+  constructor to finish, and nothing a caller can write can tell. Every
+  `Worker` record, every queue, the notifier and the buffers are built before
+  the first thread is spawned; the only state the constructor publishes
+  *after* that is the thread-id map, which is a `OnceLock`, and the only way
+  to ask it anything is `Executor::this_worker_id`, which needs an
+  `&Executor` that does not exist until the constructor has returned. So what
+  the wait buys is the absence of a lock on that read rather than an order a
+  program can observe, which is what the gate's own docs claim for it and no
+  more. The other mutant of the same method is caught, and is the opposite
+  direction: deleting the `!` in `wait_while(.., |open| !*open)` makes a
+  worker wait for the gate to *close*, and every suite hangs on its first
+  run.
+
+  **A `Drop` that only an unwind reaches, and only a scheduler bug unwinds.**
+  `InnerRun::drop` replaced with `()` is the same program on every path a
+  program takes: `Executor::corun_payload` has already called `InnerRun::end`
+  on each of them, and the payload that drop's `join` discards is dropped a
+  moment later by the `Arc<Topology>` field it was read out of. The `Drop`
+  stays for the reason the type's own docs give -- an unwind through the corun
+  frame must not take the caller's borrow of the taskflow with it while a job
+  of the inner run is still queued -- and in the unmutated program that
+  unwind is unreachable, a *task*'s panic being caught and recorded rather
+  than raised. It is the guided loop's floor clamp again: dead only in the
+  program that is correct.
+
+  **Eight mutants of the corun search's attempt counter, and the ninth that
+  is caught.** `WorkerThread::steal_until` counts failed steals against
+  `(num_queues + 1) * 2`, upstream's `MAX_STEALS`, and that count gates
+  nothing but a `thread::yield_now` -- the predicate is the only thing that
+  ends this search, which is #412's whole change. So the four mutants of
+  `max_steals`, `num_steals *= 1` and the three of `num_steals > max_steals`
+  change how often a corunning worker yields and nothing else. The ninth,
+  `num_steals -= 1`, underflows a `usize` and is caught.
+
+  **Ten of the scheduling loop's own two thresholds, and the three caught
+  beside them.** `WorkerThread::explore_task` counts the same way, and there
+  the counter also gates the give-up 150 attempts later that lets
+  `WorkerThread::wait_for_task` park. That is where the suite draws its line:
+  `*=` for the `+=`, and `==` or `<` for the first `>`, make the give-up
+  unreachable, so the worker never parks and the `waiter` matrix hangs on a
+  pool that will not settle -- all three caught. What survives is `>=` for
+  either comparison, `==` or `<` for the give-up's, and the arithmetic of
+  `max_steals` and `150 + max_steals`: each of those still yields, still
+  gives up and still parks, after a different number of attempts. The `<` is
+  the one worth a second look, since it gives up on the *first* attempt past
+  `MAX_STEALS` rather than 150 later: pass 1 reported it as a timeout, and
+  re-running it alone showed the suite passing in five seconds, so what the
+  parallel run measured was a pool that thrashes between parking and
+  stealing rather than one that loses anything. That is a throughput figure
+  and `BENCHMARKS.md`'s business, which is this group's whole point.
+
+  **A sticky victim is where the next search starts, not where the work is.**
+  `wait_for_task`'s buffer sweep sets `sticky_victim = workers.len() + buffer`
+  so that the next attempt goes to the buffer that answered. `-` for that `+`
+  names a worker's queue instead -- never out of range, `buffer` being below
+  the buffer count and `workers.len()` being the first buffer's own index --
+  so the first attempt of the next search misses and the draw, which reaches
+  every queue but this worker's own, finds the job instead.
+
+  The `*` mutant of the same expression is **not** here, and the difference is
+  the range. `workers.len() * buffer` is zero for the first buffer, which is
+  the `-` case over again -- the next search starts on worker zero, and
+  `tests/dependent_asyncs.rs`'s 65536-task chains cost a factor of six for it
+  -- but for a later buffer it is `W * b`, which indexes
+  `Buffers::steal_from` past the last buffer and panics the worker that drew
+  it. So the suite kills that mutant whenever the sweep answers with the
+  third buffer or later, which needs four workers or more and happened in two
+  of this run's three measurements of it; the third measured 33 s against a
+  5 s baseline. A mutant whose uncaught mode costs a factor of six is not a
+  value nothing promises, so it stays reported rather than joining the entry
+  above.
+
+  **Two folds of a thread-id hash.** `seed_from_current_thread` folds the two
+  halves of `hash(ThreadId)` with `(hash >> 32) ^ (hash & u32::MAX)`, and `|`
+  or `&` for that `^` is a different 32-bit seed for the same thread. Nothing
+  promises a seed: what the fold is for is that two workers do not walk the
+  same victims in the same order, which `two_threads_seed_differently` pins
+  and both mutants keep, and the value itself is read by nothing but
+  `Xorshift32::new`. The mutants of the same line whose result does not fit in
+  32 bits -- `<<` for the `>>`, and `|` or `^` for the mask's `&` -- panic in
+  `u32::try_from` on every worker thread and are caught, as are the two
+  constant returns.
+
+  **Four mutants besides that one looked like these groups and are not, which
+  is the part of this run worth reading twice.** Three of them are the pre-sleep sweep of the
+  siblings' queues, `WorkerThread::first_nonempty_sibling`, and the argument
+  that nearly excluded them was this: the only thread that pushes into a
+  worker's queue is that worker, and a worker reaches `wait_for_task` only
+  once its own `pop` has come back empty, so a backlog the sweep can see
+  belongs to a worker that is still running and will drain it -- latency, not
+  a job. **That is false, and the suite said so.** A worker *blocked inside a
+  task body* -- which is exactly what `tests/work_stealing.rs`'s
+  `skewed_starvation` and `wavefront_starvation` build, upstream's own
+  starvation cases -- holds a non-empty queue and is never going to drain it,
+  and the sweep is the second check of the notifier's two-phase guard that
+  keeps another worker from parking in front of that work. Those three mutants
+  are therefore a correctness break; what makes them survivors anyway is that
+  the break needs the lost-notification window (`notify_one` landing before
+  the sleeper's `prepare_wait`), so the starvation matrix catches them *some*
+  runs and not others -- it passed them in this run's pass 1 and failed them
+  in pass 2, over the same cases. Issue #452 is the instrument they are owed,
+  a `cfg(loom)` model of that predicate, and they are left reported rather
+  than excluded until it exists. The fourth is `Worker::is_queue_empty`
+  returning `true`, which has the same effect on the scheduler and is owed a
+  test rather than either, because that method is also a question an
+  `Observer` asks through `WorkerView`: it is killed by
+  `queue_size_agrees_with_is_queue_empty_on_one_worker`, which had been
+  asserting that agreement over a graph of chains and sources, where a
+  worker's own queue is empty at every dispatch.
+
 - **Four API-shape questions the friction log left open are all "keep", and
   the reasons are here rather than in code** (issue #260).
 
@@ -3222,6 +3369,39 @@ reason for it to be unasserted. `tests/wsq.rs`'s
 `a_defaulted_queue_is_an_empty_one` pins the only thing a reader wants from it:
 that it is the queue `new` builds and not a second constructor with a second
 meaning. Deleting it is not available, the lint being on in the gate.
+
+**A hook a corun's run never calls is an exception; a conditioner arm's own
+panic path is a test** (issue #432). The mutation run over
+`src/executor/worker.rs`, `src/executor/mod.rs`, `src/executor/scope.rs`,
+`src/executor/corun.rs`, `src/executor/module.rs` and
+`src/executor/dependent_async.rs` leaves those six files with two
+never-executed production groups between them, one of each kind; four of the
+six have none.
+
+`InnerRun::new`'s second closure is the **recorded exception**.
+`Topology::new` takes an on-finish callback (`C: FnOnce()`), and a corun's
+topology is never carried out by the run machinery: the corun frame is its own
+tear-down, `InnerRun::end` releasing the flow and the frame's two waits doing
+what a `RunHandle`'s would have done, so nothing is left to call the hook.
+`|| {}` is what the signature asks for and no path reaches it. A test would
+have to drive a corun's topology through the completion machinery, which is
+the one thing that frame exists to replace; an `expect`-style loudness has
+nothing to be loud about; and deleting it means putting an `Option` in
+`Topology::new`'s signature for the single caller with nothing to say, on
+behalf of every run that does.
+
+`WorkerThread::invoke_one`'s fourth closure is the other kind, and it was a
+real gap: the `map_err(|payload| job.record_panic(payload))` of the
+**multi-condition** arm -- what happens when a multi-condition body panics.
+`tests/exceptions.rs`'s three chain cases all install the failing body with
+`taskflow.task(c).work(..)`, which turns a conditioner into a *static* task,
+as upstream's own case does, so none of them enters a conditioner arm's
+failure path at all; and `tests/control_flow.rs`'s
+`a_panicking_conditioner_selects_nothing` covers the *single*-condition arm
+only. `a_panicking_multi_conditioner_selects_nothing` is that case for the arm
+beside it: the payload comes back from `wait` and the empty selection ends the
+branch, which is an `unwrap_or_default` on a `Vec` where the other arm has a
+`None`.
 
 ## Benchmarks and performance
 
