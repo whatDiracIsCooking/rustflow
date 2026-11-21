@@ -44,12 +44,6 @@ on:
     # runner minutes.
     - cron: "23 5 * * 1"
   workflow_dispatch:
-  # TEMPORARY, and removed again by the next commit on this branch -- see the
-  # PR body. `workflow_dispatch` cannot reach a workflow that is not yet on the
-  # default branch (the comment above says so, and both `gh workflow run` and
-  # the REST endpoint answered 404 here), so this is the only way to watch the
-  # lane run before it lands. It is NOT how this job is meant to be triggered.
-  pull_request:
 
 # Nothing here reads or writes the repository beyond the checkout.
 permissions:
@@ -154,10 +148,15 @@ jobs:
           # below reads the host's clock, environment or filesystem, and
           # leaving isolation on keeps the run independent of the machine; and
           # `-Zmiri-permissive-provenance`, which would only hide the
-          # integer-to-pointer warning crossbeam-epoch also earns. That
-          # warning is a true statement about the limit of this lane -- Miri
-          # can miss a pointer bug behind such a cast -- so it stays in the
-          # log, where it costs nothing: it is a warning, not a failure.
+          # integer-to-pointer warning crossbeam-epoch also earns -- "Tree
+          # Borrows does not support integer-to-pointer casts, so the program
+          # is likely to go wrong when this pointer gets used", as Miri itself
+          # puts it. That is the limit of this lane stated out loud and worth
+          # leaving in the log: between a model that rejects the dependency
+          # outright and one that does not model one of its casts, this job is
+          # as strict as the dependency allows. It costs nothing either way --
+          # it is a warning, not a failure, and the pointer in question has
+          # not gone wrong in any run so far.
           MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-ignore-leaks"
         run: |
           # POSIX only, no bashism: the container's /bin/sh is dash and the

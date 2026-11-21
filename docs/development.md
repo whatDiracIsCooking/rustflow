@@ -91,6 +91,11 @@ each says so out loud in the workflow beside the flag:
   appears in their allocation backtraces, and a leak is not undefined
   behaviour.
 
+The limit that leaves is in the log rather than hidden: the same crate earns
+an integer-to-pointer cast warning, and Tree Borrows does not model such a
+cast, so a pointer derived that way is one this lane cannot fully vouch for.
+Between a model that rejects the dependency outright and one that does not
+model one of its casts, the job is as strict as the dependency allows.
 `-Zmiri-disable-isolation` is deliberately absent, since none of the three
 modules reads the host's clock, environment or filesystem. In the container:
 
