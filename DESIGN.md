@@ -3549,6 +3549,66 @@ what the signature asks for and no path reaches it; deleting it means putting
 an `Option` in `Topology::over`'s signature for two callers with nothing to say,
 on behalf of every run that does.
 
+**A predicate's terms are pinned by a loom model, and a mutant killed only by
+one is a third kind of disposition** (issue #452). The second term of
+`WorkerThread::wait_for_task`'s predicate -- `first_nonempty_sibling`, the
+sweep of the *other* workers' queues between `prepare_wait` and `commit_wait`
+-- is what keeps a worker from parking in front of work nobody else will
+reach, and `tests/loom_sleep_predicate.rs` is now what says so: one thread
+pushes into a queue it will never drain and calls `notify_one`, another drives
+`wait_for_task`'s own sequence over the three terms, and loom reports a waiter
+parked with nobody left to wake it as a deadlock. The model is validated by
+mutation, as #138 requires and as every other model here is: it carries the
+three surviving mutants of that sweep -- the sweep replaced by `None`, its
+index map's `+` as `*`, its `>=` as `<` -- plus a predicate with the buffers
+term deleted and one with the done term deleted, and loom finds the deadlock
+for all five while the predicate the crate ships passes. The two index-map
+mutants are run in a pool of three as well as a pair, because two workers
+collapse both of them into the same program, "the sweep reads its own queue".
+
+**What the mutants' disposition rests on is the mechanism and not #432's
+flakiness table.** The argument stands on reading the code: only a worker
+pushes into its own queue and only once its own `pop` has come back empty --
+*except* a worker blocked inside a task body, which holds a non-empty queue it
+will never drain, which is exactly what `tests/work_stealing.rs`'s
+`skewed_starvation` and `wavefront_starvation` build `W - 1` of. Every push is
+followed by `notify_one` and `explore_task` draws every queue, so what the
+sweep covers is the one window a notification cannot: a `notify_one` landing
+before the sleeper's `prepare_wait`. The *measurement* that went with that
+argument is a different matter, and the entry above has to be read under
+#433's correction of how these runs are driven: "missed in pass 1, caught in
+pass 2 over the same cases" was read off runs at `-j 4`
+under a single `CARGO_TARGET_DIR`, which #433 then showed substitutes binaries
+between jobs, so the split is as likely to be substitution as a race window
+and is not evidence of either. What survives is that a suite which catches
+these mutants catches them as a `spin_until` giving up after 120 seconds --
+a hang, not an assertion -- and a case that fails by deadline is not a pin
+whatever its hit rate.
+
+**The disposition the three are owed is therefore neither of this section's
+two.** They are not mutants no test should kill: they break a correctness
+property, and a test now kills them. But no `cargo mutants` run over this
+crate can be the one that does, `cfg(loom)` being a `RUSTFLAGS` build of the
+whole graph rather than a feature, and a run that built it would be running
+every other suite against loom's atomics. So the third disposition is
+"killed by a model this run cannot build", and what it needs in
+`.cargo/mutants.toml` is three `exclude_re` patterns naming
+`first_nonempty_sibling` -- the whole-body replacement and the two map
+mutants -- under a comment pointing here, plus one word in that file's own
+header, which today says every pattern in it is a mutant no test should kill.
+The patterns are keyed on `file:line:col` like every other, so they belong to
+whichever run files them and take their line and column from it rather than
+from this entry.
+
+**What the model does not claim.** The queues in it are stood in for by a
+depth counter, because a `WorkerQueue` is a `crossbeam_deque::Worker` whose
+atomics are `std`'s and invisible to loom in any build; what the predicate
+asks of a queue is whether it is empty, and `tests/wsq.rs` is where the queue
+layer itself is tested. The notifier is the real one, which is the half that
+matters: the window is the Dekker pair it carries, and loom models a
+`fence(SeqCst)` properly while deliberately under-modelling a `SeqCst` *load*,
+so a model that stood the notifier in would be checking its own stand-in.
+
 ## Benchmarks and performance
 
 The benchmark suite is a part of the port with decisions of its own, and this
