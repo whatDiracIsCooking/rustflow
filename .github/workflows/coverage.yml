@@ -1,17 +1,25 @@
-# Coverage, published rather than gated. This job runs `devtools/coverage.sh
-# --functions` -- the same script and the same arguments a developer runs in
-# the container -- puts the per-file table and the total in the job summary,
-# and uploads the listing of functions the suite never executed as an
-# artifact. There is deliberately no floor: a number nobody can see does not
-# improve, and a floor set before the current misses have been dispositioned
-# would only record today's accident. The job fails when the measurement
-# fails, which is what the script's own exit status already means.
+# Coverage, published AND floored. This job runs `devtools/coverage.sh
+# --functions --check-floors` -- the same script and the same arguments a
+# developer runs in the container -- puts the per-file table, the total and the
+# floors report in the job summary, and uploads the listing of functions the
+# suite never executed as an artifact. The job fails when the measurement
+# fails, which is what the script's own exit status already meant, and now
+# also when a file of `src/` has dropped below its line in
+# `devtools/coverage-floors.txt`.
+#
+# One step, report first and check last, rather than two steps: the figures the
+# check judges have to be the figures this job published, and a second step
+# would be a second measurement of the same tree -- which moves by a few lines
+# between runs, so the gate would be failing over numbers nobody read. The
+# summary step below is `if: always()`, so the table is posted when the check
+# fails; that is the ordering #431 asks for.
 #
 # On `pull_request` and on `push` to main, unlike loom.yml: this measures the
 # diff rather than a protocol, so its answer is only useful next to the change
-# that moved it. It is not part of the gate -- `ci` is -- so a red `coverage`
-# is a measurement that could not run, never a coverage figure that was too
-# low.
+# that moved it. It is still not part of the five-command gate -- `ci` is --
+# but it is no longer a report only: a red `coverage` is now either a
+# measurement that could not run or a file under its floor, and the summary
+# says which.
 #
 # The toolchain pin lives in ONE place: `ARG RUST_VERSION` in the root
 # Dockerfile. The image below must be kept equal to it by hand, exactly as
@@ -104,7 +112,7 @@ jobs:
       - name: Toolchain versions
         run: rustc --version && cargo --version && cargo llvm-cov --version
 
-      - name: Measure coverage
+      - name: Measure coverage and check the per-file floors
         env:
           # Under the runner's workspace, so this build cannot fight `ci`'s;
           # `target/` is this repo's ignored build output, so a subdirectory of
@@ -120,14 +128,17 @@ jobs:
           # either way; the cost is that output appears at the end instead of
           # streaming.
           status=0
-          bash devtools/coverage.sh --functions > "$RUNNER_TEMP/coverage.log" 2>&1 || status=$?
+          bash devtools/coverage.sh --functions --check-floors \
+            > "$RUNNER_TEMP/coverage.log" 2>&1 || status=$?
           cat "$RUNNER_TEMP/coverage.log"
           exit "$status"
 
       # `if: always()`, because the table is worth reading even when the run
-      # that produced it went on to fail; the file may not exist at all if an
-      # earlier step did, hence the guard. Nothing here can fail the job.
-      - name: Put the table in the job summary
+      # that produced it went on to fail -- which is now also what happens when
+      # a floor is not met, so this step is what keeps the published table from
+      # being the casualty of the gate. The file may not exist at all if an
+      # earlier step failed, hence the guard. Nothing here can fail the job.
+      - name: Put the table and the floors in the job summary
         if: always()
         run: |
           set -eu
@@ -137,17 +148,31 @@ jobs:
               >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+          # The floors report is the tail of the script's output, from its
+          # first `floors: ` line, which is where the script puts it for this.
+          # Empty when the measurement failed before reaching the check.
+          floors="$(sed -n '/^floors: /,$p' "$log")"
           {
             echo "## Coverage"
             echo
-            echo "\`devtools/coverage.sh --functions\`, cargo-llvm-cov $CARGO_LLVM_COV_VERSION."
-            echo "A report, not a gate: there is no floor."
+            echo "\`devtools/coverage.sh --functions --check-floors\`, cargo-llvm-cov $CARGO_LLVM_COV_VERSION."
+            echo "The table is a report; the per-file line floors are a gate."
             echo
             echo '```'
             sed -n '/^Filename/,/^TOTAL/p' "$log"
             echo '```'
             echo
             sed -n 's/^functions never executed: /Functions never executed: /p' "$log"
+            echo
+            echo "### Per-file line floors"
+            echo
+            if [ -n "$floors" ]; then
+              echo '```'
+              echo "$floors"
+              echo '```'
+            else
+              echo "No floors report: the measurement did not reach the check."
+            fi
             echo
             echo "The full listing is the \`functions-never-executed\` artifact."
           } >> "$GITHUB_STEP_SUMMARY"
@@ -156,7 +181,9 @@ jobs:
       # when the script succeeded, and `if-no-files-found: error` is here to
       # catch the script writing it somewhere else -- which would be a silently
       # empty artifact -- rather than to add a second way for this job to go
-      # red.
+      # red. So an unmet floor skips this step, deliberately: what diagnoses an
+      # unmet LINE floor is the table and the floors report, both of which the
+      # summary above has by then, and the listing is of functions.
       - name: Upload the never-executed listing
         uses: actions/upload-artifact@v4
         with:

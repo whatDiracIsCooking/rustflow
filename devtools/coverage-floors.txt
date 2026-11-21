@@ -1,0 +1,67 @@
+# Per-file line-coverage floors: one `path  percent` line per file, sorted,
+# keyed on the repository-relative path. `devtools/coverage.sh --check-floors`
+# fails and names every file whose line coverage is below its floor; a file
+# with no line here has no floor, so a new module is ungated until someone
+# adds one.
+#
+# Written by `devtools/coverage.sh --write-floors`, which is also how to
+# raise them after a tree has gained coverage. Each floor is that run's
+# measured line coverage less the larger of two percentage points and four
+# missed lines, rounded down to a whole point. `docs/development.md` records
+# why that margin, what was measured to choose it, and what a line floor does
+# and does not say about a file whose own `#[cfg(test)]` code is in the
+# denominator.
+src/algorithm/fill.rs                     98
+src/algorithm/find.rs                     96
+src/algorithm/for_each.rs                 97
+src/algorithm/for_each_index.rs           95
+src/algorithm/generate.rs                 97
+src/algorithm/index_range.rs              97
+src/algorithm/merge.rs                    97
+src/algorithm/mod.rs                      97
+src/algorithm/module.rs                   94
+src/algorithm/partitioner.rs              97
+src/algorithm/reduce.rs                   96
+src/algorithm/scan.rs                     97
+src/algorithm/sort.rs                     96
+src/algorithm/transform.rs                97
+src/async_task.rs                         95
+src/dump.rs                               95
+src/executor/async.rs                     92
+src/executor/async_node.rs                92
+src/executor/corun.rs                     96
+src/executor/dependent_async.rs           97
+src/executor/mod.rs                       94
+src/executor/module.rs                    96
+src/executor/notifier.rs                  95
+src/executor/queue.rs                     96
+src/executor/rng.rs                       92
+src/executor/run_handle.rs                95
+src/executor/runtime.rs                   96
+src/executor/runtime_async.rs             95
+src/executor/scope.rs                     80
+src/executor/subflow.rs                   91
+src/executor/topology/job.rs              91
+src/executor/topology/mod.rs              94
+src/executor/topology/ownership.rs        95
+src/executor/topology/run.rs              96
+src/executor/worker.rs                    96
+src/flow_builder.rs                       82
+src/graph/handle.rs                       87
+src/graph/mod.rs                          94
+src/graph/node.rs                         98
+src/graph/work.rs                         91
+src/lib.rs                                 0
+src/observer/chrome.rs                    91
+src/observer/mod.rs                       92
+src/observer/tfprof.rs                    93
+src/observer/timeline.rs                  95
+src/pipeline/data_pipeline.rs             94
+src/pipeline/pipe.rs                      96
+src/pipeline/scheduler.rs                 93
+src/runtime.rs                            90
+src/semaphore.rs                          97
+src/subflow.rs                            90
+src/task.rs                               93
+src/task_group.rs                         97
+src/taskflow.rs                           93

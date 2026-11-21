@@ -238,10 +238,13 @@ alone, for the reason under "What is not ported".
   is the contributor page: the container both front ends build, the
   five-command gate `devtools/devcontainer.sh check` runs, and what CI runs
   beside it. Four measurements of the crate's own documentation and tests
-  sit beside that gate without being part of it, all reports that exit 0
-  whatever they find: `devtools/doc-ratio.sh`, `devtools/test-names.sh`,
-  `devtools/coverage.sh` and `devtools/api-witness.py`. What decides a pass
-  is the gate plus what CI's `examples` job runs: `devtools/run-examples.sh`
+  sit beside that gate: `devtools/doc-ratio.sh`, `devtools/test-names.sh`,
+  `devtools/coverage.sh` and `devtools/api-witness.py`. Three are reports that
+  exit 0 whatever they find, and so is `devtools/coverage.sh` in its default
+  and `--functions` modes; its `--check-floors` mode is a gate, and the one
+  CI's `coverage` job runs, over the per-file line floors in
+  `devtools/coverage-floors.txt`. What decides a pass is the gate, that check,
+  and what CI's `examples` job runs: `devtools/run-examples.sh`
   and the benchmarks' untimed smoke run.
 - **Two runtime dependencies**, `crossbeam-deque` and `crossbeam-utils`, and
   nothing else in the default build. "Dependency policy", below, is the rule
