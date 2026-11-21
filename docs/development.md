@@ -52,6 +52,38 @@ wake-after-last-release rule, the delivery of a failure under a runtime task,
 delivery slot, the `TaskGroup` counter, and the semaphore's
 park-and-reschedule rule.
 
+[`.github/workflows/miri.yml`](../.github/workflows/miri.yml) is the second
+weekly lane, and what it checks is the half loom cannot: loom explores every
+ordering of a *model* whose atomics it swapped out, while Miri interprets the
+real code and objects to what that code does along the way — an aliasing rule
+broken, a read of dangling or uninitialised memory, a misaligned access, a
+data race. Miri is a nightly-only rustup component, so the lane carries a
+second toolchain pinned by date in the two places that have to agree,
+`ARG MIRI_NIGHTLY` in the [`Dockerfile`](../Dockerfile) and the toolchain name
+in the workflow; a bare `nightly` would make the interpreter's verdict depend
+on the day it ran. What runs under it is the unit tests of the three modules
+holding most of the crate's `unsafe` — `executor::notifier`,
+`executor::async_node` and `pipeline::scheduler` — rather than the whole
+`--lib` suite: at roughly a hundredth of native speed, four hundred-odd cases
+of which many run a multi-worker executor over thousands of nodes is not a job
+that finishes, and a lane that covers the `unsafe` weekly is worth more than
+one that times out. Within those three, **nothing is
+`#[cfg_attr(miri, ignore)]`d** and no `MIRIFLAGS` is set — including
+`-Zmiri-disable-isolation`, which none of them needs because none reads the
+host's clock, environment or filesystem. An ignore would owe a reason both
+here and in the workflow's reason table, and the job fails on an ignored test
+missing from that table, so the two lists cannot drift apart. In the
+container:
+
+```sh
+cargo +nightly-2026-11-18 miri test --lib -- executor::notifier::tests
+```
+
+That toolchain is in the image rather than in `Cargo.toml`, so, exactly as for
+the coverage pins below, a container created before the layer that installs it
+has no `+nightly-2026-11-18` to run and needs a **host-side**
+`devtools/devcontainer.sh rebuild` first.
+
 CI runs the suite a second time as the `two-core` job of
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml): once, pinned with
 `taskset -c 0,1`, because most of the lifecycle races closed in this port were
