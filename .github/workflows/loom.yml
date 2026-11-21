@@ -13,7 +13,8 @@
 #
 # The toolchain pin lives in ONE place: `ARG RUST_VERSION` in the root
 # Dockerfile. The image below must be kept equal to it by hand, exactly as
-# ci.yml's must; when you bump one, bump all three.
+# ci.yml's must: bumping that arg means bumping every workflow that names an
+# image, this one included.
 #
 # One GitHub rule worth knowing before you edit this on a branch:
 # `workflow_dispatch` only offers the copy of this file that is on the DEFAULT

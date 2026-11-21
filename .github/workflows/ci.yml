@@ -9,7 +9,8 @@
 #
 # The toolchain pin lives in ONE place: `ARG RUST_VERSION` in the root
 # Dockerfile. The image below must be kept equal to it by hand; there is no
-# mechanism enforcing that, so when you bump one, bump the other.
+# mechanism enforcing that, so bumping that arg means bumping every workflow
+# that names an image, this one included.
 name: ci
 
 on:

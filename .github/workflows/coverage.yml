@@ -1,0 +1,165 @@
+# Coverage, published rather than gated. This job runs `devtools/coverage.sh
+# --functions` -- the same script and the same arguments a developer runs in
+# the container -- puts the per-file table and the total in the job summary,
+# and uploads the listing of functions the suite never executed as an
+# artifact. There is deliberately no floor: a number nobody can see does not
+# improve, and a floor set before the current misses have been dispositioned
+# would only record today's accident. The job fails when the measurement
+# fails, which is what the script's own exit status already means.
+#
+# On `pull_request` and on `push` to main, unlike loom.yml: this measures the
+# diff rather than a protocol, so its answer is only useful next to the change
+# that moved it. It is not part of the gate -- `ci` is -- so a red `coverage`
+# is a measurement that could not run, never a coverage figure that was too
+# low.
+#
+# The toolchain pin lives in ONE place: `ARG RUST_VERSION` in the root
+# Dockerfile. The image below must be kept equal to it by hand, exactly as
+# every other workflow's must: bumping that arg means bumping every workflow
+# that names an image, this one included.
+name: coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to a PR branch makes the first measurement pointless, the same
+# way it makes the first `ci` run pointless.
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+# Nothing here reads or writes the repository beyond the checkout; the artifact
+# upload needs no token.
+permissions:
+  contents: read
+
+env:
+  # Kept equal by hand to `ARG CARGO_LLVM_COV_VERSION` in the root Dockerfile,
+  # so that a figure measured in CI and a figure measured in the container come
+  # from the same tool. The digest pins the release asset the step below
+  # downloads, which the version alone does not: bump the two together,
+  # computing the new one with `sha256sum` over the tarball.
+  CARGO_LLVM_COV_VERSION: 0.9.1
+  CARGO_LLVM_COV_SHA256: b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.100-slim-bookworm
+    steps:
+      # ci.yml's first step, with `curl` added for the download below. Before
+      # checkout, deliberately, for ci.yml's reason: the slim image has no git,
+      # and actions/checkout silently falls back to a REST tarball without it,
+      # leaving no .git directory.
+      - name: Install container prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates pkg-config libssl-dev curl
+          rm -rf /var/lib/apt/lists/*
+
+      - uses: actions/checkout@v4
+
+      # The llvm-profdata/llvm-cov pair cargo-llvm-cov drives. The official
+      # rust images install with --profile minimal, so this component is no
+      # more present than clippy is in `ci`.
+      - name: Add llvm-tools
+        run: rustup component add llvm-tools
+
+      # The upstream prebuilt binary, pinned by version AND by digest, rather
+      # than `cargo install cargo-llvm-cov` (which would compile a few hundred
+      # crates on every PR, the cost ci.yml's `deny` job exists to avoid) and
+      # rather than a third-party action (one less thing executing arbitrary
+      # code in CI). CARGO_HOME is /usr/local/cargo in the official images, and
+      # its bin directory is already on PATH.
+      - name: Install cargo-llvm-cov at the Dockerfile's pin
+        run: |
+          # POSIX only, no bashism: see loom.yml on the step shell this image
+          # gets. The pipe below ends in the command whose status matters, so
+          # `set -e` catches a digest mismatch without `pipefail`.
+          set -eu
+          url="https://github.com/taiki-e/cargo-llvm-cov/releases/download/v$CARGO_LLVM_COV_VERSION/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/cargo-llvm-cov.tar.gz" "$url"
+          echo "$CARGO_LLVM_COV_SHA256  $RUNNER_TEMP/cargo-llvm-cov.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/cargo-llvm-cov.tar.gz" -C /usr/local/cargo/bin
+
+      # The registry only, NOT the instrumented build: a stale profile is a
+      # wrong number, and a number is this job's entire output, so the build
+      # it is measured from is made fresh every time. Keyed `coverage-`
+      # separately from `loom-` for loom.yml's reason -- an instrumented tree
+      # shares no artifact with either a normal or a cfg(loom) one, so one
+      # cache would be two trees evicting each other.
+      - name: Cache the registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: coverage-rust1.100-${{ hashFiles('Cargo.lock') }}
+          restore-keys: coverage-rust1.100-
+
+      - name: Toolchain versions
+        run: rustc --version && cargo --version && cargo llvm-cov --version
+
+      - name: Measure coverage
+        env:
+          # Under the runner's workspace, so this build cannot fight `ci`'s;
+          # `target/` is this repo's ignored build output, so a subdirectory of
+          # it is also out of git's way. The script reports under it: the
+          # listing lands in $CARGO_TARGET_DIR/llvm-cov.
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/coverage
+        run: |
+          set -eu
+          # Redirected rather than piped to `tee`, for loom.yml's reason: a
+          # pipeline's status is its last command's, and `pipefail` is a
+          # bashism this step shell does not have, so the pipe would report
+          # tee's success and hide a failed measurement. The log is shown
+          # either way; the cost is that output appears at the end instead of
+          # streaming.
+          status=0
+          bash devtools/coverage.sh --functions > "$RUNNER_TEMP/coverage.log" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/coverage.log"
+          exit "$status"
+
+      # `if: always()`, because the table is worth reading even when the run
+      # that produced it went on to fail; the file may not exist at all if an
+      # earlier step did, hence the guard. Nothing here can fail the job.
+      - name: Put the table in the job summary
+        if: always()
+        run: |
+          set -eu
+          log="$RUNNER_TEMP/coverage.log"
+          if [ ! -f "$log" ]; then
+            echo "No coverage log: the measurement did not get that far." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "## Coverage"
+            echo
+            echo "\`devtools/coverage.sh --functions\`, cargo-llvm-cov $CARGO_LLVM_COV_VERSION."
+            echo "A report, not a gate: there is no floor."
+            echo
+            echo '```'
+            sed -n '/^Filename/,/^TOTAL/p' "$log"
+            echo '```'
+            echo
+            sed -n 's/^functions never executed: /Functions never executed: /p' "$log"
+            echo
+            echo "The full listing is the \`functions-never-executed\` artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Not `if: always()`, unlike the summary above: the listing exists only
+      # when the script succeeded, and `if-no-files-found: error` is here to
+      # catch the script writing it somewhere else -- which would be a silently
+      # empty artifact -- rather than to add a second way for this job to go
+      # red.
+      - name: Upload the never-executed listing
+        uses: actions/upload-artifact@v4
+        with:
+          name: functions-never-executed
+          path: ${{ github.workspace }}/target/coverage/llvm-cov/functions-never-executed.txt
+          if-no-files-found: error
