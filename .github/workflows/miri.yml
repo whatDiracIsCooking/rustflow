@@ -54,6 +54,72 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: rust:1.100-slim-bookworm
+    # Both steps below read the same two settings, so they are the job's
+    # rather than either step's: a second copy of the flags would be a
+    # second place to keep them right.
+    env:
+      # Under the runner's workspace, as loom.yml's is, so a Miri build
+      # cannot fight a normal one's artifacts; `target/` is this repo's
+      # ignored build output, so a subdirectory of it is also out of git's
+      # way. Miri's from-source sysroot lands under here too, which is what
+      # the cache step below is mostly restoring.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/miri
+      # Tree Borrows, which is Miri's newer aliasing model, rather than
+      # the default Stacked Borrows -- and NOT a weakening: the aliasing
+      # check and the data-race detector both still run, under a different
+      # set of rules for what a derived pointer may do.
+      #
+      # It is here because Stacked Borrows rejects crossbeam-epoch, not
+      # this crate. The first run of this lane failed inside
+      # `crossbeam_epoch::internal`, where `element_of` derives a pointer
+      # to a whole `Local` from a pointer to its list `Entry` field
+      # (`&*local_ptr`, the `container_of` pattern) -- a derivation Stacked
+      # Borrows forbids and Tree Borrows allows. The path into it is
+      # `Stealer::steal`, so it fires the moment a second worker steals:
+      # every test here that runs a real executor hit it, and no frame of
+      # the crate's own `unsafe` was involved. Disabling the aliasing check
+      # instead (`-Zmiri-disable-stacked-borrows`) would have thrown away
+      # half of what this job is for.
+      #
+      # `-Zmiri-ignore-leaks` is the exit-time leak check and nothing
+      # else; the aliasing and data-race checks above are untouched by it.
+      # It is off for the same reason: the leaks are crossbeam-epoch's, by
+      # that crate's design. The nine this lane reported were
+      # `Box<crossbeam_epoch::internal::Local>` (the per-thread
+      # participant, registered on a worker's first pin) and
+      # `Box<Node<SealedBag>>` (the sealed garbage bag `Local::finalize`
+      # pushes into the global queue when that worker's thread-local
+      # handle is dropped at thread exit). Epoch-based reclamation frees
+      # either only when some thread pins again and advances the epoch,
+      # and once an `Executor`'s `Drop` has joined its workers nothing
+      # does, so both are still allocated when the process ends. Their
+      # allocation backtraces -- read with `-Zmiri-backtrace=full`,
+      # because the crate's own counting allocator in `async_node.rs`'s
+      # tests truncates the default one -- contain no frame of this crate,
+      # and a leak is not undefined behaviour either way.
+      #
+      # Deliberately NOT set: `-Zmiri-disable-isolation`, since nothing
+      # below reads the host's environment or filesystem, and leaving
+      # isolation on keeps the run independent of the machine. The witness
+      # set does read a clock -- every rendezvous in `tests/` is a
+      # `spin_until` with an `Instant::now()` deadline -- and that is the
+      # one isolation answers rather than refuses: Miri serves a *monotonic*
+      # clock from a virtual one of its own, advanced by interpreter steps
+      # rather than by the host, and only `SystemTime` would have needed the
+      # host's. A virtual clock advancing per step is also why the 120-second
+      # give-up in `tests/common/spin.rs` is unreachable here: a spin
+      # iteration buys tens of nanoseconds of it. The other flag left unset is
+      # `-Zmiri-permissive-provenance`, which would only hide the
+      # integer-to-pointer warning crossbeam-epoch also earns -- "Tree
+      # Borrows does not support integer-to-pointer casts, so the program
+      # is likely to go wrong when this pointer gets used", as Miri itself
+      # puts it. That is the limit of this lane stated out loud and worth
+      # leaving in the log: between a model that rejects the dependency
+      # outright and one that does not model one of its casts, this job is
+      # as strict as the dependency allows. It costs nothing either way --
+      # it is a warning, not a failure, and the pointer in question has
+      # not gone wrong in any run so far.
+      MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-ignore-leaks"
     steps:
       # loom.yml's first step verbatim, for its reasons: before checkout,
       # because the slim image has no git and actions/checkout silently falls
@@ -103,61 +169,6 @@ jobs:
           restore-keys: miri-nightly-2026-11-18-
 
       - name: Run the unsafe modules' unit tests under Miri
-        env:
-          # Under the runner's workspace, as loom.yml's is, so a Miri build
-          # cannot fight a normal one's artifacts; `target/` is this repo's
-          # ignored build output, so a subdirectory of it is also out of git's
-          # way. Miri's from-source sysroot lands under here too, which is what
-          # the cache above is mostly restoring.
-          CARGO_TARGET_DIR: ${{ github.workspace }}/target/miri
-          # Tree Borrows, which is Miri's newer aliasing model, rather than
-          # the default Stacked Borrows -- and NOT a weakening: the aliasing
-          # check and the data-race detector both still run, under a different
-          # set of rules for what a derived pointer may do.
-          #
-          # It is here because Stacked Borrows rejects crossbeam-epoch, not
-          # this crate. The first run of this lane failed inside
-          # `crossbeam_epoch::internal`, where `element_of` derives a pointer
-          # to a whole `Local` from a pointer to its list `Entry` field
-          # (`&*local_ptr`, the `container_of` pattern) -- a derivation Stacked
-          # Borrows forbids and Tree Borrows allows. The path into it is
-          # `Stealer::steal`, so it fires the moment a second worker steals:
-          # every test here that runs a real executor hit it, and no frame of
-          # the crate's own `unsafe` was involved. Disabling the aliasing check
-          # instead (`-Zmiri-disable-stacked-borrows`) would have thrown away
-          # half of what this job is for.
-          #
-          # `-Zmiri-ignore-leaks` is the exit-time leak check and nothing
-          # else; the aliasing and data-race checks above are untouched by it.
-          # It is off for the same reason: the leaks are crossbeam-epoch's, by
-          # that crate's design. The nine this lane reported were
-          # `Box<crossbeam_epoch::internal::Local>` (the per-thread
-          # participant, registered on a worker's first pin) and
-          # `Box<Node<SealedBag>>` (the sealed garbage bag `Local::finalize`
-          # pushes into the global queue when that worker's thread-local
-          # handle is dropped at thread exit). Epoch-based reclamation frees
-          # either only when some thread pins again and advances the epoch,
-          # and once an `Executor`'s `Drop` has joined its workers nothing
-          # does, so both are still allocated when the process ends. Their
-          # allocation backtraces -- read with `-Zmiri-backtrace=full`,
-          # because the crate's own counting allocator in `async_node.rs`'s
-          # tests truncates the default one -- contain no frame of this crate,
-          # and a leak is not undefined behaviour either way.
-          #
-          # Deliberately NOT set: `-Zmiri-disable-isolation`, since no test
-          # below reads the host's clock, environment or filesystem, and
-          # leaving isolation on keeps the run independent of the machine; and
-          # `-Zmiri-permissive-provenance`, which would only hide the
-          # integer-to-pointer warning crossbeam-epoch also earns -- "Tree
-          # Borrows does not support integer-to-pointer casts, so the program
-          # is likely to go wrong when this pointer gets used", as Miri itself
-          # puts it. That is the limit of this lane stated out loud and worth
-          # leaving in the log: between a model that rejects the dependency
-          # outright and one that does not model one of its casts, this job is
-          # as strict as the dependency allows. It costs nothing either way --
-          # it is a warning, not a failure, and the pointer in question has
-          # not gone wrong in any run so far.
-          MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-ignore-leaks"
         run: |
           # POSIX only, no bashism: the container's /bin/sh is dash and the
           # image ships no bash, so GitHub runs this step as `sh -e {0}` and
@@ -281,6 +292,177 @@ jobs:
           # in the web UI, so without this nobody reading the job through the
           # API or `gh run view --log` -- which is how this lane was brought
           # up, and how an agent reads it -- can check what it says.
+          echo "::group::step summary"
+          cat "$GITHUB_STEP_SUMMARY"
+          echo "::endgroup::"
+
+      # The second step, and the complement to the first: the unit tests above
+      # exercise one waiter slot, one free node, one scheduler at a time, with
+      # the thread that drives them being the test's own. The races their
+      # `unsafe` guards are in the *lifecycle* -- a worker parking in the
+      # notifier while another wakes it, a free node released by its last
+      # share on a thread that is not the one that allocated it, `scope`
+      # returning while a child it spawned is still being dropped -- and
+      # reaching those needs a real pool with real work in it, which only the
+      # integration suites build.
+      #
+      # So: one case per guarded module, taken from the suites that already
+      # exist rather than written for Miri, each at **two workers**, which is
+      # the smallest pool in which every ordering those guards are for is
+      # possible at all. Four cases, named in the table below beside the
+      # module each is here to witness, and all four are ordinary members of
+      # the gate's own `cargo test` -- nothing here is `cfg(miri)`-only, so a
+      # case cannot rot behind a flag nobody builds. `tests/scope.rs`'s is the
+      # one that sweeps 1..=4 workers rather than pinning two, since the suite
+      # has no two-worker-only cancellation case; two workers is one of the
+      # four it runs, so the witness is a superset of the shape asked for
+      # rather than a different one.
+      #
+      # "Guarded" rather than "unsafe" for the fourth of them, deliberately:
+      # `pipeline/scheduler.rs` holds no `unsafe` at all -- its own module
+      # docs argue the `UnsafeCell` upstream reaches for down to a `Mutex` --
+      # and what the interpreter is for there is the other half of what it
+      # does, the data-race detector over two line tasks whose discipline is
+      # a protocol rather than a lock on every field.
+      #
+      # Each is run on its own, with its own wall time recorded, because the
+      # point of this step is a number per case and not just a verdict -- and
+      # the numbers are what says the set is affordable where the
+      # four-hundred-case `--lib` suite is not. The four cost ten seconds of
+      # interpretation between them on the runner this lane uses, seven and a
+      # half of those the cancelled-scope sweep, which is the only one of the
+      # four that is not a handful of tasks; the step around them, builds
+      # included, is some twenty seconds. The `timeout` is the bound stated
+      # out loud: five minutes per case, which is forty times the slowest of
+      # them, so nothing but a witness that has stopped making progress can
+      # reach it -- and such a witness fails this lane instead of burning a
+      # weekly runner to the ground.
+      - name: Run the executor lifecycle witness set under Miri
+        run: |
+          # POSIX only, and nothing piped whose status matters: the first
+          # step's comment has both reasons.
+          set -eu
+
+          # Seconds of interpretation one witness may take. A watchdog, not
+          # a target: the measured times go into the summary below, where a
+          # reader can see for themselves how much of this they use.
+          cap=300
+
+          # `suite:case`, the suite being the file under `tests/` and so the
+          # `--test` target. The module each witnesses is the `case` table
+          # further down, which is also the guard: a renamed case stops this
+          # lane rather than quietly witnessing nothing.
+          witnesses="basics:run_and_wait_simple"
+          witnesses="$witnesses task_group:a_silent_runtime_shaped_child_is_joined_and_reported_by_its_group"
+          witnesses="$witnesses scope:a_cancelled_run_drops_every_unstarted_child_before_scope_returns"
+          witnesses="$witnesses pipelines:set_callable_replaces_the_body_a_pipe_runs"
+
+          # Built first, and together, so that the times below are
+          # interpretation and not rustc: a `cargo miri test` that has to
+          # build its test binary charges that build to the first case that
+          # needs it, which is the one figure in this table nobody wants to
+          # have to caveat.
+          targets=""
+          for witness in $witnesses; do
+            targets="$targets --test ${witness%%:*}"
+          done
+          echo "::group::build the witness binaries"
+          # Unquoted on purpose: `$targets` is a list of arguments.
+          cargo +nightly-2026-11-18 miri test --no-run $targets
+          echo "::endgroup::"
+
+          {
+            echo "## Miri, the lifecycle witness set"
+            echo
+            echo "One integration case per guarded module, two workers,"
+            echo "interpretation only -- the binaries are built in the same"
+            echo "step before the first case runs. Cap: ${cap}s per case."
+            echo
+            echo "| case | witnesses | wall | libtest | outcome |"
+            echo "| --- | --- | --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          total=0
+          for witness in $witnesses; do
+            suite=${witness%%:*}
+            case_name=${witness#*:}
+
+            # What each case is here for. A case whose name is not in this
+            # table is a case nobody can say the purpose of, so it fails the
+            # lane -- the same trap, and the same guard, as the first step's
+            # ignore table.
+            case "$case_name" in
+              run_and_wait_simple)
+                module="executor::notifier" ;;
+              a_silent_runtime_shaped_child_is_joined_and_reported_by_its_group)
+                module="executor::async_node" ;;
+              a_cancelled_run_drops_every_unstarted_child_before_scope_returns)
+                module="executor::scope" ;;
+              set_callable_replaces_the_body_a_pipe_runs)
+                module="pipeline::scheduler" ;;
+              *)
+                echo "::error::$case_name witnesses no module -- has it been renamed?"
+                exit 1 ;;
+            esac
+
+            log="$RUNNER_TEMP/witness-$case_name.log"
+            echo "::group::$suite: $case_name"
+            start=$(date +%s)
+            status=0
+            # `--exact`, so that a case which is renamed to a *prefix* of
+            # another cannot silently run something else; `< /dev/null` so
+            # cargo cannot read the step's own script off stdin.
+            timeout --kill-after=30s "$cap" \
+              cargo +nightly-2026-11-18 miri test --test "$suite" \
+                -- --exact "$case_name" > "$log" 2>&1 < /dev/null || status=$?
+            elapsed=$(( $(date +%s) - start ))
+            cat "$log"
+            echo "::endgroup::"
+            total=$((total + elapsed))
+
+            # 124 is `timeout`'s own "it did not finish"; 137 is the
+            # SIGKILL that follows when it did not take the TERM either.
+            if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+              echo "::error::$case_name did not finish within ${cap}s under Miri."
+              echo "**\`$case_name\`: over the ${cap}s cap.**" \
+                >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            if [ "$status" -ne 0 ]; then
+              echo "::error::$case_name failed under Miri."
+              echo "**\`$case_name\`: FAILED** -- see the job log." \
+                >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+
+            # Exactly one case ran: `--exact` matching nothing is a green
+            # "0 passed", and matching more than one would mean this table's
+            # time covers something it does not name.
+            passed=$(sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' \
+              "$log" | head -n 1)
+            if [ "${passed:-0}" -ne 1 ]; then
+              echo "::error::$case_name ran ${passed:-0} tests, not 1."
+              exit 1
+            fi
+
+            # libtest's own figure beside the wall clock, which is the inner
+            # bound on what the interpretation cost: the difference is cargo
+            # deciding there is nothing to rebuild and the harness starting.
+            libtest=$(sed -n \
+              's/^test result: ok\..*finished in \(.*\)$/\1/p' \
+              "$log" | head -n 1)
+            echo "| \`$case_name\` | \`$module\` | ${elapsed}s | ${libtest:-?} | ok |" \
+              >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          {
+            echo
+            echo "Four witnesses, ${total}s of wall time between them."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Both sections, in the log, for the first step's reason: a step
+          # summary is a web-UI rendering and an agent reads this job through
+          # `gh run view --log`.
           echo "::group::step summary"
           cat "$GITHUB_STEP_SUMMARY"
           echo "::endgroup::"
