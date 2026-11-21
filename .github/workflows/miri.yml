@@ -1,11 +1,17 @@
-# The crate's `unsafe` under Miri, which is an interpreter for rustc's MIR
-# rather than a test: it executes the real code and checks, at every step, the
-# things a compiled run cannot see -- an aliasing rule broken (Stacked
-# Borrows), a read of uninitialised or dangling memory, a misaligned access,
-# and a data race between two threads. That is the complement to
+# The crate's lock-free protocols under Miri, which is an interpreter for
+# rustc's MIR rather than a test: it executes the real code and checks, at
+# every step, the things a compiled run cannot see -- an aliasing rule broken
+# (Stacked Borrows), a read of uninitialised or dangling memory, a misaligned
+# access, and a data race between two threads. That is the complement to
 # `loom.yml`, not a duplicate of it: loom explores every ordering of a *model*
 # whose atomics it replaced, while Miri runs the actual notifier against the
 # actual queue once and objects to what the code does along the way.
+#
+# Two steps, and the second is not an afterthought: production `unsafe` in
+# this crate is two modules, `executor::notifier` and `executor::scope`
+# (`src/lib.rs` and the README both say so, and `docs/porting.md` says what
+# each buys), and only the first of those has unit tests to run. `scope` is
+# reached by the witness set in the second step and nowhere else in this job.
 #
 # Deliberately NOT on `pull_request` or `push`, for loom.yml's reason: the gate
 # stays the five commands, and the interpreter is something like two orders of
@@ -168,7 +174,7 @@ jobs:
           key: miri-nightly-2026-11-18-${{ hashFiles('Cargo.lock') }}
           restore-keys: miri-nightly-2026-11-18-
 
-      - name: Run the unsafe modules' unit tests under Miri
+      - name: Run the guarded modules' unit tests under Miri
         run: |
           # POSIX only, no bashism: the container's /bin/sh is dash and the
           # image ships no bash, so GitHub runs this step as `sh -e {0}` and
@@ -177,15 +183,24 @@ jobs:
           # matters.
           set -eu
 
-          # The three test modules of the files that hold most of the crate's
-          # `unsafe` -- the notifier's waiter slot, the free-node list's
-          # recycling, the pipeline scheduler's line state -- rather than the
-          # whole `--lib` suite. The suite is over four hundred cases, a good
-          # many of which run a multi-worker executor over thousands of nodes,
-          # and at Miri's speed that is not a job that finishes: a lane that
-          # covers the `unsafe` weekly is worth more than one that times out.
-          # Adding a module here is a one-line edit, and the guard below makes
-          # a filter that matches nothing a failure rather than a green run.
+          # The three test modules the interpreter is worth the most over --
+          # the notifier's lock-free waiter stack, the free-node list's
+          # recycling, the pipeline scheduler's line protocol -- rather than
+          # the whole `--lib` suite. Not "the modules holding the crate's
+          # `unsafe`", which these are not: of the three only
+          # `executor::notifier` holds any production `unsafe` at all,
+          # `async_node`'s is a counting allocator inside its own
+          # `#[cfg(test)]` module, and `pipeline::scheduler` has none by a
+          # decision its module docs argue. What they share is a discipline
+          # the type system is not checking for them, which is the half of
+          # Miri that is the data-race detector.
+          #
+          # The suite as a whole is over four hundred cases, a good many of
+          # which run a multi-worker executor over thousands of nodes, and at
+          # Miri's speed that is not a job that finishes: a lane that covers
+          # these weekly is worth more than one that times out. Adding a
+          # module here is a one-line edit, and the guard below makes a filter
+          # that matches nothing a failure rather than a green run.
           modules="executor::notifier::tests executor::async_node::tests pipeline::scheduler::tests"
 
           ran_total=0
@@ -298,8 +313,8 @@ jobs:
 
       # The second step, and the complement to the first: the unit tests above
       # exercise one waiter slot, one free node, one scheduler at a time, with
-      # the thread that drives them being the test's own. The races their
-      # `unsafe` guards are in the *lifecycle* -- a worker parking in the
+      # the thread that drives them being the test's own. The races those
+      # disciplines are for are in the *lifecycle* -- a worker parking in the
       # notifier while another wakes it, a free node released by its last
       # share on a thread that is not the one that allocated it, `scope`
       # returning while a child it spawned is still being dropped -- and
@@ -318,12 +333,18 @@ jobs:
       # four it runs, so the witness is a superset of the shape asked for
       # rather than a different one.
       #
-      # "Guarded" rather than "unsafe" for the fourth of them, deliberately:
-      # `pipeline/scheduler.rs` holds no `unsafe` at all -- its own module
-      # docs argue the `UnsafeCell` upstream reaches for down to a `Mutex` --
-      # and what the interpreter is for there is the other half of what it
-      # does, the data-race detector over two line tasks whose discipline is
-      # a protocol rather than a lock on every field.
+      # "Guarded" rather than "unsafe" throughout, deliberately, because the
+      # four are not four `unsafe` modules: only `executor::notifier` and
+      # `executor::scope` hold production `unsafe` at all -- `async_node`'s
+      # is a counting allocator inside its own `#[cfg(test)]` module and
+      # `pipeline/scheduler.rs` holds none, its docs having argued the
+      # `UnsafeCell` upstream reaches for down to a `Mutex`. What the other
+      # two are here for is the other half of what the interpreter does, the
+      # data-race detector over a discipline that is a protocol rather than a
+      # lock on every field. And of the two that do hold `unsafe`, `scope` is
+      # the one the step above reaches not at all: its two `transmute`s are
+      # in no module of that step's list, so this step is where the lane
+      # covers them.
       #
       # Each is run on its own, with its own wall time recorded, because the
       # point of this step is a number per case and not just a verdict -- and
