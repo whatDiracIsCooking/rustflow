@@ -815,3 +815,84 @@ fn make_find_if_task_runs_from_a_silent_dependent_async_body() {
         }
     }
 }
+
+// ----------------------------------------------------------------------------
+// the owned-data builder forms
+// ----------------------------------------------------------------------------
+
+/// `AlgorithmBuilder::find_if_not` over owned data: the `Taskflow::` form of
+/// the search, which takes an `Arc<Vec<_>>` and publishes into an
+/// `Arc<Mutex<_>>` instead of borrowing a slice and an output the way every
+/// `Runtime::find_if_not` case above does.
+///
+/// The index it publishes is the *first* the predicate rejects, not merely
+/// one of them: the input rejects at index 4 and again at 6, so a scan that
+/// reported either would pass a weaker assertion than this one. An input the
+/// predicate holds for everywhere publishes `None`.
+#[test]
+fn the_builder_find_if_not_reports_the_first_rejected_index() {
+    let data = Arc::new(vec![5, 5, 5, 5, 7, 5, 9]);
+    let rejected = Arc::new(Mutex::new(None));
+    let all_fives = Arc::new(vec![5; 64]);
+    let none = Arc::new(Mutex::new(Some(99)));
+
+    let mut taskflow = Taskflow::new();
+    taskflow.find_if_not(
+        Arc::clone(&data),
+        Arc::clone(&rejected),
+        |&x: &i32| x == 5,
+        GuidedPartitioner::<DefaultClosureWrapper>::default(),
+    );
+    taskflow.find_if_not(
+        Arc::clone(&all_fives),
+        Arc::clone(&none),
+        |&x: &i32| x == 5,
+        GuidedPartitioner::<DefaultClosureWrapper>::default(),
+    );
+
+    Executor::new(3)
+        .run(&taskflow)
+        .wait()
+        .expect("no task panicked");
+
+    assert_eq!(*rejected.lock().expect("uncontended"), Some(4));
+    assert_eq!(*none.lock().expect("uncontended"), None);
+}
+
+/// `AlgorithmBuilder::min_element` and `AlgorithmBuilder::max_element` over
+/// owned data, the `Taskflow::` forms of the fold the `min_max_case` sweep
+/// above runs through `Runtime::`.
+///
+/// Handed the same input and the same `a < b`, the two publish indices of
+/// opposite ends of it -- which is the pair's whole content, `max_element`
+/// being `min_element` with `cmp` flipped. The input's extremes are at known
+/// positions and appear once each, so the published index is pinned and not
+/// just the value under it.
+#[test]
+fn the_builder_min_and_max_element_report_opposite_ends() {
+    let data = Arc::new(vec![4, 1, 7, 9, 2]);
+    let smallest = Arc::new(Mutex::new(None));
+    let largest = Arc::new(Mutex::new(None));
+
+    let mut taskflow = Taskflow::new();
+    taskflow.min_element(
+        Arc::clone(&data),
+        Arc::clone(&smallest),
+        |a: &i32, b: &i32| a < b,
+        GuidedPartitioner::<DefaultClosureWrapper>::default(),
+    );
+    taskflow.max_element(
+        Arc::clone(&data),
+        Arc::clone(&largest),
+        |a: &i32, b: &i32| a < b,
+        GuidedPartitioner::<DefaultClosureWrapper>::default(),
+    );
+
+    Executor::new(3)
+        .run(&taskflow)
+        .wait()
+        .expect("no task panicked");
+
+    assert_eq!(*smallest.lock().expect("uncontended"), Some(1));
+    assert_eq!(*largest.lock().expect("uncontended"), Some(3));
+}

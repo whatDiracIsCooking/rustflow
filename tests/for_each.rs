@@ -38,8 +38,8 @@ use std::sync::{Arc, Mutex};
 use rustflow::algorithm::SlicePartitioner;
 use rustflow::algorithm::make_for_each_task;
 use rustflow::algorithm::partitioner::{
-    DefaultClosureWrapper, DynamicPartitioner, GuidedPartitioner, RandomPartitioner,
-    StaticPartitioner,
+    DefaultClosureWrapper, DynamicPartitioner, GuidedPartitioner, Partitioner, RandomPartitioner,
+    SplittingPartitioner, StaticPartitioner,
 };
 use rustflow::prelude::*;
 use rustflow::{Executor, Runtime};
@@ -190,6 +190,75 @@ worker_matrix! {
         parallel_for_random_11_threads(11),
         parallel_for_random_12_threads(12),
     }
+}
+
+// ----------------------------------------------------------------------------
+// SplittingPartitioner
+// ----------------------------------------------------------------------------
+
+/// The same sweep under `SplittingPartitioner`, the port's own fifth family,
+/// which has no upstream counterpart and so no upstream worker matrix to
+/// mirror -- two worker counts rather than twelve, since what is new here is
+/// the driving path and not the sweep.
+///
+/// That path is the one thing `SlicePartitioner::drive` does for this family
+/// and for no other: the slice is carved into one contiguous share per worker
+/// and each share handed to a task of its own, which may halve what it is
+/// left with onto a second task when a foreign worker picks it up. "Every
+/// element exactly once" therefore says more here than it does for the four
+/// strided or cursor-driven families above, because which chunks exist at all
+/// depends on which worker ran the share.
+fn parallel_for_splitting(workers: usize) {
+    parallel_for(workers, SplittingPartitioner::<DefaultClosureWrapper>::new);
+}
+
+worker_matrix! {
+    parallel_for_splitting {
+        parallel_for_splitting_2_threads(2),
+        parallel_for_splitting_4_threads(4),
+    }
+}
+
+/// `SplittingPartitioner::with_closure_wrapper`, the constructor the sweep
+/// above's `new` does not reach, and the one place a closure wrapper means
+/// something different for this family than for the other four: it wraps a
+/// whole *task*, not each chunk that task walks.
+///
+/// So the count it reports is the number of tasks the shares became, which is
+/// one per share plus one per share a steal re-split -- bounded below by the
+/// share count and above by nothing a run promises. Both sides of that are
+/// asserted: at least one wrapped task per share, and every element still
+/// visited exactly once however many there were.
+#[test]
+fn a_splitting_partitioners_wrapper_wraps_each_task_a_share_became() {
+    const N: usize = 1_000;
+    const W: usize = 4;
+
+    let tasks = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&tasks);
+    let part = SplittingPartitioner::with_closure_wrapper(8, move |body: &mut dyn FnMut()| {
+        counted.fetch_add(1, Ordering::Relaxed);
+        body();
+    });
+    assert_eq!(part.chunk_size(), 8, "the chunk size given is kept");
+
+    let data = Arc::new(Mutex::new(vec![0u32; N]));
+    let mut taskflow = Taskflow::new();
+    taskflow.for_each(Arc::clone(&data), |x: &mut u32| *x += 1, part);
+
+    Executor::new(W)
+        .run(&taskflow)
+        .wait()
+        .expect("no task panicked");
+
+    assert!(
+        data.lock().expect("uncontended").iter().all(|&x| x == 1),
+        "every element visited exactly once, whatever the shares split into"
+    );
+    assert!(
+        tasks.load(Ordering::Relaxed) >= W,
+        "one wrapped task per share at least, and one more per share a steal re-split"
+    );
 }
 
 // ----------------------------------------------------------------------------
