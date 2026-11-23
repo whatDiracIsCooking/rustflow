@@ -1430,6 +1430,28 @@ mod tests {
         assert!(nameless.load(Ordering::Acquire));
     }
 
+    /// A group opened by id holds **that** id, which is the one thing the id
+    /// route has instead of a worker: it is the worker whose scheduling loop
+    /// `corun` re-enters, and it is what the dump reports.
+    ///
+    /// Opened by hand on a worker that is deliberately **not** worker zero,
+    /// because that is the only way to ask the question: `tests/task_group.rs`
+    /// reads the same pair back through `Executor::task_group` from inside a
+    /// task body, where which worker picked the body up is the pool's
+    /// choice -- and it was worker zero often enough that a `worker_id` which
+    /// always answered zero passed that case.
+    #[test]
+    fn a_group_opened_by_id_holds_that_id() {
+        let executor = Executor::new(4);
+        let group = TaskGroup::by_id(&executor, 3);
+
+        assert_eq!(group.worker_id(), 3);
+        assert_eq!(
+            format!("{group:?}"),
+            "TaskGroup { worker: 3, size: 0, cancelled: false }"
+        );
+    }
+
     /// Where a group's children are queued, which is the whole of what the
     /// route decides: the shared buffers for a group holding a worker id,
     /// and that worker's own queue for one holding the worker (#372).

@@ -50,12 +50,13 @@
 //!   apiece and reads them after the join instead. The join is what makes
 //!   that safe, and it is the point of the case.
 
+use std::error::Error;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
 
 use rustflow::prelude::*;
-use rustflow::{Executor, Node, RunHandle, SubflowWork};
+use rustflow::{Executor, JoinError, Node, RunHandle, SubflowWork};
 
 // Only the spin: no numbered family here wants the matrix macro, and the
 // three counting helpers below are this file's own for the reason given with
@@ -1280,4 +1281,78 @@ fn a_subflow_body_reads_its_subgraph_and_the_worker_running_it() {
         1,
         "the graph the body read was the subgraph, not this one"
     );
+}
+
+/// This port's own: a [`JoinError`] is an [`Error`] whose **cause chain**
+/// reaches the failure under it, which is what a caller that prints causes
+/// rather than one line walks to find out what the subgraph's task panicked
+/// with -- and a refusal has no cause, there being nothing under "already
+/// joined".
+///
+/// Both variants in one body, which the "a failed join joins nothing" rule is
+/// what makes possible: the first `try_join` fails and leaves the subflow
+/// joinable, so the explicit join after it is the second run of the same
+/// child -- which succeeds, this one failing only once -- and the third call
+/// is the one that is refused.
+#[test]
+fn a_join_errors_cause_chain_reaches_the_task_that_failed() {
+    /// The chain a caller walks when it reports causes rather than one
+    /// message, innermost last.
+    fn causes(error: &dyn Error) -> Vec<String> {
+        let mut causes = Vec::new();
+        let mut next = error.source();
+        while let Some(cause) = next {
+            causes.push(cause.to_string());
+            next = cause.source();
+        }
+        causes
+    }
+
+    let attempts = seq_counter();
+    let reported = Arc::new(Mutex::new(Vec::new()));
+
+    let mut taskflow = Taskflow::new();
+    taskflow.emplace_subflow({
+        let attempts = Arc::clone(&attempts);
+        let reported = Arc::clone(&reported);
+        move |subflow: &mut Subflow<'_>| {
+            let attempts = Arc::clone(&attempts);
+            subflow.emplace(move || {
+                // A fixed payload rather than an `assert!`, because what the
+                // cause chain below is read for is the message: a failed
+                // assertion's payload would carry its own rendering too.
+                if seq_bump(&attempts) == 0 {
+                    panic!("the child of a joined subflow");
+                }
+            });
+
+            let failed = subflow.try_join().expect_err("the child panicked");
+            assert!(subflow.joinable(), "a failed join joins nothing");
+            subflow.join().expect("the child fails only the first time");
+            let refused = subflow.try_join().expect_err("already joined");
+            assert!(matches!(refused, JoinError::AlreadyJoined));
+
+            let mut reported = reported.lock().expect("no body panicked under this lock");
+            reported.push(causes(&failed));
+            reported.push(causes(&refused));
+        }
+    });
+
+    Executor::new(2)
+        .run(&taskflow)
+        .wait()
+        .expect("the body caught both of its errors");
+
+    let reported = reported.lock().expect("no body panicked under this lock");
+    assert_eq!(
+        reported[0],
+        vec!["a task panicked: the child of a joined subflow".to_string()],
+        "the run failure is the one cause under a join that a task failed"
+    );
+    assert!(
+        reported[1].is_empty(),
+        "and a refused join has no cause at all: {:?}",
+        reported[1]
+    );
+    assert_eq!(seq_count(&attempts), 2, "the child ran once per join");
 }

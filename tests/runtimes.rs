@@ -85,8 +85,8 @@
 //!   share the buffer as an `Arc<[AtomicI32]>`; `Shared` below has that
 //!   argument in full, including why every access of it can be relaxed.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rustflow::prelude::*;
 use rustflow::{Executor, RunError, RuntimeWork, Xorshift32};
@@ -258,6 +258,52 @@ fn a_runtime_body_sees_the_pool_and_coruns_nothing() {
             "the body saw the pool it is running on"
         );
     }
+}
+
+/// This port's own: `corun_all` is upstream's legacy name for `corun` and
+/// waits for the same thing, which only a body that has actually spawned
+/// something can say.
+///
+/// [`a_runtime_body_sees_the_pool_and_coruns_nothing`] calls all three
+/// shapes, and that is exactly why it cannot answer this: a body with nothing
+/// outstanding is one a `corun_all` that waited for nothing is
+/// indistinguishable from. **One worker**, so "the child has run" is a
+/// statement about the wait rather than about the pool -- the only thread that
+/// could have run the child is the one inside the body, and it is inside the
+/// call.
+#[test]
+fn corun_all_waits_for_what_corun_waits_for() {
+    let counter = Arc::new(AtomicI32::new(0));
+
+    let mut taskflow = Taskflow::new();
+    taskflow.emplace_runtime({
+        let counter = Arc::clone(&counter);
+        move |runtime: &mut Runtime<'_>| {
+            runtime.silent_async(count(&counter));
+            runtime.corun_all();
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                1,
+                "`corun_all` waited for the child spawned before it"
+            );
+
+            // And the name it is an alias for, over the same shape, so that
+            // what the case asserts of the two is one claim.
+            runtime.silent_async(count(&counter));
+            runtime.corun();
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                2,
+                "`corun` waited for the second one"
+            );
+        }
+    });
+
+    Executor::new(1)
+        .run(&taskflow)
+        .wait()
+        .expect("no task panicked");
+    assert_eq!(counter.load(Ordering::Relaxed), 2);
 }
 
 /// This port's own: `Runtime::corun_until` is upstream's
@@ -1269,12 +1315,17 @@ fn schedule_defers_a_bypass_onto_a_nonpreemptive_node_still_running() {
 /// way it runs at all is the call under test. The two accessors are asserted
 /// off the body's own recordings, including the relation
 /// `NonpreemptiveRuntime::worker_id`'s own doc states: it is
-/// `worker().id()` in one hop.
+/// `worker().id()` in one hop. The handle's dump is the fourth thing the body
+/// can read off it, and it is asserted against the id the body reported
+/// rather than against a fixed number: naming the worker is the whole of what
+/// that dump claims, the restricted handle holding no node to name.
 #[test]
 fn a_nonpreemptive_runtime_body_reads_its_worker_and_schedules_a_task() {
     for workers in 1..=4 {
         let value = Arc::new(AtomicI32::new(0));
         let seen_workers = Arc::new(AtomicUsize::new(0));
+        let ran_on = Arc::new(AtomicUsize::new(0));
+        let dumped = Arc::new(Mutex::new(String::new()));
         let hop_agrees = Arc::new(AtomicBool::new(false));
         let id_is_a_workers = Arc::new(AtomicBool::new(false));
 
@@ -1288,11 +1339,15 @@ fn a_nonpreemptive_runtime_body_reads_its_worker_and_schedules_a_task() {
 
         let line = {
             let seen_workers = Arc::clone(&seen_workers);
+            let ran_on = Arc::clone(&ran_on);
+            let dumped = Arc::clone(&dumped);
             let hop_agrees = Arc::clone(&hop_agrees);
             let id_is_a_workers = Arc::clone(&id_is_a_workers);
             taskflow.emplace_nonpreemptive_runtime(move |rt| {
                 seen_workers.store(rt.num_workers(), Ordering::Relaxed);
                 let id = rt.worker().id();
+                ran_on.store(id, Ordering::Relaxed);
+                *dumped.lock().expect("no body panicked under this lock") = format!("{rt:?}");
                 hop_agrees.store(id == rt.worker_id(), Ordering::Relaxed);
                 id_is_a_workers.store(id < rt.num_workers(), Ordering::Relaxed);
                 rt.schedule(bypassed);
@@ -1318,6 +1373,14 @@ fn a_nonpreemptive_runtime_body_reads_its_worker_and_schedules_a_task() {
         assert!(
             id_is_a_workers.load(Ordering::Relaxed),
             "{workers} worker(s): the worker named is one of that pool's"
+        );
+        assert_eq!(
+            *dumped.lock().expect("no body panicked under this lock"),
+            format!(
+                "NonpreemptiveRuntime {{ worker: {}, .. }}",
+                ran_on.load(Ordering::Relaxed)
+            ),
+            "{workers} worker(s): the dump names the worker the handle is for"
         );
         assert_eq!(
             value.load(Ordering::Relaxed),

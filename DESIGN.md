@@ -3190,6 +3190,68 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   putting a payload in the slot at all, so it asserted nothing about the
   clearing it was named for.
 
+  **#434's run over the dynamic-tasking and async surface adds three entries,
+  in two groups already argued for above, and the rest of its survivors are
+  tests.** `src/executor/{runtime,runtime_async,async,async_node,subflow}.rs`
+  and `src/task_group.rs` generate 287 mutants, of which 80 are caught, 31
+  time out, 163 are unviable and 13 survive. The unviable figure is the
+  largest in this series and it is one fact about two files: `runtime_async.rs`
+  is 22 one-line delegations and `task_group.rs` sixteen more, and
+  `AsyncHandle<R>`, `AsyncTask`, `TaskGroup` and `Arc<AsyncNode>` have no
+  `Default`, so 44 of the first file's 55 mutants and 40 of the second's 66
+  fail to compile -- which is why `runtime_async.rs` has a zero in both the
+  missed and the timeout column.
+
+  **A fourth `|` over disjoint single bits.** `ENTERED` in
+  `executor::runtime` is upstream's `NSTATE::PREEMPTED |
+  NSTATE::IMPLICITLY_ANCHORED` over `0x2000_0000` and `0x1000_0000`, so
+  `a | b == a ^ b` and the `^` mutant builds the same constant. The `&`
+  mutant of the same expression builds **zero**, which sets no bit, tells no
+  child that the node is waiting, and hangs -- detected under both test
+  selections, which is this group's control in its fourth instance.
+
+  **A fourth guard over a call that is a no-op without it, and it is
+  `set_up_graph`'s guard one level down.** `enter` forwards a payload nobody
+  collected under
+  `if node.base().estate().load(..) & Cancellable::CAUGHT != 0`, and
+  `NodeBase::take_panic` on an unclaimed slot takes a `None` and clears
+  nothing. `|` makes that condition always true; `^` makes it true for every
+  word the unmutated program can reach, the one word it would be false for
+  being `CAUGHT` alone, which `claim_panic` rules out by always setting
+  `EXCEPTION` beside it. So both lock a mutex per runtime task and change
+  nothing. The `!=` mutant of the same line is a different program -- it
+  forwards exactly the payloads that must *not* be forwarded and vice versa --
+  and is caught, as are both `&` mutants of the `PREEMPTED` guard forty lines
+  above it, which is three controls on one function.
+
+  **What the other ten were, and the one shape worth recording.** Six are
+  hand-written `Debug` and `Error` impls and two accessors, in #426's
+  category rather than this one, and they get tests; the two that say
+  something are a pair:
+
+  - **A test can be defeated by which worker the pool happened to pick.**
+    `TaskGroup::worker_id -> 0` passed `tests/task_group.rs`'s dump case,
+    which asserts the dump against `Executor::this_worker_id()` read inside a
+    task body on a four-worker pool -- and the body ran on worker zero in the
+    filtered pass and on worker three in the unfiltered one, so the *same*
+    mutant was missed by one measurement and caught by the other, over the
+    same case. A kill that depends on a scheduling coincidence is not a kill,
+    so the pair is now read off a group opened by hand on a worker that is
+    deliberately not zero. The `-> 1` mutant of the same line was caught both
+    times, which is what made the asymmetry visible.
+  - **A `Future` impl covered only by a doctest is covered by nothing the
+    instruments see.** `delete !` in `Delivery::poll_join` turns the
+    `will_wake` check into "register only a waker that is already there", so
+    the first poll of a handle leaves nothing to wake. No integration suite
+    polled an `AsyncHandle` at all: the mutant survived the filtered pass and
+    **hung** the unfiltered one, where the only thing that exercised the path
+    was `Executor::spawn`'s own doc example parking a thread that is never
+    unparked. `coverage.sh --functions` said the same thing from the other
+    side, listing `<AsyncHandle as Future>::poll`, `Delivery::poll_join` and
+    its closure as never executed. A doctest that hangs is detection of a
+    sort, and it is the sort a 300 s timeout finds rather than a failing
+    assertion, so the registration is now asserted on a real pool instead.
+
 - **Four API-shape questions the friction log left open are all "keep", and
   the reasons are here rather than in code** (issue #260).
 
@@ -3608,6 +3670,32 @@ layer itself is tested. The notifier is the real one, which is the half that
 matters: the window is the Dekker pair it carries, and loom models a
 `fence(SeqCst)` properly while deliberately under-modelling a `SeqCst` *load*,
 so a model that stood the notifier in would be checking its own stand-in.
+
+**Every production function hole in the async surface was a hand-written
+`Debug`, an `Error::source` or a `Future` nothing but a doctest polled** (issue
+#434). The mutation run over
+`src/executor/{runtime,runtime_async,async,async_node,subflow}.rs` and
+`src/task_group.rs` found the two lists overlapping almost exactly. The six
+files have **eight** never-executed production groups between them:
+`<AsyncHandle as Future>::poll`, `Delivery::poll_join` and the `will_wake`
+closure inside it, `Debug for AsyncHandle`, `Debug for AsyncNode` and its
+closure, `Debug for NonpreemptiveRuntime`, and `Error::source for JoinError`.
+**Five of the eight are the very mutants that survived that run**, and the
+other three are a closure or an impl that goes with one of the five, so the
+same tests answer both lists. `runtime_async.rs` and `src/task_group.rs` have
+none at all, the latter having had its two disposed of in #426. Nothing here
+is demoted or excepted: all eight are closed, which makes this the first file
+set in the series whose production section goes to **zero**.
+
+Two of them are worth the entry rather than the count. The `Future` impl is
+the gap `cargo mutants` and `coverage.sh --functions` reported from opposite
+directions and neither could have reported alone: no suite polled a handle, so
+the only thing exercising the impl was a doc example -- which the coverage
+instrument does not run and which the mutation run saw only as a 300 s hang.
+And `Error::source for JoinError` is the half of an error type that a
+`Display` test cannot reach: `JoinError::Run` and the `RunError` under it
+print the same string, so what `source` adds is the *chain*, and only a caller
+walking it can tell `Some` from `None`.
 
 ## Benchmarks and performance
 
