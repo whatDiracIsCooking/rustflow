@@ -1,5 +1,10 @@
-# Mutants `cargo mutants` must not report, because no test should kill them:
-# each is equivalent to the original, or pins a value the design leaves free.
+# Mutants `cargo mutants` must not report. Two of the three cases are that no
+# test should kill them: each is equivalent to the original, or pins a value the
+# design leaves free. The third is not that at all -- a correctness break that a
+# test *does* kill, but one no run of this tool can be, `cfg(loom)` being a
+# `RUSTFLAGS` build of the whole graph rather than a feature. A pattern of that
+# third kind names the model it rests on, because deleting the model would
+# otherwise leave the pattern standing and silently un-pin the property.
 # The argument for every one of them is in `DESIGN.md`, under "Documentation
 # and tooling" -- in particular that the third mutant of
 # `partitioner.rs:429:22`,
@@ -52,7 +57,10 @@ exclude_re = [
     'executor/worker\.rs:451:27: replace > with >= in WorkerThread::steal_until',
     # The scheduling loop's own two thresholds, where what a mutant moves is
     # the attempt a worker yields on or gives up after. The mutants of the
-    # same two lines that stop it giving up at all are caught.
+    # same two lines that stop it giving up at all are caught -- and so, which
+    # is why it is *not* here, is `<` for the give-up's own comparison: giving
+    # up on the first attempt past `MAX_STEALS` instead of 150 later fails
+    # `tests/work_stealing.rs`'s `skewed_starvation_8_workers`.
     'executor/worker\.rs:1033:43: replace \* with \+ in WorkerThread::explore_task',
     'executor/worker\.rs:1033:43: replace \* with / in WorkerThread::explore_task',
     'executor/worker\.rs:1033:38: replace \+ with - in WorkerThread::explore_task',
@@ -60,11 +68,21 @@ exclude_re = [
     'executor/worker\.rs:1051:27: replace > with >= in WorkerThread::explore_task',
     'executor/worker\.rs:1056:31: replace > with == in WorkerThread::explore_task',
     'executor/worker\.rs:1056:31: replace > with >= in WorkerThread::explore_task',
-    'executor/worker\.rs:1056:31: replace > with < in WorkerThread::explore_task',
     'executor/worker\.rs:1056:37: replace \+ with - in WorkerThread::explore_task',
     'executor/worker\.rs:1056:37: replace \+ with \* in WorkerThread::explore_task',
     # A sticky victim is where the next search starts, not where the work is.
     'executor/worker\.rs:1104:64: replace \+ with - in WorkerThread::wait_for_task',
+    # The pre-sleep sweep of the siblings' queues, and the only pattern here of
+    # the header's third kind. `k * (k >= id)` for `k + (k >= id)` is a
+    # correctness break -- a worker parks in front of a backlog no other thread
+    # is going to reach -- and `tests/loom_sleep_predicate.rs` is the test that
+    # kills it. Delete that file and this line goes with it. The integration
+    # suite kills it only when the lost-notification window is hit, so it is
+    # not the pin: one `-j 1` measurement missed it with all 87 cases of
+    # `tests/work_stealing.rs` passing in 0.61 s, where others hang on it. The
+    # sweep's other mutants are *not* here, this one aside: every measurement
+    # of those catches them, and a pattern would hide the next regression.
+    'executor/worker\.rs:1148:24: replace \+ with \* in WorkerThread::first_nonempty_sibling',
     # A worker's seed, which is a value nothing promises: what the fold is for
     # is that two threads get different streams, and both of these keep it.
     'executor/worker\.rs:1305:31: replace \^ with \| in seed_from_current_thread',

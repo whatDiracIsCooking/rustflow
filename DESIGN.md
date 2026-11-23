@@ -2943,19 +2943,21 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   value.
 
   **#432's run over the scheduling loop and its five neighbours adds
-  twenty-four entries to that list, in seven groups.**
+  twenty-four entries to that list, in eight groups** -- twenty-three of its
+  own, one of them withdrawn by the re-measurement this entry ends with, and
+  one that re-measurement adds back in a kind the list did not have before.
   `src/executor/worker.rs`, `src/executor/mod.rs`, `src/executor/scope.rs`,
   `src/executor/corun.rs`, `src/executor/module.rs` and
-  `src/executor/dependent_async.rs` generate 227 mutants, of which 33 survive
-  at least one of this run's measurements of them -- the 31 the first pass
+  `src/executor/dependent_async.rs` generate 227 mutants, of which 33 survived
+  at least one of that run's measurements of them -- the 31 the first pass
   reported missed, and two it reported as timeouts that later passes showed
   passing. One of the 33 is killed by a suite outside the ten and one by an
   out-of-range index in two measurements of three; four are killed by tests
-  that run's own PR adds, three are owed an instrument the suite cannot be
-  (issue #452, below), and the twenty-four left are mutants no test should
-  kill. Three of the groups are this entry's two
+  that run's own PR adds, three were taken to be owed an instrument the suite
+  cannot be (issue #452) and only one of them was, and the twenty-three left
+  are mutants no test should kill. Three of the groups are this entry's two
   existing reasons; the other four are one reason it did not have, and it is
-  worth stating once because it covers twenty-one of the twenty-four: **a
+  worth stating once because it covers twenty of the twenty-three: **a
   work-stealing search is tuned rather than specified.** Which queue a worker
   tries first, how many failed attempts it makes before it yields and how many
   before it gives up are upstream's own constants; what the port promises is
@@ -3013,22 +3015,22 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   change how often a corunning worker yields and nothing else. The ninth,
   `num_steals -= 1`, underflows a `usize` and is caught.
 
-  **Ten of the scheduling loop's own two thresholds, and the three caught
+  **Nine of the scheduling loop's own two thresholds, and the four caught
   beside them.** `WorkerThread::explore_task` counts the same way, and there
   the counter also gates the give-up 150 attempts later that lets
   `WorkerThread::wait_for_task` park. That is where the suite draws its line:
   `*=` for the `+=`, and `==` or `<` for the first `>`, make the give-up
   unreachable, so the worker never parks and the `waiter` matrix hangs on a
-  pool that will not settle -- all three caught. What survives is `>=` for
-  either comparison, `==` or `<` for the give-up's, and the arithmetic of
-  `max_steals` and `150 + max_steals`: each of those still yields, still
-  gives up and still parks, after a different number of attempts. The `<` is
-  the one worth a second look, since it gives up on the *first* attempt past
-  `MAX_STEALS` rather than 150 later: pass 1 reported it as a timeout, and
-  re-running it alone showed the suite passing in five seconds, so what the
-  parallel run measured was a pool that thrashes between parking and
-  stealing rather than one that loses anything. That is a throughput figure
-  and `BENCHMARKS.md`'s business, which is this group's whole point.
+  pool that will not settle -- all three caught. So is a fourth, `<` for the
+  give-up's own comparison, which gives up on the *first* attempt past
+  `MAX_STEALS` rather than 150 later: that is a pool thrashing between parking
+  and stealing rather than one that loses a job, and the thrash is enough to
+  fail `tests/work_stealing.rs`'s `skewed_starvation_8_workers` on the
+  `spin_until` deadline rather than merely to cost throughput. What survives
+  is `>=` for either comparison, `==` for the give-up's, and the arithmetic of
+  `max_steals` and `150 + max_steals`: each of those still yields, still gives
+  up and still parks, after a different number of attempts, and how many is
+  `BENCHMARKS.md`'s business, which is this group's whole point.
 
   **A sticky victim is where the next search starts, not where the work is.**
   `wait_for_task`'s buffer sweep sets `sticky_victim = workers.len() + buffer`
@@ -3075,19 +3077,68 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   starvation cases -- holds a non-empty queue and is never going to drain it,
   and the sweep is the second check of the notifier's two-phase guard that
   keeps another worker from parking in front of that work. Those three mutants
-  are therefore a correctness break; what makes them survivors anyway is that
-  the break needs the lost-notification window (`notify_one` landing before
-  the sleeper's `prepare_wait`), so the starvation matrix catches them *some*
-  runs and not others -- it passed them in this run's pass 1 and failed them
-  in pass 2, over the same cases. Issue #452 is the instrument they are owed,
-  a `cfg(loom)` model of that predicate, and they are left reported rather
-  than excluded until it exists. The fourth is `Worker::is_queue_empty`
+  are therefore a correctness break, and the instrument they are owed is
+  `tests/loom_sleep_predicate.rs` (issue #452), a `cfg(loom)` model of that
+  predicate: what the break needs is the lost-notification window (`notify_one`
+  landing before the sleeper's `prepare_wait`), and a model is the only thing
+  that reaches a window rather than waiting to be dealt one. Whether they are
+  *survivors* is a separate question from that, and the re-measurement at the
+  end of this entry splits them. Two of the three -- the sweep replaced by
+  `None` and its `>=` read as `<` -- are caught in every measurement of them,
+  failing `tests/work_stealing.rs`'s starvation cells by name on `spin_until`'s
+  deadline, so no `exclude_re` pattern is owed for either and none is filed: a
+  pattern would suppress the next genuine regression on those lines. The third,
+  the index map's `+` read as `*`, is the one the window really hides -- one
+  measurement of it missed it with all 87 cells of that suite passing in 0.61 s,
+  where others hang -- so it is the single entry in `.cargo/mutants.toml` of
+  that file's third kind, and it names the model rather than this entry. The
+  fourth mutant of this group is `Worker::is_queue_empty`
   returning `true`, which has the same effect on the scheduler and is owed a
   test rather than either, because that method is also a question an
   `Observer` asks through `WorkerView`: it is killed by
   `queue_size_agrees_with_is_queue_empty_on_one_worker`, which had been
   asserting that agreement over a graph of chains and sources, where a
   worker's own queue is empty at every dispatch.
+
+  **That matrix was measured in the configuration #433 then showed to be
+  unsound, and it has been re-taken** (issue #457). Every pass of the run above
+  was at `-j 4` under a single `CARGO_TARGET_DIR`, so each of its verdicts was
+  re-measured one job at a time, with `--no-config` -- the patterns above must
+  not suppress the mutants they are about -- in a target directory no other
+  build used, over the same ten-target selection, and with every timeout re-run
+  at a timeout above `spin_until`'s 120 s deadline so that a hang stopped being
+  a timeout and became a named failure. Twenty-three of the twenty-four entries
+  survive that unchanged. The two that do not are above, in the groups they
+  belong to: `explore_task`'s give-up comparison as `<`, which the corrected
+  measurement kills through `skewed_starvation_8_workers` where the original
+  recorded it "passing in five seconds alone" -- a pass that ran in a directory
+  that run's own `-j 4` jobs had already written to, which is the one
+  configuration in which a fast pass cannot be told from an unmutated library;
+  and the sibling sweep, two of whose three mutants are caught in every
+  measurement while the third is the one entry the list gains. The removal is
+  keyed to the **same-position control** rather than to a single verdict: at
+  the identical timeout and selection, one operator of that `>` dies while the
+  other two live, so the selection plainly reaches the line.
+
+  **What makes the re-measurement worth more than its bookkeeping is the
+  direction the broken configuration's error can run.** #433 could demonstrate
+  only a false MISSED and left the other direction open; it is open no longer.
+  At `-j 4` under one target directory, over three rounds of 39 mutants of
+  which 16 are killed by an assertion in under eight seconds, **six distinct
+  survivors were reported CAUGHT, eight times** -- each failing a test that
+  belongs to a *different* mutant of the same run, two of them failing
+  `two_threads_seed_differently`, which this entry already records both seed
+  mutants keep. The preconditions are what the negative probes were missing: a
+  survivor can be reported caught only if the binary it runs was built against
+  another mutant's library *and* that mutant's break is killed by an assertion
+  rather than by a hang, so a probe of survivors alone, or of survivors beside
+  mutants that hang, cannot produce one however long it runs. The consequence
+  for how a run of this kind is read is that a **CAUGHT** verdict from a `-j 4`
+  pass is no safer than a MISSED one: it hides a survivor, and a survivor
+  reported caught costs a disposition nobody ever writes. That is why the
+  re-measurement had to cover all 227 mutants and not only the 33 the original
+  run reported, and it is the reason the `-j 1` rule below is a rule about
+  verdicts in both directions rather than about spurious survivors.
 
   **#433's run over `executor/topology/` and `run_handle.rs` adds five entries
   to that list, in two groups, and corrects how every run in this series is
