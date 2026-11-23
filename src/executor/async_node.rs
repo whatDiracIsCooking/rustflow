@@ -419,14 +419,34 @@ mod tests {
     /// The pair the module docs argue has to be atomic, in the order that
     /// makes the successor run: a dependency named *before* the dependency
     /// finished is kept, and finishing hands it back exactly once.
+    ///
+    /// The dump is read at each of the three states this case already builds,
+    /// because those states are exactly what it reports, and because its two
+    /// derived fields are the reason it is hand-written: a scheduler log wants
+    /// the node and *how many* jobs are waiting for it, where a derive would
+    /// print every one of them.
     #[test]
     fn a_successor_named_before_the_finish_is_handed_back_by_it() {
         let dependency = node();
         let successor = Job::free(&node(), &Parent::Run);
 
+        assert_eq!(
+            format!("{dependency:?}"),
+            format!(
+                "AsyncNode {{ node: {:?}, finished: false, successors: 0 }}",
+                dependency.node()
+            ),
+            "a fresh free node's dump names its node and waits for nothing"
+        );
+
         assert!(
             dependency.push_successor(successor.clone()),
             "the dependency has not finished, so the job is kept"
+        );
+        let waiting = format!("{dependency:?}");
+        assert!(
+            waiting.ends_with("finished: false, successors: 1 }"),
+            "a kept job is counted rather than expanded: {waiting}"
         );
 
         let released = dependency.finish();
@@ -439,6 +459,25 @@ mod tests {
             dependency.finish().is_empty(),
             "the list is taken, not copied"
         );
+        let finished = format!("{dependency:?}");
+        assert!(
+            finished.ends_with("finished: true, successors: 0 }"),
+            "and the dump follows both halves of the finish: {finished}"
+        );
+    }
+
+    /// Only the two async handles may sit in a free-standing node, which is
+    /// what both constructors debug-assert: a node carrying any other kind is
+    /// one whose dispatch arm preempts it with nothing above it to resume it,
+    /// and the message names the handle it was given.
+    ///
+    /// A debug build only, as the assertion is -- `cargo test` is one, and the
+    /// release build this port ships deliberately pays nothing for the check.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a free-standing node carries an async handle, not Placeholder")]
+    fn a_free_node_refuses_a_handle_it_could_not_be_resumed_under() {
+        let _refused = AsyncNode::new("not an async task", Handle::Placeholder);
     }
 
     /// The module docs' count, counted: a free async task is its body's box

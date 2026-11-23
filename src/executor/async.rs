@@ -1184,16 +1184,46 @@ mod tests {
     /// `wait_for_all` covers async tasks, which is the whole point of
     /// counting them in `num_topologies`: when it returns, every handle has
     /// its outcome and reports it without blocking.
+    ///
+    /// `is_done` and the handle's dump are read on **both** sides of the
+    /// wait, because each is a claim about a transition rather than about a
+    /// finished task: the body is held on a flag, so "the outcome has not
+    /// arrived" is a fact here rather than a race, and the sole worker is
+    /// inside that body while the first pair is read.
+    ///
+    /// Read there and *compared* after the release, as
+    /// `tests/task_group.rs`'s dump case is: an assertion that failed with
+    /// the body still held would leave the one worker spinning into
+    /// [`spin_until`]'s deadline and the unwinding `Executor::drop` waiting
+    /// for it, so a regression in the first pair would hang the binary
+    /// instead of failing the case.
     #[test]
     fn wait_for_all_covers_an_async_task() {
         let executor = Executor::new(1);
+        let release = Arc::new(AtomicBool::new(false));
 
-        let handle = executor.spawn(|| 11);
-        assert_eq!(executor.num_topologies(), 1, "one async task, counted");
+        let handle = executor.spawn({
+            let release = Arc::clone(&release);
+            move || {
+                spin_until("the test thread to release the async body", &release);
+                11
+            }
+        });
+        let counted = executor.num_topologies();
+        let outstanding = (handle.is_done(), format!("{handle:?}"));
 
+        release.store(true, Ordering::Release);
         executor.wait_for_all();
+
+        assert_eq!(counted, 1, "one async task, counted");
+        assert_eq!(
+            outstanding,
+            (false, "AsyncHandle { done: false }".to_string()),
+            "a held body has delivered no outcome, and the dump says so"
+        );
         assert_eq!(executor.num_topologies(), 0);
         assert!(handle.is_done());
+        assert_eq!(format!("{handle:?}"), "AsyncHandle { done: true }");
         assert_eq!(handle.wait().expect("no panic"), 11);
     }
 

@@ -84,4 +84,21 @@ exclude_re = [
     # caught by `setting_up_the_same_graph_again_rearms_it`.
     'executor/topology/run\.rs:639:53: replace & with \| in set_up_graph',
     'executor/topology/run\.rs:639:53: replace & with \^ in set_up_graph',
+    # A fourth `|` over disjoint single bits: `ENTERED` is upstream's
+    # `PREEMPTED | IMPLICITLY_ANCHORED` over `0x2000_0000` and `0x1000_0000`,
+    # so `a | b == a ^ b` and `^` builds the same constant. The `&` mutant of
+    # the same expression builds zero, which sets no bit and resumes no node,
+    # and it is detected -- as a hang, under both test selections.
+    'executor/runtime\.rs:122:38: replace \| with \^',
+    # And a fourth guard over a call that is a no-op without it: `enter` reads
+    # `CAUGHT` to decide whether a runtime node's payload slot is worth
+    # locking before it forwards what nobody collected, and
+    # `NodeBase::take_panic` on an unclaimed slot takes a `None` and clears
+    # nothing. `|` makes the condition always true; `^` makes it true for
+    # every word the unmutated program can reach, the one word it is false for
+    # being `CAUGHT` alone, which `claim_panic` rules out by always setting
+    # `EXCEPTION` beside it. Both pay a mutex per entry and change nothing.
+    # The `!=` mutant of the same line is a different program and is caught.
+    'executor/runtime\.rs:249:53: replace & with \| in enter',
+    'executor/runtime\.rs:249:53: replace & with \^ in enter',
 ]

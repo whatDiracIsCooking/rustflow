@@ -56,8 +56,11 @@
 //!   runtime-shaped bodies the groups above submit.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::future::Future;
+use std::pin::pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -706,4 +709,82 @@ fn names_reach_an_observer() {
             "spawned".to_string(),
         ])
     );
+}
+
+/// This port's own: a spawned task's handle is a [`Future`], and what makes
+/// awaiting one work is that the worker finishing the task wakes whoever
+/// polled it.
+///
+/// Issue #265's loom model covers the *ordering* between the registration and
+/// the delivery, under a `cfg(loom)` build the gate does not run; what this
+/// asserts is the registration itself, end to end on a real pool. The body is
+/// held on a flag, so the first poll is `Pending` by construction and the
+/// wake that follows can only have come from the slot that poll left a waker
+/// in -- and `spin_until`'s deadline is what turns a waker nobody registered
+/// into a failing case rather than a hanging one.
+#[test]
+fn a_polled_handle_is_woken_by_the_worker_that_finishes_the_task() {
+    /// The whole runtime this needs: a count of the wakes, so that "it was
+    /// woken" is something the test thread can assert on.
+    struct Wakes(AtomicUsize);
+
+    impl Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    let executor = Executor::new(1);
+    let release = Arc::new(AtomicBool::new(false));
+    let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut context = Context::from_waker(&waker);
+
+    let mut task = pin!(executor.spawn({
+        let release = Arc::clone(&release);
+        move || {
+            spin_until("the test thread to release the polled task", || {
+                release.load(Ordering::Acquire)
+            });
+            42
+        }
+    }));
+
+    let first = task.as_mut().poll(&mut context);
+    // Polled again with the same waker, which is the `will_wake` path: a
+    // future may be polled by a different task each time, so the slot keeps
+    // one waker rather than one per poll, and the wake count below is what
+    // says which.
+    let second = task.as_mut().poll(&mut context);
+    let woken_while_held = wakes.0.load(Ordering::Acquire);
+
+    // Released before either is compared, as `tests/task_group.rs`'s dump
+    // case releases its child: an assertion that failed with the body still
+    // held would leave the one worker spinning into `spin_until`'s deadline.
+    release.store(true, Ordering::Release);
+    // The outcome is delivered -- and the waker woken -- by the body itself,
+    // before the tear-down that spends the counter this waits on, so no spin
+    // is needed to see the wake and none is wanted: a waker nobody registered
+    // makes this a failing assertion rather than a deadline.
+    executor.wait_for_all();
+
+    assert!(
+        first.is_pending(),
+        "the body was held, so the first poll left a waker instead of a value"
+    );
+    assert!(second.is_pending(), "and so was the second");
+    assert_eq!(
+        woken_while_held, 0,
+        "and nothing had woken the poller while it was held"
+    );
+    assert_eq!(
+        wakes.0.load(Ordering::Acquire),
+        1,
+        "the worker that delivered the outcome woke one registered waker once"
+    );
+
+    match task.as_mut().poll(&mut context) {
+        Poll::Ready(outcome) => assert_eq!(outcome.expect("the body did not panic"), 42),
+        Poll::Pending => panic!("the task has finished, so this poll hands the value over"),
+    }
 }
