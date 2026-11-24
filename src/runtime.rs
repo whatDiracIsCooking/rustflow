@@ -14,7 +14,15 @@
 //!
 //! Which nodes are handed one is `executor::runtime`, and the eight forms a
 //! body has for spawning work under its own node are `executor::runtime_async`.
-//! Upstream's `NonpreemptiveRuntime` is not ported.
+//!
+//! Upstream's second handle, `NonpreemptiveRuntime`, is ported in full; it
+//! lives whole in `executor::runtime`, with no shell here to split it from.
+//! The node kind that is handed one is built by
+//! [`FlowBuilder::emplace_nonpreemptive_runtime`](crate::FlowBuilder::emplace_nonpreemptive_runtime),
+//! a public method whose closure meets the handle by inference, so what that
+//! crate-private module withholds is the type's *name* rather than the handle
+//! itself; its `# Design` section has why the keyword on the type is `pub`
+//! all the same.
 
 use core::fmt;
 
