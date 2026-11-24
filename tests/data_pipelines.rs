@@ -23,7 +23,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rustflow::Executor;
-use rustflow::pipeline::data_pipeline::{DataPipeline, parallel_pipe, serial_pipe_with_flow};
+use rustflow::pipeline::data_pipeline::{
+    DataPipeline, parallel_pipe, serial_pipe, serial_pipe_with_flow,
+};
+use rustflow::pipeline::pipe::PipeType;
 use rustflow::prelude::*;
 
 #[macro_use]
@@ -999,6 +1002,172 @@ fn the_debug_output_of_a_typed_chain_names_its_shape_and_never_the_values_it_car
         assert!(
             !run.contains(VALUE_TAG),
             "and a populated slot is still printed nowhere: {run}"
+        );
+    });
+}
+
+// ----------------------------------------------------------------------------
+// A `DataPipe`'s own setters (upstream's own tests call neither)
+// ----------------------------------------------------------------------------
+
+/// `DataPipe::set_callable` is what the next run of the chain the pipe was
+/// added to carries out: the first run's values come from the callable the
+/// middle pipe was built with, the second run's from the one that replaced
+/// it.
+///
+/// The swap happens on a pipe value before it reaches a builder, because
+/// `DataPipelineBuilder::pipe` consumes each `DataPipe` it is handed -- so
+/// the second run is over the chain `DataPipeline::reset_pipes` builds from
+/// the swapped pipe, composed again for the reason that method's own docs
+/// give.
+#[test]
+fn a_replaced_data_pipe_callable_is_what_the_next_run_carries_out() {
+    /// Lines the chain runs over, so that more than one slot carries a
+    /// value through the swapped pipe.
+    const LINES: usize = 2;
+    /// Tokens the source lets through before it stops, both runs.
+    const TOKENS: usize = 6;
+    /// What the callable the middle pipe is built with multiplies by.
+    const SCALE: i32 = 10;
+    /// What the callable that replaces it adds instead, far enough from
+    /// `SCALE`'s own outputs that no value is in both runs' answers.
+    const OFFSET: i32 = 1000;
+
+    serialized(|| {
+        let seen: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+        let source = || {
+            serial_pipe_with_flow::<(), i32>(|(), pf| {
+                if pf.token() == TOKENS {
+                    pf.stop();
+                    return 0;
+                }
+                i32::try_from(pf.token()).expect("a token count fits in an i32")
+            })
+        };
+        let sink = || {
+            let seen = Arc::clone(&seen);
+            serial_pipe_with_flow::<i32, ()>(move |value, _pf| {
+                seen.lock().expect("no pipe panicked").push(value);
+            })
+        };
+        let token_values: Vec<i32> = (0..TOKENS)
+            .map(|token| i32::try_from(token).expect("a token count fits in an i32"))
+            .collect();
+
+        let mut pipeline = DataPipeline::builder(LINES)
+            .pipe(source())
+            .pipe(serial_pipe::<i32, i32>(|value| value * SCALE))
+            .pipe(sink())
+            .build();
+
+        let executor = Executor::new(2);
+        let mut taskflow = Taskflow::new();
+        compose_module(&mut taskflow, &pipeline, "module_of_data_pipeline");
+        executor.run(&taskflow).wait().expect("no task panicked");
+
+        assert_eq!(pipeline.num_tokens(), TOKENS);
+        {
+            let mut carried = seen.lock().expect("the run is over");
+            assert_eq!(
+                *carried,
+                token_values
+                    .iter()
+                    .map(|value| value * SCALE)
+                    .collect::<Vec<i32>>(),
+                "the first run's values came from the callable the middle pipe was built with"
+            );
+            carried.clear();
+        }
+
+        let replaced_sink = sink();
+        pipeline.reset_pipes(|builder| {
+            let mut middle = serial_pipe::<i32, i32>(|value| value * SCALE);
+            middle.set_callable(|value| value + OFFSET);
+            assert_eq!(
+                middle.pipe_type(),
+                PipeType::Serial,
+                "a callable swap is no part of the direction"
+            );
+            builder.pipe(source()).pipe(middle).pipe(replaced_sink)
+        });
+
+        let mut rebuilt = Taskflow::new();
+        compose_module(&mut rebuilt, &pipeline, "module_of_the_swapped_chain");
+        executor.run(&rebuilt).wait().expect("no task panicked");
+
+        assert_eq!(pipeline.num_tokens(), TOKENS);
+        assert_eq!(
+            *seen.lock().expect("the run is over"),
+            token_values
+                .iter()
+                .map(|value| value + OFFSET)
+                .collect::<Vec<i32>>(),
+            "the second run's values came from the callable that replaced it"
+        );
+    });
+}
+
+/// `DataPipe::set_type` flips a pipe `serial_pipe` built over to
+/// `PipeType::Parallel`, and the chain it sits in still carries every token's
+/// value through it: what the flip changes is the order that pipe's own
+/// tokens may run in, not which values reach it.
+///
+/// The flip is read back three ways -- off the pipe, off the built
+/// pipeline's rendering of the `Pipe` it was lowered into, and off the
+/// values the run carried -- because the first two alone would not say the
+/// scheduler ran the chain under the new direction. The chain's other two
+/// pipes stay serial so that one `Parallel` in that rendering can only be
+/// this pipe, and so that the sink collects in token order.
+#[test]
+fn a_data_pipe_flipped_to_parallel_still_carries_every_token() {
+    /// Lines the chain runs over, so that the flipped pipe has more than one
+    /// line's token to run at once.
+    const LINES: usize = 4;
+    /// Tokens the source lets through before it stops.
+    const TOKENS: usize = 8;
+
+    serialized(|| {
+        let mut middle = serial_pipe::<i32, i32>(|value| value + 1);
+        middle.set_type(PipeType::Parallel);
+        assert_eq!(middle.pipe_type(), PipeType::Parallel);
+
+        let seen: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+        let collected = Arc::clone(&seen);
+        let pipeline = DataPipeline::builder(LINES)
+            .pipe(serial_pipe_with_flow::<(), i32>(|(), pf| {
+                if pf.token() == TOKENS {
+                    pf.stop();
+                    return 0;
+                }
+                i32::try_from(pf.token()).expect("a token count fits in an i32")
+            }))
+            .pipe(middle)
+            .pipe(serial_pipe::<i32, ()>(move |value| {
+                collected.lock().expect("no pipe panicked").push(value);
+            }))
+            .build();
+
+        let built = format!("{pipeline:?}");
+        assert_eq!(
+            built.matches("type: Parallel").count(),
+            1,
+            "the flipped pipe is the one parallel pipe the scheduler was given: {built}"
+        );
+
+        let mut taskflow = Taskflow::new();
+        compose_module(&mut taskflow, &pipeline, "module_of_data_pipeline");
+        Executor::new(2)
+            .run(&taskflow)
+            .wait()
+            .expect("no task panicked");
+
+        assert_eq!(pipeline.num_tokens(), TOKENS);
+        assert_eq!(
+            *seen.lock().expect("the run is over"),
+            (1..=TOKENS)
+                .map(|value| i32::try_from(value).expect("a token count fits in an i32"))
+                .collect::<Vec<i32>>(),
+            "every token's value reached the serial sink through the flipped pipe"
         );
     });
 }

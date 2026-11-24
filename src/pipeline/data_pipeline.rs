@@ -25,6 +25,21 @@
 //! runtime index out of bounds. Handing the closure a builder over the line
 //! count the reset is about keeps the check and leaves the count the
 //! method's own to decide.
+//!
+//! **Replacing a pipe's callable is one method per callable shape, where
+//! upstream's `callable(U&&)` is one method deducing which shape it was
+//! handed.** [`DataPipe::set_callable`] takes the `Fn(I) -> O` shape and
+//! [`DataPipe::set_callable_with_flow`] the `Fn(I, &mut Pipeflow) -> O` one.
+//! Covering both from a single method would need `impl<F: Fn(I) -> O> ..`
+//! beside `impl<F: Fn(I, &mut Pipeflow) -> O> ..`, which coherence rejects
+//! as overlapping (E0119) even though no closure satisfies both -- the
+//! limitation `DESIGN.md` already records for `emplace`'s task kinds and for
+//! the static and dynamic loop traits. A marker type parameter routes around
+//! it, at the price of a public trait and a marker type per shape in a
+//! surface that is otherwise four free functions, and of a closure whose
+//! shape the compiler can no longer infer from its own argument list.
+//! Splitting by shape is what those four constructors already do, one name
+//! per shape, so a setter is the pair of whichever one built the pipe.
 
 use std::any::Any;
 use std::fmt;
@@ -68,6 +83,12 @@ type Callable<I, O> = Box<dyn Fn(I, &mut Pipeflow) -> O + Send + Sync>;
 /// private -- and consumed by [`DataPipelineBuilder::pipe`], which checks `I`
 /// against the chain's previous pipe's own output type before it will accept
 /// one.
+///
+/// The callable bound is `Fn(..) + Send + Sync`, both kinds of pipe paying it
+/// alike; `DESIGN.md`'s "A pipe callable is `Fn + Send + Sync`" entry has why
+/// `Fn` rather than `FnMut`. [`DataPipe::set_type`],
+/// [`DataPipe::set_callable`] and [`DataPipe::set_callable_with_flow`] change
+/// a pipe under that same bound before it is added to a chain.
 pub struct DataPipe<I, O> {
     kind: PipeType,
     callable: Callable<I, O>,
@@ -88,6 +109,101 @@ impl<I, O> DataPipe<I, O> {
     #[must_use]
     pub fn pipe_type(&self) -> PipeType {
         self.kind
+    }
+
+    /// Changes this pipe's direction: upstream's `type(PipeType)`.
+    ///
+    /// A chain's first pipe must still be [`PipeType::Serial`] when
+    /// [`DataPipelineBuilder::build`] runs, which is where a flipped first
+    /// pipe is caught.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rustflow::pipeline::data_pipeline::serial_pipe;
+    /// use rustflow::pipeline::pipe::PipeType;
+    ///
+    /// let mut pipe = serial_pipe::<i32, i32>(|value| value + 1);
+    /// pipe.set_type(PipeType::Parallel);
+    /// assert_eq!(pipe.pipe_type(), PipeType::Parallel);
+    /// ```
+    pub fn set_type(&mut self, pipe_type: PipeType) {
+        self.kind = pipe_type;
+    }
+
+    /// Replaces this pipe's callable with one that only needs its input
+    /// value: upstream's `callable(U&&)` handed [`serial_pipe`]'s own
+    /// callable shape, leaving the direction alone. This module's `# Design`
+    /// section has why the other shape is [`DataPipe::set_callable_with_flow`]
+    /// rather than this method again.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::{Arc, Mutex};
+    ///
+    /// use rustflow::Executor;
+    /// use rustflow::pipeline::data_pipeline::{
+    ///     DataPipeline, serial_pipe, serial_pipe_with_flow,
+    /// };
+    /// use rustflow::prelude::*;
+    ///
+    /// let seen: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+    /// let collected = Arc::clone(&seen);
+    /// let mut sink = serial_pipe::<i32, ()>(|_value| unreachable!("replaced below"));
+    /// sink.set_callable(move |value| collected.lock().expect("uncontended").push(value));
+    ///
+    /// let pipeline = DataPipeline::builder(1)
+    ///     .pipe(serial_pipe_with_flow::<(), i32>(|(), pf| {
+    ///         if pf.token() == 3 {
+    ///             pf.stop();
+    ///             return 0;
+    ///         }
+    ///         i32::try_from(pf.token()).expect("a token count fits in an i32")
+    ///     }))
+    ///     .pipe(sink)
+    ///     .build();
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// let module = taskflow.composed_of(&pipeline);
+    /// taskflow.task(module).name("module_of_data_pipeline");
+    /// Executor::new(2).run(&taskflow).wait().expect("no task panicked");
+    ///
+    /// assert_eq!(*seen.lock().expect("the run is over"), vec![0, 1, 2]);
+    /// ```
+    pub fn set_callable(&mut self, callable: impl Fn(I) -> O + Send + Sync + 'static)
+    where
+        I: Send + 'static,
+        O: Send + 'static,
+    {
+        self.callable = Box::new(move |input, _pf: &mut Pipeflow| callable(input));
+    }
+
+    /// Replaces this pipe's callable with one that also needs the running
+    /// token's [`Pipeflow`]: upstream's `callable(U&&)` handed
+    /// [`serial_pipe_with_flow`]'s own callable shape, leaving the direction
+    /// alone.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rustflow::pipeline::data_pipeline::parallel_pipe_with_flow;
+    /// use rustflow::pipeline::pipe::PipeType;
+    ///
+    /// let mut pipe = parallel_pipe_with_flow::<i32, i32>(|value, _pf| value);
+    /// pipe.set_callable_with_flow(|value, pf| {
+    ///     value + i32::try_from(pf.line()).expect("a line count fits in an i32")
+    /// });
+    /// assert_eq!(pipe.pipe_type(), PipeType::Parallel);
+    /// ```
+    pub fn set_callable_with_flow(
+        &mut self,
+        callable: impl Fn(I, &mut Pipeflow) -> O + Send + Sync + 'static,
+    ) where
+        I: Send + 'static,
+        O: Send + 'static,
+    {
+        self.callable = Box::new(callable);
     }
 }
 
@@ -653,6 +769,39 @@ mod tests {
             parallel_pipe_with_flow::<i32, i32>(|value, _pf| value).pipe_type(),
             PipeType::Parallel
         );
+    }
+
+    /// Both setters reach the field the constructors set, and a callable
+    /// swap leaves the direction where [`DataPipe::set_type`] left it.
+    ///
+    /// Calls the stored callable directly, as the erased closure
+    /// [`DataPipelineBuilder::pipe`] builds does: what a run of a chain
+    /// makes of a swapped pipe is `tests/data_pipelines.rs`'s own pair of
+    /// cases.
+    #[test]
+    fn a_data_pipes_type_and_both_callable_shapes_can_be_replaced() {
+        let mut pipeflow = Pipeflow {
+            line: 3,
+            ..Pipeflow::default()
+        };
+        let mut pipe = serial_pipe::<i32, i32>(|value| value + 1);
+        assert_eq!((pipe.callable)(1, &mut pipeflow), 2);
+
+        pipe.set_type(PipeType::Parallel);
+        assert_eq!(pipe.pipe_type(), PipeType::Parallel);
+
+        pipe.set_callable(|value| value * 10);
+        assert_eq!((pipe.callable)(2, &mut pipeflow), 20);
+        assert_eq!(
+            pipe.pipe_type(),
+            PipeType::Parallel,
+            "a callable swap is no part of the direction"
+        );
+
+        pipe.set_callable_with_flow(|value, pf| {
+            value + i32::try_from(pf.line()).expect("a line count fits in an i32")
+        });
+        assert_eq!((pipe.callable)(5, &mut pipeflow), 8);
     }
 
     #[test]

@@ -542,6 +542,16 @@ scratch rather than resetting one object twice.
   and `DataPipeline::reset_lines` thread through to the inner `Pipeline` the
   way `reset()` already delegates, each checking the new chain's types through
   `DataPipelineBuilder::pipe` as the builder does.
+- **The same gap one level down, tracked by #460 and done there.** `DataPipe`
+  carried only `pipe_type()` where `Pipe` has `set_type` and `set_callable`
+  besides, so a pipe built by one of the four constructors could not be
+  adjusted before being added to a chain. `DataPipe::set_type`,
+  `DataPipe::set_callable` and `DataPipe::set_callable_with_flow` are in, the
+  callable pair split by shape for the reason
+  `src/pipeline/data_pipeline.rs`'s own `# Design` section gives. Not an
+  example PR's finding but the 2026-11-23 parity audit's, and noted here
+  because this is the entry a reader asking what the typed family does not
+  have reads first.
 - **Reported in:** PR #252 (#199).
 
 ### Upstream's own data-pipeline example has a live type bug the port's typed builder rejects
