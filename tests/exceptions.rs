@@ -29,18 +29,20 @@
 //! of the eight is reduced -- the hundred rounds of a hundred children are
 //! upstream's own, and so are the 1024 failures of the two `.Runtime` cases.
 //!
-//! Two groups of that file are still not here, and neither is waiting on a
-//! node kind:
+//! One group of that file is still not here, and it is not waiting on a node
+//! kind: `Probe1..4` read a failed task's payload back off the node it failed
+//! on, through `tf::Task::exception_ptr()`. That accessor is deliberately not
+//! part of this port: `Job::record_panic` *drops* a payload that loses the
+//! race for an anchor rather than parking it on the node, which
+//! `a_thousand_tasks_failing_at_once_report_exactly_one_panic` below pins
+//! from the other side. So those four wait on that decision being revisited
+//! rather than on a milestone.
 //!
-//! - the algorithm cases, `Algorithm` and `NestedAlgorithm`, need the
-//!   parallel algorithms a later milestone brings.
-//! - `Probe1..4` read a failed task's payload back off the node it failed on,
-//!   through `tf::Task::exception_ptr()`. That accessor is deliberately not
-//!   part of this port: `Job::record_panic` *drops* a payload that loses the
-//!   race for an anchor rather than parking it on the node, which
-//!   `a_thousand_tasks_failing_at_once_report_exactly_one_panic` below pins
-//!   from the other side. So those four wait on that decision being
-//!   revisited rather than on a milestone.
+//! The algorithm pair, `Algorithm` and `NestedAlgorithm`, is at the end of
+//! the file as of #463 -- a `for_each_index` whose every body panics, and the
+//! same with the panic two graphs down through a `corun`. They were the last
+//! of upstream's file waiting on a milestone, the parallel algorithms having
+//! landed with #164-#179.
 //!
 //! The subflow family is here in full, and the file is ordered by the issue a
 //! case arrived with rather than by upstream's layout.
@@ -117,6 +119,7 @@ use std::panic;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use rustflow::algorithm::partitioner::DefaultPartitioner;
 use rustflow::prelude::*;
 use rustflow::{AsyncHandle, CorunError, Executor, JoinError, RunError, Semaphore};
 
@@ -2111,5 +2114,127 @@ worker_matrix! {
         a_failing_task_between_an_acquire_and_its_release_leaves_the_count_taken_1_thread(1),
         a_failing_task_between_an_acquire_and_its_release_leaves_the_count_taken_2_threads(2),
         a_failing_task_between_an_acquire_and_its_release_leaves_the_count_taken_3_threads(3),
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: Algorithm
+// ----------------------------------------------------------------------------
+
+/// Upstream's `algorithm(W)`: a `for_each_index(0, 50, 1)` whose every body
+/// fails, ten times over, each round's own run reporting that failure.
+///
+/// The ten rounds are upstream's own stress loop and are kept: each round
+/// builds a fresh taskflow, so what they repeat is a whole algorithm task
+/// being built, failing and torn down, which is the shape in which a run that
+/// did not clean up after itself would show.
+///
+/// The worker sweep is what makes the case cover two deliveries rather than
+/// one, because `for_each_index` is a runtime task: at one worker it takes
+/// its own single-worker arm, so the whole walk runs inline in that task's
+/// body and the panic is the node's own, while above one worker the walk is
+/// spawned and the panic is a child's, reaching the run through the runtime
+/// node's implicit anchor. Upstream's default partitioner is spelled out
+/// here because this port takes it as an argument rather than defaulting it.
+fn algorithm(workers: usize) {
+    let executor = Executor::new(workers);
+
+    for round in 1..=10 {
+        let mut taskflow = Taskflow::new();
+        taskflow.for_each_index(
+            0_i64,
+            50,
+            1,
+            |_| panic!("algorithm"),
+            DefaultPartitioner::default(),
+        );
+
+        let error = executor
+            .run(&taskflow)
+            .wait()
+            .expect_err("every body of the range panicked");
+        assert_failed_with(
+            &error,
+            "algorithm",
+            &format!("{workers} worker(s), round {round}"),
+        );
+    }
+}
+
+worker_matrix! {
+    algorithm {
+        a_panicking_for_each_index_body_fails_the_run_1_thread(1),
+        a_panicking_for_each_index_body_fails_the_run_2_threads(2),
+        a_panicking_for_each_index_body_fails_the_run_3_threads(3),
+        a_panicking_for_each_index_body_fails_the_run_4_threads(4),
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Testcase: NestedAlgorithm
+// ----------------------------------------------------------------------------
+
+/// Upstream's `nested_algorithm(W)`: a `for_each_index(0, 10, 1)` whose every
+/// body coruns a second taskflow of its own, itself a
+/// `for_each_index(0, 10, 1)` whose every body fails, ten times over -- and
+/// the failure two graphs down is what the outer run reports.
+///
+/// This is the one case here whose answer had to be read off the port's own
+/// contract first, and that contract is upstream's: `DESIGN.md`'s "Waiting on
+/// a nested graph comes in two shapes" entry keeps `corun` as the rethrowing
+/// call, so a payload the corunning worker is handed goes to
+/// `resume_unwind` and becomes the calling body's own failure unless that
+/// body catches it. So the assertion below is upstream's assertion, not an
+/// adaptation of it: nothing in the body catches, so the chunk task fails
+/// with `"oops"`, and the walk carries it up to the run exactly as
+/// [`an_uncaught_corun_failure_becomes_the_outer_runs_failure`] has it.
+/// [`Executor::try_corun`] is the call a body that meant to inspect the
+/// failure would make instead, and no body here means to.
+fn nested_algorithm(workers: usize) {
+    let executor = Arc::new(Executor::new(workers));
+
+    for round in 1..=10 {
+        let mut taskflow = Taskflow::new();
+        taskflow.for_each_index(
+            0_i64,
+            10,
+            1,
+            {
+                let executor = Arc::clone(&executor);
+                move |_| {
+                    let mut inner = Taskflow::new();
+                    inner.for_each_index(
+                        0_i64,
+                        10,
+                        1,
+                        |_| panic!("oops"),
+                        DefaultPartitioner::default(),
+                    );
+                    executor
+                        .corun(&inner)
+                        .expect("a chunk body runs on a worker, so it may corun");
+                }
+            },
+            DefaultPartitioner::default(),
+        );
+
+        let error = executor
+            .run(&taskflow)
+            .wait()
+            .expect_err("the corun of the inner range re-raised its panic");
+        assert_failed_with(
+            &error,
+            "oops",
+            &format!("{workers} worker(s), round {round}"),
+        );
+    }
+}
+
+worker_matrix! {
+    nested_algorithm {
+        a_panic_under_a_corun_for_each_index_reaches_the_outer_run_1_thread(1),
+        a_panic_under_a_corun_for_each_index_reaches_the_outer_run_2_threads(2),
+        a_panic_under_a_corun_for_each_index_reaches_the_outer_run_3_threads(3),
+        a_panic_under_a_corun_for_each_index_reaches_the_outer_run_4_threads(4),
     }
 }
