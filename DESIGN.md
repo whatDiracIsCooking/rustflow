@@ -2942,6 +2942,29 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   `buffer_of`'s doc comment calls free is free in its *cost*, not in its
   value.
 
+  **#430's three were re-measured under the corrected method below, and all
+  three still survive** (issue #454). Both directions of that run's verdicts
+  were in doubt, `-j 4` being able to report a false MISSED and, as #457
+  showed, a false CAUGHT -- and the wrong CAUGHT is the dangerous one, a
+  survivor reported caught getting no row in a table and no disposition. All
+  232 mutants of the three files, re-run at `-j 1` in a directory no other
+  process wrote to, come back **109 caught, 3 missed, 99 timeouts and 21
+  unviable**: the three missed are exactly the three patterns above, the
+  unviable count is unchanged, and nothing that run reported caught turns out
+  to survive. Its ninety-nine timeouts are detection rather than doubt: each
+  names a test stalled past sixty seconds against a selection whose baseline
+  test phase takes under four, and the nineteen whose stall fell in an
+  integration case were re-run at `-t 300`, where one becomes a **named
+  failure** -- `wavefront_starvation_8_workers`, at `spin.rs`'s 120 s give-up
+  -- seven more already name a failing assertion in a log the run never
+  reaches the end of, and eleven hang for the full three hundred seconds.
+  Each of the three also carries the control this entry asks of an equivalent
+  mutant, under the same selection -- at `commit_wait`'s expression the `&`
+  mutant of the **same line and column** does not finish at all, and at
+  `notify_all`'s guard the `!=` mutant of the same line does not either, while
+  the two `&` mutants of the argument one line below are caught in under a
+  second.
+
   **#432's run over the scheduling loop and its five neighbours adds
   twenty-four entries to that list, in eight groups** -- twenty-three of its
   own, one of them withdrawn by the re-measurement this entry ends with, and
@@ -3209,6 +3232,14 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   mutants` writes only MISSED, TIMEOUT and UNVIABLE to stdout when stdout is
   not a tty, so **`outcomes.json` is the file to tally** -- the stdout stream of
   #433's run shows 0 caught of 67 lines where `outcomes.json` has 80 of 220.
+
+  And **one `cargo mutants` process per target directory**, which is the rule
+  `-j 1` is a special case of: two concurrent runs share the rlib and
+  test-binary paths even when their `--output` directories differ, so one job
+  per run buys nothing against substitution unless the directory is exclusive
+  too. That reproduced inside #454's re-verification, from nothing but two of
+  its own passes overlapping in one directory, and the overlapping outcomes
+  were discarded and re-measured in a clean one.
 
   **What a timeout means here, which is not what it means elsewhere in this
   entry.** 61 of the 220 time out, and reading their logs is the step that tells
