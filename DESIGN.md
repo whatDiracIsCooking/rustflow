@@ -1826,6 +1826,24 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   with no shared state between them -- one after another, in whatever order
   the caller chooses.
 
+- **`ObserverType` and `to_string(ObserverType)` are not ported**
+  (issue #461). The same header declares `enum class ObserverType : int {
+  TFPROF, CHROME, UNDEFINED }` and a `to_string` over it, and at the pinned
+  v4.1.0 tag that enum is dead API: it appears nowhere else under
+  `taskflow/` -- not as a field, a parameter or a return type, and not in
+  upstream's own tests, examples or benchmarks -- and the only other file in
+  the tree that names it is the C++20 module interface
+  `modules/tf.core.cppm`, which re-exports the symbol. The three strings its
+  `to_string` returns label nothing in either observer's output format. So
+  there is nothing to translate it *for*: the two kinds it can name are
+  `ChromeObserver` and `TfProfObserver`, both of which this port has as
+  types, and `Executor::make_observer<O>` hands back an `Arc<O>`, so
+  every holder of an observer here already knows statically which one it
+  holds. What would be left is `UNDEFINED`, the variant a C++ enum needs in
+  order to spell its own absent case, which in Rust is `Option`'s job. A
+  later pin that gives the enum a use -- a kind tag written into the `.tfp`
+  block, say -- is what reopens this.
+
 ## Algorithms
 
 - **The index algorithms take a slice or an `IndexRange`, never a generic

@@ -286,6 +286,11 @@ alone, for the reason under "What is not ported".
   singleton whose destructor writes a file to a path an environment variable
   names; [`DESIGN.md`](DESIGN.md)'s entry on `TFProfManager` has the
   decision, and `TfProfObserver` is what is kept.
+- `ObserverType` and its `to_string`, the same header's observer-kind tag:
+  nothing under upstream's `taskflow/` reads that enum outside its own
+  definition, and the two kinds it names are the two observers this port
+  already hands back as types. [`DESIGN.md`](DESIGN.md)'s entry on it has the
+  decision.
 - The serializer and the rest of upstream's `utility/` directory that `std`
   already covers.
 - Three of upstream's twenty-five benchmarks, where what they measure has no
