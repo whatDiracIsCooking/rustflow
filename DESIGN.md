@@ -2569,17 +2569,28 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
   35-name list for no gain: `rustflow::pipeline::Pipeline` reads as well as
   `rustflow::Pipeline` and says more, which is a distinction a single C++
   namespace has nowhere to draw. And a part of the scheduler that no program
-  outside the crate can drive is not a root name and ought not be `pub`
-  either, which is the arbiter issue #279 asks for: it excludes
-  `NonpreemptiveRuntime` and `NonpreemptiveRuntimeWork` (the README already
-  lists the first as deliberately not user-facing), the `executor::topology`
-  types, and the `executor::queue` trio `Buffers`, `Thief` and `WorkerQueue`,
-  whose only caller anywhere is `tests/wsq.rs` -- a test of the queue layer,
-  not a program using it. Those three root lines were the rule's first
-  outstanding application, and #279 took it: withdrawing them edited
-  `tests/wsq.rs` to name `rustflow::executor::queue::...` instead, the same
-  module path `tests/notifiers.rs` already uses for the notifiers, which were
-  never root names.
+  outside the crate can drive is not a root name and ought not be `pub` either,
+  which is the arbiter issue #279 asks for: it excludes the
+  `executor::topology` types and the `executor::queue` trio `Buffers`, `Thief`
+  and `WorkerQueue`, whose only caller anywhere is `tests/wsq.rs` -- a test of
+  the queue layer, not a program using it. Those three root lines were the
+  rule's first outstanding application, and #279 took it: withdrawing them
+  edited `tests/wsq.rs` to name `rustflow::executor::queue::...` instead, the
+  same module path `tests/notifiers.rs` already uses for the notifiers, which
+  were never root names. `NonpreemptiveRuntime` and `NonpreemptiveRuntimeWork`
+  are out of the root list on the adjacent ground their own docs give,
+  drivability being the wrong test for them: a program outside the crate really
+  can drive one, `FlowBuilder::emplace_nonpreemptive_runtime` being public and
+  a body closure being handed the handle with its parameter's type inferred.
+  What no caller can do is *name* one -- `executor::runtime` is `pub(crate)`,
+  and `graph::NonpreemptiveRuntimeWork`, nameable as that one is, has no public
+  constructor and nothing public to call on a value of it -- so neither is a
+  name a program using the crate writes, which is what a root line is for. The
+  handle's keyword is `pub` all the same, where this rule's second clause would
+  have it `pub(crate)`; `src/executor/runtime.rs`'s `# Design` section has the
+  `private_bounds` reason. The README lists the first under what is not ported
+  on the same reading: a *nameable* type, the node kind itself being ported and
+  callable.
 
   **`SemaphoreError` stopped qualifying, and the rule took the type as well as
   its root line** (issue #347). #329 demoted `SemaphoreError::max_value` to
