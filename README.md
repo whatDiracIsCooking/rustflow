@@ -269,10 +269,19 @@ alone, for the reason under "What is not ported".
 - Deferred pipelines: `pipeline.hpp` at the pin has no `defer`, and
   upstream's `test_deferred_*.cpp` files are not in its own test
   `CMakeLists`.
-- `NonpreemptiveRuntime` as a user-facing type. The port keeps an internal
-  nonpreemptive node kind a pipeline's line task dispatches through rather
-  than a type a caller names; [`DESIGN.md`](DESIGN.md)'s entry on the
-  eleventh `Handle` variant has why.
+- `NonpreemptiveRuntime` as a *nameable* type -- the node kind itself is
+  ported and callable. `FlowBuilder::emplace_nonpreemptive_runtime` is a
+  public method, a pipeline's line task dispatches through the same node
+  kind, and a body closure is handed the restricted handle with its
+  parameter's type inferred, so it can `schedule` a task of its own graph
+  through one. What no public path spells is the type: it lives in the
+  crate-private `executor::runtime` module, so it is neither a root
+  re-export nor a name a caller can write in an annotation, a field or a
+  signature of its own. The handle is restricted because a node with no
+  preemption protocol has no way to resume itself if its body spawned nested
+  work, and a name is the one thing a body never needs in order to use one;
+  [`DESIGN.md`](DESIGN.md)'s entry on the eleventh `Handle` variant has the
+  decision.
 - `TFProfManager`. A library has no business installing a process-global
   singleton whose destructor writes a file to a path an environment variable
   names; [`DESIGN.md`](DESIGN.md)'s entry on `TFProfManager` has the
