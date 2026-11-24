@@ -1,4 +1,5 @@
-//! Golden-string tests for the Graphviz DOT dump (`src/dump.rs`).
+//! Golden-string tests for the Graphviz DOT dump (`src/dump.rs`), and for the
+//! one-line description of a single task written beside it.
 //!
 //! # How these goldens were obtained
 //!
@@ -21,6 +22,13 @@
 //! For the same reason, the issue's "output parses with `dot`" check is **not
 //! done**: there is no `graphviz` in the container either. It stays an open
 //! item, and it was never part of the gate.
+//!
+//! The one-line goldens added for issue #459 were read the same way, from
+//! `Task::dump` at `taskflow/core/task.hpp` line 1482 of the same commit and
+//! its `to_string(TaskType)` at lines 66-82: `task `, the name or the node's
+//! address, then ` [type=` and the type's lower-case name and `]`, with no
+//! trailing newline. The address is the only byte of it this port substitutes,
+//! and it substitutes the same `p<arena index>` the document does.
 //!
 //! The nested-graph goldens added for issue #46 come from the same reading of
 //! the same four functions, and carry the same caveat: the module-stack loop
@@ -67,7 +75,9 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use rustflow::{Graph, Handle, SubflowWork, Task, Taskflow, Work};
+use rustflow::{
+    AsyncWork, FlowBuilder, Graph, Handle, RuntimeWork, SubflowWork, Task, TaskType, Taskflow, Work,
+};
 
 /// Asserts that no identifier is declared twice in `dot`.
 ///
@@ -937,4 +947,169 @@ fn a_module_graph_and_a_subflow_keep_their_identifiers_apart() {
         )
     );
     assert_unique_node_ids(&taskflow.dump());
+}
+
+/// Upstream:
+///
+/// ```cpp
+/// tf::Taskflow taskflow;
+/// auto a = taskflow.emplace([](){});
+/// a.name("a");
+/// auto b = taskflow.placeholder();
+/// a.dump(std::cout);   // task a [type=static]
+/// b.dump(std::cout);   // task 0x5648f2b0e2c0 [type=placeholder]
+/// ```
+///
+/// A named task prints its name and an unnamed one the identifier that stands
+/// in for upstream's node address -- and the point of that substitution is the
+/// last two assertions: the fallback is the id the document gives the very
+/// same node, so the two outputs can be read together.
+#[test]
+fn a_task_dumps_one_line_and_an_unnamed_one_falls_back_to_its_id() {
+    let mut taskflow = Taskflow::with_name("one-liner");
+    let a = taskflow.emplace(|| {});
+    taskflow.task(a).name("a");
+    let b = taskflow.placeholder();
+
+    assert_eq!(taskflow.task_ref(a).dump(), "task a [type=static]");
+    assert_eq!(taskflow.task_ref(b).dump(), "task p1 [type=placeholder]");
+
+    let document = taskflow.dump();
+    assert!(document.contains("    p0[label=\"a\" ];\n"));
+    assert!(document.contains("    p1[label=\"p1\" ];\n"));
+}
+
+/// `Display` and `dump_into` are the other two spellings upstream has --
+/// `operator<<(std::ostream&, const Task&)` and `dump(std::ostream&)` -- and
+/// all three write the one line: no leading and no trailing newline, so a
+/// caller streaming several of them chooses its own separator.
+///
+/// The refusal is this port's own, as it is for the document: a `fmt::Write`
+/// reports a write it would not take, where an `ostream` sets a bit upstream
+/// never reads.
+#[test]
+fn display_and_dump_into_write_the_same_line() {
+    let mut taskflow = Taskflow::with_name("spellings");
+    let a = taskflow.emplace(|| {});
+    taskflow.task(a).name("a");
+
+    let view = taskflow.task_ref(a);
+    let line = view.dump();
+    assert_eq!(format!("{view}"), line);
+    assert_eq!(view.to_string(), line);
+
+    let mut out = String::from("before: ");
+    view.dump_into(&mut out)
+        .expect("writing to a String cannot fail");
+    view.dump_into(&mut out)
+        .expect("writing to a String cannot fail");
+    assert_eq!(out, format!("before: {line}{line}"));
+
+    assert!(
+        view.dump_into(&mut Refusing).is_err(),
+        "the writer's own refusal comes back to the caller"
+    );
+}
+
+/// Upstream:
+///
+/// ```cpp
+/// auto task = taskflow.emplace([](){});
+/// std::cout << task.name() << " type=[" << tf::to_string(task.type()) << "]\n";
+/// ```
+///
+/// The `type=` of the line is `TaskType`'s own name table and nothing else, so
+/// every handle kind is dumped here and checked against it -- including the
+/// four pairs that fold onto one type, which is upstream's folding: both
+/// conditioners report `condition`, both module forms `module`, both async
+/// forms `async`, and a nonpreemptive runtime task `runtime`.
+///
+/// The closing assertion is what keeps the case honest as handles are added:
+/// it fails unless every type a handle can report was one of the lines just
+/// checked. `TaskType::Undefined` is absent because no handle maps to it.
+#[test]
+fn every_task_kind_reports_the_name_its_type_table_gives_it() {
+    let mut taskflow = Taskflow::with_name("kinds");
+
+    let kinds: Vec<(&str, Handle, TaskType)> = vec![
+        ("placeholder", Handle::Placeholder, TaskType::Placeholder),
+        ("static", Handle::Static(Work::new(|| {})), TaskType::Static),
+        (
+            "condition",
+            Handle::Condition(Work::new(|| 0)),
+            TaskType::Condition,
+        ),
+        (
+            "multi-condition",
+            Handle::MultiCondition(Work::new(Vec::new)),
+            TaskType::Condition,
+        ),
+        (
+            "subflow",
+            subflow_handle(child_graph(&["c0"])),
+            TaskType::Subflow,
+        ),
+        (
+            "runtime",
+            Handle::Runtime(RuntimeWork::new(|_| {})),
+            TaskType::Runtime,
+        ),
+        (
+            "module",
+            Handle::Module(target("target", "x")),
+            TaskType::Module,
+        ),
+        (
+            "adopted-module",
+            Handle::AdoptedModule(child_graph(&["c0"])),
+            TaskType::Module,
+        ),
+        (
+            "async",
+            Handle::Async(AsyncWork::plain(|| {})),
+            TaskType::Async,
+        ),
+        (
+            "dependent-async",
+            Handle::DependentAsync(AsyncWork::plain(|| {})),
+            TaskType::Async,
+        ),
+    ];
+
+    let mut tasks: Vec<(Task, TaskType)> = kinds
+        .into_iter()
+        .map(|(name, handle, task_type)| {
+            (taskflow.graph_mut().add_named_node(name, handle), task_type)
+        })
+        .collect();
+
+    // The one handle a caller outside the crate cannot build by hand, so this
+    // kind comes from its builder instead.
+    let line = taskflow.emplace_nonpreemptive_runtime(|_line| {});
+    taskflow.task(line).name("nonpreemptive-runtime");
+    tasks.push((line, TaskType::Runtime));
+
+    let mut reported = HashSet::new();
+    for (task, task_type) in tasks {
+        let view = taskflow.task_ref(task);
+        assert_eq!(
+            view.dump(),
+            format!("task {} [type={}]", view.name(), task_type.as_str())
+        );
+        reported.insert(task_type);
+    }
+
+    assert_eq!(
+        reported,
+        HashSet::from([
+            TaskType::Placeholder,
+            TaskType::Static,
+            TaskType::Condition,
+            TaskType::Subflow,
+            TaskType::Runtime,
+            TaskType::Module,
+            TaskType::Async,
+        ]),
+        "a handle kind reports a type no line above checked"
+    );
 }

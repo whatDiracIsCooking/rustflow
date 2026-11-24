@@ -62,12 +62,17 @@
 //!   rather than a bare [`Task`] index, which upstream's single `Node*`-based
 //!   handle has no need to tell apart but a bare arena index here would
 //!   invite a caller to look up against the wrong one.
-//! - `exception_ptr()` and `dump()` wait for the milestones that give them
-//!   meaning, and so does the `composed_of()`/`adopt()` pair upstream has on
-//!   `tf::Task` as well as on its builder: the builder forms are
+//! - `exception_ptr()` waits for the milestone that gives it meaning, and so
+//!   does the `composed_of()`/`adopt()` pair upstream has on `tf::Task` as
+//!   well as on its builder: the builder forms are
 //!   [`FlowBuilder::composed_of`](crate::FlowBuilder::composed_of) and
 //!   [`FlowBuilder::adopt`](crate::FlowBuilder::adopt), and turning an
 //!   existing task into a module has no caller in this port yet.
+//! - `dump()` and the `operator<<` beside it are ported as [`TaskRef::dump`]
+//!   and [`TaskRef`]'s `Display`, on the query half with the rest of the
+//!   read-only surface, and they are written in [`crate::dump`] rather than
+//!   here so that the one line and the DOT document it has to agree with name
+//!   a node by one spelling.
 //! - Upstream dispatches one `work()` over five callable shapes, and with no
 //!   overloading here each shape is its own method: [`TaskMut::work`],
 //!   [`TaskMut::condition_work`], [`TaskMut::multi_condition_work`],

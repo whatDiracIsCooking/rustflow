@@ -1,6 +1,8 @@
-//! Translated from `taskflow/core/taskflow.hpp` (Taskflow v4.1.0).
+//! Translated from `taskflow/core/taskflow.hpp` and `Task::dump` in
+//! `taskflow/core/task.hpp` (Taskflow v4.1.0).
 //!
-//! The four `dump`/`_dump` overloads there write a task graph as Graphviz DOT.
+//! The four `dump`/`_dump` overloads of the first write a task graph as
+//! Graphviz DOT; `Task::dump` in the second describes one task in one line.
 //! This port reproduces their output line for line, with one substitution
 //! forced on it: upstream identifies a node by printing its address
 //! (`p0x55f2a4...`) and a graph by printing the graph's address
@@ -20,7 +22,11 @@
 //!   same top-level graph: `Taskflow: p0`.
 //! * An unnamed node falls back to its own id as its label, as upstream falls
 //!   back to the address it is already printing, so a nameless first node
-//!   reads `p0[label="p0" ];`.
+//!   reads `p0[label="p0" ];`. [`TaskRef::dump`] falls back to that same
+//!   `p<index>` where upstream's one-liner prints the `Node*` itself, so a
+//!   nameless task reads alike in both. It is the bare form in that line
+//!   whatever the node's graph is: a handle borrows one graph and knows
+//!   nothing of a document that graph may be nested in.
 //! * A node of a *nested* graph needs more than its arena index, because every
 //!   graph numbers its own nodes from zero where upstream's addresses were
 //!   unique across all of them. The ids of a nested graph therefore carry
@@ -94,11 +100,13 @@
 //! # Coverage
 //!
 //! Every [`Handle`] this crate has dumps, which is the whole of upstream's
-//! four functions. The `match` arms below name every variant rather than
-//! defaulting, so the next variant to arrive stops compiling until its format
-//! is decided. The handles upstream has and this crate does not --
-//! `NonpreemptiveRuntime` above all -- never sit in a taskflow's own graph,
-//! so upstream's dump has nothing to say about them either.
+//! four graph-level functions. The `match` arms below name every variant
+//! rather than defaulting, so the next variant to arrive stops compiling until
+//! its format is decided. The one-line dump reads
+//! [`TaskType`](crate::TaskType) rather than the handle, and that mapping is
+//! exhaustive for the same reason. The handles upstream has and this crate
+//! does not -- `NonpreemptiveRuntime` above all -- never sit in a taskflow's
+//! own graph, so upstream's dump has nothing to say about them either.
 //!
 //! What is unchecked rather than unwritten is the syntax of the output: the
 //! development container has no `graphviz`, so nothing here has been through
@@ -111,6 +119,7 @@ use std::collections::hash_map::Entry;
 use std::sync::{Arc, TryLockError};
 
 use crate::graph::{Graph, Handle, Node, Task};
+use crate::task::TaskRef;
 use crate::taskflow::Taskflow;
 
 /// The id of the top-level graph, upstream's `dumper.visited[top]`, which is
@@ -136,6 +145,62 @@ const TOP_NODE_PREFIX: &str = "p";
 /// graph's. See the module docs: without it the subgraph of the top graph's
 /// `p1` and module graph 1 would fight over `cluster_p1` and `p1_0`.
 const SUBGRAPH_MARKER: &str = "_sub";
+
+impl TaskRef<'_> {
+    /// Returns the one-line description of this task.
+    ///
+    /// Upstream's `Task::dump`, as a `String` for the reason
+    /// [`Taskflow::dump`] is one. The line is
+    /// `task <name> [type=<task type>]`, with no trailing newline, and an
+    /// unnamed task is named by the `p<arena index>` the
+    /// [module docs](crate::dump) substitute for the node address upstream
+    /// prints -- the id [`Graph::dump_into`] writes the same node under.
+    ///
+    /// ```
+    /// use rustflow::prelude::*;
+    ///
+    /// let mut taskflow = Taskflow::new();
+    /// let a = taskflow.emplace(|| {});
+    /// taskflow.task(a).name("a");
+    /// let b = taskflow.placeholder();
+    ///
+    /// assert_eq!(taskflow.task_ref(a).dump(), "task a [type=static]");
+    /// assert_eq!(taskflow.task_ref(b).dump(), "task p1 [type=placeholder]");
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the formatting machinery fails, which writing to a `String`
+    /// cannot do.
+    #[must_use]
+    pub fn dump(self) -> String {
+        let mut line = String::new();
+        self.dump_into(&mut line)
+            .expect("writing a dump to a String cannot fail");
+        line
+    }
+
+    /// Writes the one-line description of this task into an existing writer.
+    ///
+    /// Upstream's `Task::dump(std::ostream&)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error the writer returns.
+    pub fn dump_into(self, out: &mut impl fmt::Write) -> fmt::Result {
+        out.write_str("task ")?;
+        write_name(out, self.name(), &node_id(TOP_NODE_PREFIX, self.task()))?;
+        write!(out, " [type={}]", self.task_type())
+    }
+}
+
+impl fmt::Display for TaskRef<'_> {
+    /// The same line [`TaskRef::dump`] returns, upstream's
+    /// `operator<<(std::ostream&, const Task&)`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.dump_into(f)
+    }
+}
 
 impl Graph {
     /// Writes the node and edge lines of this graph as Graphviz DOT.
