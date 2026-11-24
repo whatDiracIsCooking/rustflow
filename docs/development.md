@@ -44,13 +44,14 @@ The loom models in `tests/loom_*.rs` are the one test target the gate does not
 build — they need a `cfg(loom)` rebuild of the whole dependency graph, which
 only `RUSTFLAGS` sets — so
 [`.github/workflows/loom.yml`](../.github/workflows/loom.yml) runs them weekly
-and on `workflow_dispatch` instead of per PR. There are eight, one per
+and on `workflow_dispatch` instead of per PR. There are nine, one per
 lock-free protocol or cross-thread rule a machine-checked model states better
 than a paragraph: the notifier's wait protocol, the run storage's
 wake-after-last-release rule, the delivery of a failure under a runtime task,
 `Runtime::scope`'s join rule, a node's dispatch claim, the `AsyncHandle`
-delivery slot, the `TaskGroup` counter, and the semaphore's
-park-and-reschedule rule.
+delivery slot, the `TaskGroup` counter, the semaphore's
+park-and-reschedule rule, and the sweep of the other workers' queues a worker
+makes between arming its waiter and parking in it.
 
 [`.github/workflows/miri.yml`](../.github/workflows/miri.yml) is the second
 weekly lane, and what it checks is the half loom cannot: loom explores every
@@ -340,7 +341,8 @@ paid for by every pull request, and the first thing it buys is the habit of
 ignoring a red `coverage`; a floor that is too low is paid for once, by a
 reviewer, and `--write-floors` raises it in one command on a tree that has
 earned it. The floors can only rise from here: the mutation chain adds tests,
-and this milestone's closing docs issue re-measures.
+and the re-measure that closed the milestone raised nine of the 54 on the
+strength of them, which "What the suite is held to" below names.
 
 **They are floors on line coverage only, and a line floor is partly a floor on
 test code.** Regions and functions are not floored: the never-executed function
@@ -511,3 +513,137 @@ from its path, so `cat` that `.git` file when you inherit one.
   deliberate: sharing one `./target` across a container and a host build has
   them overwrite each other's artifacts. Run `cargo` on the host if you like —
   it gets its own `./target` and the two never meet.
+
+## What the suite is held to
+
+Coverage, mutation and the two weekly lanes are the evidence behind the suite,
+and exactly one of them fails a pull request: the per-file coverage floors. The
+sections above say what each is and how to run it; this one is the **state of
+each on a dated measurement of this tree**, which is what the next pass starts
+from, and every figure in it names the command it came from. The milestone that
+put them there ran 2026-11-21 to 2026-11-24 and is the sixth with no step
+number in [`porting.md`](porting.md).
+
+**Coverage.** `devtools/coverage.sh --functions --check-floors`, 2026-11-24, at
+commit be63c15: **97.85% of 17178 lines** (370 missed), 97.53% of 19954 regions
+and **91.42% of 2424 function groups**, 208 of which the suite never executed —
+**10 of 1267 production groups** and 198 of 1157 in `src/`'s own `#[cfg(test)]`
+code. The two further runs of the same tree quoted below --
+`--functions --write-floors` and `--check-floors` -- read 372 and 373 missed
+lines (97.83% both) and the identical 208, 10 and 198, which is the order of
+the spread this page already describes: the line figure moves by a line or two
+between runs, the function counts do not move at all. The baseline the lane
+started from, for comparison, is the one above: 96.20% of 17035 lines and 253
+never-executed groups, measured on 2026-11-21 at 59cf9e4.
+
+The production count is the one a coverage gap can be read off, and its
+trajectory across the milestone is **55 → 25 → 10**: 55 of 1267 when #442 split
+the listing (5d804e4), 25 once the five dispositions had landed (3d9a290), 10
+today — with the test-code count at exactly 198 in all three, which is the split
+earning its keep. The ten that remain are each a **recorded exception with an
+entry in [`DESIGN.md`](../DESIGN.md)**, and no production function the suite
+never executes is an owed test:
+
+- five `assert_send_sync` calls in `const _: () = { ... }` blocks —
+  `graph/mod.rs`, `taskflow.rs` and `executor/topology/{job,ownership,run}.rs`
+  — whose only possible call is the one the compile already made (#425);
+- `AtomicWaiter::lock`'s poisoned-lock arm, which nothing under that lock can
+  reach (#430);
+- the three `|| {}` on-finish callbacks `Topology::over`'s signature asks for
+  over runs whose tear-down no path reaches (#432's `InnerRun::new`, #433's
+  `free_standing` and `nothing_to_run`);
+- pdqsort's bad-partition fallback, which an adversarial input reaches and a
+  case does not (#428).
+
+So a new line in that section of a later listing is new, and that is the
+comparison to make rather than a percentage.
+
+**The floors stand at 54, all met**, thinnest headroom **1.64 points** —
+`algorithm/for_each_index.rs` against a floor of 95 — on the `--check-floors`
+run above. This issue's re-measure raised **nine** of them through
+`devtools/coverage.sh --write-floors` and the margin rule above:
+`executor/async.rs` 92 to 97, `executor/async_node.rs` 92 to 96,
+`executor/mod.rs` 94 to 98, `executor/notifier.rs` 95 to 97,
+`executor/queue.rs` 96 to 98, `executor/rng.rs` 92 to 93,
+`executor/run_handle.rs` 95 to 97, `executor/subflow.rs` 91 to 93 and
+`executor/topology/job.rs` 91 to 96. Those nine are exactly the files the four
+mutation runs below added tests to, which is the mutation chain paying the
+coverage lane. One floor the same run offered was **not** taken:
+`algorithm/partitioner.rs` measured 98.71% in it against the 99.04% its
+standing floor of 97 was written from, so `--write-floors` proposed 96, and a
+floor that moves down is a floor measured on an unlucky run rather than a tree
+that has lost coverage. Floors rise; a `--write-floors` diff is read before it
+is committed, and a line that falls in it is dropped.
+
+**Mutation.** `cargo mutants --list`, 2026-11-24, generates **2486** mutants
+over `src/`, after the 46 `exclude_re` patterns in `.cargo/mutants.toml` —
+`--list` applies the config, so every count here is a count of mutants a run
+would actually report. Which files have been mutated, and when:
+
+| Files | Mutants today | Run |
+|---|---|---|
+| `src/graph/` | 208 | #274, 2026-11-18 |
+| `src/semaphore.rs` | 26 | #274, 2026-11-18 |
+| `src/algorithm/partitioner.rs` | 189 | #274, 2026-11-18 |
+| `src/executor/{notifier,rng,queue}.rs` | 229 | #430, 2026-11-21; re-verified #454, 2026-11-24 |
+| `src/executor/{worker,mod,scope,corun,module,dependent_async}.rs` | 203 | #432, 2026-11-21; re-verified #457, 2026-11-23 |
+| `src/executor/topology/` and `src/executor/run_handle.rs` | 215 | #433, 2026-11-21 |
+| `src/executor/{runtime,runtime_async,async,async_node,subflow}.rs` and `src/task_group.rs` | 284 | #434, 2026-11-23 |
+
+A run's own total is larger than its row, because the exclusions it argued for
+are in the count above and were not in its: #430 drove 232 mutants, #432 227,
+#433 220 and #434 287, 966 between them, and each of those four numbers belongs
+to the issue that measured it rather than to this tree. What the four runs
+found is in `DESIGN.md`'s mutation entries, and the summary is that **none of
+them found a bug in the port**: every finding was a defect in a test, in an
+instrument or in the method, most often a test that asserted less than it
+appeared to.
+
+The same `--list`, over the files no run has reached yet, is the map the next
+pass starts from — **1132 mutants**, which is 46% of the crate's:
+
+| Files | Mutants | Note |
+|---|---|---|
+| `src/algorithm/` less `partitioner.rs` | 664 | `sort.rs` is 254 of them, `for_each_index.rs` 98, `merge.rs` 65 |
+| `src/observer/` | 164 | `tfprof.rs` 75, `mod.rs` 39, `timeline.rs` 35, `chrome.rs` 15 |
+| `src/pipeline/` | 99 | `scheduler.rs` 52, `data_pipeline.rs` 31, `pipe.rs` 16 |
+| the handle and builder surface | 205 | `task.rs` 62, `dump.rs` 44, `taskflow.rs` 30, `subflow.rs` 25, `flow_builder.rs` 19, `async_task.rs` 19, `runtime.rs` 6 |
+
+Those four groups and the seven rows above account for all 2486, so the map has
+no gap in it. Three of the crate's 55 files under `src/` generate no mutant at
+all and are in neither table: `executor/topology/mod.rs`, which is 16 lines of
+production code in front of the crate's largest test module, and
+`pipeline/mod.rs` and `lib.rs`, which are documentation and re-exports.
+
+**How a run of this kind must be driven is itself a finding** (#433, corrected
+and widened by #457), and it is not the default. One job at a time, in a
+`CARGO_TARGET_DIR` no other build and no other `cargo mutants` process is
+using: at `-j N` under one directory the jobs overwrite each other's rlib and
+test binaries, so a mutant can be reported MISSED *or* **CAUGHT** when it is
+neither, and a survivor reported caught costs a disposition nobody ever
+writes. The test selection goes through `--cargo-arg` rather than
+`--cargo-test-arg`, which is the difference between the build phase compiling
+the one target and all ninety; survivors are then re-measured unfiltered over
+the whole suite; and the verdicts are tallied from `outcomes.json`, not from
+stdout, which carries only MISSED, TIMEOUT and UNVIABLE when it is not a tty.
+`DESIGN.md`'s entry on it has the evidence for each of those, and
+[`.cargo/mutants.toml`](../.cargo/mutants.toml) carries the equivalent mutants
+a run must not report.
+
+**Miri, and what is ignored under it: nothing.** `grep -rn 'cfg_attr(miri' src
+tests` reports no match on this tree (2026-11-24), and neither step of the lane
+can be emptied quietly — the unit-test step fails on an ignored test missing
+from the workflow's reason table, and each witness of the lifecycle step must
+report exactly one passing case. Between them the two steps cover the three
+modules whose discipline the type system is not checking and the four lifecycle
+races those disciplines exist for; the division worth remembering is that the
+crate's production `unsafe` is `executor/notifier.rs` and `executor/scope.rs`
+only, the first reached by the unit-test step and the second by **no** test
+module in it, so the witness set is the one thing putting `scope.rs`'s two
+lifetime-erasing `transmute`s under the interpreter. The costs are #429's
+measurement of 2026-11-21 and are not re-taken here, the lane being weekly CI
+on a toolchain pinned apart from the gate's: ten seconds of interpretation over
+the four cases, seven and a half of them the cancelled-scope case, some twenty
+seconds for the step including the four builds, against a `timeout` of 300
+seconds per case. "Getting a toolchain" above has both steps in full, the two
+`MIRIFLAGS` and why each is `crossbeam-epoch`'s rather than this crate's.

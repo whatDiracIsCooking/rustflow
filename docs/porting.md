@@ -42,7 +42,7 @@ in, and the port is at parity with upstream's user-facing surface at v4.1.0.
    `test_deferred_*.cpp` files exist, they are not in its own test
    `CMakeLists`.
 
-**Five milestones have no step number.** A **consolidation** ran between
+**Six milestones have no step number.** A **consolidation** ran between
 steps 5 and 6, on what five steps had left behind: five milestones' worth of
 rationale collected in doc comments, an async family written three times over
 its three receivers, and the run's machinery one 2,352-line file over a dozen
@@ -75,7 +75,7 @@ suite, all twelve in `pipeline` and none in any nested shape, which is not
 what the stack entry had expected of it (#342); a chunk of the algorithms'
 chunk loop costs 15 ns and 1.3% of its run, leaving a fan-out that reaches 15
 to 19 of 24 workers as the open lead (#343); and 24 of the 196 ids were timing
-their own input setup (#366). **Scheduler performance** ran last, on the worst
+their own input setup (#366). **Scheduler performance** ran fifth, on the worst
 thing those tables said: five nested shapes — `skynet`, `nqueens`,
 `integrate`, `fibonacci` and `merge_sort` — were *slower* at 24 workers than
 at one. Twenty-six issues later they are not, and the two changes that did
@@ -104,19 +104,37 @@ both recorded in [`DESIGN.md`](../DESIGN.md) with their reasons: stack-allocated
 jobs for scoped children, and a splittable source range for external
 submission.
 
-All five keep their decisions in
+**Test hardening** ran last and is the only one of the six that changed no
+production line of `src/` at all — every line it added there is inside a
+`#[cfg(test)] mod tests` — because what it was for is the evidence behind the
+suite rather than the code under it: a coverage lane and a Miri lane beside the
+gate, the per-file line coverage of `src/` turned into a gate of its own over a
+floors file, and the executor core mutation-tested in four runs of some 966
+mutants. Those four runs and the two re-measurements that re-took the first
+two of them **found no bug in the port**: every finding was a defect in a test,
+in an instrument or in the method, most often a test that asserted less than it
+appeared to — a routing case measured at a width where the mutated shift is
+harmless, an RNG known answer seeded with the one seed where `|` is `^`, an
+agreement asserted over a graph on which every observation was empty.
+[`development.md`](development.md)'s "What the suite is held to" is the map it
+leaves behind: what the suite covers, which modules have been mutated and when,
+which have not and how many mutants they hold, and what runs under Miri.
+
+All six keep their decisions in
 [`DESIGN.md`](../DESIGN.md), one entry per decision, in the subsystem
 section each belongs to rather than under the milestone that took it — the
 benchmarks milestone's own under "Benchmarks and performance", and the three
 it took about the port itself under "Executor core" and "Algorithms"; the
 scheduler milestone's are spread over "Executor core", "Dynamic tasking",
-"The async family" and "Algorithms", and that file's preamble lists where each
-of them is.
+"The async family" and "Algorithms", and the test-hardening milestone's are
+nearly all under "Documentation and tooling", that being the section the
+instruments and the mutants no test should kill belong to. That file's preamble
+lists where each of them is.
 
-So the step-to-milestone mapping is the seven steps with those five among
-them, which are milestones 6, 9, 10, 11 and 12: step 6 is the sixth step and
-the seventh milestone, step 7 the eighth. A later step may do the same, and if
-one does it belongs in this list the same way, named here rather than
+So the step-to-milestone mapping is the seven steps with those six among
+them, which are milestones 6, 9, 10, 11, 12 and 13: step 6 is the sixth step
+and the seventh milestone, step 7 the eighth. A later step may do the same, and
+if one does it belongs in this list the same way, named here rather than
 renumbering the steps, since the numbers are what every issue and every
 `DESIGN.md` entry has been written against.
 
