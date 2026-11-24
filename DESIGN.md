@@ -64,6 +64,34 @@ in this file that name a milestone where every other names an issue; they are
 the last two of "Executor core", and they are stack-allocated jobs for scoped
 children and a splittable source range for external submission.
 
+**Decisions taken in M13**, the test-hardening milestone, extend an existing
+entry far more often than they add one, because what that milestone produced is
+tests and instruments rather than a change to the port. Four mutation runs of
+966 mutants between them, two re-measurements of the first two, five coverage
+dispositions and two new weekly lanes later, **it found no bug in the port**:
+every finding was a defect in a test, in an instrument or in the method, most
+often a test that asserted less than it appeared to. Where each decision is: in
+"Documentation and tooling", the list of mutants no test should kill (#309)
+gains #430's three patterns, #432's twenty-four, #433's five and #434's three,
+the two re-measurements that re-took the first two matrices under a sound
+method (#454, #457), and the third kind of
+disposition #452 added -- a mutant whose only possible killer is a loom model;
+beside that list in the same section are how a run of this kind must be driven
+(#433, widened by #457), the never-executed dispositions at one entry each
+(#424, #425, #426, #427, #428), the listing's own denominator (#442), the
+per-file line floors as the one gate among the instruments (#431) and what Miri
+is afforded here (#422, #429). In "The async family", the inventory the scope
+seam's join rests on (#423) is under "A scoped spawn", beside #416's own, the
+two being one incident read from two sides. Two tooling fixes earned a clause
+in the paragraph on the instruments rather than an entry: #421, which built the
+coverage lane #431 then gated, and #444, whose answer was that
+`api-witness.py` could not attribute a closure built in an argument block, so
+nothing about the port changed. The measured figures behind all of it -- the
+coverage trajectory, the map of which modules have and have not been mutated,
+what the Miri lane costs -- are in [`docs/development.md`](docs/development.md)
+under "What the suite is held to", this file keeping the decisions rather than
+the numbers.
+
 The entries are grouped by the part of the port they decide rather than by the
 milestone that decided them; each still names its issue, which is where the
 order they were taken in is recorded.
@@ -3460,11 +3488,14 @@ the next pass does not answer them a fourth way (issues #129, #130, #133,
 this crate's own documentation and tests live in `devtools/`, and all four
 **report**: `doc-ratio.sh` (#126, with #228's `design` column) measures the
 ratio this contract names, `test-names.sh` (#262) is the test-name comparison a
-documentation pass is held to, `coverage.sh` (#263) runs `cargo-llvm-cov` over
-`src/` alone, and `api-witness.py` (#325, made type-aware there and precise
-about signatures and annotations in #331) counts the public declarations no
-test, example, benchmark or doc example witnesses, each call site read against
-the type it reaches rather than against a bare name. Three of them are a gate
+documentation pass is held to, `coverage.sh` (#263, with #421's listing of the
+functions no test executes and the `coverage` job that publishes it) runs
+`cargo-llvm-cov` over `src/` alone, and `api-witness.py` (#325, made type-aware
+there, precise about signatures and annotations in #331, and taught in #444 to
+attribute a closure built in an argument block to the call it is handed to)
+counts the public declarations no test, example, benchmark or doc example
+witnesses, each call site read against the type it reaches rather than against
+a bare name. Three of them are a gate
 in no mode: each exits 0 whatever it finds -- `test-names.sh diff` non-zero
 only on a difference a PR asked for, `api-witness.py` only on a measurement
 that could not run -- so a number from one is something a reviewer reads rather
@@ -3778,6 +3809,39 @@ And `Error::source for JoinError` is the half of an error type that a
 `Display` test cannot reach: `JoinError::Run` and the `RunError` under it
 print the same string, so what `source` adds is the *chain*, and only a caller
 walking it can tell `Some` from `None`.
+
+**What Miri is afforded here is two bounded steps rather than the suite, and
+nothing is ignored inside them** (issues #422 and #429). The interpreter runs
+at some hundredth of native speed, so the `--lib` suite -- four hundred odd
+cases, many of them a multi-worker executor over thousands of nodes -- is not a
+job that finishes, and a weekly lane that covers the protocols is worth more
+than one that times out. So the lane runs the unit tests of the three modules
+whose discipline the type system is not checking for them, and then a
+**lifecycle witness set**: four integration cases, one per guarded module, each
+at two workers, the smallest pool in which every ordering those disciplines
+exist for is possible. The second step was the open question #429 was scoped
+around, with a decline recorded here as its other branch; the branch taken is
+the lane, because the cost is bounded and measured, and
+[`docs/development.md`](docs/development.md) carries the figures and the cap
+per case.
+
+Three things about that shape are decisions rather than consequences. **The
+witness set is not redundant with the step above it**: the crate's production
+`unsafe` is `executor/notifier.rs` and `executor/scope.rs` and nothing else,
+and no test module the first step selects reaches `scope.rs`, so its two
+lifetime-erasing `transmute`s are under the interpreter in the witness set
+alone -- which is also why deleting a witness is not a tidy-up. **An ignore
+cannot hide in either step**: the first fails on an ignored test missing from
+the workflow's own reason table and the second on a witness that does not
+report exactly one passing case, so the answer to "what is ignored and why" is
+that nothing is, and it stays that answer without anybody checking. And **no
+witness is `cfg(miri)`-only**, all four being ordinary members of the gate's
+`cargo test`, which keeps a case the interpreter depends on from rotting behind
+a flag nothing else builds. The nightly the lane carries is pinned by date in
+the two places that have to agree rather than tracking `nightly`, for the
+reason every other pin in this repo exists; the two `MIRIFLAGS` it sets are
+`crossbeam-epoch`'s rather than this crate's, and that argument is in
+`docs/development.md` beside the flags themselves.
 
 ## Benchmarks and performance
 

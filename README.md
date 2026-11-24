@@ -237,8 +237,18 @@ alone, for the reason under "What is not ported".
   the [`Dockerfile`](Dockerfile), and [`docs/development.md`](docs/development.md)
   is the contributor page: the container both front ends build, the
   five-command gate `devtools/devcontainer.sh check` runs, and what CI runs
-  beside it. Four measurements of the crate's own documentation and tests
-  sit beside that gate: `devtools/doc-ratio.sh`, `devtools/test-names.sh`,
+  beside it. Four lanes do, and not one of them is a repeat count: the suite a
+  second time pinned to two cores with `taskset -c 0,1`, which is how most of
+  the lifecycle races this port closed were found; a `coverage` job on every
+  pull request, publishing the per-file table and the listing of every function
+  the suite never executed; and weekly, the nine `loom` models under
+  `tests/loom_*.rs` and a `miri` job on a date-pinned nightly — the unit tests
+  of three modules whose discipline the type system is not checking, then a
+  four-case executor lifecycle witness set at two workers, which is the only
+  thing putting `src/executor/scope.rs` under the interpreter. Nothing in
+  either Miri step is ignored. Four measurements of the crate's own
+  documentation and tests sit beside that gate:
+  `devtools/doc-ratio.sh`, `devtools/test-names.sh`,
   `devtools/coverage.sh` and `devtools/api-witness.py`. Three are reports that
   exit 0 whatever they find, and so is `devtools/coverage.sh` in its default
   and `--functions` modes; its `--check-floors` mode is a gate, and the one
@@ -364,7 +374,13 @@ performance" section -- the two it took about the scheduler being filed under
 the part of the port they decide, as every entry there is. A **scheduler
 performance** milestone ran after it, on what those tables found, and is the
 fifth with no step number; "Performance" above is what it changed and
-`docs/porting.md` has its paragraph. The three rules
+`docs/porting.md` has its paragraph. A **test hardening** milestone is the
+sixth and ran last, and it is the one that changed no production line of
+`src/`: it added the coverage and Miri lanes named above and mutation-tested
+the executor core, finding no bug in the port and a run of defects in the tests
+and instruments themselves.
+[`docs/development.md`](docs/development.md)'s "What the suite is held to" is
+the measured state it leaves. The three rules
 below are the ones a contributor needs before touching anything.
 
 ### Upstream pin
@@ -395,7 +411,7 @@ keep the same split:
   default build stays at those two.
 - **Dev** dependencies need only be useful: `loom` for the lock-free parts
   and for the cross-thread rules a machine-checked model states better than
-  a paragraph (eight models under `tests/loom_*.rs`, each named in
+  a paragraph (nine models under `tests/loom_*.rs`, each named in
   [`docs/development.md`](docs/development.md)), `criterion` for the ported
   benchmarks, `rayon` as the baseline those benchmarks compare against, in
   the role TBB plays upstream, and `proptest` for the generated inputs
